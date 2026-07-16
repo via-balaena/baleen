@@ -9,7 +9,7 @@
 //! whole reproducer. This is the FoundationDB discipline shrunk to a laptop.
 
 use hv_core::evtchn::{PortState, System};
-use hv_core::{prng::Prng, HvCore, Hypercall};
+use hv_core::{grant, prng::Prng, HvCore, Hypercall};
 use hv_hal::TimeSource;
 
 use crate::{FakeMemory, ManualClock};
@@ -160,6 +160,84 @@ pub fn run_evtchn(seed: u64, steps: u32) -> EvtchnOutcome {
     EvtchnOutcome::of(&sys)
 }
 
+/// A comparable summary of a finished grant-table run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct GrantOutcome {
+    pub granted: u32,
+    pub free: u32,
+    pub active_maps: u32,
+    /// Whether the system's invariants hold at the end — asserted in release too.
+    pub invariants_hold: bool,
+}
+
+impl GrantOutcome {
+    fn of(sys: &grant::System) -> Self {
+        let mut o = GrantOutcome::default();
+        for grantor in 0..sys.domain_count() as u16 {
+            for gref in 0..sys.entry_count(grantor) as u32 {
+                if sys.is_granted(grantor, gref) {
+                    o.granted += 1;
+                } else {
+                    o.free += 1;
+                }
+            }
+        }
+        o.active_maps = sys.active_maps() as u32;
+        o.invariants_hold = sys.invariants_hold();
+        o
+    }
+}
+
+/// Drive the grant-table [`grant::System`] through a seed-derived operation stream
+/// across a few domains, tracking live handles so unmaps target real mappings. This
+/// stresses the safety property under interleaving: an end_access racing live maps
+/// must never succeed, and no mapping is ever left dangling.
+pub fn run_grant(seed: u64, steps: u32) -> GrantOutcome {
+    const DOMAINS: u16 = 3;
+    const ENTRIES: u32 = 6;
+
+    let mut sys = grant::System::new(DOMAINS as usize, ENTRIES as usize);
+    let mut rng = Prng::new(seed);
+    let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee, handle) of live maps
+
+    for _ in 0..steps {
+        let grantor = rng.below(u32::from(DOMAINS)) as u16;
+        let gref = rng.below(ENTRIES);
+        match rng.below(6) {
+            0 => {
+                let grantee = rng.below(u32::from(DOMAINS)) as u16;
+                let readonly = rng.below(2) == 0;
+                let frame = u64::from(rng.below(64));
+                let _ = sys.grant_access(grantor, gref, grantee, frame, readonly);
+            }
+            1 => {
+                let _ = sys.end_access(grantor, gref);
+            }
+            2 | 5 => {
+                let grantee = rng.below(u32::from(DOMAINS)) as u16;
+                let writable = rng.below(2) == 0;
+                if let Ok(h) = sys.map(grantee, grantor, gref, writable) {
+                    handles.push((grantee, h));
+                }
+            }
+            3 => {
+                if !handles.is_empty() {
+                    let idx = rng.below(handles.len() as u32) as usize;
+                    let (grantee, handle) = handles.swap_remove(idx);
+                    let _ = sys.unmap(grantee, handle);
+                }
+            }
+            _ => {
+                let grantee = rng.below(u32::from(DOMAINS)) as u16;
+                let write = rng.below(2) == 0;
+                let _ = sys.copy(grantee, grantor, gref, write);
+            }
+        }
+    }
+
+    GrantOutcome::of(&sys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,6 +329,43 @@ mod tests {
         assert!(
             any_bound,
             "no seed ever established an interdomain binding — generator too weak"
+        );
+    }
+
+    /// The grant-table headline: no seeded interleaving of grant/end/map/unmap/copy
+    /// ever leaves a grant dangling or a refcount wrong — end_access-while-mapped is
+    /// refused, so a mapping can never outlive its grant.
+    #[test]
+    fn grant_invariants_hold_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            let outcome = run_grant(seed, 256);
+            assert!(
+                outcome.invariants_hold,
+                "grant-table invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the grant-table machine.
+    #[test]
+    fn grant_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_grant(seed, 256),
+                run_grant(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The generator actually reaches live mappings — the refcount/dangling
+    /// invariants only mean something once maps exist.
+    #[test]
+    fn grant_seeds_reach_active_maps() {
+        let any_mapped = (0..256u64).any(|s| run_grant(s, 256).active_maps > 0);
+        assert!(
+            any_mapped,
+            "no seed ever established a live mapping — generator too weak"
         );
     }
 }

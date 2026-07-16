@@ -37,14 +37,34 @@ fuzz_target!(|data: &[u8]| {
         let port = u32::from(a) % PORTS as u32;
 
         match op % 8 {
-            0 => drop(sys.alloc_unbound(dom, u16::from(a) % DOMAINS as u16)),
-            1 => drop(sys.bind_interdomain(dom, u16::from(a) % DOMAINS as u16, u32::from(b) % PORTS as u32)),
-            2 => drop(sys.bind_virq(dom, u32::from(a) % 2, b % 4)),
-            3 => drop(sys.bind_ipi(dom, u32::from(a) % 2)),
-            4 => drop(sys.close(dom, port)),
-            5 => drop(sys.send(dom, port)),
-            6 => drop(if b & 1 == 0 { sys.mask(dom, port) } else { sys.unmask(dom, port) }),
-            _ => drop(sys.consume(dom, port)),
+            0 => {
+                let _ = sys.alloc_unbound(dom, u16::from(a) % DOMAINS as u16);
+            }
+            1 => {
+                let _ = sys.bind_interdomain(dom, u16::from(a) % DOMAINS as u16, u32::from(b) % PORTS as u32);
+            }
+            2 => {
+                let _ = sys.bind_virq(dom, u32::from(a) % 2, b % 4);
+            }
+            3 => {
+                let _ = sys.bind_ipi(dom, u32::from(a) % 2);
+            }
+            4 => {
+                let _ = sys.close(dom, port);
+            }
+            5 => {
+                let _ = sys.send(dom, port);
+            }
+            6 => {
+                let _ = if b & 1 == 0 {
+                    sys.mask(dom, port)
+                } else {
+                    sys.unmask(dom, port)
+                };
+            }
+            _ => {
+                let _ = sys.consume(dom, port);
+            }
         }
 
         // The property: no reachable sequence of operations ever leaves the system

@@ -24,6 +24,7 @@
 extern crate alloc;
 
 pub mod evtchn;
+pub mod grant;
 pub mod prng;
 
 use hv_hal::{GuestMemory, TimeSource};

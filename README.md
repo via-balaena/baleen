@@ -98,13 +98,18 @@ one-line regression test, not a Heisenbug.
 - **M1 — architecture proof** *(this commit)*: `hv-core` dispatches two toy
   hypercalls, driven entirely by `hv-sim` with deterministic seeded replay. No
   hardware, no asm.
-- **M2** *(landed)*: event channels as a pure, whole-system state machine in
-  `hv-core::evtchn` — interdomain / VIRQ / IPI ports, with reciprocity, VIRQ
-  uniqueness, and no-signal-on-free invariants checked on every transition.
-  Property-tested (`hv-core`), seeded-simulated (`hv-sim::run_evtchn`), and fuzzed
-  (`hv-fuzz` `evtchn`). Generic and ABI-agnostic — port numbering and the
-  `shared_info` wire layout stay in the M5 personality. Clean-room provenance
-  discipline starts here, the first time Xen behavior informs a core design — see
+- **M2** *(landed)*: the two historically XSA-prone subsystems, each as a pure,
+  whole-system state machine with invariants checked on every transition,
+  property-tested (`hv-core`), seeded-simulated (`hv-sim`), and fuzzed (`hv-fuzz`):
+  - `hv-core::evtchn` — event channels (interdomain / VIRQ / IPI ports), guarding
+    interdomain **reciprocity**, VIRQ uniqueness, and no-signal-on-free.
+  - `hv-core::grant` — grant tables (grant / end / map / unmap / copy), guarding the
+    core safety rule that **a grant with a live mapping cannot be ended**, plus
+    refcount consistency and read-only integrity.
+
+  Both are generic and ABI-agnostic — wire formats (the `shared_info` bitmaps, the
+  `grant_entry` structs) stay in the M5 personality. Clean-room provenance discipline
+  is live here, the first time Xen behavior informs a core design — see
   [`CLEANROOM.md`](CLEANROOM.md).
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.

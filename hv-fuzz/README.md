@@ -29,3 +29,4 @@ cargo +nightly fuzz list                # list targets
 | -------- | --------------------------------------------------- | ----------- |
 | `decode` | `hv_core::Hypercall::decode` — the ABI decode seam   | `hv-core` `decode_contract_holds_*` |
 | `evtchn` | `hv_core::evtchn::System` — the event-channel machine | `hv-sim` `evtchn_invariants_hold_across_many_seeds` |
+| `grant`  | `hv_core::grant::System` — the grant-table machine    | `hv-sim` `grant_invariants_hold_across_many_seeds` |

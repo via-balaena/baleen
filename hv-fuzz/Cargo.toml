@@ -34,3 +34,10 @@ path = "fuzz_targets/evtchn.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "grant"
+path = "fuzz_targets/grant.rs"
+test = false
+doc = false
+bench = false
