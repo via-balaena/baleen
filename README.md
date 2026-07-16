@@ -127,6 +127,16 @@ one-line regression test, not a Heisenbug.
   `grant_entry` structs) stay in the M5 personality. Clean-room provenance discipline
   is live here, the first time Xen behavior informs a core design — see
   [`CLEANROOM.md`](CLEANROOM.md).
+- **Scheduling policy** *(landed)*: `hv-core::policy` — the layer that *picks*, above
+  the dispatch seam (a guest never asks to be scheduled; the tick/idle path does). A
+  work-conserving, weighted-proportional-fair policy that runs the least-serviced-
+  per-weight vCPU and time-slices with a quantum, enacting only through the
+  mechanism's public transitions. Unlike a state machine it has no safety invariant —
+  a bad policy is unfair, not unsafe — so it is held to *properties* instead:
+  work-conservation, proportional fairness, and starvation-freedom, all
+  property-tested (`hv-sim`) and fuzzed (`hv-fuzz`). This completes `hv-core`'s pure
+  brain — three whole-system state machines, credit accounting, and a policy over
+  them — all green on a laptop before any hardware exists.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into
