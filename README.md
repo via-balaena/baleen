@@ -114,7 +114,11 @@ one-line regression test, not a Heisenbug.
   - `hv-core::grant` — grant tables (grant / end / map / unmap / copy), guarding the
     core safety rule that **a grant with a live mapping cannot be ended**, plus
     refcount consistency and read-only integrity.
-  - `hv-core::Hypervisor` — the integrated core: per-domain credit plus both
+  - `hv-core::sched` — the scheduler (admit / run / preempt / block / wake / offline)
+    over a fixed set of physical CPUs, guarding **pCPU exclusivity by reciprocity**
+    (a vCPU is `Running{pcpu}` iff that CPU names it back) plus monotonic per-vCPU
+    time accounting. Mechanism only — scheduling *policy* stays above the core.
+  - `hv-core::Hypervisor` — the integrated core: per-domain credit plus all three
     subsystems behind one typed, ABI-neutral `HvCall` dispatch. `hv-sim` drives the
     whole thing through one seam, and one `invariants_hold()` covers the lot. This is
     the real dispatch seam the M5 personality will decode wire-format calls into.

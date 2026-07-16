@@ -5,10 +5,10 @@
 //!
 //! Everything before this module was a subsystem in isolation: the credit account
 //! ([`crate::HvCore`]), event channels ([`crate::evtchn`]), grant tables
-//! ([`crate::grant`]). [`Hypervisor`] is the brain that owns all three and routes a
-//! single, typed hypercall vocabulary ([`HvCall`]) into them — so `hv-sim` drives
-//! one integrated core, and one invariant check ([`Hypervisor::invariants_hold`])
-//! covers the whole thing.
+//! ([`crate::grant`]), the scheduler ([`crate::sched`]). [`Hypervisor`] is the brain
+//! that owns them all and routes a single, typed hypercall vocabulary ([`HvCall`])
+//! into them — so `hv-sim` drives one integrated core, and one invariant check
+//! ([`Hypervisor::invariants_hold`]) covers the whole thing.
 //!
 //! **This is the dispatch seam, for real.** [`HvCall`] is *ABI-neutral*: it names
 //! operations, not wire encodings. At M5 the Xen personality (`baleen-xenabi`)
@@ -25,8 +25,11 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use hv_hal::Ticks;
+
 use crate::evtchn::{self, Port, Vcpu, Virq};
 use crate::grant::{self, Frame, GrantHandle, GrantRef};
+use crate::sched::{self, Pcpu};
 use crate::{HError, HvCore};
 
 /// A domain identifier, shared across all subsystems.
@@ -83,6 +86,23 @@ pub enum HvCall {
         gref: GrantRef,
         write: bool,
     },
+
+    /// Bring one of the caller's vCPUs online (`Offline` → `Runnable`).
+    SchedAdmit { vcpu: Vcpu },
+    /// Dispatch one of the caller's runnable vCPUs onto physical CPU `pcpu`, starting
+    /// its on-CPU interval at `now`. `now` is a plain operation input: the core owns
+    /// no clock, so whoever builds the call reads [`hv_hal::TimeSource`] and stamps it.
+    SchedRun { vcpu: Vcpu, pcpu: Pcpu, now: Ticks },
+    /// Preempt one of the caller's running vCPUs back to `Runnable`, closing its
+    /// on-CPU interval at `now`.
+    SchedPreempt { vcpu: Vcpu, now: Ticks },
+    /// Block one of the caller's vCPUs on an event, closing any on-CPU interval at
+    /// `now`.
+    SchedBlock { vcpu: Vcpu, now: Ticks },
+    /// Wake one of the caller's blocked vCPUs (`Blocked` → `Runnable`).
+    SchedWake { vcpu: Vcpu },
+    /// Take one of the caller's vCPUs offline, closing any on-CPU interval at `now`.
+    SchedOffline { vcpu: Vcpu, now: Ticks },
 }
 
 /// The success value of a routed hypercall.
@@ -111,6 +131,8 @@ pub enum HvError {
     Evtchn(evtchn::EvtchnError),
     /// The grant subsystem rejected the call.
     Grant(grant::GrantError),
+    /// The scheduler subsystem rejected the call.
+    Sched(sched::SchedError),
 }
 
 /// The integrated hypervisor core: per-domain credit plus the two whole-system
@@ -119,17 +141,26 @@ pub struct Hypervisor {
     credit: Vec<HvCore>,
     evtchn: evtchn::System,
     grant: grant::System,
+    sched: sched::System,
 }
 
 impl Hypervisor {
     /// A hypervisor of `num_domains` domains, each with `ports_per_domain`
-    /// event-channel ports and `grants_per_domain` grant slots. All three subsystems
-    /// share the same domain count.
-    pub fn new(num_domains: usize, ports_per_domain: usize, grants_per_domain: usize) -> Self {
+    /// event-channel ports, `grants_per_domain` grant slots, and `vcpus_per_domain`
+    /// virtual CPUs, scheduled over `num_pcpus` shared physical CPUs. Every subsystem
+    /// shares the same domain count; the physical CPUs are system-wide.
+    pub fn new(
+        num_domains: usize,
+        ports_per_domain: usize,
+        grants_per_domain: usize,
+        vcpus_per_domain: usize,
+        num_pcpus: usize,
+    ) -> Self {
         Hypervisor {
             credit: (0..num_domains).map(|_| HvCore::new()).collect(),
             evtchn: evtchn::System::new(num_domains, ports_per_domain),
             grant: grant::System::new(num_domains, grants_per_domain),
+            sched: sched::System::new(num_domains, vcpus_per_domain, num_pcpus),
         }
     }
 
@@ -235,6 +266,37 @@ impl Hypervisor {
                 .copy(caller, grantor, gref, write)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Grant),
+
+            HvCall::SchedAdmit { vcpu } => self
+                .sched
+                .admit(caller, vcpu)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
+            HvCall::SchedRun { vcpu, pcpu, now } => self
+                .sched
+                .run(caller, vcpu, pcpu, now)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
+            HvCall::SchedPreempt { vcpu, now } => self
+                .sched
+                .preempt(caller, vcpu, now)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
+            HvCall::SchedBlock { vcpu, now } => self
+                .sched
+                .block(caller, vcpu, now)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
+            HvCall::SchedWake { vcpu } => self
+                .sched
+                .wake(caller, vcpu)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
+            HvCall::SchedOffline { vcpu, now } => self
+                .sched
+                .offline(caller, vcpu, now)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
         }
     }
 
@@ -243,6 +305,7 @@ impl Hypervisor {
     pub fn invariants_hold(&self) -> bool {
         self.evtchn.invariants_hold()
             && self.grant.invariants_hold()
+            && self.sched.invariants_hold()
             && self.credit.iter().all(HvCore::invariants_hold)
     }
 
@@ -266,6 +329,11 @@ impl Hypervisor {
         &self.grant
     }
 
+    /// The scheduler subsystem, for inspection.
+    pub fn sched(&self) -> &sched::System {
+        &self.sched
+    }
+
     fn credit_of(&mut self, dom: DomId) -> Result<&mut HvCore, HvError> {
         self.credit.get_mut(dom as usize).ok_or(HvError::BadDomain)
     }
@@ -276,7 +344,7 @@ mod tests {
     use super::*;
 
     fn hv() -> Hypervisor {
-        Hypervisor::new(3, 8, 6)
+        Hypervisor::new(3, 8, 6, 2, 2)
     }
 
     #[test]
@@ -354,6 +422,41 @@ mod tests {
     }
 
     #[test]
+    fn a_vcpu_runs_and_deschedules_through_dispatch() {
+        let mut h = hv();
+        // Domain 2 admits vCPU 0, runs it on pCPU 1, then preempts it back.
+        h.dispatch(2, HvCall::SchedAdmit { vcpu: 0 }).unwrap();
+        h.dispatch(
+            2,
+            HvCall::SchedRun {
+                vcpu: 0,
+                pcpu: 1,
+                now: 100,
+            },
+        )
+        .unwrap();
+        assert_eq!(h.sched().occupant(1), Some((2, 0)));
+        // Another domain cannot take that physical CPU while it is occupied.
+        h.dispatch(0, HvCall::SchedAdmit { vcpu: 0 }).unwrap();
+        assert_eq!(
+            h.dispatch(
+                0,
+                HvCall::SchedRun {
+                    vcpu: 0,
+                    pcpu: 1,
+                    now: 100
+                }
+            ),
+            Err(HvError::Sched(sched::SchedError::PcpuBusy))
+        );
+        h.dispatch(2, HvCall::SchedPreempt { vcpu: 0, now: 130 })
+            .unwrap();
+        assert_eq!(h.sched().occupant(1), None);
+        assert_eq!(h.sched().runtime(2, 0), Some(30));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
     fn errors_are_tagged_by_subsystem() {
         let mut h = hv();
         assert_eq!(
@@ -374,6 +477,18 @@ mod tests {
                 }
             ),
             Err(HvError::Grant(grant::GrantError::WrongState))
+        );
+        // Running a vCPU that was never admitted is a scheduler WrongState.
+        assert_eq!(
+            h.dispatch(
+                0,
+                HvCall::SchedRun {
+                    vcpu: 0,
+                    pcpu: 0,
+                    now: 0
+                }
+            ),
+            Err(HvError::Sched(sched::SchedError::WrongState))
         );
     }
 }

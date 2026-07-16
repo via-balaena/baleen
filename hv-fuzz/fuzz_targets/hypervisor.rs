@@ -25,11 +25,14 @@ use hv_core::{HvCall, HvOutcome, Hypervisor};
 const DOMAINS: usize = 3;
 const PORTS: usize = 8;
 const GRANTS: usize = 6;
+const VCPUS: usize = 2;
+const PCPUS: usize = 2;
 
 fuzz_target!(|data: &[u8]| {
-    let mut hv = Hypervisor::new(DOMAINS, PORTS, GRANTS);
+    let mut hv = Hypervisor::new(DOMAINS, PORTS, GRANTS, VCPUS, PCPUS);
     let mut handles: Vec<(u16, u32)> = Vec::new();
     let mut bytes = data.iter().copied();
+    let mut now: u64 = 0;
 
     while let Some(op) = bytes.next() {
         let caller = (u16::from(bytes.next().unwrap_or(0))) % DOMAINS as u16;
@@ -38,8 +41,11 @@ fuzz_target!(|data: &[u8]| {
         let port = u32::from(a) % PORTS as u32;
         let gref = u32::from(a) % GRANTS as u32;
         let other = u16::from(b) % DOMAINS as u16;
+        let vcpu = u32::from(a) % VCPUS as u32;
+        let pcpu = u32::from(b) % PCPUS as u32;
+        now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 15 {
+        let call = match op % 21 {
             0 => HvCall::CreditGrant { amount: u32::from(a) },
             1 => HvCall::CreditSpend { amount: u32::from(a) },
             2 => HvCall::EvtchnAllocUnbound { remote: other },
@@ -69,7 +75,13 @@ fuzz_target!(|data: &[u8]| {
                 assert!(hv.invariants_hold(), "integrated invariant violated");
                 continue;
             }
-            _ => HvCall::GrantCopy { grantor: other, gref, write: a & 1 == 0 },
+            14 => HvCall::GrantCopy { grantor: other, gref, write: a & 1 == 0 },
+            15 => HvCall::SchedAdmit { vcpu },
+            16 => HvCall::SchedRun { vcpu, pcpu, now },
+            17 => HvCall::SchedPreempt { vcpu, now },
+            18 => HvCall::SchedBlock { vcpu, now },
+            19 => HvCall::SchedWake { vcpu },
+            _ => HvCall::SchedOffline { vcpu, now },
         };
 
         let _ = hv.dispatch(caller, call);

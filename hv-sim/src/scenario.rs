@@ -333,6 +333,10 @@ pub struct HvSummary {
     pub grants: u32,
     pub active_maps: u32,
     pub total_balance: u64,
+    /// vCPUs currently on a physical CPU.
+    pub running: u32,
+    /// Total closed on-CPU time across all vCPUs.
+    pub total_runtime: u64,
     /// Whether every subsystem's invariants hold at the end.
     pub invariants_hold: bool,
 }
@@ -363,6 +367,15 @@ impl HvSummary {
         for dom in 0..hv.domain_count() as u16 {
             s.total_balance += hv.balance(dom).unwrap_or(0);
         }
+        let sc = hv.sched();
+        for dom in 0..sc.domain_count() as u16 {
+            for vcpu in 0..sc.vcpu_count(dom) as u32 {
+                if sc.is_running(dom, vcpu) {
+                    s.running += 1;
+                }
+                s.total_runtime += sc.runtime(dom, vcpu).unwrap_or(0);
+            }
+        }
         s.invariants_hold = hv.invariants_hold();
         s
     }
@@ -376,17 +389,32 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
     const DOMAINS: u16 = 3;
     const PORTS: u32 = 8;
     const GRANTS: u32 = 6;
+    const VCPUS: u32 = 2;
+    const PCPUS: u32 = 2;
 
-    let mut hv = Hypervisor::new(DOMAINS as usize, PORTS as usize, GRANTS as usize);
+    let mut hv = Hypervisor::new(
+        DOMAINS as usize,
+        PORTS as usize,
+        GRANTS as usize,
+        VCPUS as usize,
+        PCPUS as usize,
+    );
     let mut rng = Prng::new(seed);
+    let clock = ManualClock::new();
     let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee/owner, handle) of live maps
 
     for _ in 0..steps {
+        // Crank the clock so scheduler run/preempt intervals span seed-derived gaps.
+        clock.advance(1 + u64::from(rng.below(16)));
+        let now = clock.now();
+
         let caller = rng.below(u32::from(DOMAINS)) as u16;
         let port = rng.below(PORTS);
         let gref = rng.below(GRANTS);
+        let vcpu = rng.below(VCPUS);
+        let pcpu = rng.below(PCPUS);
 
-        match rng.below(15) {
+        match rng.below(21) {
             0 => drop_ok(hv.dispatch(
                 caller,
                 HvCall::CreditGrant {
@@ -467,7 +495,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
                     drop_ok(hv.dispatch(owner, HvCall::GrantUnmap { handle }));
                 }
             }
-            _ => {
+            14 => {
                 let grantor = rng.below(u32::from(DOMAINS)) as u16;
                 drop_ok(hv.dispatch(
                     caller,
@@ -478,6 +506,12 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
                     },
                 ));
             }
+            15 => drop_ok(hv.dispatch(caller, HvCall::SchedAdmit { vcpu })),
+            16 => drop_ok(hv.dispatch(caller, HvCall::SchedRun { vcpu, pcpu, now })),
+            17 => drop_ok(hv.dispatch(caller, HvCall::SchedPreempt { vcpu, now })),
+            18 => drop_ok(hv.dispatch(caller, HvCall::SchedBlock { vcpu, now })),
+            19 => drop_ok(hv.dispatch(caller, HvCall::SchedWake { vcpu })),
+            _ => drop_ok(hv.dispatch(caller, HvCall::SchedOffline { vcpu, now })),
         }
     }
 
@@ -717,6 +751,14 @@ mod tests {
         assert!(
             summaries.iter().any(|s| s.total_balance > 0),
             "no seed exercised credit"
+        );
+        assert!(
+            summaries.iter().any(|s| s.running > 0),
+            "no seed put a vCPU on a physical CPU"
+        );
+        assert!(
+            summaries.iter().any(|s| s.total_runtime > 0),
+            "no seed accrued any scheduler runtime"
         );
     }
 }
