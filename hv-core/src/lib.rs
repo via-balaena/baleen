@@ -26,6 +26,7 @@ extern crate alloc;
 pub mod evtchn;
 pub mod grant;
 pub mod hypervisor;
+pub mod policy;
 pub mod prng;
 pub mod sched;
 

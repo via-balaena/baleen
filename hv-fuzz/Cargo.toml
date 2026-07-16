@@ -50,6 +50,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "hypervisor"
 path = "fuzz_targets/hypervisor.rs"
 test = false

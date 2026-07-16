@@ -9,7 +9,7 @@
 //! whole reproducer. This is the FoundationDB discipline shrunk to a laptop.
 
 use hv_core::evtchn::{PortState, System};
-use hv_core::{grant, prng::Prng, sched, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor};
+use hv_core::{grant, policy, prng::Prng, sched, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor};
 use hv_hal::TimeSource;
 
 use crate::{FakeMemory, ManualClock};
@@ -322,6 +322,149 @@ pub fn run_sched(seed: u64, steps: u32) -> SchedOutcome {
     }
 
     SchedOutcome::of(&sys)
+}
+
+/// A comparable summary of a finished scheduling-policy run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyOutcome {
+    pub running: u32,
+    pub total_runtime: u64,
+    /// Smallest per-vCPU runtime among vCPUs that were ever admitted — a starvation
+    /// witness.
+    pub min_admitted_runtime: u64,
+    /// Whether the mechanism invariant held after every `advance`.
+    pub invariants_hold: bool,
+    /// Whether the policy was work-conserving at every step: never an idle physical
+    /// CPU while a vCPU sat runnable.
+    pub work_conserving: bool,
+}
+
+/// Whether any physical CPU is idle while some vCPU is runnable — the negation of
+/// work conservation, checked directly against the mechanism state.
+fn has_idle_cpu_with_waiter(sys: &sched::System) -> bool {
+    let idle = (0..sys.pcpu_count() as u32).any(|p| sys.occupant(p).is_none());
+    if !idle {
+        return false;
+    }
+    (0..sys.domain_count() as u16).any(|d| {
+        (0..sys.vcpu_count(d) as u32).any(|v| sys.state_of(d, v) == Some(sched::RunState::Runnable))
+    })
+}
+
+/// Drive the scheduling [`policy::Scheduler`] over the [`sched::System`] mechanism:
+/// a seed churns vCPU availability (admit / block / wake / offline) while the policy
+/// fills and preempts physical CPUs at each cranked tick. Asserts nothing itself —
+/// it *reports* whether the mechanism stayed consistent and whether work conservation
+/// held throughout, so the tests can turn those into properties over the seed space.
+pub fn run_policy(seed: u64, steps: u32) -> PolicyOutcome {
+    const DOMAINS: u16 = 2;
+    const VCPUS: u32 = 3;
+    const PCPUS: u32 = 2;
+
+    let mut sys = sched::System::new(DOMAINS as usize, VCPUS as usize, PCPUS as usize);
+    let mut pol = policy::Scheduler::new(DOMAINS as usize, VCPUS as usize, 4);
+    // A spread of weights so the fair-share logic is exercised, not just the 1:1 case.
+    for dom in 0..DOMAINS {
+        for vcpu in 0..VCPUS {
+            pol.set_weight(dom, vcpu, 1 + vcpu);
+        }
+    }
+    let mut rng = Prng::new(seed);
+    let clock = ManualClock::new();
+    let mut admitted = [[false; VCPUS as usize]; DOMAINS as usize];
+
+    let mut invariants_hold = true;
+    let mut work_conserving = true;
+
+    for _ in 0..steps {
+        clock.advance(1 + u64::from(rng.below(8)));
+        let now = clock.now();
+        let dom = rng.below(u32::from(DOMAINS)) as u16;
+        let vcpu = rng.below(VCPUS);
+
+        // Churn availability. `run`/`preempt` are the policy's job, so this stream only
+        // changes whether a vCPU *wants* a CPU, never places one directly.
+        match rng.below(4) {
+            0 => {
+                if sys.admit(dom, vcpu).is_ok() {
+                    admitted[dom as usize][vcpu as usize] = true;
+                }
+            }
+            1 => {
+                let _ = sys.block(dom, vcpu, now);
+            }
+            2 => {
+                let _ = sys.wake(dom, vcpu);
+            }
+            _ => {
+                let _ = sys.offline(dom, vcpu, now);
+            }
+        }
+
+        // The policy fills/preempts to a fixpoint at this instant.
+        pol.advance(&mut sys, now);
+
+        invariants_hold &= sys.invariants_hold();
+        work_conserving &= !has_idle_cpu_with_waiter(&sys);
+    }
+
+    let mut out = PolicyOutcome {
+        invariants_hold,
+        work_conserving,
+        min_admitted_runtime: u64::MAX,
+        ..PolicyOutcome::default()
+    };
+    let mut any_admitted = false;
+    for dom in 0..DOMAINS {
+        for vcpu in 0..VCPUS {
+            if sys.is_running(dom, vcpu) {
+                out.running += 1;
+            }
+            let rt = sys.runtime(dom, vcpu).unwrap_or(0);
+            out.total_runtime += rt;
+            if admitted[dom as usize][vcpu as usize] {
+                any_admitted = true;
+                out.min_admitted_runtime = out.min_admitted_runtime.min(rt);
+            }
+        }
+    }
+    if !any_admitted {
+        out.min_admitted_runtime = 0;
+    }
+    out
+}
+
+/// Run `vcpus` vCPUs — all continuously runnable, never blocking — under the policy on
+/// `pcpus` physical CPUs for `ticks` of time, with the given per-vCPU `weights`, and
+/// return each vCPU's final accrued runtime. This is the controlled setting where
+/// proportional fairness is meant to hold: with everyone always wanting the CPU, run
+/// time should split in proportion to weight. Single domain, one vCPU per index.
+#[cfg(test)]
+fn run_policy_steady(
+    weights: &[policy::Weight],
+    pcpus: usize,
+    quantum: u64,
+    ticks: u64,
+) -> Vec<u64> {
+    let vcpus = weights.len();
+    let mut sys = sched::System::new(1, vcpus, pcpus);
+    let mut pol = policy::Scheduler::new(1, vcpus, quantum);
+    for (v, &w) in weights.iter().enumerate() {
+        sys.admit(0, v as u32).unwrap();
+        pol.set_weight(0, v as u32, w);
+    }
+    // Step time in unit ticks so preemption points are resolved finely; the policy
+    // re-fills and re-slices at each tick.
+    for t in 1..=ticks {
+        pol.advance(&mut sys, t);
+    }
+    // Close out every still-running interval so the final runtimes are comparable.
+    for v in 0..vcpus {
+        let _ = sys.preempt(0, v as u32, ticks);
+    }
+    (0..vcpus)
+        .map(|v| sys.runtime(0, v as u32).unwrap_or(0))
+        .collect()
 }
 
 /// A comparable census of a finished integrated-hypervisor run, spanning all three
@@ -706,6 +849,78 @@ mod tests {
                 "seed {seed}: runtime shrank from {short} to {long} over more steps"
             );
         }
+    }
+
+    /// Policy over mechanism: across many seeds of churning vCPU availability, the
+    /// mechanism invariant never breaks and the policy stays work-conserving — no
+    /// physical CPU idles while a vCPU is runnable. These are the policy's two headline
+    /// properties, checked after every scheduling fixpoint inside `run_policy`.
+    #[test]
+    fn policy_is_consistent_and_work_conserving_across_seeds() {
+        for seed in 0..5_000u64 {
+            let outcome = run_policy(seed, 256);
+            assert!(
+                outcome.invariants_hold,
+                "mechanism invariant broke under the policy on seed {seed}"
+            );
+            assert!(
+                outcome.work_conserving,
+                "policy left a CPU idle with a vCPU waiting on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the policy driver: same seed, same census exactly. The policy
+    /// is a pure function of mechanism state and time, so the whole run reproduces.
+    #[test]
+    fn policy_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_policy(seed, 256),
+                run_policy(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// Proportional fairness: with every vCPU continuously runnable, accrued run time
+    /// splits in proportion to weight. Three vCPUs weighted 1:2:3 sharing one CPU over
+    /// 6000 ticks should land near 1000:2000:3000 — and strictly in weight order.
+    #[test]
+    fn policy_shares_cpu_in_proportion_to_weight() {
+        let rt = run_policy_steady(&[1, 2, 3], 1, 1, 6000);
+        let sum: u64 = rt.iter().sum();
+        assert!(sum >= 5900, "the single CPU should stay busy: total {sum}");
+        for (i, w) in [1u64, 2, 3].iter().enumerate() {
+            let expected = 6000 * w / 6;
+            let lo = expected * 9 / 10;
+            let hi = expected * 11 / 10;
+            assert!(
+                rt[i] >= lo && rt[i] <= hi,
+                "vcpu {i} (weight {w}) got {}, expected ~{expected}",
+                rt[i]
+            );
+        }
+        assert!(
+            rt[0] < rt[1] && rt[1] < rt[2],
+            "heavier weights must earn strictly more CPU: {rt:?}"
+        );
+    }
+
+    /// No starvation: with more runnable vCPUs than CPUs and equal weights, every vCPU
+    /// still earns a fair, non-trivial slice — none is left at zero. Five equal vCPUs
+    /// on two CPUs over 5000 ticks should each land near 2000.
+    #[test]
+    fn policy_starves_no_one() {
+        let rt = run_policy_steady(&[1, 1, 1, 1, 1], 2, 2, 5000);
+        let min = *rt.iter().min().unwrap();
+        let max = *rt.iter().max().unwrap();
+        assert!(min > 0, "a vCPU was starved to zero: {rt:?}");
+        // Equal weights → the spread between the most- and least-served stays tight.
+        assert!(
+            max - min <= max / 5,
+            "equal-weight vCPUs diverged too far: {rt:?}"
+        );
     }
 
     /// The integration headline: drive all three subsystems through the single

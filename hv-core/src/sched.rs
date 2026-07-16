@@ -273,6 +273,18 @@ impl System {
         self.vcpu(dom, vcpu).ok().map(|v| v.runtime)
     }
 
+    /// When the current on-CPU interval began, for a vCPU that is `Running` now;
+    /// `None` if it is not running (or its ids are bad). A policy layer above the
+    /// mechanism uses this to measure how long the current interval has lasted — the
+    /// quantum check — without keeping its own copy of dispatch times.
+    pub fn on_cpu_since(&self, dom: DomId, vcpu: Vcpu) -> Option<Ticks> {
+        let v = self.vcpu(dom, vcpu).ok()?;
+        match v.state {
+            RunState::Running { .. } => Some(v.dispatched_at),
+            _ => None,
+        }
+    }
+
     /// Who is running on a physical CPU, if `pcpu` is in range and occupied.
     pub fn occupant(&self, pcpu: Pcpu) -> Option<(DomId, Vcpu)> {
         self.pcpus.get(pcpu as usize).copied().flatten()
@@ -537,6 +549,20 @@ mod tests {
         assert_eq!(s.occupant(0), None);
         assert_eq!(s.occupant(1), Some((0, 0)));
         assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn on_cpu_since_tracks_the_current_interval_only() {
+        let mut s = sys();
+        s.admit(0, 0).unwrap();
+        assert_eq!(s.on_cpu_since(0, 0), None, "not running yet");
+        s.run(0, 0, 0, 100).unwrap();
+        assert_eq!(s.on_cpu_since(0, 0), Some(100));
+        s.preempt(0, 0, 150).unwrap();
+        assert_eq!(s.on_cpu_since(0, 0), None, "no longer running");
+        // A fresh interval reports the new dispatch time, not the old one.
+        s.run(0, 0, 1, 200).unwrap();
+        assert_eq!(s.on_cpu_since(0, 0), Some(200));
     }
 
     #[test]
