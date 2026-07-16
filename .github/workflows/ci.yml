@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The single source of truth for "green": the same bar `cargo xtask ci`
+      # enforces locally — rustfmt --check, clippy -D warnings, then the tests.
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
+  # Compile-check the standalone fuzz crate so a broken target is caught in CI,
+  # without spending wall-clock actually fuzzing on every push.
+  fuzz-build:
+    name: fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hv-fuzz
+
+      - name: cargo check (hv-fuzz)
+        working-directory: hv-fuzz
+        run: cargo check --all-targets

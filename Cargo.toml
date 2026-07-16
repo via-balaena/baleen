@@ -4,9 +4,12 @@
 [workspace]
 resolver = "2"
 members = ["hv-hal", "hv-core", "hv-sim", "xtask"]
-# hv-metal (bare-metal binary, M3) and hv-fuzz (cargo-fuzz targets, M2) join the
-# workspace when they arrive. They need a custom target / nightly and would break
-# `cargo test --workspace`, so they stay out until there is a tested brain to plug in.
+# hv-fuzz is a standalone crate (its own workspace) excluded here so stable
+# `cargo test --workspace` never builds the nightly/libFuzzer machinery.
+exclude = ["hv-fuzz"]
+# hv-metal (bare-metal binary, M3) joins the workspace when it arrives; it needs a
+# custom target and would break `cargo test --workspace`, so it stays out until
+# there is a tested brain to plug in.
 
 [workspace.package]
 version = "0.0.0"

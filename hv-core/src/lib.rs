@@ -231,6 +231,50 @@ mod tests {
         );
     }
 
+    /// The decoder's full contract — the same property `hv-fuzz`'s `decode` target
+    /// asserts, mirrored here so stable CI proves it deterministically without
+    /// nightly or cargo-fuzz. If you change either, change both.
+    fn assert_decode_contract(nr: u32, arg0: u64) {
+        let fits_u32 = arg0 <= u64::from(u32::MAX);
+        match Hypercall::decode(RawHypercall { nr, arg0 }) {
+            Ok(Hypercall::Grant { amount }) => {
+                assert_eq!(nr, NR_GRANT);
+                assert_eq!(u64::from(amount), arg0);
+            }
+            Ok(Hypercall::Spend { amount }) => {
+                assert_eq!(nr, NR_SPEND);
+                assert_eq!(u64::from(amount), arg0);
+            }
+            Err(HError::BadHypercall) => {
+                let known = nr == NR_GRANT || nr == NR_SPEND;
+                assert!(
+                    !known || !fits_u32,
+                    "rejected a valid (nr={nr}, arg0={arg0})"
+                );
+            }
+            Err(other) => panic!("decode returned an unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_contract_holds_over_grid() {
+        // Every hypercall number near the known range, crossed with the argument
+        // boundary values that matter for the u32-fit check.
+        let args = [
+            0u64,
+            1,
+            u64::from(u32::MAX) - 1,
+            u64::from(u32::MAX),
+            u64::from(u32::MAX) + 1,
+            u64::MAX,
+        ];
+        for nr in 0..8u32 {
+            for &arg0 in &args {
+                assert_decode_contract(nr, arg0);
+            }
+        }
+    }
+
     #[test]
     fn grant_then_spend_settles() {
         let mut core = HvCore::new();

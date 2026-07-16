@@ -2,3 +2,10 @@
 **/*.rs.bk
 Cargo.lock
 .DS_Store
+
+# cargo-fuzz build/run artifacts (hv-fuzz is a standalone crate)
+/hv-fuzz/target
+/hv-fuzz/corpus
+/hv-fuzz/artifacts
+/hv-fuzz/coverage
+/hv-fuzz/Cargo.lock
