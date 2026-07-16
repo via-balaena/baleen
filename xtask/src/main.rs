@@ -13,16 +13,34 @@ fn main() {
     let ok = match task.as_str() {
         "test" => run("cargo", &["test", "--workspace"]),
         "check" => run("cargo", &["check", "--workspace"]),
+        "doc" => doc(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
-                && run("cargo", &["clippy", "--workspace", "--", "-D", "warnings"])
+                && run(
+                    "cargo",
+                    &[
+                        "clippy",
+                        "--workspace",
+                        "--all-targets",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                )
                 && run("cargo", &["test", "--workspace"])
+                && doc()
         }
         other => {
             if !other.is_empty() {
                 eprintln!("xtask: unknown task {other:?}\n");
             }
-            eprintln!("usage: cargo xtask <task>\n  test   run the workspace test suite\n  check  type-check the workspace\n  ci     fmt --check, clippy -D warnings, then test");
+            eprintln!(
+                "usage: cargo xtask <task>\n  \
+                 test   run the workspace test suite\n  \
+                 check  type-check the workspace\n  \
+                 doc    build docs, denying broken links\n  \
+                 ci     fmt --check, clippy -D warnings, test, then doc"
+            );
             exit(2);
         }
     };
@@ -31,12 +49,28 @@ fn main() {
     }
 }
 
-/// Run a command inherited stdio, returning whether it succeeded.
+/// Build the docs with broken intra-doc links (and every other rustdoc lint)
+/// treated as errors, so doc rot fails CI the same way a broken test does.
+fn doc() -> bool {
+    run_env(
+        "cargo",
+        &["doc", "--workspace", "--no-deps"],
+        &[("RUSTDOCFLAGS", "-D warnings")],
+    )
+}
+
+/// Run a command inheriting stdio, returning whether it succeeded.
 fn run(program: &str, args: &[&str]) -> bool {
+    run_env(program, args, &[])
+}
+
+/// Like [`run`], with extra environment variables set for the child.
+fn run_env(program: &str, args: &[&str], env: &[(&str, &str)]) -> bool {
     eprintln!("$ {program} {}", args.join(" "));
-    Command::new(program)
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
 }

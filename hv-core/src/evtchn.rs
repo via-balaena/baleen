@@ -33,6 +33,12 @@ use alloc::vec::Vec;
 /// A domain identifier — an index into the [`System`]'s domain table.
 pub type DomId = u16;
 /// A port identifier — an index into a domain's port table.
+///
+/// A bare slot index, reclaimed by [`System::close`] and re-handed by the next
+/// bind. A stale port number therefore names whatever binding later reused the slot
+/// (there is no generation counter). Because a domain only ever operates on its own
+/// ports, this can confuse a domain with *itself* but never crosses a domain
+/// boundary; guests must not reuse closed ports, as in Xen.
 pub type Port = u32;
 /// A virtual CPU identifier, scoped to a domain.
 pub type Vcpu = u32;
@@ -156,13 +162,24 @@ impl System {
         // Allocate our end only after the peer check passes; nothing is mutated on
         // any error path, so a failed bind is a true no-op.
         let port = self.find_free(dom)?;
-        self.chan_mut(dom, port).unwrap().state = PortState::Interdomain {
-            remote,
-            remote_port,
+        // Overwrite the whole channel on both ends, not just `.state`: a fresh
+        // channel starts clean, clearing any `masked` bit the peer's domain may have
+        // set while it sat `Unbound` (otherwise the channel would be born masked).
+        *self.chan_mut(dom, port).unwrap() = EventChannel {
+            state: PortState::Interdomain {
+                remote,
+                remote_port,
+            },
+            pending: false,
+            masked: false,
         };
-        self.chan_mut(remote, remote_port).unwrap().state = PortState::Interdomain {
-            remote: dom,
-            remote_port: port,
+        *self.chan_mut(remote, remote_port).unwrap() = EventChannel {
+            state: PortState::Interdomain {
+                remote: dom,
+                remote_port: port,
+            },
+            pending: false,
+            masked: false,
         };
         self.check_invariants();
         Ok(port)
@@ -296,7 +313,7 @@ impl System {
 
     /// The first invariant breach found, or `None` if the system is consistent.
     /// This is the single source of truth for correctness, used both by the
-    /// debug-time [`Self::check_invariants`] and by release-mode property tests.
+    /// debug-time invariant assertion and by release-mode property tests.
     pub fn first_violation(&self) -> Option<Violation> {
         for (d, dom) in self.domains.iter().enumerate() {
             for (p, ec) in dom.ports.iter().enumerate() {
@@ -555,6 +572,22 @@ mod tests {
         let mut s = sys();
         assert_eq!(s.alloc_unbound(9, 0), Err(EvtchnError::BadDomain));
         assert_eq!(s.send(0, 99), Err(EvtchnError::BadPort));
+    }
+
+    #[test]
+    fn a_bound_channel_starts_unmasked_even_if_the_unbound_port_was_masked() {
+        let mut s = sys();
+        let unbound = s.alloc_unbound(1, 0).unwrap();
+        // Domain 1 masks its port while it is still half-open.
+        s.mask(1, unbound).unwrap();
+        assert!(s.is_masked(1, unbound));
+
+        // Binding forms a fresh channel — the stale mask must not carry over.
+        let local = s.bind_interdomain(0, 1, unbound).unwrap();
+        assert!(!s.is_masked(1, unbound), "bound channel was born masked");
+
+        s.send(0, local).unwrap();
+        assert!(s.deliverable(1, unbound), "fresh channel should deliver");
     }
 
     #[test]

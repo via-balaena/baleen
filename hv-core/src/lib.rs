@@ -98,12 +98,19 @@ impl Hypercall {
     }
 }
 
-/// A domain's credit account — the M1 stand-in state machine.
+/// A domain's credit account.
 ///
 /// `balance` is the current credit; `granted` and `spent` are running totals kept
 /// only so the conservation invariant can be checked. On hardware these become the
 /// real accounting structures, but the discipline is identical: every transition
 /// re-establishes the invariant before returning.
+///
+/// In the integrated core this is one per-domain credit subsystem of
+/// [`crate::Hypervisor`], reached via [`Self::grant_credit`] / [`Self::spend_credit`].
+/// Its [`Self::dispatch`] + [`Hypercall::decode`] path is the original M1
+/// illustration of the ABI-decode seam — kept and fuzzed as a worked example, but
+/// superseded by the typed [`crate::HvCall`] dispatch that a real personality (M5)
+/// will decode guest wire-format calls into.
 #[derive(Debug, Default)]
 pub struct HvCore {
     balance: u64,
@@ -137,10 +144,14 @@ impl HvCore {
     /// routes the toy ABI here.
     pub fn grant_credit(&mut self, amount: u32) -> HResult {
         let amount = u64::from(amount);
-        // On overflow we return before mutating anything, so the invariant holds on
-        // the error path.
-        self.balance = self.balance.checked_add(amount).ok_or(HError::Overflow)?;
-        self.granted += amount;
+        // Both `balance` and the running `granted` total are overflow-checked before
+        // anything is written, so a rejected call mutates nothing. `granted` is
+        // monotonic while `balance` only oscillates, so `granted` can overflow even
+        // when `balance` would not — it must be checked in its own right.
+        let new_balance = self.balance.checked_add(amount).ok_or(HError::Overflow)?;
+        let new_granted = self.granted.checked_add(amount).ok_or(HError::Overflow)?;
+        self.balance = new_balance;
+        self.granted = new_granted;
         self.check_invariants();
         Ok(self.balance)
     }
@@ -151,8 +162,11 @@ impl HvCore {
         if amount > self.balance {
             return Err(HError::Insufficient);
         }
+        // `spent` is monotonic and can overflow independently of `balance`; check it
+        // before mutating so the invariant holds even at the u64 ceiling.
+        let new_spent = self.spent.checked_add(amount).ok_or(HError::Overflow)?;
         self.balance -= amount;
-        self.spent += amount;
+        self.spent = new_spent;
         self.check_invariants();
         Ok(self.balance)
     }
@@ -330,5 +344,22 @@ mod tests {
         // balance is now 2*u32::MAX, still far below u64::MAX, so this must succeed;
         // the overflow guard is exercised in the simulator's long seeded runs.
         assert!(call(&mut core, Hypercall::Grant { amount: u32::MAX }).is_ok());
+    }
+
+    #[test]
+    fn grant_spend_cycles_keep_totals_consistent() {
+        // The scenario where unchecked totals would overflow: balance oscillates
+        // while `granted`/`spent` climb monotonically. The overflow itself is
+        // unreachable in-test (u64 ceiling), but this confirms the totals track
+        // exactly and the invariant holds across many cycles.
+        let mut core = HvCore::new();
+        for _ in 0..1000 {
+            core.grant_credit(1000).unwrap();
+            core.spend_credit(1000).unwrap();
+            assert!(core.invariants_hold());
+        }
+        assert_eq!(core.balance(), 0);
+        assert_eq!(core.granted(), 1000 * 1000);
+        assert_eq!(core.spent(), 1000 * 1000);
     }
 }

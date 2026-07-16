@@ -44,6 +44,12 @@ pub type GrantRef = u32;
 /// A guest frame number (which page is being granted).
 pub type Frame = u64;
 /// A handle returned by [`System::map`], naming one live mapping.
+///
+/// A bare slot index, reclaimed by [`System::unmap`] and reused by the next map
+/// (there is no generation counter). A stale handle therefore acts on whatever
+/// mapping later reused the slot — but [`System::unmap`] requires the caller to be
+/// the mapping's grantee, so a domain can only ever confuse *itself* this way, never
+/// another domain. Guests must not reuse freed handles, as in Xen.
 pub type GrantHandle = u32;
 
 /// A grant-table entry.
