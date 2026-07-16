@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[workspace]
+resolver = "2"
+members = ["hv-hal", "hv-core", "hv-sim", "xtask"]
+# hv-metal (bare-metal binary, M3) and hv-fuzz (cargo-fuzz targets, M2) join the
+# workspace when they arrive. They need a custom target / nightly and would break
+# `cargo test --workspace`, so they stay out until there is a tested brain to plug in.
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+authors = ["Via Balaena"]
+repository = "https://github.com/via-balaena/baleen"
+rust-version = "1.96"
+
+[workspace.lints.rust]
+# The fence, enforced by the compiler: no crate in this workspace may write unsafe.
+# When hv-metal joins, it — and only it — overrides this in its own manifest.
+unsafe_code = "forbid"

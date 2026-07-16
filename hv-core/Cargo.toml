@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[package]
+name = "hv-core"
+description = "All hypervisor logic as a no_std library: hypercall dispatch and state machines, zero unsafe."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hv-hal = { path = "../hv-hal" }
+
+[lints]
+workspace = true

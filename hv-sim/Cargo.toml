@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[package]
+name = "hv-sim"
+description = "Host harness: fake memory, a hand-cranked clock, and deterministic seeded simulation of hv-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hv-hal = { path = "../hv-hal" }
+hv-core = { path = "../hv-core" }
+
+[lints]
+workspace = true
