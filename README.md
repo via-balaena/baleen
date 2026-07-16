@@ -98,9 +98,14 @@ one-line regression test, not a Heisenbug.
 - **M1 — architecture proof** *(this commit)*: `hv-core` dispatches two toy
   hypercalls, driven entirely by `hv-sim` with deterministic seeded replay. No
   hardware, no asm.
-- **M2**: event channels as a pure state machine — property-tested and fuzzed.
-  Generic, ABI-agnostic. Clean-room provenance discipline starts *here*, the first
-  time Xen behavior might inform a core design — see [`CLEANROOM.md`](CLEANROOM.md).
+- **M2** *(landed)*: event channels as a pure, whole-system state machine in
+  `hv-core::evtchn` — interdomain / VIRQ / IPI ports, with reciprocity, VIRQ
+  uniqueness, and no-signal-on-free invariants checked on every transition.
+  Property-tested (`hv-core`), seeded-simulated (`hv-sim::run_evtchn`), and fuzzed
+  (`hv-fuzz` `evtchn`). Generic and ABI-agnostic — port numbering and the
+  `shared_info` wire layout stay in the M5 personality. Clean-room provenance
+  discipline starts here, the first time Xen behavior informs a core design — see
+  [`CLEANROOM.md`](CLEANROOM.md).
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

@@ -8,6 +8,7 @@
 //! transition, so a violation surfaces here — and the seed that produced it is the
 //! whole reproducer. This is the FoundationDB discipline shrunk to a laptop.
 
+use hv_core::evtchn::{PortState, System};
 use hv_core::{prng::Prng, HvCore, Hypercall};
 use hv_hal::TimeSource;
 
@@ -65,6 +66,100 @@ pub fn run(seed: u64, steps: u32) -> Outcome {
     }
 }
 
+/// A comparable summary of a finished event-channel run — a census of port states
+/// plus signal counts. Two runs from the same seed produce an identical summary.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EvtchnOutcome {
+    pub free: u32,
+    pub unbound: u32,
+    pub interdomain: u32,
+    pub virq: u32,
+    pub ipi: u32,
+    pub pending: u32,
+    pub masked: u32,
+    /// Whether the system's invariants hold at the end — asserted in release too.
+    pub invariants_hold: bool,
+}
+
+impl EvtchnOutcome {
+    fn of(sys: &System) -> Self {
+        let mut o = EvtchnOutcome::default();
+        for dom in 0..sys.domain_count() as u16 {
+            for port in 0..sys.port_count(dom) as u32 {
+                match sys.state_of(dom, port) {
+                    Some(PortState::Free) => o.free += 1,
+                    Some(PortState::Unbound { .. }) => o.unbound += 1,
+                    Some(PortState::Interdomain { .. }) => o.interdomain += 1,
+                    Some(PortState::Virq { .. }) => o.virq += 1,
+                    Some(PortState::Ipi { .. }) => o.ipi += 1,
+                    None => {}
+                }
+                if sys.is_pending(dom, port) {
+                    o.pending += 1;
+                }
+                if sys.is_masked(dom, port) {
+                    o.masked += 1;
+                }
+            }
+        }
+        o.invariants_hold = sys.invariants_hold();
+        o
+    }
+}
+
+/// Drive the event-channel [`System`] through a seed-derived sequence of operations
+/// across a few domains. Same discipline as [`run`]: the core's `debug_assert!`
+/// invariants fire on every transition, and the seed is the whole reproducer. This
+/// is where interdomain reciprocity is stress-tested under interleaved close/bind
+/// races — the exact shape of Xen's historical event-channel XSAs.
+pub fn run_evtchn(seed: u64, steps: u32) -> EvtchnOutcome {
+    const DOMAINS: u16 = 3;
+    const PORTS: u32 = 8;
+
+    let mut sys = System::new(DOMAINS as usize, PORTS as usize);
+    let mut rng = Prng::new(seed);
+
+    for _ in 0..steps {
+        let dom = rng.below(u32::from(DOMAINS)) as u16;
+        let port = rng.below(PORTS);
+        match rng.below(8) {
+            0 => {
+                let remote = rng.below(u32::from(DOMAINS)) as u16;
+                let _ = sys.alloc_unbound(dom, remote);
+            }
+            1 => {
+                let remote = rng.below(u32::from(DOMAINS)) as u16;
+                let remote_port = rng.below(PORTS);
+                let _ = sys.bind_interdomain(dom, remote, remote_port);
+            }
+            2 => {
+                let _ = sys.bind_virq(dom, rng.below(2), rng.below(4) as u8);
+            }
+            3 => {
+                let _ = sys.bind_ipi(dom, rng.below(2));
+            }
+            4 => {
+                let _ = sys.close(dom, port);
+            }
+            5 => {
+                let _ = sys.send(dom, port);
+            }
+            6 => {
+                let _ = if rng.below(2) == 0 {
+                    sys.mask(dom, port)
+                } else {
+                    sys.unmask(dom, port)
+                };
+            }
+            _ => {
+                let _ = sys.consume(dom, port);
+            }
+        }
+    }
+
+    EvtchnOutcome::of(&sys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +215,42 @@ mod tests {
         let b = run(7, 256);
         assert_eq!(a.ticks, b.ticks);
         assert!(a.ticks >= 256, "clock advanced at least one tick per step");
+    }
+
+    /// The M2 headline: no seeded interleaving of alloc/bind/close/send/mask ever
+    /// breaks the event-channel invariants — reciprocity above all. `invariants_hold`
+    /// is evaluated in release too, so this test bites regardless of build profile.
+    #[test]
+    fn evtchn_invariants_hold_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            let outcome = run_evtchn(seed, 256);
+            assert!(
+                outcome.invariants_hold,
+                "event-channel invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the event-channel machine: same seed, same census exactly.
+    #[test]
+    fn evtchn_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_evtchn(seed, 256),
+                run_evtchn(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The generator actually reaches interesting states — some run leaves a live
+    /// interdomain link standing — otherwise the coverage above proves little.
+    #[test]
+    fn evtchn_seeds_reach_interdomain_bindings() {
+        let any_bound = (0..256u64).any(|s| run_evtchn(s, 256).interdomain > 0);
+        assert!(
+            any_bound,
+            "no seed ever established an interdomain binding — generator too weak"
+        );
     }
 }

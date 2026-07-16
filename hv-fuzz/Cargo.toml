@@ -27,3 +27,10 @@ path = "fuzz_targets/decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "evtchn"
+path = "fuzz_targets/evtchn.rs"
+test = false
+doc = false
+bench = false

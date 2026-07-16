@@ -17,6 +17,13 @@
 
 #![no_std]
 
+// The event-channel state machine needs a dynamically sized port table, so the core
+// gains an `alloc` dependency at M2. Both implementations supply a global allocator
+// (`hv-sim` via std; `hv-metal` will provide one on the metal). Still `no_std`,
+// still zero `unsafe`.
+extern crate alloc;
+
+pub mod evtchn;
 pub mod prng;
 
 use hv_hal::{GuestMemory, TimeSource};
