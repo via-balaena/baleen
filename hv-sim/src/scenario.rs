@@ -467,6 +467,46 @@ fn run_policy_steady(
         .collect()
 }
 
+/// A sleeper-fairness contrast: one CPU shared by two equal-weight vCPUs. `A` stays
+/// runnable the whole time; `B` sleeps through a long warm-up (so `A` piles up
+/// service) and then wakes to contend. Returns the number of contest-phase ticks each
+/// vCPU held the CPU. With wake-boost on, `B` is placed at `A`'s level on waking and
+/// the two share the contest evenly; with it off, `B` monopolises the CPU to catch up
+/// on the service it missed while asleep, starving `A`.
+#[cfg(test)]
+fn run_sleeper(boost: bool) -> (u64, u64) {
+    const WARMUP: u64 = 4000;
+    const CONTEST: u64 = 2000;
+
+    let mut sys = sched::System::new(1, 2, 1);
+    let mut pol = policy::Scheduler::new(1, 2, 5);
+    pol.set_wake_boost(boost);
+    sys.admit(0, 0).unwrap();
+    sys.admit(0, 1).unwrap();
+
+    let mut t = 0u64;
+    // B sleeps immediately; A runs the warm-up alone and accrues all the service.
+    sys.block(0, 1, t).unwrap();
+    for _ in 0..WARMUP {
+        t += 1;
+        pol.advance(&mut sys, t);
+    }
+
+    // B wakes; now both contend for the single CPU. Sample who holds it each tick.
+    sys.wake(0, 1).unwrap();
+    let (mut a_ticks, mut b_ticks) = (0u64, 0u64);
+    for _ in 0..CONTEST {
+        t += 1;
+        pol.advance(&mut sys, t);
+        match sys.occupant(0) {
+            Some((0, 0)) => a_ticks += 1,
+            Some((0, 1)) => b_ticks += 1,
+            _ => {}
+        }
+    }
+    (a_ticks, b_ticks)
+}
+
 /// A comparable census of a finished integrated-hypervisor run, spanning all three
 /// subsystems plus the combined invariant verdict.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -920,6 +960,33 @@ mod tests {
         assert!(
             max - min <= max / 5,
             "equal-weight vCPUs diverged too far: {rt:?}"
+        );
+    }
+
+    /// Wake-boost / sleeper fairness: a vCPU that sleeps through a long warm-up and
+    /// then wakes must not monopolise the CPU to catch up on the service it missed.
+    /// With wake-boost the two vCPUs share the contested CPU roughly evenly; without
+    /// it, the waker starves the vCPU that stayed runnable — and turning it on visibly
+    /// fixes that.
+    #[test]
+    fn wake_boost_keeps_a_waking_sleeper_from_starving_the_runnable() {
+        const CONTEST: u64 = 2000;
+
+        let (a_on, b_on) = run_sleeper(true);
+        assert!(
+            a_on >= CONTEST * 4 / 10 && b_on >= CONTEST * 4 / 10,
+            "with wake-boost the contested CPU should split ~evenly: A={a_on} B={b_on}"
+        );
+
+        let (a_off, _b_off) = run_sleeper(false);
+        assert!(
+            a_off <= CONTEST / 10,
+            "without wake-boost the always-runnable vCPU is starved: A={a_off}"
+        );
+
+        assert!(
+            a_on > a_off,
+            "wake-boost must materially improve the starved vCPU's share: {a_on} vs {a_off}"
         );
     }
 

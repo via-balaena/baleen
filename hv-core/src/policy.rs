@@ -26,13 +26,23 @@
 //! * **Starvation-free** — a [`Scheduler::quantum`] time-slice forces a running vCPU to
 //!   yield to a more-deserving waiter, so nobody waits behind a CPU-bound peer
 //!   forever.
+//! * **Sleeper-fair** — [wake-boost](Scheduler::set_wake_boost) places a vCPU that
+//!   re-enters the runnable pool (from `Blocked`, or freshly `admit`ted) at the pool's
+//!   *floor*, not below it. Without this, a vCPU that slept — and so accrued no
+//!   service while the others ran — would, on waking, look infinitely more deserving
+//!   and monopolise a CPU to "catch up", starving the vCPUs that stayed runnable. This
+//!   is the scheduler's version of CFS's `place_entity`.
 //!
-//! **Near-stateless by design.** The fairness signal is the run time the mechanism
-//! *already* tracks ([`sched::System::runtime`]) plus the current interval
-//! ([`sched::System::on_cpu_since`]); the policy adds only *configuration* — per-vCPU
-//! weights and one quantum. Richer schemes (credit replenishment, wake-boost to fix
-//! sleeper unfairness, per-pCPU run queues) layer on top of this later without
-//! disturbing the mechanism beneath.
+//! **Lean by design.** The fairness signal is the run time the mechanism *already*
+//! tracks ([`sched::System::runtime`]) plus the current interval
+//! ([`sched::System::on_cpu_since`]); the policy adds only configuration — per-vCPU
+//! weights and one quantum — and the small bookkeeping wake-boost needs (a per-vCPU
+//! service offset, set on the wake edge, and a snapshot of who was schedulable last).
+//! A continuously-runnable vCPU never wakes, so its offset stays zero and it is ranked
+//! on raw service exactly as before — wake-boost only corrects the vCPUs that leave
+//! and rejoin the pool. Further refinements (a latency credit that places sleepers
+//! slightly *ahead* of the floor for interactivity, credit replenishment, per-pCPU run
+//! queues) layer on top of this without disturbing the mechanism beneath.
 //!
 //! Provenance: weighted proportional-share selection (least virtual-runtime-first)
 //! and quantum-based preemption are textbook fair-scheduling mechanics from general
@@ -73,8 +83,11 @@ pub enum Decision {
 }
 
 /// A weighted-proportional-fair, work-conserving scheduling policy over a
-/// [`sched::System`]. Holds only configuration — per-vCPU weights and a time-slice
-/// quantum; the dynamic fairness state is read from the mechanism.
+/// [`sched::System`]. Its fairness signal is the run time the mechanism already
+/// tracks; the only state it owns is configuration (per-vCPU weights, a time-slice
+/// quantum) plus the small bookkeeping [wake-boost](Scheduler::set_wake_boost) needs —
+/// a per-vCPU service offset and a snapshot of who was schedulable last, so a wake
+/// edge can be spotted.
 pub struct Scheduler {
     /// `weights[dom][vcpu]`. Sized to match the mechanism it drives; lookups outside
     /// range fall back to [`MIN_WEIGHT`], so a shape mismatch is safe, not a panic.
@@ -82,19 +95,54 @@ pub struct Scheduler {
     /// The time-slice: a running vCPU becomes preemptible once it has held its CPU
     /// for at least this many ticks.
     quantum: Ticks,
+    /// `offset[dom][vcpu]`: extra service (in ticks) added on top of the mechanism's
+    /// tracked runtime when ranking a vCPU. Wake-boost raises this on the edge into
+    /// the runnable pool so a long-slept (or freshly admitted) vCPU is placed at the
+    /// pack's floor instead of dominating with its stale-low service. Zero for a vCPU
+    /// that never leaves the runnable pool — so continuously-runnable vCPUs are ranked
+    /// on raw service exactly as before.
+    offset: Vec<Vec<u128>>,
+    /// `was_schedulable[dom][vcpu]`: whether the vCPU was `Runnable` or `Running` at
+    /// the last accounting pass, so the transition *into* the pool (a wake) is
+    /// detectable.
+    was_schedulable: Vec<Vec<bool>>,
+    /// Whether wake-boost is applied. On by default; a caller can disable it to get
+    /// the raw least-service-first behaviour (useful to show the difference).
+    wake_boost: bool,
 }
 
 impl Scheduler {
     /// A policy for `num_domains` domains of `vcpus_per_domain` vCPUs each, every vCPU
-    /// at the default weight, with time-slice `quantum`. A `quantum` of `0` makes a
-    /// running vCPU preemptible immediately (pure least-service-first, maximal
-    /// fairness, maximal context switching).
+    /// at the default weight, with time-slice `quantum` and wake-boost on. A `quantum`
+    /// of `0` makes a running vCPU preemptible immediately (pure least-service-first,
+    /// maximal fairness, maximal context switching).
     pub fn new(num_domains: usize, vcpus_per_domain: usize, quantum: Ticks) -> Self {
         Scheduler {
             weights: (0..num_domains)
                 .map(|_| alloc::vec![MIN_WEIGHT; vcpus_per_domain])
                 .collect(),
             quantum,
+            offset: (0..num_domains)
+                .map(|_| alloc::vec![0u128; vcpus_per_domain])
+                .collect(),
+            was_schedulable: (0..num_domains)
+                .map(|_| alloc::vec![false; vcpus_per_domain])
+                .collect(),
+            wake_boost: true,
+        }
+    }
+
+    /// Enable or disable wake-boost (on by default). With it off, a vCPU entering the
+    /// runnable pool is ranked on its raw accumulated service — so a long-slept or
+    /// newly-admitted vCPU will monopolise a CPU to "catch up", starving the vCPUs
+    /// that stayed runnable. With it on, such a vCPU is placed at the pool's floor and
+    /// simply shares fairly from there. Clears any offsets accumulated so far.
+    pub fn set_wake_boost(&mut self, enabled: bool) {
+        self.wake_boost = enabled;
+        for row in &mut self.offset {
+            for o in row.iter_mut() {
+                *o = 0;
+            }
         }
     }
 
@@ -167,18 +215,21 @@ impl Scheduler {
         Decision::Idle
     }
 
-    /// Drive `sys` to a scheduling fixpoint at time `now` by enacting [`Self::next`]
-    /// repeatedly until it returns [`Decision::Idle`]. Returns the number of
-    /// transitions enacted. This is the thin driver the hypervisor's tick/idle path
-    /// calls; it mutates the mechanism only through its public transitions, so the
-    /// mechanism's invariants hold throughout.
+    /// Drive `sys` to a scheduling fixpoint at time `now`: first account for wake
+    /// events (see [`Self::set_wake_boost`]), then enact [`Self::next`] until it returns
+    /// [`Decision::Idle`]. Returns the number of transitions enacted. This is the thin
+    /// driver the hypervisor's tick/idle path calls; it mutates the mechanism only
+    /// through its public transitions, so the mechanism's invariants hold throughout.
     ///
     /// Terminates: each [`Decision::Run`] consumes an idle CPU, and each
     /// [`Decision::Preempt`] targets a vCPU whose quantum has expired and replaces it
     /// (via the following `Run`) with one just dispatched at `now` — elapsed `0`, not
     /// re-preemptible at this `now` — so at most one preemption occurs per physical
     /// CPU per call.
-    pub fn advance(&self, sys: &mut sched::System, now: Ticks) -> u32 {
+    pub fn advance(&mut self, sys: &mut sched::System, now: Ticks) -> u32 {
+        // Fold in any wake edges before deciding, so a just-woken vCPU is placed at the
+        // pool's floor rather than ranked on its stale-low service.
+        self.account(sys, now);
         let mut enacted = 0;
         // Bound the loop defensively so a hypothetical non-converging `next` cannot
         // spin forever. Least-service-first is a total order, so `advance` moves
@@ -261,8 +312,9 @@ impl Scheduler {
     /// A vCPU's proportional-share position as the rational `service / weight`, kept
     /// as its numerator/denominator pair so it can be compared exactly with
     /// cross-multiplication (no division, no float). `service` is effective runtime:
-    /// closed on-CPU intervals plus the current in-flight one, so a running vCPU is
-    /// not perpetually flattered by its unaccounted time.
+    /// closed on-CPU intervals, plus the current in-flight one (so a running vCPU is
+    /// not flattered by its unaccounted time), plus its wake-boost `offset` (so a
+    /// just-woken vCPU sits at the pool's floor, not below it).
     fn share(&self, sys: &sched::System, dom: DomId, vcpu: Vcpu, now: Ticks) -> Share {
         let closed = u128::from(sys.runtime(dom, vcpu).unwrap_or(0));
         let in_flight = match sys.on_cpu_since(dom, vcpu) {
@@ -270,14 +322,102 @@ impl Scheduler {
             None => 0,
         };
         Share {
-            service: closed + in_flight,
+            service: closed + in_flight + self.offset_of(dom, vcpu),
             weight: u128::from(self.weight_of(dom, vcpu)),
+        }
+    }
+
+    /// Fold in wake edges: any vCPU that entered the runnable pool (from `Blocked` or
+    /// `Offline`) since the last call is placed at the pool's *floor* — the minimum
+    /// service-per-weight among the vCPUs that were already there — so its stale-low
+    /// service cannot let it monopolise a CPU to catch up. Only ever raises a vCPU's
+    /// standing (a boost, never a penalty), and does nothing for a vCPU that never
+    /// left the pool, so continuously-runnable vCPUs keep ranking on raw service.
+    fn account(&mut self, sys: &sched::System, now: Ticks) {
+        // Pass 1: the floor of the established pack — vCPUs schedulable now *and* at
+        // the last snapshot, so this tick's wakers do not anchor to each other.
+        let mut floor: Option<Share> = None;
+        for dom in 0..sys.domain_count() as DomId {
+            for vcpu in 0..sys.vcpu_count(dom) as Vcpu {
+                if schedulable(sys, dom, vcpu) && self.was_schedulable(dom, vcpu) {
+                    let s = self.share(sys, dom, vcpu, now);
+                    if floor.map(|f| more_deserving(s, f)).unwrap_or(true) {
+                        floor = Some(s);
+                    }
+                }
+            }
+        }
+
+        // Pass 2: place each waker at the floor (if boost is on), then refresh the
+        // snapshot for next time.
+        for dom in 0..sys.domain_count() as DomId {
+            for vcpu in 0..sys.vcpu_count(dom) as Vcpu {
+                let now_sched = schedulable(sys, dom, vcpu);
+                let woke = now_sched && !self.was_schedulable(dom, vcpu);
+                if woke && self.wake_boost {
+                    if let Some(f) = floor {
+                        // Target service so `target / weight == floor.service / floor.weight`.
+                        let weight = u128::from(self.weight_of(dom, vcpu));
+                        let target = f.service.saturating_mul(weight) / f.weight;
+                        let raw = u128::from(sys.runtime(dom, vcpu).unwrap_or(0));
+                        // Boost only: never drag a vCPU that is already above the floor
+                        // back down.
+                        self.set_offset(dom, vcpu, target.saturating_sub(raw));
+                    }
+                }
+                self.set_was_schedulable(dom, vcpu, now_sched);
+            }
         }
     }
 
     fn first_idle_pcpu(&self, sys: &sched::System) -> Option<Pcpu> {
         (0..sys.pcpu_count() as Pcpu).find(|&p| sys.occupant(p).is_none())
     }
+
+    fn offset_of(&self, dom: DomId, vcpu: Vcpu) -> u128 {
+        self.offset
+            .get(dom as usize)
+            .and_then(|r| r.get(vcpu as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn set_offset(&mut self, dom: DomId, vcpu: Vcpu, value: u128) {
+        if let Some(o) = self
+            .offset
+            .get_mut(dom as usize)
+            .and_then(|r| r.get_mut(vcpu as usize))
+        {
+            *o = value;
+        }
+    }
+
+    fn was_schedulable(&self, dom: DomId, vcpu: Vcpu) -> bool {
+        self.was_schedulable
+            .get(dom as usize)
+            .and_then(|r| r.get(vcpu as usize))
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn set_was_schedulable(&mut self, dom: DomId, vcpu: Vcpu, value: bool) {
+        if let Some(s) = self
+            .was_schedulable
+            .get_mut(dom as usize)
+            .and_then(|r| r.get_mut(vcpu as usize))
+        {
+            *s = value;
+        }
+    }
+}
+
+/// Whether a vCPU is in the runnable pool — `Runnable` or `Running`, the states that
+/// carry a live scheduling position (as opposed to `Blocked` / `Offline`).
+fn schedulable(sys: &sched::System, dom: DomId, vcpu: Vcpu) -> bool {
+    matches!(
+        sys.state_of(dom, vcpu),
+        Some(RunState::Runnable | RunState::Running { .. })
+    )
 }
 
 /// A vCPU's fair-share position as the rational `service / weight`. Compared by
@@ -331,7 +471,7 @@ mod tests {
 
     #[test]
     fn advance_is_work_conserving_until_the_cpu_is_full() {
-        let (mut sys, pol) = setup(10);
+        let (mut sys, mut pol) = setup(10);
         sys.admit(0, 0).unwrap();
         sys.admit(0, 1).unwrap();
         // One CPU, two runnable vCPUs: advance fills the CPU and then, with no
@@ -421,8 +561,47 @@ mod tests {
     }
 
     #[test]
+    fn wake_boost_places_a_newcomer_at_the_floor_not_ahead() {
+        let (mut sys, mut pol) = setup(10);
+        // A = (0,0) runs alone from t=0 and accrues a large service.
+        sys.admit(0, 0).unwrap();
+        pol.advance(&mut sys, 0);
+        assert!(sys.is_running(0, 0));
+        // Much later, a fresh vCPU B = (0,1) is admitted with zero accrued service.
+        sys.admit(0, 1).unwrap();
+        pol.advance(&mut sys, 1000);
+        // Wake-boost places B at A's level, so B does NOT preempt A to catch up: the
+        // incumbent keeps the CPU and B waits its fair turn.
+        assert_eq!(
+            sys.occupant(0),
+            Some((0, 0)),
+            "a boosted newcomer must not evict the incumbent to catch up"
+        );
+        assert_eq!(sys.state_of(0, 1), Some(RunState::Runnable));
+    }
+
+    #[test]
+    fn without_wake_boost_a_newcomer_hogs_the_cpu() {
+        let (mut sys, mut pol) = setup(10);
+        pol.set_wake_boost(false);
+        sys.admit(0, 0).unwrap();
+        pol.advance(&mut sys, 0);
+        assert!(sys.is_running(0, 0));
+        sys.admit(0, 1).unwrap();
+        pol.advance(&mut sys, 1000);
+        // Ranked on raw service, the zero-service newcomer looks infinitely more
+        // deserving and immediately evicts the long-running incumbent — exactly the
+        // unfairness wake-boost exists to prevent.
+        assert_eq!(
+            sys.occupant(0),
+            Some((0, 1)),
+            "an unboosted newcomer preempts and seizes the CPU"
+        );
+    }
+
+    #[test]
     fn advance_terminates_and_leaves_the_mechanism_consistent() {
-        let (mut sys, pol) = setup(0); // quantum 0: maximally eager to preempt
+        let (mut sys, mut pol) = setup(0); // quantum 0: maximally eager to preempt
         for d in 0..2u16 {
             for v in 0..2u32 {
                 sys.admit(d, v).unwrap();
