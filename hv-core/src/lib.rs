@@ -25,7 +25,10 @@ extern crate alloc;
 
 pub mod evtchn;
 pub mod grant;
+pub mod hypervisor;
 pub mod prng;
+
+pub use hypervisor::{HvCall, HvError, HvOutcome, Hypervisor};
 
 use hv_hal::{GuestMemory, TimeSource};
 
@@ -129,7 +132,38 @@ impl HvCore {
         self.spent
     }
 
-    /// Dispatch one decoded hypercall and re-check the invariants.
+    /// Deposit `amount` credits, returning the new balance. The direct entry point
+    /// the integrated [`crate::hypervisor::Hypervisor`] calls; [`Self::dispatch`]
+    /// routes the toy ABI here.
+    pub fn grant_credit(&mut self, amount: u32) -> HResult {
+        let amount = u64::from(amount);
+        // On overflow we return before mutating anything, so the invariant holds on
+        // the error path.
+        self.balance = self.balance.checked_add(amount).ok_or(HError::Overflow)?;
+        self.granted += amount;
+        self.check_invariants();
+        Ok(self.balance)
+    }
+
+    /// Withdraw `amount` credits, failing if the balance is insufficient.
+    pub fn spend_credit(&mut self, amount: u32) -> HResult {
+        let amount = u64::from(amount);
+        if amount > self.balance {
+            return Err(HError::Insufficient);
+        }
+        self.balance -= amount;
+        self.spent += amount;
+        self.check_invariants();
+        Ok(self.balance)
+    }
+
+    /// Whether the conservation invariant holds. Evaluated in release too, so the
+    /// integrated hypervisor can fold it into its own release-mode check.
+    pub fn invariants_hold(&self) -> bool {
+        self.granted == self.spent + self.balance
+    }
+
+    /// Dispatch one decoded toy hypercall.
     ///
     /// `mem` and `time` are unused by these toy calls but are threaded through to
     /// fix the calling convention now: the core reaches the outside world *only*
@@ -141,27 +175,10 @@ impl HvCore {
         M: GuestMemory,
         T: TimeSource,
     {
-        let result = match call {
-            Hypercall::Grant { amount } => {
-                let amount = u64::from(amount);
-                // On overflow we return before mutating anything, so the invariant
-                // still holds on the error path.
-                self.balance = self.balance.checked_add(amount).ok_or(HError::Overflow)?;
-                self.granted += amount;
-                Ok(self.balance)
-            }
-            Hypercall::Spend { amount } => {
-                let amount = u64::from(amount);
-                if amount > self.balance {
-                    return Err(HError::Insufficient);
-                }
-                self.balance -= amount;
-                self.spent += amount;
-                Ok(self.balance)
-            }
-        };
-        self.check_invariants();
-        result
+        match call {
+            Hypercall::Grant { amount } => self.grant_credit(amount),
+            Hypercall::Spend { amount } => self.spend_credit(amount),
+        }
     }
 
     /// The library's invariants, checked on every transition.

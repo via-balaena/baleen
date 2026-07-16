@@ -106,8 +106,12 @@ one-line regression test, not a Heisenbug.
   - `hv-core::grant` — grant tables (grant / end / map / unmap / copy), guarding the
     core safety rule that **a grant with a live mapping cannot be ended**, plus
     refcount consistency and read-only integrity.
+  - `hv-core::Hypervisor` — the integrated core: per-domain credit plus both
+    subsystems behind one typed, ABI-neutral `HvCall` dispatch. `hv-sim` drives the
+    whole thing through one seam, and one `invariants_hold()` covers the lot. This is
+    the real dispatch seam the M5 personality will decode wire-format calls into.
 
-  Both are generic and ABI-agnostic — wire formats (the `shared_info` bitmaps, the
+  All of it is generic and ABI-agnostic — wire formats (the `shared_info` bitmaps, the
   `grant_entry` structs) stay in the M5 personality. Clean-room provenance discipline
   is live here, the first time Xen behavior informs a core design — see
   [`CLEANROOM.md`](CLEANROOM.md).

@@ -41,3 +41,10 @@ path = "fuzz_targets/grant.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hypervisor"
+path = "fuzz_targets/hypervisor.rs"
+test = false
+doc = false
+bench = false

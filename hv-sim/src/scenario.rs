@@ -9,7 +9,7 @@
 //! whole reproducer. This is the FoundationDB discipline shrunk to a laptop.
 
 use hv_core::evtchn::{PortState, System};
-use hv_core::{grant, prng::Prng, HvCore, Hypercall};
+use hv_core::{grant, prng::Prng, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor};
 use hv_hal::TimeSource;
 
 use crate::{FakeMemory, ManualClock};
@@ -238,6 +238,172 @@ pub fn run_grant(seed: u64, steps: u32) -> GrantOutcome {
     GrantOutcome::of(&sys)
 }
 
+/// A comparable census of a finished integrated-hypervisor run, spanning all three
+/// subsystems plus the combined invariant verdict.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HvSummary {
+    pub interdomain: u32,
+    pub pending: u32,
+    pub grants: u32,
+    pub active_maps: u32,
+    pub total_balance: u64,
+    /// Whether every subsystem's invariants hold at the end.
+    pub invariants_hold: bool,
+}
+
+impl HvSummary {
+    fn of(hv: &Hypervisor) -> Self {
+        let mut s = HvSummary::default();
+        let e = hv.evtchn();
+        for dom in 0..e.domain_count() as u16 {
+            for port in 0..e.port_count(dom) as u32 {
+                if matches!(e.state_of(dom, port), Some(PortState::Interdomain { .. })) {
+                    s.interdomain += 1;
+                }
+                if e.is_pending(dom, port) {
+                    s.pending += 1;
+                }
+            }
+        }
+        let g = hv.grant();
+        for grantor in 0..g.domain_count() as u16 {
+            for gref in 0..g.entry_count(grantor) as u32 {
+                if g.is_granted(grantor, gref) {
+                    s.grants += 1;
+                }
+            }
+        }
+        s.active_maps = g.active_maps() as u32;
+        for dom in 0..hv.domain_count() as u16 {
+            s.total_balance += hv.balance(dom).unwrap_or(0);
+        }
+        s.invariants_hold = hv.invariants_hold();
+        s
+    }
+}
+
+/// Drive the whole integrated [`Hypervisor`] through a seed-derived stream of typed
+/// hypercalls across all three subsystems, tracking live grant handles so unmaps go
+/// to their owners. One loop exercises credit, event channels, and grant tables
+/// through the single dispatch seam; one invariant check covers the lot.
+pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
+    const DOMAINS: u16 = 3;
+    const PORTS: u32 = 8;
+    const GRANTS: u32 = 6;
+
+    let mut hv = Hypervisor::new(DOMAINS as usize, PORTS as usize, GRANTS as usize);
+    let mut rng = Prng::new(seed);
+    let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee/owner, handle) of live maps
+
+    for _ in 0..steps {
+        let caller = rng.below(u32::from(DOMAINS)) as u16;
+        let port = rng.below(PORTS);
+        let gref = rng.below(GRANTS);
+
+        match rng.below(15) {
+            0 => drop_ok(hv.dispatch(
+                caller,
+                HvCall::CreditGrant {
+                    amount: rng.below(1000),
+                },
+            )),
+            1 => drop_ok(hv.dispatch(
+                caller,
+                HvCall::CreditSpend {
+                    amount: rng.below(1000),
+                },
+            )),
+            2 => {
+                let remote = rng.below(u32::from(DOMAINS)) as u16;
+                drop_ok(hv.dispatch(caller, HvCall::EvtchnAllocUnbound { remote }));
+            }
+            3 => {
+                let remote = rng.below(u32::from(DOMAINS)) as u16;
+                let remote_port = rng.below(PORTS);
+                drop_ok(hv.dispatch(
+                    caller,
+                    HvCall::EvtchnBindInterdomain {
+                        remote,
+                        remote_port,
+                    },
+                ));
+            }
+            4 => drop_ok(hv.dispatch(
+                caller,
+                HvCall::EvtchnBindVirq {
+                    vcpu: rng.below(2),
+                    virq: rng.below(4) as u8,
+                },
+            )),
+            5 => drop_ok(hv.dispatch(caller, HvCall::EvtchnBindIpi { vcpu: rng.below(2) })),
+            6 => drop_ok(hv.dispatch(caller, HvCall::EvtchnClose { port })),
+            7 => drop_ok(hv.dispatch(caller, HvCall::EvtchnSend { port })),
+            8 => {
+                let call = if rng.below(2) == 0 {
+                    HvCall::EvtchnMask { port }
+                } else {
+                    HvCall::EvtchnUnmask { port }
+                };
+                drop_ok(hv.dispatch(caller, call));
+            }
+            9 => drop_ok(hv.dispatch(caller, HvCall::EvtchnConsume { port })),
+            10 => {
+                let grantee = rng.below(u32::from(DOMAINS)) as u16;
+                drop_ok(hv.dispatch(
+                    caller,
+                    HvCall::GrantAccess {
+                        gref,
+                        grantee,
+                        frame: u64::from(rng.below(64)),
+                        readonly: rng.below(2) == 0,
+                    },
+                ));
+            }
+            11 => drop_ok(hv.dispatch(caller, HvCall::GrantEndAccess { gref })),
+            12 => {
+                let grantor = rng.below(u32::from(DOMAINS)) as u16;
+                // The caller maps, so the caller owns the resulting handle.
+                if let Ok(HvOutcome::Handle(h)) = hv.dispatch(
+                    caller,
+                    HvCall::GrantMap {
+                        grantor,
+                        gref,
+                        writable: rng.below(2) == 0,
+                    },
+                ) {
+                    handles.push((caller, h));
+                }
+            }
+            13 => {
+                if !handles.is_empty() {
+                    let idx = rng.below(handles.len() as u32) as usize;
+                    let (owner, handle) = handles.swap_remove(idx);
+                    drop_ok(hv.dispatch(owner, HvCall::GrantUnmap { handle }));
+                }
+            }
+            _ => {
+                let grantor = rng.below(u32::from(DOMAINS)) as u16;
+                drop_ok(hv.dispatch(
+                    caller,
+                    HvCall::GrantCopy {
+                        grantor,
+                        gref,
+                        write: rng.below(2) == 0,
+                    },
+                ));
+            }
+        }
+    }
+
+    HvSummary::of(&hv)
+}
+
+/// Discard a dispatch result — many calls fail by design (spend beyond balance,
+/// send on a free port), and that is part of what the sim exercises.
+fn drop_ok(result: Result<HvOutcome, hv_core::HvError>) {
+    let _ = result;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +532,52 @@ mod tests {
         assert!(
             any_mapped,
             "no seed ever established a live mapping — generator too weak"
+        );
+    }
+
+    /// The integration headline: drive all three subsystems through the single
+    /// dispatch seam for thousands of seeds, and the *combined* invariant never
+    /// breaks. One check now stands in for the whole core.
+    #[test]
+    fn hypervisor_invariants_hold_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            let summary = run_hypervisor(seed, 256);
+            assert!(
+                summary.invariants_hold,
+                "integrated invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the integrated core.
+    #[test]
+    fn hypervisor_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_hypervisor(seed, 256),
+                run_hypervisor(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The integrated run genuinely exercises all three subsystems — across the seed
+    /// space we see live interdomain links, live grant maps, and non-zero balances.
+    /// If any stayed empty, the dispatch seam wouldn't really be covered.
+    #[test]
+    fn hypervisor_exercises_all_three_subsystems() {
+        let summaries: Vec<_> = (0..256u64).map(|s| run_hypervisor(s, 256)).collect();
+        assert!(
+            summaries.iter().any(|s| s.interdomain > 0),
+            "no seed exercised event channels"
+        );
+        assert!(
+            summaries.iter().any(|s| s.active_maps > 0),
+            "no seed exercised grant mappings"
+        );
+        assert!(
+            summaries.iter().any(|s| s.total_balance > 0),
+            "no seed exercised credit"
         );
     }
 }
