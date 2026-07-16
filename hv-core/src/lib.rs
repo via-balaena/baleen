@@ -27,6 +27,7 @@ pub mod evtchn;
 pub mod grant;
 pub mod hypervisor;
 pub mod prng;
+pub mod sched;
 
 pub use hypervisor::{HvCall, HvError, HvOutcome, Hypervisor};
 

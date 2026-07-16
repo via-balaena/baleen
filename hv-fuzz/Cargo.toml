@@ -43,6 +43,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sched"
+path = "fuzz_targets/sched.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "hypervisor"
 path = "fuzz_targets/hypervisor.rs"
 test = false

@@ -9,7 +9,7 @@
 //! whole reproducer. This is the FoundationDB discipline shrunk to a laptop.
 
 use hv_core::evtchn::{PortState, System};
-use hv_core::{grant, prng::Prng, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor};
+use hv_core::{grant, prng::Prng, sched, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor};
 use hv_hal::TimeSource;
 
 use crate::{FakeMemory, ManualClock};
@@ -236,6 +236,92 @@ pub fn run_grant(seed: u64, steps: u32) -> GrantOutcome {
     }
 
     GrantOutcome::of(&sys)
+}
+
+/// A comparable summary of a finished scheduler run — a census of vCPU run states,
+/// physical-CPU occupancy, and total accrued runtime.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SchedOutcome {
+    pub offline: u32,
+    pub runnable: u32,
+    pub running: u32,
+    pub blocked: u32,
+    pub busy_pcpus: u32,
+    /// Total closed on-CPU time across all vCPUs. Monotonic in `steps` for a fixed
+    /// seed, because per-vCPU runtime only ever grows.
+    pub total_runtime: u64,
+    /// Whether the system's invariants hold at the end — asserted in release too.
+    pub invariants_hold: bool,
+}
+
+impl SchedOutcome {
+    fn of(sys: &sched::System) -> Self {
+        let mut o = SchedOutcome::default();
+        for dom in 0..sys.domain_count() as u16 {
+            for vcpu in 0..sys.vcpu_count(dom) as u32 {
+                match sys.state_of(dom, vcpu) {
+                    Some(sched::RunState::Offline) => o.offline += 1,
+                    Some(sched::RunState::Runnable) => o.runnable += 1,
+                    Some(sched::RunState::Running { .. }) => o.running += 1,
+                    Some(sched::RunState::Blocked) => o.blocked += 1,
+                    None => {}
+                }
+                o.total_runtime += sys.runtime(dom, vcpu).unwrap_or(0);
+            }
+        }
+        o.busy_pcpus = sys.busy_pcpus() as u32;
+        o.invariants_hold = sys.invariants_hold();
+        o
+    }
+}
+
+/// Drive the scheduler [`sched::System`] through a seed-derived stream of
+/// admit/run/preempt/block/wake/offline operations across a few domains and physical
+/// CPUs, cranking a [`ManualClock`] so time accounting is part of the replay. Same
+/// discipline as the others: the core's `debug_assert!` fires on every transition, so
+/// a broken pCPU-exclusivity reciprocity surfaces here with the seed as the whole
+/// reproducer. This is where two vCPUs racing for one physical CPU is stress-tested.
+pub fn run_sched(seed: u64, steps: u32) -> SchedOutcome {
+    const DOMAINS: u16 = 3;
+    const VCPUS: u32 = 2;
+    const PCPUS: u32 = 2;
+
+    let mut sys = sched::System::new(DOMAINS as usize, VCPUS as usize, PCPUS as usize);
+    let mut rng = Prng::new(seed);
+    let clock = ManualClock::new();
+
+    for _ in 0..steps {
+        // Advance time first so every run/preempt interval spans a seed-derived gap;
+        // `now` is thus part of the replay exactly like the event ordering is.
+        clock.advance(1 + u64::from(rng.below(16)));
+        let now = clock.now();
+
+        let dom = rng.below(u32::from(DOMAINS)) as u16;
+        let vcpu = rng.below(VCPUS);
+        let pcpu = rng.below(PCPUS);
+        match rng.below(6) {
+            0 => {
+                let _ = sys.admit(dom, vcpu);
+            }
+            1 => {
+                let _ = sys.run(dom, vcpu, pcpu, now);
+            }
+            2 => {
+                let _ = sys.preempt(dom, vcpu, now);
+            }
+            3 => {
+                let _ = sys.block(dom, vcpu, now);
+            }
+            4 => {
+                let _ = sys.wake(dom, vcpu);
+            }
+            _ => {
+                let _ = sys.offline(dom, vcpu, now);
+            }
+        }
+    }
+
+    SchedOutcome::of(&sys)
 }
 
 /// A comparable census of a finished integrated-hypervisor run, spanning all three
@@ -533,6 +619,59 @@ mod tests {
             any_mapped,
             "no seed ever established a live mapping — generator too weak"
         );
+    }
+
+    /// The scheduler headline: no seeded interleaving of admit/run/preempt/block/
+    /// wake/offline ever breaks pCPU exclusivity — no physical CPU runs two vCPUs,
+    /// and the run-state and occupancy views stay perfect reciprocals.
+    /// `invariants_hold` is evaluated in release too, so this bites in any profile.
+    #[test]
+    fn sched_invariants_hold_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            let outcome = run_sched(seed, 256);
+            assert!(
+                outcome.invariants_hold,
+                "scheduler invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the scheduler machine: same seed, same census exactly.
+    #[test]
+    fn sched_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_sched(seed, 256),
+                run_sched(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The generator actually reaches running vCPUs — the exclusivity and accounting
+    /// invariants only mean something once vCPUs are on physical CPUs.
+    #[test]
+    fn sched_seeds_reach_running_vcpus() {
+        let any_running = (0..256u64).any(|s| run_sched(s, 256).running > 0);
+        assert!(
+            any_running,
+            "no seed ever put a vCPU on a physical CPU — generator too weak"
+        );
+    }
+
+    /// Accrued runtime is monotonic in the number of steps: a longer run of the same
+    /// seed shares the shorter run's prefix exactly (deterministic replay), and
+    /// per-vCPU runtime only ever grows — so total runtime can never shrink.
+    #[test]
+    fn sched_runtime_is_monotonic_in_steps() {
+        for seed in [1u64, 7, 42, 0xD1CE, u64::MAX] {
+            let short = run_sched(seed, 128).total_runtime;
+            let long = run_sched(seed, 256).total_runtime;
+            assert!(
+                long >= short,
+                "seed {seed}: runtime shrank from {short} to {long} over more steps"
+            );
+        }
     }
 
     /// The integration headline: drive all three subsystems through the single
