@@ -15,6 +15,12 @@ until there is a tested brain to plug in.
 The payoff: green CI in week one, and you are never more than a day from a passing
 test on a multi-year solo project.
 
+> **On the name.** "Baleen" is an interim working name. The `baleen` crate name on
+> crates.io is currently held by an unrelated placeholder, so the eventual published
+> binary may ship under a different crate name; the project identity is the
+> `via-balaena/baleen` repository. The internal library crates (`hv-*`) are marked
+> `publish = false` and are not intended for crates.io.
+
 ## Workspace
 
 | crate           | what it is                                                                            | status |

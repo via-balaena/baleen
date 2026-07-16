@@ -4,6 +4,8 @@
 [package]
 name = "hv-core"
 description = "All hypervisor logic as a no_std library: hypercall dispatch and state machines, zero unsafe."
+# Internal workspace crate — not for crates.io. Guards against an accidental publish.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

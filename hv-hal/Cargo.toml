@@ -4,6 +4,8 @@
 [package]
 name = "hv-hal"
 description = "Hardware abstraction traits for the Baleen hypervisor (no_std)."
+# Internal workspace crate — not for crates.io. Guards against an accidental publish.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
