@@ -65,6 +65,15 @@ pub enum Hypercall {
 impl Hypercall {
     /// Decode the raw ABI into a typed hypercall.
     ///
+    /// **Personality seam — temporary home.** The wire encoding and the hypercall
+    /// number space (`NR_GRANT`, `NR_SPEND`, …) are *personality*-owned, not
+    /// core-owned: they are ABI decisions, and `hv-core` deliberately knows no ABI.
+    /// This lives here only to keep M1 a single crate. At M5, when the Xen
+    /// personality (`baleen-xenabi`) arrives, `decode` moves northbound into it —
+    /// the personality owns Xen's numbering and structs, and hands `hv-core` an
+    /// already-typed, ABI-neutral [`Hypercall`]. The core's job is the *operation*,
+    /// never the *wire format*.
+    ///
     /// Rejects out-of-range arguments rather than silently truncating them — the
     /// argument field is a `u32`, and a guest that sets the high bits is malformed,
     /// not lucky. This strictness is what keeps the fuzzer's findings meaningful.
