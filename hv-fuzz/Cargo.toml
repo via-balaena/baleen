@@ -62,3 +62,10 @@ path = "fuzz_targets/hypervisor.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "p2m"
+path = "fuzz_targets/p2m.rs"
+test = false
+doc = false
+bench = false

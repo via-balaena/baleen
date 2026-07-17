@@ -70,7 +70,7 @@ of a sort — one faces guests, one faces hardware — and neither leaks into th
                   │      neutral, ABI-agnostic ops
           ┌───────▼────────────────────────▼─────────────┐
           │  hv-core   (no_std, zero unsafe)              │
-          │  scheduler · event channels · grant table     │
+          │  sched · evtchn · grant · page-type accounting│
           │  dispatch · invariants — knows no personality │
           └───────────────────┬──────────────────────────┘
                               │  speaks ONLY through
@@ -137,10 +137,21 @@ one-line regression test, not a Heisenbug.
   runnable — the scheduler's version of CFS's `place_entity`. Unlike a state machine
   it has no safety invariant — a bad policy is unfair, not unsafe — so it is held to
   *properties* instead: work-conservation, proportional fairness, starvation-freedom,
-  and sleeper fairness, all property-tested (`hv-sim`) and fuzzed (`hv-fuzz`). This
-  completes `hv-core`'s pure brain — three whole-system state machines, credit
-  accounting, and a policy over them — all green on a laptop before any hardware
-  exists.
+  and sleeper fairness, all property-tested (`hv-sim`) and fuzzed (`hv-fuzz`).
+- **Page-type accounting** *(landed)*: `hv-core::p2m` — a fourth whole-system state
+  machine, Xen's third historical XSA factory after event channels and grant tables.
+  Every machine frame carries an existence reference count and two typed counts
+  (allocate / get / put / get_type / put_type / free); the safety invariant is
+  **write-xor-pagetable** — `get_type` refuses a writable reference while a page-table
+  reference is live and vice-versa, so a frame is never usable as both writable memory
+  and a page table at once (the exact shape of the `PGT_*` typecount bugs that let a
+  guest forge a PTE and escape). Reference coherence (typed ≤ total) and owner
+  integrity ride alongside; a frame can only be freed once nothing references it.
+  Joined the one `HvCall` seam, folded into the integrated `invariants_hold()`,
+  property-tested (`hv-core`), seeded-simulated (`hv-sim`), and fuzzed (`hv-fuzz`) —
+  the seventh fuzz target. This brings `hv-core`'s pure brain to **four** whole-system
+  state machines, credit accounting, and a scheduling policy over them — all green on
+  a laptop before any hardware exists.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

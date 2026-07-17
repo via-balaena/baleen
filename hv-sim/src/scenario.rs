@@ -9,7 +9,10 @@
 //! whole reproducer. This is the FoundationDB discipline shrunk to a laptop.
 
 use hv_core::evtchn::{PortState, System};
-use hv_core::{grant, policy, prng::Prng, sched, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor};
+use hv_core::p2m::PageType;
+use hv_core::{
+    grant, p2m, policy, prng::Prng, sched, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor,
+};
 use hv_hal::TimeSource;
 
 use crate::{FakeMemory, ManualClock};
@@ -324,6 +327,93 @@ pub fn run_sched(seed: u64, steps: u32) -> SchedOutcome {
     SchedOutcome::of(&sys)
 }
 
+/// A comparable summary of a finished page-type run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct P2mOutcome {
+    pub allocated: u32,
+    /// Frames currently typed writable.
+    pub writable_typed: u32,
+    /// Frames currently typed as a page table.
+    pub pagetable_typed: u32,
+    /// Total existence references across all allocated frames.
+    pub total_refs: u64,
+    /// Whether the system's invariants hold at the end — asserted in release too.
+    pub invariants_hold: bool,
+}
+
+impl P2mOutcome {
+    fn of(sys: &p2m::System) -> Self {
+        let mut o = P2mOutcome::default();
+        for mfn in 0..sys.frame_count() as u32 {
+            if sys.is_allocated(mfn) {
+                o.allocated += 1;
+                o.total_refs += u64::from(sys.refs(mfn).unwrap_or(0));
+                match sys.current_type(mfn) {
+                    Some(PageType::Writable) => o.writable_typed += 1,
+                    Some(PageType::PageTable) => o.pagetable_typed += 1,
+                    None => {}
+                }
+            }
+        }
+        o.invariants_hold = sys.invariants_hold();
+        o
+    }
+}
+
+/// Drive the page-type [`p2m::System`] through a seed-derived stream of allocate / get
+/// / put / get_type / put_type / free operations across a few domains and frames,
+/// tracking live typed references so put_type targets a type the frame actually holds.
+/// Same discipline as the others: the core's `debug_assert!` fires on every transition,
+/// so a broken writable-xor-pagetable exclusivity surfaces here with the seed as the
+/// whole reproducer. This is where a page racing between writable and page-table use —
+/// the shape of Xen's `PGT_*` typecount XSAs — is stress-tested.
+pub fn run_p2m(seed: u64, steps: u32) -> P2mOutcome {
+    const DOMAINS: u16 = 3;
+    const FRAMES: u32 = 6;
+
+    let mut sys = p2m::System::new(DOMAINS as usize, FRAMES as usize);
+    let mut rng = Prng::new(seed);
+    let mut typed: Vec<(u32, PageType)> = Vec::new(); // (mfn, type) of live typed refs
+
+    for _ in 0..steps {
+        let owner = rng.below(u32::from(DOMAINS)) as u16;
+        let mfn = rng.below(FRAMES);
+        match rng.below(7) {
+            0 => {
+                let _ = sys.allocate(owner, mfn);
+            }
+            1 => {
+                let _ = sys.get(mfn);
+            }
+            2 => {
+                let _ = sys.put(mfn);
+            }
+            3 | 4 => {
+                let ty = if rng.below(2) == 0 {
+                    PageType::Writable
+                } else {
+                    PageType::PageTable
+                };
+                if sys.get_type(mfn, ty).is_ok() {
+                    typed.push((mfn, ty));
+                }
+            }
+            5 => {
+                if !typed.is_empty() {
+                    let idx = rng.below(typed.len() as u32) as usize;
+                    let (m, ty) = typed.swap_remove(idx);
+                    let _ = sys.put_type(m, ty);
+                }
+            }
+            _ => {
+                let _ = sys.free(owner, mfn);
+            }
+        }
+    }
+
+    P2mOutcome::of(&sys)
+}
+
 /// A comparable summary of a finished scheduling-policy run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyOutcome {
@@ -520,6 +610,10 @@ pub struct HvSummary {
     pub running: u32,
     /// Total closed on-CPU time across all vCPUs.
     pub total_runtime: u64,
+    /// Machine frames currently allocated.
+    pub allocated_frames: u32,
+    /// Machine frames currently carrying a type (writable or page table).
+    pub typed_frames: u32,
     /// Whether every subsystem's invariants hold at the end.
     pub invariants_hold: bool,
 }
@@ -559,6 +653,15 @@ impl HvSummary {
                 s.total_runtime += sc.runtime(dom, vcpu).unwrap_or(0);
             }
         }
+        let p = hv.p2m();
+        for mfn in 0..p.frame_count() as u32 {
+            if p.is_allocated(mfn) {
+                s.allocated_frames += 1;
+                if p.current_type(mfn).is_some() {
+                    s.typed_frames += 1;
+                }
+            }
+        }
         s.invariants_hold = hv.invariants_hold();
         s
     }
@@ -587,6 +690,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
     let mut rng = Prng::new(seed);
     let clock = ManualClock::new();
     let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee/owner, handle) of live maps
+    let mut typed: Vec<(u32, PageType)> = Vec::new(); // (mfn, type) of live p2m typed refs
 
     for _ in 0..steps {
         // Crank the clock so scheduler run/preempt intervals span seed-derived gaps.
@@ -598,8 +702,9 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         let gref = rng.below(GRANTS);
         let vcpu = rng.below(VCPUS);
         let pcpu = rng.below(PCPUS);
+        let mfn = rng.below(FRAMES);
 
-        match rng.below(21) {
+        match rng.below(27) {
             0 => drop_ok(hv.dispatch(
                 caller,
                 HvCall::CreditGrant {
@@ -696,7 +801,28 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
             17 => drop_ok(hv.dispatch(caller, HvCall::SchedPreempt { vcpu, now })),
             18 => drop_ok(hv.dispatch(caller, HvCall::SchedBlock { vcpu, now })),
             19 => drop_ok(hv.dispatch(caller, HvCall::SchedWake { vcpu })),
-            _ => drop_ok(hv.dispatch(caller, HvCall::SchedOffline { vcpu, now })),
+            20 => drop_ok(hv.dispatch(caller, HvCall::SchedOffline { vcpu, now })),
+            21 => drop_ok(hv.dispatch(caller, HvCall::P2mAllocate { mfn })),
+            22 => drop_ok(hv.dispatch(caller, HvCall::P2mGet { mfn })),
+            23 => drop_ok(hv.dispatch(caller, HvCall::P2mPut { mfn })),
+            24 => {
+                let ty = if rng.below(2) == 0 {
+                    PageType::Writable
+                } else {
+                    PageType::PageTable
+                };
+                if hv.dispatch(caller, HvCall::P2mGetType { mfn, ty }).is_ok() {
+                    typed.push((mfn, ty));
+                }
+            }
+            25 => {
+                if !typed.is_empty() {
+                    let idx = rng.below(typed.len() as u32) as usize;
+                    let (m, ty) = typed.swap_remove(idx);
+                    drop_ok(hv.dispatch(caller, HvCall::P2mPutType { mfn: m, ty }));
+                }
+            }
+            _ => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
         }
     }
 
@@ -893,6 +1019,50 @@ mod tests {
         }
     }
 
+    /// The page-type headline: no seeded interleaving of allocate/get/put/get_type/
+    /// put_type/free ever lets a frame be referenced as writable and as a page table at
+    /// once, nor lets the typed counts outrun the total — the type-confusion and
+    /// coherence invariants hold throughout. `invariants_hold` is evaluated in release
+    /// too, so this bites in any profile.
+    #[test]
+    fn p2m_invariants_hold_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            let outcome = run_p2m(seed, 256);
+            assert!(
+                outcome.invariants_hold,
+                "page-type invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the page-type machine: same seed, same census exactly.
+    #[test]
+    fn p2m_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_p2m(seed, 256),
+                run_p2m(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The generator actually reaches typed frames of *both* kinds across the seed
+    /// space — the exclusivity invariant only means something once frames are being
+    /// pinned as writable and as page tables.
+    #[test]
+    fn p2m_seeds_reach_both_types() {
+        let outcomes: Vec<_> = (0..256u64).map(|s| run_p2m(s, 256)).collect();
+        assert!(
+            outcomes.iter().any(|o| o.writable_typed > 0),
+            "no seed ever pinned a frame writable — generator too weak"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.pagetable_typed > 0),
+            "no seed ever pinned a frame as a page table — generator too weak"
+        );
+    }
+
     /// Policy over mechanism: across many seeds of churning vCPU availability, the
     /// mechanism invariant never breaks and the policy stays work-conserving — no
     /// physical CPU idles while a vCPU is runnable. These are the policy's two headline
@@ -1018,11 +1188,12 @@ mod tests {
         }
     }
 
-    /// The integrated run genuinely exercises all three subsystems — across the seed
-    /// space we see live interdomain links, live grant maps, and non-zero balances.
-    /// If any stayed empty, the dispatch seam wouldn't really be covered.
+    /// The integrated run genuinely exercises all four subsystems — across the seed
+    /// space we see live interdomain links, live grant maps, non-zero balances, running
+    /// vCPUs, and typed machine frames. If any stayed empty, the dispatch seam wouldn't
+    /// really be covered.
     #[test]
-    fn hypervisor_exercises_all_three_subsystems() {
+    fn hypervisor_exercises_all_subsystems() {
         let summaries: Vec<_> = (0..256u64).map(|s| run_hypervisor(s, 256)).collect();
         assert!(
             summaries.iter().any(|s| s.interdomain > 0),
@@ -1043,6 +1214,14 @@ mod tests {
         assert!(
             summaries.iter().any(|s| s.total_runtime > 0),
             "no seed accrued any scheduler runtime"
+        );
+        assert!(
+            summaries.iter().any(|s| s.allocated_frames > 0),
+            "no seed allocated a machine frame"
+        );
+        assert!(
+            summaries.iter().any(|s| s.typed_frames > 0),
+            "no seed pinned a machine frame's type"
         );
     }
 }
