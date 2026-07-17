@@ -299,16 +299,20 @@ impl Hypervisor {
                 .bind_interdomain(caller, remote, remote_port)
                 .map(HvOutcome::Port)
                 .map_err(HvError::Evtchn),
-            HvCall::EvtchnBindVirq { vcpu, virq } => self
-                .evtchn
-                .bind_virq(caller, vcpu, virq)
-                .map(HvOutcome::Port)
-                .map_err(HvError::Evtchn),
-            HvCall::EvtchnBindIpi { vcpu } => self
-                .evtchn
-                .bind_ipi(caller, vcpu)
-                .map(HvOutcome::Port)
-                .map_err(HvError::Evtchn),
+            HvCall::EvtchnBindVirq { vcpu, virq } => {
+                self.check_bind_vcpu(caller, vcpu)?;
+                self.evtchn
+                    .bind_virq(caller, vcpu, virq)
+                    .map(HvOutcome::Port)
+                    .map_err(HvError::Evtchn)
+            }
+            HvCall::EvtchnBindIpi { vcpu } => {
+                self.check_bind_vcpu(caller, vcpu)?;
+                self.evtchn
+                    .bind_ipi(caller, vcpu)
+                    .map(HvOutcome::Port)
+                    .map_err(HvError::Evtchn)
+            }
             HvCall::EvtchnClose { port } => self
                 .evtchn
                 .close(caller, port)
@@ -348,11 +352,7 @@ impl Hypervisor {
                 grantor,
                 gref,
                 write,
-            } => self
-                .grant
-                .copy(caller, grantor, gref, write)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::Grant),
+            } => self.grant_copy(caller, grantor, gref, write),
 
             HvCall::SchedAdmit { vcpu } => self
                 .sched
@@ -514,6 +514,45 @@ impl Hypervisor {
             .link(caller, parent, slot, child)
             .map(|()| HvOutcome::Done)
             .map_err(HvError::P2m)
+    }
+
+    /// A grant-checked copy (Xen's `GNTTABOP_copy`): authorizes an access to the grant's
+    /// frame without taking a reference. Like [`Self::grant_map`], it refuses a *stale*
+    /// grant — one whose frame the grantor no longer owns (freed and reallocated after the
+    /// grant was written) — so a copy can never be authorized against a third party's page
+    /// (a confused deputy). Without this the copy path would trust `grant.copy`'s
+    /// grantee/readonly checks alone, which the map path deliberately does not.
+    fn grant_copy(
+        &self,
+        caller: DomId,
+        grantor: DomId,
+        gref: GrantRef,
+        write: bool,
+    ) -> Result<HvOutcome, HvError> {
+        if let Some(frame) = self.grant.granted_frame(grantor, gref) {
+            if self.p2m.owner_of(frame) != Some(grantor) {
+                return Err(HvError::StaleGrant);
+            }
+        }
+        self.grant
+            .copy(caller, grantor, gref, write)
+            .map(|()| HvOutcome::Done)
+            .map_err(HvError::Grant)
+    }
+
+    /// Reject an event-channel bind to a vCPU the caller does not have. Event channels
+    /// model no vCPU table of their own, so a `bind_virq`/`bind_ipi` to an out-of-range
+    /// vCPU would otherwise create a port whose notify-target can never exist (a wasted
+    /// port with a permanently-stuck pending bit). The scheduler owns the vCPU space, so
+    /// the seam cross-checks it here — mirroring Xen's `vcpu_id` validation at bind time.
+    /// A bad *caller* is left to the subsystem to report as its own `BadDomain`.
+    fn check_bind_vcpu(&self, caller: DomId, vcpu: Vcpu) -> Result<(), HvError> {
+        if (caller as usize) < self.sched.domain_count()
+            && (vcpu as usize) >= self.sched.vcpu_count(caller)
+        {
+            return Err(HvError::Sched(sched::SchedError::BadVcpu));
+        }
+        Ok(())
     }
 
     /// Revoke a grant — unless a *foreign page-table entry* still relies on it. A grant is
@@ -1797,6 +1836,59 @@ mod tests {
         assert!(h
             .dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 })
             .is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_stale_grant_cannot_be_copied() {
+        let mut h = hv();
+        // Domain 0 allocates frame 4, grants it, then frees it (allowed — no live map).
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 4 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 4,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        h.dispatch(0, HvCall::P2mFree { mfn: 4 }).unwrap();
+        // Domain 2 now owns frame 4; domain 0's grant is stale. A copy must be refused
+        // for the same reason a map is — it would authorize access to domain 2's page.
+        h.dispatch(2, HvCall::P2mAllocate { mfn: 4 }).unwrap();
+        assert_eq!(
+            h.dispatch(
+                1,
+                HvCall::GrantCopy {
+                    grantor: 0,
+                    gref: 0,
+                    write: false
+                }
+            ),
+            Err(HvError::StaleGrant)
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn binding_an_event_channel_to_a_nonexistent_vcpu_is_refused() {
+        let mut h = hv(); // 2 vCPUs per domain, so vCPU 2 does not exist
+        assert_eq!(
+            h.dispatch(0, HvCall::EvtchnBindIpi { vcpu: 2 }),
+            Err(HvError::Sched(sched::SchedError::BadVcpu))
+        );
+        assert_eq!(
+            h.dispatch(0, HvCall::EvtchnBindVirq { vcpu: 5, virq: 1 }),
+            Err(HvError::Sched(sched::SchedError::BadVcpu))
+        );
+        // No port was created, and a real vCPU still binds fine.
+        assert_eq!(h.evtchn().state_of(0, 0), Some(evtchn::PortState::Free));
+        assert!(matches!(
+            h.dispatch(0, HvCall::EvtchnBindIpi { vcpu: 1 }),
+            Ok(HvOutcome::Port(_))
+        ));
         assert!(h.invariants_hold());
     }
 
