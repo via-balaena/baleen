@@ -284,6 +284,36 @@ impl System {
             .unwrap_or(false)
     }
 
+    /// The vCPU (within this port's own domain) that a delivery on this port should
+    /// wake — the notify target. Derived purely from the binding, so no per-port
+    /// field is stored:
+    ///
+    /// - a `Virq { vcpu, .. }` or `Ipi { vcpu }` port targets its bound `vcpu`;
+    /// - an `Interdomain` or `Unbound` port targets vCPU 0, Xen's default
+    ///   `notify_vcpu_id`. Steering it elsewhere (Xen's `EVTCHNOP_bind_vcpu`) is a
+    ///   later refinement with no safety content, so the default stands for now;
+    /// - a `Free` port targets nothing.
+    ///
+    /// This is the read half of the event→scheduler seam: [`crate::Hypervisor`] wakes
+    /// `(dom, notify_target)` when a port here becomes deliverable. The core names the
+    /// target; the seam moves the scheduler.
+    pub fn notify_target(&self, dom: DomId, port: Port) -> Option<Vcpu> {
+        match self.chan(dom, port).ok()?.state {
+            PortState::Virq { vcpu, .. } | PortState::Ipi { vcpu } => Some(vcpu),
+            PortState::Interdomain { .. } | PortState::Unbound { .. } => Some(0),
+            PortState::Free => None,
+        }
+    }
+
+    /// Whether `vcpu` has any *deliverable* event waiting on one of `dom`'s ports —
+    /// a port that is pending, unmasked, and notify-targets this vCPU. The seam uses
+    /// this to refuse to let a vCPU block with work already pending (the lost-wakeup
+    /// race), and the cross-invariant uses it from the other side.
+    pub fn has_deliverable_for(&self, dom: DomId, vcpu: Vcpu) -> bool {
+        (0..self.port_count(dom) as Port)
+            .any(|port| self.deliverable(dom, port) && self.notify_target(dom, port) == Some(vcpu))
+    }
+
     /// The state of a port, if the ids are in range.
     pub fn state_of(&self, dom: DomId, port: Port) -> Option<PortState> {
         self.chan(dom, port).ok().map(|c| c.state)
@@ -588,6 +618,44 @@ mod tests {
 
         s.send(0, local).unwrap();
         assert!(s.deliverable(1, unbound), "fresh channel should deliver");
+    }
+
+    #[test]
+    fn notify_target_follows_the_binding() {
+        let mut s = sys();
+        // VIRQ and IPI ports target their bound vCPU.
+        let v = s.bind_virq(0, 3, 1).unwrap();
+        assert_eq!(s.notify_target(0, v), Some(3));
+        let i = s.bind_ipi(0, 2).unwrap();
+        assert_eq!(s.notify_target(0, i), Some(2));
+        // Interdomain and unbound ports default to vCPU 0.
+        let unbound = s.alloc_unbound(1, 0).unwrap();
+        assert_eq!(s.notify_target(1, unbound), Some(0));
+        let local = s.bind_interdomain(0, 1, unbound).unwrap();
+        assert_eq!(s.notify_target(0, local), Some(0));
+        assert_eq!(s.notify_target(1, unbound), Some(0));
+        // A free port targets nothing.
+        assert_eq!(s.notify_target(0, 7), None);
+    }
+
+    #[test]
+    fn has_deliverable_for_tracks_pending_unmasked_targets() {
+        let mut s = sys();
+        // An IPI port on vCPU 1, not yet signalled: nothing deliverable for anyone.
+        let p = s.bind_ipi(0, 1).unwrap();
+        assert!(!s.has_deliverable_for(0, 1));
+        // Signal it — now vCPU 1 (its target) has a deliverable event, but vCPU 0 does not.
+        s.send(0, p).unwrap();
+        assert!(s.has_deliverable_for(0, 1));
+        assert!(!s.has_deliverable_for(0, 0));
+        // Masking suppresses deliverability without clearing pending: not deliverable.
+        s.mask(0, p).unwrap();
+        assert!(!s.has_deliverable_for(0, 1));
+        // Unmasking restores it; consuming the pending bit clears it for good.
+        s.unmask(0, p).unwrap();
+        assert!(s.has_deliverable_for(0, 1));
+        s.consume(0, p).unwrap();
+        assert!(!s.has_deliverable_for(0, 1));
     }
 
     #[test]
