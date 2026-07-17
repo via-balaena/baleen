@@ -518,6 +518,13 @@ impl System {
     /// the child being freed or re-typed while the parent points at it). Because a link's
     /// child sits one level *below* its parent, the page-table graph is a DAG of depth at
     /// most four — no cycle is representable.
+    ///
+    /// The caller must own the *table* it is editing, but **`child` may belong to another
+    /// domain** — a cross-domain (foreign) entry, the mechanism behind shared page tables
+    /// and foreign memory mappings. `p2m` enforces only the type discipline here; whether
+    /// the caller is *authorized* to reference a foreign frame is a cross-subsystem
+    /// question (it must hold a grant from the frame's owner), checked at the dispatch
+    /// seam — the same split as the grant↔page-type join.
     pub fn link(
         &mut self,
         caller: DomId,
@@ -528,10 +535,8 @@ impl System {
         if slot >= TABLE_SLOTS {
             return Err(P2mError::BadSlot);
         }
-        // The caller must own both the table it is editing and the frame it points at
-        // (a domain builds its own page tables over its own memory; cross-domain shared
-        // page tables are a later refinement). Validate everything against an immutable
-        // view first, so a rejected link mutates nothing.
+        // The caller must own the table it is editing. Validate everything against an
+        // immutable view first, so a rejected link mutates nothing.
         let level = match self.frame(parent)? {
             Frame::Allocated {
                 owner, pt_level, ..
@@ -547,13 +552,11 @@ impl System {
             }
             Frame::Free => return Err(P2mError::WrongState),
         };
-        match self.frame(child)? {
-            Frame::Allocated { owner, .. } => {
-                if *owner != caller {
-                    return Err(P2mError::NotYours);
-                }
-            }
-            Frame::Free => return Err(P2mError::WrongState),
+        // `child` need only be allocated — it may belong to another domain (a foreign
+        // entry). Its *owner* keeps it whatever type the reference below demands, so no
+        // ownership check here; authorization is the seam's.
+        if !self.is_allocated(child) {
+            return Err(P2mError::WrongState);
         }
         // The slot must be empty — an entry is never overwritten in place (unlink it
         // first), which keeps a live edge from being silently re-pointed.
@@ -743,6 +746,41 @@ impl System {
     /// Total live page-table entries across the whole system.
     pub fn active_links(&self) -> usize {
         self.links.iter().filter(|l| l.active).count()
+    }
+
+    /// Every live page-table entry as a `(parent, slot, child)` triple. The integrating
+    /// layer uses this to reason about *cross-domain* entries — a link whose `parent` and
+    /// `child` have different owners — which `p2m` itself is deliberately blind to
+    /// (ownership authorization lives at the seam, not in the type discipline).
+    pub fn link_edges(&self) -> Vec<(Mfn, u32, Mfn)> {
+        self.links
+            .iter()
+            .filter(|l| l.active)
+            .map(|l| (l.parent, l.slot, l.child))
+            .collect()
+    }
+
+    /// Whether any live page-table entry points at a frame `owner` owns *from a table
+    /// another domain owns* — i.e. a foreign domain has one of `owner`'s frames mapped
+    /// into its own page tables. The page-table cousin of
+    /// [`crate::grant::System::has_foreign_map`], and part of the domain-teardown
+    /// precondition: such a frame cannot be reclaimed out from under the foreign mapper.
+    pub fn has_foreign_link_into(&self, owner: DomId) -> bool {
+        self.links.iter().any(|l| {
+            l.active
+                && self.owner_of(l.child) == Some(owner)
+                && self.owner_of(l.parent) != Some(owner)
+        })
+    }
+
+    /// Whether `frame` is referenced by any live page-table entry from a table another
+    /// domain owns — a foreign mapping of this specific frame. The seam uses it to refuse
+    /// revoking a grant while a foreign page-table entry still relies on it.
+    pub fn is_foreign_linked(&self, frame: Mfn) -> bool {
+        let owner = self.owner_of(frame);
+        self.links
+            .iter()
+            .any(|l| l.active && l.child == frame && self.owner_of(l.parent) != owner)
     }
 
     /// Number of frames in the table.
@@ -1271,19 +1309,17 @@ mod tests {
     }
 
     #[test]
-    fn link_rejects_bad_slots_foreign_frames_and_occupied_slots() {
+    fn link_rejects_bad_slots_non_owner_tables_and_occupied_slots() {
         let mut s = System::new(2, 8);
         s.allocate(0, 0).unwrap();
         s.allocate(0, 1).unwrap();
-        s.allocate(1, 2).unwrap(); // owned by domain 1
         s.pin(0, 0, PtLevel::L2).unwrap();
 
         // Slot out of range.
         assert_eq!(s.link(0, 0, TABLE_SLOTS, 1), Err(P2mError::BadSlot));
-        // The caller must own both the table and the child.
-        assert_eq!(s.link(1, 0, 0, 1), Err(P2mError::NotYours)); // not domain 1's table
-        assert_eq!(s.link(0, 0, 0, 2), Err(P2mError::NotYours)); // child is domain 1's
-                                                                 // Linking into a frame that is not a table is refused.
+        // The caller must own the *table* it edits (though not necessarily the child).
+        assert_eq!(s.link(1, 0, 0, 1), Err(P2mError::NotYours));
+        // Linking into a frame that is not a table is refused.
         assert_eq!(s.link(0, 1, 0, 0), Err(P2mError::WrongState));
 
         // A good link, then a second into the same slot is refused (no in-place
@@ -1293,6 +1329,34 @@ mod tests {
         assert_eq!(s.unlink(0, 0, 1), Err(P2mError::WrongState)); // no entry at slot 1
         s.unlink(0, 0, 0).unwrap();
         assert_eq!(s.child_at(0, 0), None);
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn link_permits_a_foreign_child_at_the_p2m_layer() {
+        // `p2m` enforces only the type discipline; a foreign child is allowed here, and
+        // *authorization* (a grant) is the dispatch seam's business. Domain 0 links an
+        // L1 leaf onto a frame domain 1 owns.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(1, 2).unwrap(); // a frame domain 1 owns
+        s.pin(0, 0, PtLevel::L1).unwrap();
+
+        s.link(0, 0, 0, 2).unwrap();
+        assert_eq!(s.child_at(0, 0), Some(2));
+        // The foreign frame is now writable-typed and pinned alive by the entry — domain
+        // 1 can neither free nor re-type it while domain 0's table points at it.
+        assert_eq!(s.current_type(2), Some(PageType::Writable));
+        assert_eq!(s.free(1, 2), Err(P2mError::InUse));
+        assert!(s.is_foreign_linked(2));
+        assert!(s.has_foreign_link_into(1));
+        assert!(!s.has_foreign_link_into(0));
+
+        // Unlinking releases it, and now domain 1 can reclaim its frame.
+        s.unlink(0, 0, 0).unwrap();
+        assert!(!s.is_foreign_linked(2));
+        assert_eq!(s.current_type(2), None);
+        assert!(s.free(1, 2).is_ok());
         assert!(s.invariants_hold());
     }
 

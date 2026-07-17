@@ -385,6 +385,24 @@ impl System {
         self.maps.iter().any(|m| m.active && m.grantee == grantee)
     }
 
+    /// Whether `grantor` currently offers `grantee` an active grant of `frame` — and, if
+    /// `writable` is asked, a read-*write* one. This is the *permit* side of the grant
+    /// table (distinct from a live map): it answers "may `grantee` access this frame?",
+    /// which the dispatch seam uses to authorize a cross-domain page-table entry against
+    /// the frame's owner. Returns false if no such grant stands.
+    pub fn authorizes(&self, grantor: DomId, grantee: DomId, frame: Frame, writable: bool) -> bool {
+        let Ok(dom) = self.domain(grantor) else {
+            return false;
+        };
+        dom.entries.iter().any(|e| {
+            matches!(
+                e,
+                GrantEntry::Access { grantee: g, frame: f, readonly, .. }
+                    if *g == grantee && *f == frame && (!writable || !*readonly)
+            )
+        })
+    }
+
     /// Whether `gref` in `grantor` is an active grant.
     pub fn is_granted(&self, grantor: DomId, gref: GrantRef) -> bool {
         matches!(self.entry(grantor, gref), Ok(GrantEntry::Access { .. }))
@@ -676,6 +694,29 @@ mod tests {
         assert!(!s.has_foreign_map(0));
         s.unmap(0, self_h).unwrap();
         assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn authorizes_reports_the_permit_a_grantor_offers() {
+        let mut s = sys();
+        // Domain 0 grants frame 42 read-write to domain 1, and frame 7 read-only to it.
+        s.grant_access(0, 0, 1, 42, false).unwrap();
+        s.grant_access(0, 1, 1, 7, true).unwrap();
+
+        // A read-write grant authorizes both a writable and a read-only reference.
+        assert!(s.authorizes(0, 1, 42, true));
+        assert!(s.authorizes(0, 1, 42, false));
+        // A read-only grant authorizes only a read-only reference.
+        assert!(!s.authorizes(0, 1, 7, true));
+        assert!(s.authorizes(0, 1, 7, false));
+        // No permit for the wrong grantee, the wrong frame, or a ghost grantor.
+        assert!(!s.authorizes(0, 2, 42, true)); // grantee 2 not named
+        assert!(!s.authorizes(0, 1, 99, true)); // frame not granted
+        assert!(!s.authorizes(9, 1, 42, true)); // grantor out of range
+
+        // Revoking the grant withdraws the permit.
+        s.end_access(0, 0).unwrap();
+        assert!(!s.authorizes(0, 1, 42, true));
     }
 
     #[test]

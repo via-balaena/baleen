@@ -187,6 +187,12 @@ pub enum HvError {
     /// spanning grant tables and page-type accounting, so it belongs to the seam, not one
     /// subsystem.
     DomainBusy,
+    /// A page-table entry into a frame another domain owns was refused: the caller holds
+    /// no read-write grant of that frame from its owner (or tried to share a page-table
+    /// node rather than map a leaf). Cross-domain page-table sharing needs the owner's
+    /// consent, which a grant expresses — the isolation guard on the page-table↔grant
+    /// join, so it belongs to the seam.
+    Unauthorized,
 }
 
 /// A breach of a *cross-subsystem* invariant — one that relates two subsystems and so
@@ -208,6 +214,12 @@ pub enum CrossViolation {
     /// prevent. No future signal edge will wake a vCPU that is already asleep with the
     /// pending bit set, so the event would never be observed.
     LostWakeup { dom: DomId, vcpu: Vcpu },
+    /// A cross-domain page-table entry — a table maps a frame *another* domain owns —
+    /// stands with no read-write grant from that owner to the mapping domain authorizing
+    /// it. The isolation breach the page-table↔grant join exists to prevent: a domain
+    /// reaching into another's memory through its page tables without consent (or holding
+    /// the mapping after the grant was revoked).
+    UnauthorizedForeignLink { parent: Mfn, child: Mfn },
 }
 
 /// The integrated hypervisor core: per-domain credit plus the whole-system subsystems,
@@ -325,11 +337,7 @@ impl Hypervisor {
                 .grant_access(caller, gref, grantee, frame, readonly)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Grant),
-            HvCall::GrantEndAccess { gref } => self
-                .grant
-                .end_access(caller, gref)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::Grant),
+            HvCall::GrantEndAccess { gref } => self.grant_end_access(caller, gref),
             HvCall::GrantMap {
                 grantor,
                 gref,
@@ -397,11 +405,7 @@ impl Hypervisor {
                 parent,
                 slot,
                 child,
-            } => self
-                .p2m
-                .link(caller, parent, slot, child)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::P2m),
+            } => self.p2m_link(caller, parent, slot, child),
             HvCall::P2mUnlink { parent, slot } => self
                 .p2m
                 .unlink(caller, parent, slot)
@@ -476,6 +480,58 @@ impl Hypervisor {
             "grant unmap could not release its page reference: {released:?}"
         );
         Ok(HvOutcome::Done)
+    }
+
+    /// Install a page-table entry, authorizing it if it crosses a domain boundary — the
+    /// page-table↔grant half of cross-domain sharing. An entry into the caller's *own*
+    /// frame is a plain [`crate::p2m::System::link`]. An entry into a frame *another
+    /// domain owns* is only permitted when that owner has granted the frame to the caller
+    /// read-write ([`grant::System::authorizes`]): a domain cannot map a foreign page into
+    /// its address space without the owner's consent. Foreign entries are leaves (an `L1`
+    /// table maps a data page), so a foreign child must go under an `L1` — sharing whole
+    /// page-table *subtrees* across domains is a later refinement. `p2m` enforces the type
+    /// discipline; this seam adds the authorization it is deliberately blind to.
+    fn p2m_link(
+        &mut self,
+        caller: DomId,
+        parent: Mfn,
+        slot: u32,
+        child: Mfn,
+    ) -> Result<HvOutcome, HvError> {
+        if let Some(owner) = self.p2m.owner_of(child) {
+            if owner != caller {
+                // A foreign entry: it must be an authorized L1 leaf. Check the grant and
+                // the level *before* touching p2m, so an unauthorized link is a no-op.
+                if self.p2m.current_type(parent) != Some(PageType::PageTable(PtLevel::L1)) {
+                    return Err(HvError::Unauthorized);
+                }
+                if !self.grant.authorizes(owner, caller, child, true) {
+                    return Err(HvError::Unauthorized);
+                }
+            }
+        }
+        self.p2m
+            .link(caller, parent, slot, child)
+            .map(|()| HvOutcome::Done)
+            .map_err(HvError::P2m)
+    }
+
+    /// Revoke a grant — unless a *foreign page-table entry* still relies on it. A grant is
+    /// the authorization behind a cross-domain page-table link; revoking it while such a
+    /// link is live would strand the mapping unauthorized, so the seam refuses (the
+    /// grant's frame is still in use), exactly as `grant.end_access` already refuses while
+    /// a live grant *map* stands. With no foreign link depending, the grant subsystem's
+    /// own checks (bad ref, still-mapped) apply unchanged.
+    fn grant_end_access(&mut self, caller: DomId, gref: GrantRef) -> Result<HvOutcome, HvError> {
+        if let Some(frame) = self.grant.granted_frame(caller, gref) {
+            if self.p2m.is_foreign_linked(frame) {
+                return Err(HvError::Grant(grant::GrantError::InUse));
+            }
+        }
+        self.grant
+            .end_access(caller, gref)
+            .map(|()| HvOutcome::Done)
+            .map_err(HvError::Grant)
     }
 
     /// Signal a port, then wake its target if the signal made it deliverable — the
@@ -579,9 +635,12 @@ impl Hypervisor {
         if target as usize >= self.domain_count() {
             return Err(HvError::BadDomain);
         }
-        // The single precondition. Checked before any mutation, so a refusal is a true
-        // no-op.
-        if self.grant.has_foreign_map(target) {
+        // The precondition. Checked before any mutation, so a refusal is a true no-op. No
+        // *foreign* domain may hold one of `target`'s frames — neither a live grant map
+        // nor a live cross-domain page-table entry — since teardown would then have to
+        // yank a page out from under it. (`target`'s own foreign links, into *other*
+        // domains' frames, are fine: `unlink_all` releases them.)
+        if self.grant.has_foreign_map(target) || self.p2m.has_foreign_link_into(target) {
             return Err(HvError::DomainBusy);
         }
 
@@ -650,6 +709,10 @@ impl Hypervisor {
     /// Event↔scheduler: no deliverable (pending, unmasked) event may rest on a `Blocked`
     /// vCPU — a signal that made a port deliverable must have woken the vCPU it
     /// notify-targets, so a still-`Blocked` target is a lost wakeup.
+    ///
+    /// Page-table↔grant: every cross-domain page-table entry (a table mapping a frame
+    /// another domain owns) must be authorized by a read-write grant from that owner — no
+    /// domain reaches into another's memory through its page tables without consent.
     pub fn first_cross_violation(&self) -> Option<CrossViolation> {
         for grantor in 0..self.grant.domain_count() as DomId {
             for gref in 0..self.grant.entry_count(grantor) as GrantRef {
@@ -681,6 +744,24 @@ impl Hypervisor {
                         return Some(CrossViolation::LostWakeup { dom, vcpu });
                     }
                 }
+            }
+        }
+        // Page-table↔grant: every *cross-domain* page-table entry must be authorized by a
+        // read-write grant from the child frame's owner to the domain whose table maps it.
+        // An unauthorized foreign entry is a domain reaching into another's memory without
+        // consent — the isolation breach this join exists to prevent.
+        for (parent, _slot, child) in self.p2m.link_edges() {
+            let (Some(child_owner), Some(parent_owner)) =
+                (self.p2m.owner_of(child), self.p2m.owner_of(parent))
+            else {
+                continue;
+            };
+            if child_owner != parent_owner
+                && !self
+                    .grant
+                    .authorizes(child_owner, parent_owner, child, true)
+            {
+                return Some(CrossViolation::UnauthorizedForeignLink { parent, child });
             }
         }
         None
@@ -1556,6 +1637,166 @@ mod tests {
         assert!(!h.p2m().is_allocated(1));
         assert!(!h.p2m().is_allocated(2));
         assert!(h.is_torn_down(1));
+        assert!(h.invariants_hold());
+    }
+
+    // Domain 1 owns frame 5 and grants it read-write to domain 0; domain 0 owns frame 0
+    // and pins it as an L1 table. The stage for cross-domain page-table sharing.
+    fn foreign_link_stage(h: &mut Hypervisor) {
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 5,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 0,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+    }
+
+    fn link5(h: &mut Hypervisor) -> Result<HvOutcome, HvError> {
+        h.dispatch(
+            0,
+            HvCall::P2mLink {
+                parent: 0,
+                slot: 0,
+                child: 5,
+            },
+        )
+    }
+
+    #[test]
+    fn a_grant_authorized_foreign_leaf_maps_and_unmaps() {
+        let mut h = hv();
+        foreign_link_stage(&mut h);
+        // Domain 0 maps domain 1's granted frame into its own L1 table.
+        assert_eq!(link5(&mut h), Ok(HvOutcome::Done));
+        assert_eq!(h.p2m().child_at(0, 0), Some(5));
+        // The foreign frame is now writable-typed and pinned alive by the entry — its
+        // owner can neither free nor re-type it while domain 0's table maps it.
+        assert_eq!(h.p2m().current_type(5), Some(PageType::Writable));
+        assert_eq!(
+            h.dispatch(1, HvCall::P2mFree { mfn: 5 }),
+            Err(HvError::P2m(p2m::P2mError::InUse))
+        );
+        assert!(h.invariants_hold());
+        // Unlinking releases it, and domain 1 can reclaim its frame.
+        h.dispatch(0, HvCall::P2mUnlink { parent: 0, slot: 0 })
+            .unwrap();
+        assert_eq!(h.p2m().current_type(5), None);
+        assert!(h.dispatch(1, HvCall::P2mFree { mfn: 5 }).is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn an_unauthorized_foreign_link_is_refused() {
+        let mut h = hv();
+        // Domain 1 owns frame 5 but grants nothing; domain 0 pins an L1 table.
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 0,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+        // No grant → no authority to map domain 1's page.
+        assert_eq!(link5(&mut h), Err(HvError::Unauthorized));
+        assert_eq!(h.p2m().child_at(0, 0), None);
+        assert_eq!(h.p2m().current_type(5), None);
+
+        // Even *with* a grant, a foreign child may only be a leaf under an L1 — sharing a
+        // page-table node is not allowed. Grant it, but make domain 0's table an L2.
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 5,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 1 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 1,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.dispatch(
+                0,
+                HvCall::P2mLink {
+                    parent: 1,
+                    slot: 0,
+                    child: 5
+                }
+            ),
+            Err(HvError::Unauthorized)
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_grant_cannot_be_revoked_while_a_foreign_link_relies_on_it() {
+        let mut h = hv();
+        foreign_link_stage(&mut h);
+        link5(&mut h).unwrap();
+        // Domain 1 cannot revoke the grant out from under domain 0's live mapping — that
+        // would strand the entry unauthorized.
+        assert_eq!(
+            h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }),
+            Err(HvError::Grant(grant::GrantError::InUse))
+        );
+        assert!(h.invariants_hold());
+        // Once domain 0 unlinks, the grant is free to revoke.
+        h.dispatch(0, HvCall::P2mUnlink { parent: 0, slot: 0 })
+            .unwrap();
+        assert!(h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }).is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn destroying_a_domain_whose_frame_is_foreign_linked_is_refused() {
+        let mut h = hv();
+        foreign_link_stage(&mut h);
+        link5(&mut h).unwrap();
+        // Domain 1's frame is mapped into domain 0's table, so domain 1 cannot be torn
+        // down — the same refuse-if-busy rule as a live foreign grant map.
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Err(HvError::DomainBusy)
+        );
+        // But the *linker* can be destroyed: teardown unlinks its foreign entry, freeing
+        // domain 1's frame, and spares domain 1.
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 0, now: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.is_torn_down(0));
+        assert_eq!(h.p2m().owner_of(5), Some(1), "domain 1 keeps its frame");
+        assert_eq!(h.p2m().current_type(5), None, "no longer foreign-mapped");
+        assert!(h.invariants_hold());
+        // With the link gone, domain 1 can now be destroyed too.
+        assert!(h
+            .dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 })
+            .is_ok());
         assert!(h.invariants_hold());
     }
 
