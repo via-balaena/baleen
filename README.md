@@ -290,6 +290,36 @@ whole integrated core to depth 5 ≈ 1.40M) with zero violations.
   over ≈1.14M states, zero violations, with read-only-onto-page-table reached), witnessed
   by the seeded `run_ptab`/`run_foreign` drivers, and fuzzed. Shared page-table *nodes*
   (foreign interior entries, not just leaves) remain deferred.
+- **Domain lifecycle / creation** *(landed)*: close the lifecycle loop. Teardown existed,
+  but there was no *creation*, and every domain slot implicitly existed and accepted
+  operations from birth — there was no "doesn't exist yet" state. Model it explicitly: a
+  `DomainLife { Dead, Live }` per slot. **Domain 0 boots `Live`+privileged** (the
+  primordial control domain); **every other slot boots `Dead`**. `HvCall::DomainCreate {
+  target, privileged }` is `Dead`→`Live`, privileged-caller-only, and stamps the new
+  domain's authority; `DomainDestroy` is now `Live`→`Dead` and clears privilege on death.
+  The load-bearing change is a **caller-liveness gate**: every hypercall requires a `Live`
+  caller, checked once centrally — which is what turns "a `Dead` domain owns nothing" from
+  teardown's one-shot postcondition into a *standing* invariant (a slot that can issue no
+  hypercall can never acquire a resource to hold), and makes target-liveness fall out for
+  free (a `Dead` domain offers no grant and owns no frame, so any op naming one already
+  fails naturally). Two new standing invariants join the cross-check family:
+  **`DeadDomainNotClean`** (every `Dead` slot is an empty shell across all four subsystems —
+  the graduated postcondition) and **`PrivilegedDeadDomain`** (privilege implies `Live`).
+  The second is the point: privilege is now **stateful and constrained**, so it is finally
+  *invariant-bearing* rather than a bare guard — the sole transition that confers privilege
+  is `DomainCreate`, itself privilege-gated, so **no domain can self-elevate**, a provenance
+  the model checker confirms by finding no reachable self-elevated state. New errors
+  `NotAlive` / `AlreadyAlive`; authority reuses `Denied`. dom0 may be destroyed with no
+  special case (minimal-sound — it just strands the system). Verified end to end: the
+  seeded `run_destroy` now cycles domains `Dead`→`Live`→`Dead`→`Live` and predicts every
+  create/destroy outcome; a dedicated lifecycle sweep model-checks the standing invariants
+  exhaustively (closes complete at depth 12 over 10,178 states); and the whole thing is
+  fuzzed. The grant↔p2m depth-7 sweep re-measures at **715,164** states (down from ≈1.14M:
+  the liveness gate and creation reshaped the reachable set — a second domain must now be
+  *created* before it can act, so the old boot-time two-domain states sit behind a creation
+  edge), the integrated-core sweep at 382,008 — all clean, zero violations. Finer/delegable
+  privilege (a capability model, mutable privilege) and domain-ID reuse policy stay
+  deferred; the lifecycle now has both a birth and a death to build them on.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

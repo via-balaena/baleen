@@ -854,11 +854,17 @@ impl Hypervisor {
     ///    entries torn down, pins dropped, foreign maps excluded by the precondition), so
     ///    each free succeeds.
     ///
-    /// What remains is an empty but still-existent shell: domain slots are fixed-size
-    /// and never removed, so peers left `Unbound { remote: target }` stay valid.
-    /// Verification rides on the existing invariant net (a mis-ordered teardown trips
-    /// grant↔p2m or evtchn↔sched, caught by the `dispatch` cross-check) plus a
-    /// debug-time postcondition that nothing live points into `target` any more.
+    /// What remains is a `Dead`, unprivileged, empty shell: domain slots are fixed-size
+    /// and never removed, so peers left `Unbound { remote: target }` stay valid, and only a
+    /// later [`Self::domain_create`] can revive it. Verification rides on the existing
+    /// invariant net (a mis-ordered teardown trips grant↔p2m or evtchn↔sched, caught by the
+    /// `dispatch` cross-check). The old debug-time postcondition — "nothing live points into
+    /// `target`" — has *graduated*: it is now the standing
+    /// [`CrossViolation::DeadDomainNotClean`] invariant, which `dispatch` checks after this
+    /// returns (the slot is `Dead` now, so the invariant demands it be clean) and which
+    /// holds forever, not just at this instant. The local `debug_assert!` below is kept only
+    /// as a precise, localized failure message for teardown; the standing invariant is what
+    /// actually guarantees it.
     ///
     /// Provenance: the refuse-if-busy lifecycle (rather than force-unmap, or Xen's
     /// deferred dying-domain RCU teardown) is a design decision informed by the public
