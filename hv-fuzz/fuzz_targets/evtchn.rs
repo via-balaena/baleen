@@ -41,7 +41,11 @@ fuzz_target!(|data: &[u8]| {
                 let _ = sys.alloc_unbound(dom, u16::from(a) % DOMAINS as u16);
             }
             1 => {
-                let _ = sys.bind_interdomain(dom, u16::from(a) % DOMAINS as u16, u32::from(b) % PORTS as u32);
+                let _ = sys.bind_interdomain(
+                    dom,
+                    u16::from(a) % DOMAINS as u16,
+                    u32::from(b) % PORTS as u32,
+                );
             }
             2 => {
                 let _ = sys.bind_virq(dom, u32::from(a) % 2, b % 4);

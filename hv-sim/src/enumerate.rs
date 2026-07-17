@@ -545,6 +545,24 @@ mod tests {
         }
     }
 
+    /// The domain lifecycle in focus: create + destroy + the cheapest way for a domain to
+    /// *acquire* a resource (own a frame, pin it as a page table), so the standing
+    /// lifecycle invariants have real content to check — a domain that allocates a frame
+    /// and is then destroyed must return to a clean, unprivileged `Dead` shell. Small
+    /// universe, so it runs deep: every reachable interleaving of birth, resource
+    /// acquisition, and death is proven to leave every `Dead` slot clean and unprivileged
+    /// (and to never let a domain self-elevate — no reachable state has privilege without a
+    /// privileged creator behind it).
+    fn lifecycle_cfg(depth: u32) -> Config {
+        Config {
+            p2m: true,
+            create: true,
+            destroy: true,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
     fn all_cfg(depth: u32) -> Config {
         Config {
             evtchn: true,
@@ -590,10 +608,26 @@ mod tests {
         expect_clean(&all_cfg(3));
     }
 
+    /// The domain lifecycle, exhaustively: every reachable interleaving of create, destroy,
+    /// and frame ownership over a tiny world leaves every `Dead` slot a clean, unprivileged
+    /// shell — teardown's postcondition proven as a standing invariant, and privilege proven
+    /// to never materialise without a privileged creator.
+    #[test]
+    fn the_domain_lifecycle_is_exhaustively_sound() {
+        let states = expect_clean(&lifecycle_cfg(6));
+        assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
     #[test]
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn grant_and_p2m_seams_deep() {
         expect_no_violation(&grant_p2m_cfg(7));
+    }
+
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn domain_lifecycle_deep() {
+        expect_no_violation(&lifecycle_cfg(12));
     }
 
     #[test]

@@ -1055,6 +1055,11 @@ fn woke(before: Option<sched::RunState>, after: Option<sched::RunState>) -> bool
 pub struct DestroyOutcome {
     /// Destroy calls that tore a domain down (`Ok`).
     pub teardowns: u32,
+    /// `DomainCreate` calls that brought a `Dead` slot back to life (`Ok`). Since the
+    /// driver starts every domain `Live`, a successful create can only mean a slot that
+    /// was *torn down earlier this run* has been reborn — so this counting non-zero
+    /// witnesses the full Dead→Live→Dead→Live lifecycle cycle, not just one-way teardown.
+    pub creations: u32,
     /// Destroy calls refused because a foreign domain held a live map (`DomainBusy`).
     pub busy_refusals: u32,
     /// Destroy calls refused because the caller was neither the target nor privileged
@@ -1089,22 +1094,27 @@ fn is_empty_shell(hv: &Hypervisor, target: u16) -> bool {
 
 /// Drive the integrated [`Hypervisor`] through a seed-derived stream that *builds
 /// domains up* across all four subsystems — ports, vCPUs on physical CPUs, grants,
-/// live maps (foreign and self), pinned and plain frames — and periodically issues a
-/// [`HvCall::DomainDestroy`] against a random target. Whole-domain teardown is the
-/// operation that welds every subsystem and both seams at once, so this is where it is
+/// live maps (foreign and self), pinned and plain frames — and cycles them through the
+/// **whole lifecycle**: it periodically issues a [`HvCall::DomainDestroy`] against a
+/// random target and a [`HvCall::DomainCreate`] to bring a torn-down slot back to life.
+/// Teardown and creation are the operations that weld every subsystem and both seams at
+/// once (the birth/death of a domain), so this is where the closed lifecycle loop is
 /// stress-tested under interleaving.
 ///
-/// Each destroy is checked against two predictions. First the **authority gate**: a caller
-/// may destroy the target only if it *is* the target or is privileged (dom0), else `Denied`
-/// with no effect. Then, if authorized, the busy precondition
-/// ([`grant::System::has_foreign_map`]) predicts the rest exactly — refuse (`DomainBusy`)
-/// iff a foreign domain holds a live map of one of the target's frames, tear down cleanly
-/// otherwise — and every clean teardown must leave an empty shell (`is_empty_shell`).
-/// Callers are drawn across all domains (only domain 0 is privileged), so both the denied
-/// and the authorized paths are reached. The integrated invariant is asserted after every
-/// step, so a mis-ordered teardown (a freed port with a live peer, a freed on-CPU vCPU, a
-/// foreign-mapped freed frame, a deliverable event on an offlined vCPU) surfaces here with
-/// the seed as the whole reproducer.
+/// Every destroy is pinned by predictions in the impl's order: the caller must be `Live`
+/// (the dispatch gate), then the **authority gate** (a caller may destroy a target only if
+/// it *is* the target or is privileged), then target **liveness** (nothing to tear down if
+/// already `Dead`), then the busy precondition ([`grant::System::has_foreign_map`]) —
+/// refuse (`DomainBusy`) iff a foreign domain holds a live map of one of the target's
+/// frames, tear down cleanly otherwise, and every clean teardown must leave an empty shell
+/// (`is_empty_shell`). Every create is pinned likewise: `NotAlive` if the caller is `Dead`,
+/// `Denied` if the caller is unprivileged (only a control domain may create), `AlreadyAlive`
+/// if the target is still `Live`, else a clean `Dead`→`Live` birth. Callers are drawn across
+/// all domains, and a create may mint a *privileged* child — so authority propagates and
+/// both the denied and authorized paths of each operation are reached. The integrated
+/// invariant — now including the lifecycle predicates (a `Dead` slot is a clean,
+/// unprivileged shell) — is asserted after every step, so a mis-ordered teardown or a
+/// resource surviving a domain's death surfaces here with the seed as the whole reproducer.
 pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
     const DOMAINS: u16 = 3;
     const PORTS: u32 = 6;
@@ -1129,6 +1139,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
 
     let mut out = DestroyOutcome {
         teardowns: 0,
+        creations: 0,
         busy_refusals: 0,
         denials: 0,
         postcondition_held: true,
@@ -1145,7 +1156,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
         let pcpu = rng.below(PCPUS);
         let mfn = rng.below(FRAMES);
 
-        match rng.below(16) {
+        match rng.below(17) {
             0 => {
                 let remote = rng.below(u32::from(DOMAINS)) as u16;
                 drop_ok(hv.dispatch(caller, HvCall::EvtchnAllocUnbound { remote }));
@@ -1223,10 +1234,58 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                 },
             )),
             13 => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
+            14 => {
+                // Bring a slot to life — the birth half of the lifecycle. Predictions in
+                // the impl's order: the caller must be Live (gate), privileged (authority),
+                // and the target Dead (lifecycle). A create may mint a privileged child, so
+                // authority propagates beyond dom0. Because every domain starts Live, a
+                // successful create is necessarily the *rebirth* of a slot torn down earlier
+                // this run — closing the Dead→Live→Dead→Live cycle.
+                let target = rng.below(u32::from(DOMAINS)) as u16;
+                let privileged = rng.below(2) == 0;
+                let caller_live = hv.is_live(caller);
+                let caller_priv = hv.is_privileged(caller);
+                let target_dead = !hv.is_live(target);
+                match hv.dispatch(caller, HvCall::DomainCreate { target, privileged }) {
+                    Ok(HvOutcome::Done) => {
+                        out.creations += 1;
+                        // A birth: a live, privileged caller over a Dead target, and the
+                        // target is now Live with exactly the requested authority.
+                        let born_correctly = caller_live
+                            && caller_priv
+                            && target_dead
+                            && hv.is_live(target)
+                            && hv.is_privileged(target) == privileged;
+                        if !born_correctly {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::Denied) => {
+                        // A live but unprivileged caller — a no-op.
+                        if !caller_live || caller_priv {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::AlreadyAlive) => {
+                        // A live, privileged caller aimed at a still-Live target — a no-op.
+                        if !(caller_live && caller_priv && !target_dead) {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::NotAlive) => {
+                        // The caller itself is Dead (the gate) — a no-op.
+                        if caller_live {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    other => panic!("unexpected create outcome {other:?}"),
+                }
+            }
             _ => {
-                // Tear a domain down. Two predictions pin the outcome exactly: the
-                // authority gate (may the caller destroy this target?) and the busy
-                // precondition (does a foreign domain hold one of its frames?).
+                // Tear a domain down. Predictions pin the outcome exactly: caller liveness
+                // (the gate), the authority gate (may the caller destroy this target?),
+                // target liveness (is it alive to tear down?), and the busy precondition
+                // (does a foreign domain hold one of its frames?).
                 let target = rng.below(u32::from(DOMAINS)) as u16;
                 // The outcome is pinned by four predictions, in the impl's order: the caller
                 // must itself be Live (the dispatch gate — a caller torn down earlier this
@@ -2122,6 +2181,13 @@ mod tests {
         assert!(
             outcomes.iter().any(|o| o.denials > 0),
             "no seed ever hit an authority denial — the privilege gate is uncovered"
+        );
+        // Since every domain starts Live, a successful create is the rebirth of a slot torn
+        // down earlier — so this proves the full Dead→Live→Dead→Live cycle is exercised, not
+        // just one-way teardown.
+        assert!(
+            outcomes.iter().any(|o| o.creations > 0),
+            "no seed ever recreated a torn-down domain — the lifecycle cycle is uncovered"
         );
     }
 

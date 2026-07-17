@@ -51,7 +51,10 @@ fn check_decode_contract(nr: u32, arg0: u64) {
         // that does not fit the u32 field. Nothing else may be rejected.
         Err(HError::BadHypercall) => {
             let known = nr == NR_GRANT || nr == NR_SPEND;
-            assert!(!known || !fits_u32, "rejected a valid (nr={nr}, arg0={arg0})");
+            assert!(
+                !known || !fits_u32,
+                "rejected a valid (nr={nr}, arg0={arg0})"
+            );
         }
         Err(other) => panic!("decode returned an unexpected error: {other:?}"),
     }

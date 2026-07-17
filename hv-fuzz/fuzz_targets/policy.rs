@@ -32,10 +32,9 @@ const PCPUS: usize = 2;
 /// breach.
 fn idle_cpu_with_waiter(sys: &System) -> bool {
     let idle = (0..sys.pcpu_count() as u32).any(|p| sys.occupant(p).is_none());
-    idle
-        && (0..sys.domain_count() as u16).any(|d| {
-            (0..sys.vcpu_count(d) as u32).any(|v| sys.state_of(d, v) == Some(RunState::Runnable))
-        })
+    idle && (0..sys.domain_count() as u16).any(|d| {
+        (0..sys.vcpu_count(d) as u32).any(|v| sys.state_of(d, v) == Some(RunState::Runnable))
+    })
 }
 
 fuzz_target!(|data: &[u8]| {
