@@ -394,6 +394,39 @@ violations.
   zero violations — witnessed by the seeded `run_foreign` (now sharing and tearing down
   cross-domain subtrees, with a `node_links` reachability witness) across 10k seeds, and
   fuzzed through the integrated target.
+- **Hierarchical control revocation** *(landed)*: close the flat-delegation wart. The
+  capability model shipped `controls` as a bare boolean matrix, so *any* controller could
+  revoke *any* edge — its own delegator's included. Sound (revocation only removes authority)
+  but a policy wart. Fix it by recording **provenance**: each cell becomes a `Control` —
+  `Absent | Root | Via(D)` — so each target's column is a **delegation tree** rooted at its
+  creator (`Root`, stamped at `DomainCreate`), every delegated edge (`Via(D)`, stamped at
+  `ControlGrant`) recording the delegator `D` that handed it out. `ControlRevoke` becomes
+  **chain-restricted and cascading**: a caller may revoke `from` only *within the subtree it
+  roots* — `from == caller` (renounce) or a domain the caller delegated to transitively — never
+  upward at a delegator, sibling, or the `Root` from below (Denied); and removing an edge
+  cascades its whole delegated subtree away, so nothing is orphaned. `DomainDestroy` folds
+  **delegator-death** into the same cascade — a torn-down delegator's `Via` edges (where it is
+  neither endpoint) are swept — via one shared fixpoint. **Acyclicity comes from the
+  transition, not an ordering** (there is no natural order on domains, unlike page-table
+  levels): a `Via` edge only ever attaches a *fresh* leaf beneath a present delegator, so no
+  interleaving can close a cycle — which is exactly why `ControlGrant` must be idempotent and
+  **provenance-preserving** (re-parenting an existing controller is the one move that could
+  forge a cycle). This is the diamond move the capability arc set up (design-lesson #11e): the
+  stored provenance **upgrades "every edge traces to a creation root" from a by-construction
+  guard property into a checked state invariant**, `ControlEdgeOrphaned` — walking any present
+  edge's provenance must terminate at a `Root` within `domain_count` steps, catching both an
+  orphan (a `Via` whose delegator's cell went `Absent`) and a cycle (no `Root` in bound). It
+  sits *beside* `ControlEdgeDeadEndpoint` (endpoint liveness); neither subsumes the other.
+  Model-checked exhaustively over a dedicated four-domain create/destroy/delegate world — the
+  smallest that can form a depth-2 delegation chain (a two-domain world cannot even represent a
+  `Via` edge) — closing complete at depth 8 with **30,992 states, zero violations**; the
+  `state_key` now fingerprints provenance, not mere presence, so no two distinct trees merge.
+  Witnessed by `run_destroy` (bumped to four domains) across 10k seeds, which predicts every
+  revoke outcome via an independent subtree re-derivation and reaches both a **chain-restricted
+  denial** (the wart-closing refusal) and a genuine **cascade** (a revoke that removed a whole
+  subtree). A delegatee that can no longer strip its delegator, while an ancestor still can and
+  it cascades, is the disaggregated-toolstack authority Xen's XSM does coarsely — here a checked
+  invariant.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
   AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
