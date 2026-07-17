@@ -13,8 +13,12 @@
 //! deliverable event is left on a `Blocked` vCPU. Unlike the per-subsystem targets, this
 //! one explores cross-subsystem interleavings — both seams the `Hypervisor` owns:
 //! `EvtchnSend`/`EvtchnUnmask`/`SchedBlock` route through the event↔scheduler seam, so a
-//! *lost wakeup* is caught here too. The seeded mirrors in `hv-sim` (`run_hypervisor`
-//! broadly, `run_seam` with a wake-biased stream) make the properties deterministic.
+//! *lost wakeup* is caught here too. `DomainDestroy` is the whole-domain teardown that
+//! welds all four subsystems and both seams at once — refused when a foreign domain
+//! holds a live map, tearing the domain to an empty shell otherwise — so a mis-ordered
+//! teardown trips the same combined invariant. The seeded mirrors in `hv-sim`
+//! (`run_hypervisor` broadly, `run_seam` wake-biased, `run_destroy` teardown-biased)
+//! make the properties deterministic.
 //!
 //! Run it (needs nightly + `cargo install cargo-fuzz`):
 //!
@@ -53,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
         let mfn = u32::from(a) % FRAMES as u32;
         now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 25 {
+        let call = match op % 26 {
             0 => HvCall::CreditGrant { amount: u32::from(a) },
             1 => HvCall::CreditSpend { amount: u32::from(a) },
             2 => HvCall::EvtchnAllocUnbound { remote: other },
@@ -93,7 +97,10 @@ fuzz_target!(|data: &[u8]| {
             21 => HvCall::P2mAllocate { mfn },
             22 => HvCall::P2mFree { mfn },
             23 => HvCall::P2mPin { mfn },
-            _ => HvCall::P2mUnpin { mfn },
+            24 => HvCall::P2mUnpin { mfn },
+            // Tear a whole domain down — all four subsystems and both seams at once.
+            // Stale handles it leaves behind are already tolerated by the unmap arm.
+            _ => HvCall::DomainDestroy { target: other, now },
         };
 
         let _ = hv.dispatch(caller, call);

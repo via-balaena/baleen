@@ -194,6 +194,26 @@ one-line regression test, not a Heisenbug.
   observes it), and is fuzzed through the integrated target. Only the *scheduler* wakeup
   is the core's business; *injecting* the interrupt into an already-running vCPU stays
   the HAL's job, past the fence.
+- **Domain teardown** *(landed)*: `HvCall::DomainDestroy` — the whole-system operation
+  that welds all four subsystems and both seams at once. Tearing a domain down means
+  closing its every port, offlining its every vCPU, unmapping its every grant map,
+  revoking its every grant, and unpinning and freeing its every frame — an ordered
+  sweep built entirely from the existing invariant-safe transitions, so it adds
+  ordering, not new mutation. It is **atomic, all-or-nothing, refuse-if-busy**: one
+  precondition gates everything — no *foreign* domain may hold a live grant map of one
+  of the target's frames (the one thing teardown can't do is yank a page out from under
+  another domain) — so it either refuses with a new `HvError::DomainBusy`, mutating
+  nothing, or every step past the precondition succeeds by construction, leaving an
+  empty but still-existent shell (domain slots are fixed-size and never removed; a peer
+  left `Unbound` still names a domain that exists). No new standing invariant: a
+  destroyed domain is verified by *postcondition* (nothing live points into it), riding
+  atop the existing net, which already catches every teardown-ordering bug — a freed
+  port with a live peer trips evtchn reciprocity, a freed on-CPU vCPU trips scheduler
+  occupancy, a freed foreign-mapped frame trips the grant↔page-type seam, a deliverable
+  event on an offlined vCPU trips lost-wakeup. Holds across 10k seeds (`run_destroy`
+  builds domains up and tears them down mid-flight, reaching both the busy-refusal and
+  clean-teardown paths) and is fuzzed through the integrated target. Privilege and
+  domain-ID reuse are deferred (no domain *creation* yet).
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

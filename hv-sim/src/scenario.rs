@@ -1011,6 +1011,199 @@ fn woke(before: Option<sched::RunState>, after: Option<sched::RunState>) -> bool
     before == Some(sched::RunState::Blocked) && after == Some(sched::RunState::Runnable)
 }
 
+/// A comparable summary of a finished domain-teardown run. The counts are *observed
+/// outcomes* of the destroy calls issued, so a test can prove both the refuse-if-busy
+/// and the clean-teardown paths are genuinely reached — and that the postcondition
+/// held every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DestroyOutcome {
+    /// Destroy calls that tore a domain down (`Ok`).
+    pub teardowns: u32,
+    /// Destroy calls refused because a foreign domain held a live map (`DomainBusy`).
+    pub busy_refusals: u32,
+    /// Whether every destroy matched its precondition and left a proper empty shell:
+    /// refused exactly when a foreign map stood, and otherwise reduced the target to
+    /// nothing-live. A single mismatch flips this false for the whole run.
+    pub postcondition_held: bool,
+    /// Whether the integrated invariant held after every step, not just at the end.
+    pub invariants_hold: bool,
+}
+
+/// Whether `target` has been reduced to an empty but still-existent shell — the
+/// teardown postcondition, checked from the sim through public queries: it holds no
+/// port, no online vCPU, offers or holds no grant, and owns no frame.
+fn is_empty_shell(hv: &Hypervisor, target: u16) -> bool {
+    let e = hv.evtchn();
+    let no_ports =
+        (0..e.port_count(target) as u32).all(|p| e.state_of(target, p) == Some(PortState::Free));
+    let sc = hv.sched();
+    let no_vcpus = (0..sc.vcpu_count(target) as u32)
+        .all(|v| sc.state_of(target, v) == Some(sched::RunState::Offline));
+    let g = hv.grant();
+    let no_grants = (0..g.entry_count(target) as u32).all(|gr| !g.is_granted(target, gr));
+    let no_maps = !g.holds_any_map(target);
+    let p = hv.p2m();
+    let no_frames = (0..p.frame_count() as u32).all(|m| p.owner_of(m) != Some(target));
+    no_ports && no_vcpus && no_grants && no_maps && no_frames
+}
+
+/// Drive the integrated [`Hypervisor`] through a seed-derived stream that *builds
+/// domains up* across all four subsystems — ports, vCPUs on physical CPUs, grants,
+/// live maps (foreign and self), pinned and plain frames — and periodically issues a
+/// [`HvCall::DomainDestroy`] against a random target. Whole-domain teardown is the
+/// operation that welds every subsystem and both seams at once, so this is where it is
+/// stress-tested under interleaving.
+///
+/// Each destroy is checked against its own precondition: [`grant::System::has_foreign_map`]
+/// predicts the outcome exactly — refuse (`DomainBusy`) iff a foreign domain holds a
+/// live map of one of the target's frames, tear down cleanly otherwise — and every
+/// clean teardown must leave an empty shell (`is_empty_shell`). The integrated
+/// invariant is asserted after every step, so a mis-ordered teardown (a freed port with
+/// a live peer, a freed on-CPU vCPU, a foreign-mapped freed frame, a deliverable event
+/// on an offlined vCPU) surfaces here with the seed as the whole reproducer.
+pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
+    const DOMAINS: u16 = 3;
+    const PORTS: u32 = 6;
+    const GRANTS: u32 = 4;
+    const VCPUS: u32 = 2;
+    const PCPUS: u32 = 2;
+    const FRAMES: u32 = 6;
+
+    let mut hv = Hypervisor::new(
+        DOMAINS as usize,
+        PORTS as usize,
+        GRANTS as usize,
+        VCPUS as usize,
+        PCPUS as usize,
+        FRAMES as usize,
+    );
+    let clock = ManualClock::new();
+    let mut rng = Prng::new(seed);
+    let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee, handle) of live maps
+    let mut grants: Vec<(u16, u32, u16, bool)> = Vec::new(); // (grantor, gref, grantee, readonly)
+
+    let mut out = DestroyOutcome {
+        teardowns: 0,
+        busy_refusals: 0,
+        postcondition_held: true,
+        invariants_hold: true,
+    };
+
+    for _ in 0..steps {
+        clock.advance(1 + u64::from(rng.below(16)));
+        let now = clock.now();
+        let caller = rng.below(u32::from(DOMAINS)) as u16;
+        let port = rng.below(PORTS);
+        let gref = rng.below(GRANTS);
+        let vcpu = rng.below(VCPUS);
+        let pcpu = rng.below(PCPUS);
+        let mfn = rng.below(FRAMES);
+
+        match rng.below(16) {
+            0 => {
+                let remote = rng.below(u32::from(DOMAINS)) as u16;
+                drop_ok(hv.dispatch(caller, HvCall::EvtchnAllocUnbound { remote }));
+            }
+            1 => {
+                let remote = rng.below(u32::from(DOMAINS)) as u16;
+                let remote_port = rng.below(PORTS);
+                drop_ok(hv.dispatch(
+                    caller,
+                    HvCall::EvtchnBindInterdomain {
+                        remote,
+                        remote_port,
+                    },
+                ));
+            }
+            2 => drop_ok(hv.dispatch(caller, HvCall::EvtchnBindIpi { vcpu })),
+            3 => drop_ok(hv.dispatch(caller, HvCall::EvtchnClose { port })),
+            4 => drop_ok(hv.dispatch(caller, HvCall::EvtchnSend { port })),
+            5 => {
+                // A mappable grant: the grantor allocates the frame it grants (so a
+                // later map takes a real page reference through the seam). Record it so
+                // the map arm can target it as the right grantee — grantee may be the
+                // grantor itself, so self-grants are exercised too.
+                let frame = mfn;
+                let _ = hv.dispatch(caller, HvCall::P2mAllocate { mfn: frame });
+                let grantee = rng.below(u32::from(DOMAINS)) as u16;
+                let readonly = rng.below(2) == 0;
+                if hv
+                    .dispatch(
+                        caller,
+                        HvCall::GrantAccess {
+                            gref,
+                            grantee,
+                            frame,
+                            readonly,
+                        },
+                    )
+                    .is_ok()
+                {
+                    grants.push((caller, gref, grantee, readonly));
+                }
+            }
+            6 => {
+                if !grants.is_empty() {
+                    let idx = rng.below(grants.len() as u32) as usize;
+                    let (grantor, ggref, grantee, readonly) = grants[idx];
+                    if let Ok(HvOutcome::Handle(h)) = hv.dispatch(
+                        grantee,
+                        HvCall::GrantMap {
+                            grantor,
+                            gref: ggref,
+                            writable: !readonly,
+                        },
+                    ) {
+                        handles.push((grantee, h));
+                    }
+                }
+            }
+            7 => {
+                if !handles.is_empty() {
+                    let idx = rng.below(handles.len() as u32) as usize;
+                    let (owner, handle) = handles.swap_remove(idx);
+                    drop_ok(hv.dispatch(owner, HvCall::GrantUnmap { handle }));
+                }
+            }
+            8 => drop_ok(hv.dispatch(caller, HvCall::SchedAdmit { vcpu })),
+            9 => drop_ok(hv.dispatch(caller, HvCall::SchedRun { vcpu, pcpu, now })),
+            10 => drop_ok(hv.dispatch(caller, HvCall::SchedBlock { vcpu, now })),
+            11 => drop_ok(hv.dispatch(caller, HvCall::P2mAllocate { mfn })),
+            12 => drop_ok(hv.dispatch(caller, HvCall::P2mPin { mfn })),
+            13 => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
+            _ => {
+                // Tear a domain down. Its precondition predicts the outcome exactly, so
+                // check the two against each other and verify the resulting shape.
+                let target = rng.below(u32::from(DOMAINS)) as u16;
+                let foreign = hv.grant().has_foreign_map(target);
+                match hv.dispatch(caller, HvCall::DomainDestroy { target, now }) {
+                    Ok(HvOutcome::Done) => {
+                        out.teardowns += 1;
+                        // A clean teardown must not have had a foreign map, and must
+                        // leave nothing live pointing into the target.
+                        if foreign || !is_empty_shell(&hv, target) {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::DomainBusy) => {
+                        out.busy_refusals += 1;
+                        // A refusal must have had a foreign map (and, being a no-op,
+                        // leaves the target as busy as it was — nothing to check here).
+                        if !foreign {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    other => panic!("unexpected destroy outcome {other:?}"),
+                }
+            }
+        }
+
+        out.invariants_hold &= hv.invariants_hold();
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1456,6 +1649,55 @@ mod tests {
         assert!(
             outcomes.iter().any(|o| o.block_noops > 0),
             "no seed ever hit the block-with-pending-event no-op — driver too weak"
+        );
+    }
+
+    /// The domain-teardown headline: across many seeds of building domains up and
+    /// tearing them down mid-flight, the integrated invariant holds after every step
+    /// *and* every destroy obeys its contract — refused exactly when a foreign map
+    /// stood, and otherwise leaving a proper empty shell. Teardown welds all four
+    /// subsystems and both seams, so this is the whole net biting at once.
+    #[test]
+    fn destroy_is_sound_and_keeps_its_contract_across_seeds() {
+        for seed in 0..10_000u64 {
+            let out = run_destroy(seed, 256);
+            assert!(
+                out.invariants_hold,
+                "integrated invariant violated under teardown on seed {seed}"
+            );
+            assert!(
+                out.postcondition_held,
+                "a destroy broke its precondition/postcondition contract on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the teardown driver: same seed, same observed outcome exactly.
+    #[test]
+    fn destroy_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_destroy(seed, 256),
+                run_destroy(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The driver genuinely reaches *both* teardown paths across the seed space: some
+    /// run refuses a destroy because a foreign domain holds a live map (`DomainBusy`),
+    /// and some run tears a domain down cleanly. If either stayed zero, the soundness
+    /// test above would be proving teardown over a path it never actually takes.
+    #[test]
+    fn destroy_reaches_both_the_busy_and_clean_paths() {
+        let outcomes: Vec<_> = (0..256u64).map(|s| run_destroy(s, 256)).collect();
+        assert!(
+            outcomes.iter().any(|o| o.teardowns > 0),
+            "no seed ever tore a domain down — driver too weak"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.busy_refusals > 0),
+            "no seed ever hit a busy-refusal — the refuse-if-busy path is uncovered"
         );
     }
 }
