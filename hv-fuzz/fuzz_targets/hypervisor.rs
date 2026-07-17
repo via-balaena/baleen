@@ -17,7 +17,10 @@
 //! page tables, so a *mislevelled* entry (a table pointing at a frame of the wrong level)
 //! is caught by the same invariant — and `P2mLink` onto a frame another domain owns routes
 //! through the page-table↔grant authorization seam, so an *unauthorized* cross-domain entry
-//! is caught too. `DomainCreate`/`DomainDestroy` are the birth and death of a whole domain,
+//! is caught too, at any level: since `parent`, `child`, and `writable` are all
+//! fuzzer-chosen, this exercises foreign *leaves* (a data page under an `L1`) and foreign
+//! *interior* node shares (a table pointing at another domain's `L(k-1)` node, sharing a
+//! subtree) alike. `DomainCreate`/`DomainDestroy` are the birth and death of a whole domain,
 //! welding every subsystem and seam at once — creation lifts a Dead slot to Live (`may_create`
 //! callers only, the creator gaining per-target control of the child), destroy tears a domain
 //! to a clean shell (refused when a foreign domain holds a live map) — so a mis-ordered

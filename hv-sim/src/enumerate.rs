@@ -613,7 +613,11 @@ mod tests {
     /// The grant↔page-type and page-table↔grant seams, exhaustively: every reachable
     /// state of a 2-domain / 2-frame / 2-grant world under all grant and page-table
     /// hypercalls (including cross-domain foreign links and teardown) holds every
-    /// invariant. A *proof* over the seam, not a sample.
+    /// invariant. A *proof* over the seam, not a sample. The CI depth is too shallow to
+    /// reach a foreign *interior* node share (an `L2`→foreign-`L1` edge needs ~6 hypercalls
+    /// to set up — create, allocate, pin an `L2`, allocate the peer's frame, grant it, then
+    /// link); the deep twin below runs past that, so it exhaustively covers foreign node
+    /// sharing, not just leaves.
     #[test]
     fn grant_and_p2m_seams_are_exhaustively_sound() {
         let states = expect_clean(&grant_p2m_cfg(4));
@@ -648,6 +652,10 @@ mod tests {
         assert!(states > 200, "suspiciously few states explored: {states}");
     }
 
+    /// The deep grant↔page-type / page-table↔grant sweep. Depth 7 is enough to reach a
+    /// cross-domain page-table *node* share (a foreign interior entry, an `L2` pointing at
+    /// another domain's `L1` node) and everything under it, so this exhaustively proves the
+    /// `UnauthorizedForeignLink` invariant over foreign subtrees as well as foreign leaves.
     #[test]
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn grant_and_p2m_seams_deep() {

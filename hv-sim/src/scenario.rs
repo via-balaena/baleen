@@ -1583,8 +1583,13 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
 pub struct ForeignOutcome {
     /// Cross-domain entries successfully installed (a domain mapped another's frame).
     pub links: u32,
-    /// Of those, the *read-only* ones — a foreign leaf authorized by any grant (contrast
-    /// a writable leaf, which needs a read-write grant). A witness that the read-only
+    /// Of those, the ones that shared a page-table *node* — an *interior* foreign entry
+    /// (an `Lk` table pointing at another domain's `L(k-1)` node), sharing a whole subtree
+    /// rather than a single leaf. A witness that the subtree-sharing path is reached, not
+    /// just leaf mapping.
+    pub node_links: u32,
+    /// Of those, the *read-only* ones — a foreign entry authorized by any grant (contrast
+    /// a writable entry, which needs a read-write grant). A witness that the read-only
     /// cross-domain path is reached, not just the writable one.
     pub ro_links: u32,
     /// Foreign links refused for want of a grant of matching permission
@@ -1599,34 +1604,67 @@ pub struct ForeignOutcome {
 }
 
 /// Drive the integrated [`Hypervisor`] through a seed-derived stream *biased to exercise
-/// cross-domain page-table sharing*. Two domains each own an `L1` table; the loop grants
-/// data frames across the domain boundary — read-only or read-write by a seed bit — maps
-/// granted foreign frames into the other domain's table at a seed-chosen access, unlinks
-/// them, and revokes grants. It also attempts *unauthorized* foreign links (no grant, or a
-/// writable entry over a read-only grant) to witness the isolation guard firing. The
-/// authorization invariant — every cross-domain entry backed by a grant of matching
-/// permission — is checked after every step, so a breach surfaces here with the seed as
-/// the whole reproducer.
+/// cross-domain page-table sharing — leaves and whole subtrees alike*. Each of two domains
+/// owns an `L2` table, an `L1` node (with one of its own data leaves already under it, so
+/// the node is a real subtree), and spare data frames. The loop grants a data frame *or an
+/// `L1` node* across the domain boundary — read-only or read-write by a seed bit — and maps
+/// the granted foreign frame into the peer's table at a seed-chosen access: a data frame
+/// goes under the peer's `L1` (a foreign *leaf*), a node under the peer's `L2` (a foreign
+/// *interior* entry, sharing the subtree). It unlinks entries, revokes grants, and attempts
+/// *unauthorized* links (no grant, or a writable entry over a read-only grant) to witness
+/// the isolation guard firing. The authorization invariant — every cross-domain entry
+/// backed by a grant of matching permission, at every level — is checked after every step,
+/// so a breach surfaces here with the seed as the whole reproducer.
 pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
     const DOMAINS: u16 = 2;
     const GRANTS: u32 = 6;
-    const FRAMES: u32 = 8;
-    // Frame `d` is domain `d`'s L1 table; the rest are data frames to grant and map.
-    const TABLE0: u32 = 0;
-    const TABLE1: u32 = 1;
-    const FIRST_DATA: u32 = 2;
+    const FRAMES: u32 = 10;
+    // Per domain `d`: frame `d` is its L2 table, frame `2 + d` its L1 *node*, frame `4 + d`
+    // the node's own leaf (linked once at setup so the node is a genuine subtree). Frames
+    // `6..10` are spare data frames, owner = `mfn % 2`, granted and mapped as foreign leaves.
+    const L2_BASE: u32 = 0;
+    const L1_BASE: u32 = 2;
+    const NODE_LEAF_BASE: u32 = 4;
+    const FIRST_DATA: u32 = 6;
+    let l2_of = |dom: u16| L2_BASE + u32::from(dom);
+    let l1_of = |dom: u16| L1_BASE + u32::from(dom);
 
     let mut hv = Hypervisor::new(DOMAINS as usize, 1, GRANTS as usize, 1, 1, FRAMES as usize);
     bring_all_domains_live(&mut hv, DOMAINS);
-    // Stand up one L1 table per domain, and hand each data frame to an owner.
-    for (dom, table) in [(0u16, TABLE0), (1u16, TABLE1)] {
-        hv.dispatch(dom, HvCall::P2mAllocate { mfn: table })
+    // Stand up each domain's L2 table, its L1 node, and the node's own leaf; then hand out
+    // the spare data frames. The L1 node thus starts as a real subtree (one leaf beneath),
+    // so a peer sharing the node exposes a genuine subtree transitively, not an empty table.
+    for dom in 0..DOMAINS {
+        hv.dispatch(dom, HvCall::P2mAllocate { mfn: l2_of(dom) })
             .unwrap();
         hv.dispatch(
             dom,
             HvCall::P2mPin {
-                mfn: table,
+                mfn: l2_of(dom),
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+        hv.dispatch(dom, HvCall::P2mAllocate { mfn: l1_of(dom) })
+            .unwrap();
+        hv.dispatch(
+            dom,
+            HvCall::P2mPin {
+                mfn: l1_of(dom),
                 level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+        let node_leaf = NODE_LEAF_BASE + u32::from(dom);
+        hv.dispatch(dom, HvCall::P2mAllocate { mfn: node_leaf })
+            .unwrap();
+        hv.dispatch(
+            dom,
+            HvCall::P2mLink {
+                parent: l1_of(dom),
+                slot: 0,
+                child: node_leaf,
+                writable: true,
             },
         )
         .unwrap();
@@ -1635,10 +1673,11 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
         let owner = (mfn % u32::from(DOMAINS)) as u16;
         hv.dispatch(owner, HvCall::P2mAllocate { mfn }).unwrap();
     }
-    let table_of = |dom: u16| if dom == 0 { TABLE0 } else { TABLE1 };
 
     let mut rng = Prng::new(seed);
-    let mut grants: Vec<(u16, u32, u16, u32)> = Vec::new(); // (grantor, gref, grantee, frame)
+    // (grantor, gref, grantee, frame, is_node) — is_node routes the map under the peer's
+    // L2 (an interior entry) rather than its L1 (a leaf).
+    let mut grants: Vec<(u16, u32, u16, u32, bool)> = Vec::new();
     let mut links: Vec<(u16, u32, u32)> = Vec::new(); // (linker, parent table, slot)
     let mut out = ForeignOutcome {
         invariants_hold: true,
@@ -1648,10 +1687,19 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
     for _ in 0..steps {
         match rng.below(6) {
             0 => {
-                // Grant a data frame to the *other* domain, so it can be foreign-mapped.
-                let frame = FIRST_DATA + rng.below(FRAMES - FIRST_DATA);
-                let grantor = (frame % u32::from(DOMAINS)) as u16;
+                // Grant something to the *other* domain so it can be foreign-mapped: with
+                // even odds a plain data frame (mapped later as a leaf) or this domain's L1
+                // node (mapped later as an interior entry, sharing the subtree).
+                let grantor = rng.below(u32::from(DOMAINS)) as u16;
                 let grantee = 1 - grantor;
+                let is_node = rng.below(2) == 0;
+                let frame = if is_node {
+                    l1_of(grantor)
+                } else {
+                    // A spare data frame this domain owns.
+                    let span = (FRAMES - FIRST_DATA) / u32::from(DOMAINS);
+                    FIRST_DATA + u32::from(grantor) + u32::from(DOMAINS) * rng.below(span)
+                };
                 let gref = rng.below(GRANTS);
                 // A read-only grant authorizes only a read-only entry; a read-write one
                 // authorizes both. Choosing here exercises both authorization paths.
@@ -1668,7 +1716,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                     )
                     .is_ok()
                 {
-                    grants.push((grantor, gref, grantee, frame));
+                    grants.push((grantor, gref, grantee, frame, is_node));
                 }
             }
             1 => {
@@ -1690,13 +1738,21 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
             }
             2 | 3 => {
                 // Map a granted foreign frame into the grantee's table, at a seed-chosen
-                // access. A writable entry over a read-only grant is refused
-                // (Unauthorized); a read-only entry is authorized by any grant.
+                // access. A data frame goes under the grantee's L1 (a leaf); the peer's L1
+                // node goes under the grantee's L2 (an interior entry, sharing its subtree).
+                // A writable entry over a read-only grant is refused (Unauthorized); a
+                // read-only entry is authorized by any grant.
                 if !grants.is_empty() {
                     let idx = rng.below(grants.len() as u32) as usize;
-                    let (_grantor, _gref, grantee, frame) = grants[idx];
-                    let parent = table_of(grantee);
-                    let slot = rng.below(8);
+                    let (_grantor, _gref, grantee, frame, is_node) = grants[idx];
+                    let parent = if is_node {
+                        l2_of(grantee)
+                    } else {
+                        l1_of(grantee)
+                    };
+                    // Slot 0 of the L1 node is taken by its own leaf; leave it be, and share
+                    // the L2's slots freely.
+                    let slot = 1 + rng.below(7);
                     let writable = rng.below(2) == 0;
                     match hv.dispatch(
                         grantee,
@@ -1709,6 +1765,9 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                     ) {
                         Ok(_) => {
                             out.links += 1;
+                            if is_node {
+                                out.node_links += 1;
+                            }
                             if !writable {
                                 out.ro_links += 1;
                             }
@@ -1728,24 +1787,32 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                 }
             }
             _ => {
-                // Attempt an *unauthorized* foreign link: map the other domain's data
-                // frame with no grant behind it. Witness the isolation guard.
+                // Attempt an *unauthorized* foreign link with no grant behind it — either a
+                // leaf (peer's data frame under our L1) or a node share (peer's L1 node
+                // under our L2). Witness the isolation guard at both levels.
                 let linker = rng.below(u32::from(DOMAINS)) as u16;
                 let foreign = 1 - linker;
-                let frame = FIRST_DATA + rng.below(FRAMES - FIRST_DATA);
-                if (frame % u32::from(DOMAINS)) as u16 == foreign {
-                    let slot = rng.below(8);
-                    if let Err(hv_core::HvError::Unauthorized) = hv.dispatch(
-                        linker,
-                        HvCall::P2mLink {
-                            parent: table_of(linker),
-                            slot,
-                            child: frame,
-                            writable: true,
-                        },
-                    ) {
-                        out.unauthorized += 1;
-                    }
+                let as_node = rng.below(2) == 0;
+                let (parent, child) = if as_node {
+                    (l2_of(linker), l1_of(foreign))
+                } else {
+                    // Some spare data frame the foreign domain owns.
+                    let span = (FRAMES - FIRST_DATA) / u32::from(DOMAINS);
+                    let child =
+                        FIRST_DATA + u32::from(foreign) + u32::from(DOMAINS) * rng.below(span);
+                    (l1_of(linker), child)
+                };
+                let slot = 1 + rng.below(7);
+                if let Err(hv_core::HvError::Unauthorized) = hv.dispatch(
+                    linker,
+                    HvCall::P2mLink {
+                        parent,
+                        slot,
+                        child,
+                        writable: true,
+                    },
+                ) {
+                    out.unauthorized += 1;
                 }
             }
         }
@@ -2357,6 +2424,11 @@ mod tests {
         assert!(
             outcomes.iter().any(|o| o.links > 0),
             "no seed ever installed a cross-domain entry — driver too weak"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.node_links > 0),
+            "no seed ever shared a page-table node (interior foreign entry) — the \
+             subtree-sharing path is uncovered"
         );
         assert!(
             outcomes.iter().any(|o| o.ro_links > 0),
