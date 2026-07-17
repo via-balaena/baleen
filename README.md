@@ -119,8 +119,10 @@ configuration it breadth-first visits *every* reachable state and checks the
 integrated invariant at each — a proof, not a sample, that no reachable state can
 break it. CI runs shallow per-seam sweeps in seconds; the deep on-demand sweeps
 (`cargo test --release -- --ignored`) have exhaustively cleared **millions** of
-distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 1.14M states, the
-whole integrated core to depth 5 ≈ 1.40M) with zero violations.
+distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 742k states —
+including cross-domain foreign *node* shares, not just leaves; the whole integrated
+core to depth 5 ≈ 415k; event↔scheduler to depth 8 past the 1.5M cap) with zero
+violations.
 
 ## Milestones
 
@@ -277,8 +279,9 @@ whole integrated core to depth 5 ≈ 1.40M) with zero violations.
   write-locked, so its owner can neither free nor re-type it while the entry maps it), and
   the dispatch seam adds the **authorization** it is blind to. A cross-domain entry is
   allowed only when the frame's owner has granted it to the mapping domain
-  (`grant::authorizes`) — Xen's grant-mapped foreign page — and is restricted to `L1`
-  leaves (sharing a page-table *node* is deferred). A grant can't be revoked while a
+  (`grant::authorizes`) — Xen's grant-mapped foreign page — and, at this milestone, is
+  restricted to `L1` leaves (sharing a page-table *node* was later lifted — see *Cross-domain
+  shared page-table nodes* below). A grant can't be revoked while a
   foreign entry relies on it (the frame is in use), and the new cross-subsystem invariant
   **every cross-domain entry is backed by a live grant of matching permission**
   (`CrossViolation::UnauthorizedForeignLink`) is checked after every dispatch — the
@@ -302,7 +305,8 @@ whole integrated core to depth 5 ≈ 1.40M) with zero violations.
   read-only transition is model-checked exhaustively (the grant↔p2m sweep closes at depth 7
   over ≈1.14M states, zero violations, with read-only-onto-page-table reached), witnessed
   by the seeded `run_ptab`/`run_foreign` drivers, and fuzzed. Shared page-table *nodes*
-  (foreign interior entries, not just leaves) remain deferred.
+  (foreign interior entries, not just leaves) landed later — see *Cross-domain shared
+  page-table nodes* below.
 - **Domain lifecycle / creation** *(landed)*: close the lifecycle loop. Teardown existed,
   but there was no *creation*, and every domain slot implicitly existed and accepted
   operations from birth — there was no "doesn't exist yet" state. Model it explicitly: a
@@ -361,6 +365,35 @@ whole integrated core to depth 5 ≈ 1.40M) with zero violations.
   and predicting every outcome. A domain **capability** delegable to specific peers is exactly
   the toolstack-domain / driver-domain disaggregation Xen's XSM/Flask does coarsely — here it
   is a checked invariant.
+- **Cross-domain shared page-table nodes** *(landed)*: lift cross-domain sharing from
+  leaf-only to a foreign **node** — an `Lk` table (`k >= 2`) pointing at another domain's
+  `L(k-1)` table, sharing a whole page-table *subtree* rather than a single data page. This
+  is the mechanism behind a real shared address space. The lift is one deleted line: the
+  only thing forcing leaves was `current_type(parent) == PageTable(L1)` for a foreign child
+  in `p2m_link`; dropping it lets a foreign child sit at any level, authorized by the
+  *unchanged, uniform* `grant::authorizes(owner, caller, child, writable)` — a read-write
+  grant for a writable entry, any grant for a read-only one — whether the child is a data
+  page or a table node (design-lesson #6/#8: relaxing a check is sound only because its
+  replacement invariant already covers the relaxation). **Transitive consent** is the model
+  and it *falls out* of the existing seam rather than being built: `UnauthorizedForeignLink`
+  only fires on edges whose parent and child differ in owner, and every edge *inside* the
+  owner's shared subtree is same-owner, so one grant of the node frame authorizes the
+  caller's walk into the entire subtree beneath — the caller holds, and needs, no grants of
+  the leaf frames. On an interior entry `writable` is the traversal read/write bit the MMU
+  ANDs down the walk (past the fence): it gates the grant permission required but never
+  yields a writable *type* on the node (a node is always typed as a page table), so a
+  read-only node grant can never produce write access to the leaves beneath. Three
+  guarantees hold for free, confirmed not assumed: **acyclicity** (every edge, foreign
+  included, strictly decreases level, so the cross-domain graph stays a DAG of depth <= 4 —
+  no cycle representable); **teardown & revoke-block** (both key on the boundary edge, so
+  `has_foreign_link_into`/`is_foreign_linked_by` already refuse tearing down a domain whose
+  node a peer shares, or revoking the grant under a live share); and the **replacement
+  invariant** itself, which already scanned every edge at every level. Model-checked
+  exhaustively — the grant<->p2m depth-7 sweep now reaches a foreign interior node share and
+  everything under it, re-measured at **741,777** states (up from 738,897), closed complete,
+  zero violations — witnessed by the seeded `run_foreign` (now sharing and tearing down
+  cross-domain subtrees, with a `node_links` reachability witness) across 10k seeds, and
+  fuzzed through the integrated target.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
   AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
