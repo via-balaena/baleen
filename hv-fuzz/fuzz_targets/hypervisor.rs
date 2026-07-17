@@ -27,9 +27,10 @@ const PORTS: usize = 8;
 const GRANTS: usize = 6;
 const VCPUS: usize = 2;
 const PCPUS: usize = 2;
+const FRAMES: usize = 6;
 
 fuzz_target!(|data: &[u8]| {
-    let mut hv = Hypervisor::new(DOMAINS, PORTS, GRANTS, VCPUS, PCPUS);
+    let mut hv = Hypervisor::new(DOMAINS, PORTS, GRANTS, VCPUS, PCPUS, FRAMES);
     let mut handles: Vec<(u16, u32)> = Vec::new();
     let mut bytes = data.iter().copied();
     let mut now: u64 = 0;

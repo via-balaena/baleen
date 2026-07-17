@@ -574,6 +574,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
     const GRANTS: u32 = 6;
     const VCPUS: u32 = 2;
     const PCPUS: u32 = 2;
+    const FRAMES: u32 = 6;
 
     let mut hv = Hypervisor::new(
         DOMAINS as usize,
@@ -581,6 +582,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         GRANTS as usize,
         VCPUS as usize,
         PCPUS as usize,
+        FRAMES as usize,
     );
     let mut rng = Prng::new(seed);
     let clock = ManualClock::new();

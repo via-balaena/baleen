@@ -29,6 +29,7 @@ use hv_hal::Ticks;
 
 use crate::evtchn::{self, Port, Vcpu, Virq};
 use crate::grant::{self, Frame, GrantHandle, GrantRef};
+use crate::p2m::{self, Mfn, PageType};
 use crate::sched::{self, Pcpu};
 use crate::{HError, HvCore};
 
@@ -103,6 +104,19 @@ pub enum HvCall {
     SchedWake { vcpu: Vcpu },
     /// Take one of the caller's vCPUs offline, closing any on-CPU interval at `now`.
     SchedOffline { vcpu: Vcpu, now: Ticks },
+
+    /// Allocate a free machine frame to the caller.
+    P2mAllocate { mfn: Mfn },
+    /// Take a bare existence reference on a machine frame.
+    P2mGet { mfn: Mfn },
+    /// Drop a bare existence reference on a machine frame.
+    P2mPut { mfn: Mfn },
+    /// Take a typed reference on a machine frame — writable-xor-pagetable enforced.
+    P2mGetType { mfn: Mfn, ty: PageType },
+    /// Drop a typed reference on a machine frame.
+    P2mPutType { mfn: Mfn, ty: PageType },
+    /// Free one of the caller's machine frames back to the pool.
+    P2mFree { mfn: Mfn },
 }
 
 /// The success value of a routed hypercall.
@@ -133,6 +147,8 @@ pub enum HvError {
     Grant(grant::GrantError),
     /// The scheduler subsystem rejected the call.
     Sched(sched::SchedError),
+    /// The page-type subsystem rejected the call.
+    P2m(p2m::P2mError),
 }
 
 /// The integrated hypervisor core: per-domain credit plus the two whole-system
@@ -142,25 +158,29 @@ pub struct Hypervisor {
     evtchn: evtchn::System,
     grant: grant::System,
     sched: sched::System,
+    p2m: p2m::System,
 }
 
 impl Hypervisor {
     /// A hypervisor of `num_domains` domains, each with `ports_per_domain`
     /// event-channel ports, `grants_per_domain` grant slots, and `vcpus_per_domain`
-    /// virtual CPUs, scheduled over `num_pcpus` shared physical CPUs. Every subsystem
-    /// shares the same domain count; the physical CPUs are system-wide.
+    /// virtual CPUs, scheduled over `num_pcpus` shared physical CPUs, with `num_frames`
+    /// machine frames in the shared page pool. Every subsystem shares the same domain
+    /// count; the physical CPUs and machine frames are system-wide.
     pub fn new(
         num_domains: usize,
         ports_per_domain: usize,
         grants_per_domain: usize,
         vcpus_per_domain: usize,
         num_pcpus: usize,
+        num_frames: usize,
     ) -> Self {
         Hypervisor {
             credit: (0..num_domains).map(|_| HvCore::new()).collect(),
             evtchn: evtchn::System::new(num_domains, ports_per_domain),
             grant: grant::System::new(num_domains, grants_per_domain),
             sched: sched::System::new(num_domains, vcpus_per_domain, num_pcpus),
+            p2m: p2m::System::new(num_domains, num_frames),
         }
     }
 
@@ -297,6 +317,37 @@ impl Hypervisor {
                 .offline(caller, vcpu, now)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Sched),
+
+            HvCall::P2mAllocate { mfn } => self
+                .p2m
+                .allocate(caller, mfn)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mGet { mfn } => self
+                .p2m
+                .get(mfn)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mPut { mfn } => self
+                .p2m
+                .put(mfn)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mGetType { mfn, ty } => self
+                .p2m
+                .get_type(mfn, ty)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mPutType { mfn, ty } => self
+                .p2m
+                .put_type(mfn, ty)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mFree { mfn } => self
+                .p2m
+                .free(caller, mfn)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
         }
     }
 
@@ -306,6 +357,7 @@ impl Hypervisor {
         self.evtchn.invariants_hold()
             && self.grant.invariants_hold()
             && self.sched.invariants_hold()
+            && self.p2m.invariants_hold()
             && self.credit.iter().all(HvCore::invariants_hold)
     }
 
@@ -334,6 +386,11 @@ impl Hypervisor {
         &self.sched
     }
 
+    /// The page-type subsystem, for inspection.
+    pub fn p2m(&self) -> &p2m::System {
+        &self.p2m
+    }
+
     fn credit_of(&mut self, dom: DomId) -> Result<&mut HvCore, HvError> {
         self.credit.get_mut(dom as usize).ok_or(HvError::BadDomain)
     }
@@ -344,7 +401,7 @@ mod tests {
     use super::*;
 
     fn hv() -> Hypervisor {
-        Hypervisor::new(3, 8, 6, 2, 2)
+        Hypervisor::new(3, 8, 6, 2, 2, 8)
     }
 
     #[test]
@@ -457,6 +514,51 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_types_and_frees_through_dispatch() {
+        let mut h = hv();
+        // Domain 1 allocates frame 3 and types it writable.
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 3 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mGetType {
+                mfn: 3,
+                ty: PageType::Writable,
+            },
+        )
+        .unwrap();
+        assert_eq!(h.p2m().current_type(3), Some(PageType::Writable));
+        // While it is writable, no one can pin it as a page table.
+        assert_eq!(
+            h.dispatch(
+                1,
+                HvCall::P2mGetType {
+                    mfn: 3,
+                    ty: PageType::PageTable
+                }
+            ),
+            Err(HvError::P2m(p2m::P2mError::TypePinned))
+        );
+        // A different domain cannot free frame 3 — it is not the owner.
+        assert_eq!(
+            h.dispatch(0, HvCall::P2mFree { mfn: 3 }),
+            Err(HvError::P2m(p2m::P2mError::NotYours))
+        );
+        // Release the type and the allocation reference, then the owner frees it.
+        h.dispatch(
+            1,
+            HvCall::P2mPutType {
+                mfn: 3,
+                ty: PageType::Writable,
+            },
+        )
+        .unwrap();
+        h.dispatch(1, HvCall::P2mPut { mfn: 3 }).unwrap();
+        assert!(h.dispatch(1, HvCall::P2mFree { mfn: 3 }).is_ok());
+        assert!(!h.p2m().is_allocated(3));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
     fn errors_are_tagged_by_subsystem() {
         let mut h = hv();
         assert_eq!(
@@ -489,6 +591,11 @@ mod tests {
                 }
             ),
             Err(HvError::Sched(sched::SchedError::WrongState))
+        );
+        // Getting a reference on an unallocated frame is a page-type WrongState.
+        assert_eq!(
+            h.dispatch(0, HvCall::P2mGet { mfn: 0 }),
+            Err(HvError::P2m(p2m::P2mError::WrongState))
         );
     }
 }
