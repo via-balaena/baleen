@@ -333,6 +333,34 @@ whole integrated core to depth 5 ≈ 1.40M) with zero violations.
   edge), the integrated-core sweep at 382,008 — all clean, zero violations. Finer/delegable
   privilege (a capability model, mutable privilege) and domain-ID reuse policy stay
   deferred; the lifecycle now has both a birth and a death to build them on.
+- **Finer / delegable privilege** *(landed)*: refine the coarse authority bit into a real
+  capability model, now that the lifecycle made authority stateful. One `privileged` bit
+  had bundled two powers — "may create domains" *and* "may destroy any domain" — so split
+  it. `may_create` (the honest residue, renamed from `privileged`, its invariant
+  `PrivilegedDeadDomain` → `DeadDomainMayCreate`) is a global capability gating only
+  creation, with the same provenance (only a `may_create` domain confers it, so none
+  self-elevates). **`controls[H][T]`** is the new *per-target* authority: H may destroy T
+  *specifically* — a capability over one named domain, not a blanket privilege. It is
+  **rooted in creation** (creating T grants the creator `controls[creator][T]`) and
+  **delegable** (`ControlGrant`/`ControlRevoke` hand it to, or take it from, another
+  domain). Pure **least-privilege**: no implicit transitivity, so a domain controls exactly
+  what it created or was delegated — dom0 holds *no* blanket power over a grandchild it did
+  not build. Destroy is gated on `controls[caller][target]` (or self), never a global bit;
+  a nice consequence is that a `Dead` domain has no controller, so destroying one is
+  `Denied`, indistinguishable from a live-but-uncontrolled peer (no liveness leak). New
+  standing invariant **`ControlEdgeDeadEndpoint`** — every control edge relates two `Live`
+  domains — and teardown clears every edge into *and* out of a domain, so **no capability
+  outlives the domain it named**. This is authority made fully invariant-bearing
+  (design-lessons #9/#10 carried to their conclusion): stateful, per-target, delegable, and
+  constrained. Flat delegation for now — any controller may delegate or revoke any edge,
+  sound because edges only ever trace back to a creation root; hierarchical (chain-restricted)
+  revocation is the deferred refinement. Model-checked exhaustively over every reachable edge
+  configuration: the lifecycle+delegation sweep closes complete at depth 12 (18,422 states),
+  the integrated core at depth 5 (415,417), grant↔p2m at depth 7 (738,897) — all zero
+  violations, with `run_destroy` and the fuzzer exercising create/destroy/delegate/revoke
+  and predicting every outcome. A domain **capability** delegable to specific peers is exactly
+  the toolstack-domain / driver-domain disaggregation Xen's XSM/Flask does coarsely — here it
+  is a checked invariant.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
   AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
