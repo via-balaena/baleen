@@ -757,7 +757,10 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
                     HvCall::GrantAccess {
                         gref,
                         grantee,
-                        frame: rng.below(64),
+                        // Grant a real machine frame (the caller must own it for a map
+                        // to take, so grants target the shared p2m frame set), coupling
+                        // the grant and page-type subsystems through the seam.
+                        frame: rng.below(FRAMES),
                         readonly: rng.below(2) == 0,
                     },
                 ));

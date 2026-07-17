@@ -58,6 +58,19 @@ pub type Frame = u32;
 /// another domain. Guests must not reuse freed handles, as in Xen.
 pub type GrantHandle = u32;
 
+/// What a successful [`System::unmap`] released: the frame the mapping was over and
+/// whether it was writable. Returned so an integrating layer (the hypervisor's
+/// grant↔page-type seam) can mirror the release into whatever else references the
+/// frame — a writable unmap must drop a writable *type* reference, a read-only one only
+/// an existence reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unmapped {
+    /// The machine frame the released mapping was over.
+    pub frame: Frame,
+    /// Whether the released mapping was writable.
+    pub writable: bool,
+}
+
 /// A grant-table entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GrantEntry {
@@ -251,8 +264,10 @@ impl System {
         Ok(handle)
     }
 
-    /// Grantee unmaps a mapping it owns, releasing its reference.
-    pub fn unmap(&mut self, grantee: DomId, handle: GrantHandle) -> Result<(), GrantError> {
+    /// Grantee unmaps a mapping it owns, releasing its reference. Returns what was
+    /// released (frame and writability) so a caller integrating grant tables with the
+    /// page-type counts can mirror exactly the reverse of what the map acquired.
+    pub fn unmap(&mut self, grantee: DomId, handle: GrantHandle) -> Result<Unmapped, GrantError> {
         let mapping = *self
             .maps
             .get(handle as usize)
@@ -263,12 +278,17 @@ impl System {
         if mapping.grantee != grantee {
             return Err(GrantError::NotYours);
         }
+        // The frame comes from the grant entry, which an active mapping always backs
+        // onto (the dangling-map invariant), so this pattern always matches.
+        let mut frame = 0;
         if let Ok(GrantEntry::Access {
+            frame: f,
             maps,
             writable_maps,
             ..
         }) = self.entry_mut(mapping.grantor, mapping.gref)
         {
+            frame = *f;
             *maps = maps.saturating_sub(1);
             if mapping.writable {
                 *writable_maps = writable_maps.saturating_sub(1);
@@ -276,7 +296,10 @@ impl System {
         }
         self.maps[handle as usize].active = false;
         self.check_invariants();
-        Ok(())
+        Ok(Unmapped {
+            frame,
+            writable: mapping.writable,
+        })
     }
 
     /// A transient grant-checked access (Xen's `GNTTABOP_copy`): validates the same
@@ -317,6 +340,16 @@ impl System {
     pub fn map_count(&self, grantor: DomId, gref: GrantRef) -> Option<u32> {
         match self.entry(grantor, gref) {
             Ok(GrantEntry::Access { maps, .. }) => Some(*maps),
+            _ => None,
+        }
+    }
+
+    /// The live *writable* map count of a grant, if it is active. Used by the
+    /// hypervisor's grant↔page-type cross-check to confirm every writable mapping is
+    /// backed by a writable-type reference on the frame.
+    pub fn writable_map_count(&self, grantor: DomId, gref: GrantRef) -> Option<u32> {
+        match self.entry(grantor, gref) {
+            Ok(GrantEntry::Access { writable_maps, .. }) => Some(*writable_maps),
             _ => None,
         }
     }
