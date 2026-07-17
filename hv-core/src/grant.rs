@@ -426,6 +426,16 @@ impl System {
         }
     }
 
+    /// The domain a grant names as its grantee, if it is active. Lets the seam reason
+    /// about *who* a grant authorizes (e.g. whether revoking it would strand a specific
+    /// domain's foreign page-table entry), without exposing the entry internals.
+    pub fn grantee_of(&self, grantor: DomId, gref: GrantRef) -> Option<DomId> {
+        match self.entry(grantor, gref) {
+            Ok(GrantEntry::Access { grantee, .. }) => Some(*grantee),
+            _ => None,
+        }
+    }
+
     /// The frame a grant offers, if it is active.
     pub fn granted_frame(&self, grantor: DomId, gref: GrantRef) -> Option<Frame> {
         match self.entry(grantor, gref) {

@@ -556,14 +556,19 @@ impl Hypervisor {
     }
 
     /// Revoke a grant — unless a *foreign page-table entry* still relies on it. A grant is
-    /// the authorization behind a cross-domain page-table link; revoking it while such a
-    /// link is live would strand the mapping unauthorized, so the seam refuses (the
-    /// grant's frame is still in use), exactly as `grant.end_access` already refuses while
-    /// a live grant *map* stands. With no foreign link depending, the grant subsystem's
-    /// own checks (bad ref, still-mapped) apply unchanged.
+    /// the authorization behind a cross-domain page-table link; revoking it while the
+    /// grantee still maps the frame would strand that mapping unauthorized, so the seam
+    /// refuses (the grant's frame is still in use), exactly as `grant.end_access` already
+    /// refuses while a live grant *map* stands. The block is keyed on *this grant's
+    /// grantee*: a different domain's grant of the same frame may still be revoked freely
+    /// (its grantee's mapping — if any — is authorized by its own grant, not this one). No
+    /// foreign link depending, and the grant subsystem's own checks apply unchanged.
     fn grant_end_access(&mut self, caller: DomId, gref: GrantRef) -> Result<HvOutcome, HvError> {
-        if let Some(frame) = self.grant.granted_frame(caller, gref) {
-            if self.p2m.is_foreign_linked(frame) {
+        if let (Some(frame), Some(grantee)) = (
+            self.grant.granted_frame(caller, gref),
+            self.grant.grantee_of(caller, gref),
+        ) {
+            if self.p2m.is_foreign_linked_by(frame, grantee) {
                 return Err(HvError::Grant(grant::GrantError::InUse));
             }
         }
@@ -1808,6 +1813,36 @@ mod tests {
         h.dispatch(0, HvCall::P2mUnlink { parent: 0, slot: 0 })
             .unwrap();
         assert!(h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }).is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn revoking_an_unrelated_grant_of_a_foreign_linked_frame_is_allowed() {
+        let mut h = hv();
+        foreign_link_stage(&mut h); // domain 1 grants frame 5 (gref 0) to domain 0
+                                    // Domain 1 *also* grants the same frame to domain 2 at gref 1.
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 1,
+                grantee: 2,
+                frame: 5,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        // Only domain 0 maps the frame into its table.
+        link5(&mut h).unwrap();
+
+        // Domain 2's grant does not back any live entry, so revoking it is allowed even
+        // though the frame is foreign-linked — the block is keyed on the grantee, not the
+        // frame. (The over-conservative version wrongly refused this.)
+        assert!(h.dispatch(1, HvCall::GrantEndAccess { gref: 1 }).is_ok());
+        // Domain 0's grant — the one that authorizes the live entry — is still refused.
+        assert_eq!(
+            h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }),
+            Err(HvError::Grant(grant::GrantError::InUse))
+        );
         assert!(h.invariants_hold());
     }
 

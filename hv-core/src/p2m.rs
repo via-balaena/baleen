@@ -783,6 +783,20 @@ impl System {
             .any(|l| l.active && l.child == frame && self.owner_of(l.parent) != owner)
     }
 
+    /// Whether `frame` is foreign-mapped *specifically by `linker`* — a live page-table
+    /// entry from one of `linker`'s tables onto `frame`, which `linker` does not own. Lets
+    /// the seam refuse revoking a grant only when *that grant's grantee* relies on it,
+    /// rather than any grant of the frame.
+    pub fn is_foreign_linked_by(&self, frame: Mfn, linker: DomId) -> bool {
+        let owner = self.owner_of(frame);
+        self.links.iter().any(|l| {
+            l.active
+                && l.child == frame
+                && self.owner_of(l.parent) == Some(linker)
+                && Some(linker) != owner
+        })
+    }
+
     /// Number of frames in the table.
     pub fn frame_count(&self) -> usize {
         self.frames.len()
