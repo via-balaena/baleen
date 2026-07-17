@@ -215,15 +215,19 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                 for slot in 0..2u32 {
                     v.push((caller, HvCall::P2mUnlink { parent: mfn, slot }));
                     for child in 0..cfg.frames as u32 {
-                        v.push((
-                            caller,
-                            HvCall::P2mLink {
-                                parent: mfn,
-                                slot,
-                                child,
-                                writable: true,
-                            },
-                        ));
+                        // Both a writable and a read-only leaf — the read-only one is the
+                        // linear-map case, a leaf that may point at a live page table.
+                        for &writable in &bools {
+                            v.push((
+                                caller,
+                                HvCall::P2mLink {
+                                    parent: mfn,
+                                    slot,
+                                    child,
+                                    writable,
+                                },
+                            ));
+                        }
                     }
                 }
             }

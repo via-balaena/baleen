@@ -1236,9 +1236,14 @@ pub struct PtabOutcome {
     pub l3: u32,
     pub l2: u32,
     pub l1: u32,
-    /// Frames typed writable — under this driver, the leaves an L1 table maps.
+    /// Frames typed writable — under this driver, the writable leaves an L1 table maps.
     pub leaves: u32,
     pub active_links: u32,
+    /// Read-only leaves installed onto a frame that was *already a page table* — the
+    /// linear-map case, where a guest maps one of its own tables read-only to read its
+    /// PTEs while the CPU still walks it. A witness that the read-only-onto-page-table
+    /// path (writable-xor-pagetable coexistence) is actually reached under interleaving.
+    pub ro_onto_pagetable: u32,
     /// Whether the whole-system page invariant — including hierarchical
     /// level-correctness — held after every step.
     pub invariants_hold: bool,
@@ -1265,38 +1270,58 @@ impl PtabOutcome {
     }
 }
 
-/// Try to install one valid page-table entry: pick a table `parent`, a free `slot`, and
-/// an *untyped* `child` the same domain owns, and link them. Choosing an untyped child
-/// means the link always establishes it one level down, so the driver actually grows
-/// trees rather than bouncing off type conflicts. On success the `(parent, slot)` edge is
-/// recorded so a later step can unlink it.
-fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) {
+/// Try to install one valid page-table entry: pick a table `parent`, a free `slot`, a
+/// `child` the same domain owns, and link them. Returns `true` iff it installed a
+/// *read-only leaf onto a frame that was already a page table* — the linear-map case.
+///
+/// A seed bit chooses read-only or writable. A **writable** entry (or any interior one)
+/// needs an *untyped* child, so the link establishes it one level down and the driver
+/// grows L4→…→leaf trees rather than bouncing off type conflicts. A **read-only leaf**
+/// (under an `L1`) imposes no type, so it may point at *any* frame the owner holds —
+/// including one already typed as a page table, exercising the read-only-view-of-a-table
+/// coexistence. On success the `(parent, slot)` edge is recorded for a later unlink.
+fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) -> bool {
     // Candidate parents: any frame currently typed as a page table.
     let parents: Vec<u32> = (0..sys.frame_count() as u32)
         .filter(|&m| matches!(sys.current_type(m), Some(PageType::PageTable(_))))
         .collect();
     if parents.is_empty() {
-        return;
+        return false;
     }
     let parent = parents[rng.below(parents.len() as u32) as usize];
     let slot = rng.below(p2m::TABLE_SLOTS);
     if sys.child_at(parent, slot).is_some() {
-        return; // slot occupied — leave it for another step
+        return false; // slot occupied — leave it for another step
     }
     let owner = match sys.owner_of(parent) {
         Some(o) => o,
-        None => return,
+        None => return false,
     };
-    // Candidate children: untyped frames the same domain owns, other than the parent.
+    // A read-only *leaf* (only meaningful under an L1 parent) may point at any allocated
+    // frame; every other entry needs an untyped child to establish the level below.
+    let ro_leaf =
+        rng.below(2) == 0 && sys.current_type(parent) == Some(PageType::PageTable(PtLevel::L1));
     let children: Vec<u32> = (0..sys.frame_count() as u32)
-        .filter(|&m| m != parent && sys.owner_of(m) == Some(owner) && sys.current_type(m).is_none())
+        .filter(|&m| {
+            m != parent
+                && sys.owner_of(m) == Some(owner)
+                && if ro_leaf {
+                    sys.is_allocated(m)
+                } else {
+                    sys.current_type(m).is_none()
+                }
+        })
         .collect();
     if children.is_empty() {
-        return;
+        return false;
     }
     let child = children[rng.below(children.len() as u32) as usize];
-    if sys.link(owner, parent, slot, child, true).is_ok() {
+    let onto_pagetable = ro_leaf && matches!(sys.current_type(child), Some(PageType::PageTable(_)));
+    if sys.link(owner, parent, slot, child, !ro_leaf).is_ok() {
         links.push((parent, slot));
+        onto_pagetable
+    } else {
+        false
     }
 }
 
@@ -1316,6 +1341,7 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
     let mut links: Vec<(u32, u32)> = Vec::new(); // (parent, slot) of live edges to unlink
 
     let mut invariants_hold = true;
+    let mut ro_onto_pagetable = 0u32;
     for _ in 0..steps {
         let mfn = rng.below(FRAMES);
         match rng.below(8) {
@@ -1329,7 +1355,9 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
                     let _ = sys.pin(owner, mfn, pt_level(rng.below(4)));
                 }
             }
-            2..=4 => try_link(&mut sys, &mut rng, &mut links),
+            2..=4 => {
+                ro_onto_pagetable += try_link(&mut sys, &mut rng, &mut links) as u32;
+            }
             5 => {
                 if !links.is_empty() {
                     let idx = rng.below(links.len() as u32) as usize;
@@ -1353,7 +1381,10 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
         invariants_hold &= sys.invariants_hold();
     }
 
-    PtabOutcome::of(&sys, invariants_hold)
+    PtabOutcome {
+        ro_onto_pagetable,
+        ..PtabOutcome::of(&sys, invariants_hold)
+    }
 }
 
 /// A census of a finished cross-domain page-table run. The counts are *observed
@@ -1363,7 +1394,13 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
 pub struct ForeignOutcome {
     /// Cross-domain entries successfully installed (a domain mapped another's frame).
     pub links: u32,
-    /// Foreign links refused for want of a grant (`HvError::Unauthorized`).
+    /// Of those, the *read-only* ones — a foreign leaf authorized by any grant (contrast
+    /// a writable leaf, which needs a read-write grant). A witness that the read-only
+    /// cross-domain path is reached, not just the writable one.
+    pub ro_links: u32,
+    /// Foreign links refused for want of a grant of matching permission
+    /// (`HvError::Unauthorized`) — no grant at all, or a writable entry over a read-only
+    /// grant.
     pub unauthorized: u32,
     /// Grant revocations refused because a live foreign entry still relied on the grant.
     pub revoke_blocks: u32,
@@ -1374,11 +1411,13 @@ pub struct ForeignOutcome {
 
 /// Drive the integrated [`Hypervisor`] through a seed-derived stream *biased to exercise
 /// cross-domain page-table sharing*. Two domains each own an `L1` table; the loop grants
-/// data frames across the domain boundary, maps granted foreign frames into the other
-/// domain's table, unlinks them, and revokes grants. It also attempts *unauthorized*
-/// foreign links (no grant) to witness the isolation guard firing. The authorization
-/// invariant — every cross-domain entry backed by a live grant — is checked after every
-/// step, so a breach surfaces here with the seed as the whole reproducer.
+/// data frames across the domain boundary — read-only or read-write by a seed bit — maps
+/// granted foreign frames into the other domain's table at a seed-chosen access, unlinks
+/// them, and revokes grants. It also attempts *unauthorized* foreign links (no grant, or a
+/// writable entry over a read-only grant) to witness the isolation guard firing. The
+/// authorization invariant — every cross-domain entry backed by a grant of matching
+/// permission — is checked after every step, so a breach surfaces here with the seed as
+/// the whole reproducer.
 pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
     const DOMAINS: u16 = 2;
     const GRANTS: u32 = 6;
@@ -1424,6 +1463,9 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                 let grantor = (frame % u32::from(DOMAINS)) as u16;
                 let grantee = 1 - grantor;
                 let gref = rng.below(GRANTS);
+                // A read-only grant authorizes only a read-only entry; a read-write one
+                // authorizes both. Choosing here exercises both authorization paths.
+                let readonly = rng.below(2) == 0;
                 if hv
                     .dispatch(
                         grantor,
@@ -1431,7 +1473,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                             gref,
                             grantee,
                             frame,
-                            readonly: false,
+                            readonly,
                         },
                     )
                     .is_ok()
@@ -1457,26 +1499,33 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                 }
             }
             2 | 3 => {
-                // Map a granted foreign frame into the grantee's table.
+                // Map a granted foreign frame into the grantee's table, at a seed-chosen
+                // access. A writable entry over a read-only grant is refused
+                // (Unauthorized); a read-only entry is authorized by any grant.
                 if !grants.is_empty() {
                     let idx = rng.below(grants.len() as u32) as usize;
                     let (_grantor, _gref, grantee, frame) = grants[idx];
                     let parent = table_of(grantee);
                     let slot = rng.below(8);
-                    if hv
-                        .dispatch(
-                            grantee,
-                            HvCall::P2mLink {
-                                parent,
-                                slot,
-                                child: frame,
-                                writable: true,
-                            },
-                        )
-                        .is_ok()
-                    {
-                        out.links += 1;
-                        links.push((grantee, parent, slot));
+                    let writable = rng.below(2) == 0;
+                    match hv.dispatch(
+                        grantee,
+                        HvCall::P2mLink {
+                            parent,
+                            slot,
+                            child: frame,
+                            writable,
+                        },
+                    ) {
+                        Ok(_) => {
+                            out.links += 1;
+                            if !writable {
+                                out.ro_links += 1;
+                            }
+                            links.push((grantee, parent, slot));
+                        }
+                        Err(hv_core::HvError::Unauthorized) => out.unauthorized += 1,
+                        Err(_) => {}
                     }
                 }
             }
@@ -2053,6 +2102,13 @@ mod tests {
             ("L1", outcomes.iter().any(|o| o.l1 > 0)),
             ("leaf", outcomes.iter().any(|o| o.leaves > 0)),
             ("edge", outcomes.iter().any(|o| o.active_links > 0)),
+            // The read-only leaf onto a live page table — the linear-map coexistence.
+            // Without this, the loosened invariant would be proving itself over a case
+            // the driver never actually reaches.
+            (
+                "ro-onto-pagetable",
+                outcomes.iter().any(|o| o.ro_onto_pagetable > 0),
+            ),
         ] {
             assert!(reached, "no seed ever produced a {name} — driver too weak");
         }
@@ -2093,6 +2149,10 @@ mod tests {
         assert!(
             outcomes.iter().any(|o| o.links > 0),
             "no seed ever installed a cross-domain entry — driver too weak"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.ro_links > 0),
+            "no seed ever installed a read-only cross-domain entry — the RO path is uncovered"
         );
         assert!(
             outcomes.iter().any(|o| o.unauthorized > 0),

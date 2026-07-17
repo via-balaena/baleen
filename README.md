@@ -106,8 +106,8 @@ configuration it breadth-first visits *every* reachable state and checks the
 integrated invariant at each — a proof, not a sample, that no reachable state can
 break it. CI runs shallow per-seam sweeps in seconds; the deep on-demand sweeps
 (`cargo test --release -- --ignored`) have exhaustively cleared **millions** of
-distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 1.4M states, the
-whole integrated core to depth 5 ≈ 0.8M) with zero violations.
+distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 1.14M states, the
+whole integrated core to depth 5 ≈ 1.40M) with zero violations.
 
 ## Milestones
 
@@ -247,11 +247,11 @@ whole integrated core to depth 5 ≈ 0.8M) with zero violations.
   foreign child (enforcing only the type discipline — the foreign frame is kept alive and
   write-locked, so its owner can neither free nor re-type it while the entry maps it), and
   the dispatch seam adds the **authorization** it is blind to. A cross-domain entry is
-  allowed only when the frame's owner has granted it read-write to the mapping domain
+  allowed only when the frame's owner has granted it to the mapping domain
   (`grant::authorizes`) — Xen's grant-mapped foreign page — and is restricted to `L1`
   leaves (sharing a page-table *node* is deferred). A grant can't be revoked while a
   foreign entry relies on it (the frame is in use), and the new cross-subsystem invariant
-  **every cross-domain entry is backed by a live read-write grant**
+  **every cross-domain entry is backed by a live grant of matching permission**
   (`CrossViolation::UnauthorizedForeignLink`) is checked after every dispatch — the
   page-table↔grant join, the core's *third* cross-subsystem seam. It extends domain
   teardown too: a domain whose frame is foreign-mapped can't be destroyed
@@ -259,8 +259,21 @@ whole integrated core to depth 5 ≈ 0.8M) with zero violations.
   while a mapper's own foreign entries are released by the existing `unlink_all`. Holds
   across 10k seeds (`run_foreign` grants, maps, unlinks, and revokes across the domain
   boundary, reaching the authorized, unauthorized, and revoke-blocked paths) and is fuzzed
-  through the integrated target. Read-only foreign leaves and shared page-table nodes
-  deferred.
+  through the integrated target.
+- **Read-only page-table leaves** *(landed)*: an `L1` leaf now carries the paging
+  read/write bit, which sharpens the central exclusivity rule from "no reference coexists
+  with a page-table type" to its exact content: **write-xor-pagetable**. A *writable* leaf
+  holds a `Writable` type reference on its child (so it can never also be a page table); a
+  *read-only* leaf holds only a bare existence reference — a reader is type-agnostic,
+  exactly as a read-only grant map already is — so it may point at **any** allocated frame,
+  including a live page table. That is the *linear-map* case a guest reading its own page
+  tables depends on, and it is safe precisely because neither path can write the frame. The
+  seam authorizes a foreign leaf at its *matching* permission (a read-write grant for a
+  writable entry, any grant for a read-only one), refining `UnauthorizedForeignLink`. The
+  read-only transition is model-checked exhaustively (the grant↔p2m sweep closes at depth 7
+  over ≈1.14M states, zero violations, with read-only-onto-page-table reached), witnessed
+  by the seeded `run_ptab`/`run_foreign` drivers, and fuzzed. Shared page-table *nodes*
+  (foreign interior entries, not just leaves) remain deferred.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into
