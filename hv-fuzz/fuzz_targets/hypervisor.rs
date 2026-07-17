@@ -13,11 +13,13 @@
 //! deliverable event is left on a `Blocked` vCPU. Unlike the per-subsystem targets, this
 //! one explores cross-subsystem interleavings — both seams the `Hypervisor` owns:
 //! `EvtchnSend`/`EvtchnUnmask`/`SchedBlock` route through the event↔scheduler seam, so a
-//! *lost wakeup* is caught here too. `DomainDestroy` is the whole-domain teardown that
-//! welds all four subsystems and both seams at once — refused when a foreign domain
-//! holds a live map, tearing the domain to an empty shell otherwise — so a mis-ordered
-//! teardown trips the same combined invariant. The seeded mirrors in `hv-sim`
-//! (`run_hypervisor` broadly, `run_seam` wake-biased, `run_destroy` teardown-biased)
+//! *lost wakeup* is caught here too. `P2mLink`/`P2mUnlink` build and dismantle multi-level
+//! page tables, so a *mislevelled* entry (a table pointing at a frame of the wrong level)
+//! is caught by the same invariant. `DomainDestroy` is the whole-domain teardown that
+//! welds all four subsystems and both seams at once — refused when a foreign domain holds
+//! a live map, tearing the domain to an empty shell otherwise — so a mis-ordered teardown
+//! trips the same combined invariant. The seeded mirrors in `hv-sim` (`run_hypervisor`
+//! broadly, `run_seam` wake-biased, `run_ptab` tree-building, `run_destroy` teardown-biased)
 //! make the properties deterministic.
 //!
 //! Run it (needs nightly + `cargo install cargo-fuzz`):
@@ -30,7 +32,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use hv_core::p2m::PtLevel;
+use hv_core::p2m::{PtLevel, TABLE_SLOTS};
 use hv_core::{HvCall, HvOutcome, Hypervisor};
 
 fn pt_level(n: u8) -> PtLevel {
@@ -65,9 +67,11 @@ fuzz_target!(|data: &[u8]| {
         let vcpu = u32::from(a) % VCPUS as u32;
         let pcpu = u32::from(b) % PCPUS as u32;
         let mfn = u32::from(a) % FRAMES as u32;
+        let child = u32::from(b) % FRAMES as u32;
+        let slot = u32::from(a) % TABLE_SLOTS;
         now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 26 {
+        let call = match op % 28 {
             0 => HvCall::CreditGrant { amount: u32::from(a) },
             1 => HvCall::CreditSpend { amount: u32::from(a) },
             2 => HvCall::EvtchnAllocUnbound { remote: other },
@@ -108,6 +112,10 @@ fuzz_target!(|data: &[u8]| {
             22 => HvCall::P2mFree { mfn },
             23 => HvCall::P2mPin { mfn, level: pt_level(b) },
             24 => HvCall::P2mUnpin { mfn },
+            // Page-table entries — build and dismantle the hierarchy. A mislevelled link
+            // is refused at the seam, so only well-formed edges ever take.
+            25 => HvCall::P2mLink { parent: mfn, slot, child },
+            26 => HvCall::P2mUnlink { parent: mfn, slot },
             // Tear a whole domain down — all four subsystems and both seams at once.
             // Stale handles it leaves behind are already tolerated by the unmap arm.
             _ => HvCall::DomainDestroy { target: other, now },

@@ -214,6 +214,25 @@ one-line regression test, not a Heisenbug.
   builds domains up and tears them down mid-flight, reaching both the busy-refusal and
   clean-teardown paths) and is fuzzed through the integrated target. Privilege and
   domain-ID reuse are deferred (no domain *creation* yet).
+- **Multi-level page tables** *(landed)*: deepen `p2m` from a single page-table type into
+  the full four-level hierarchy (Xen's `PGT_l1..l4`). A page-table type now carries its
+  paging **level**, and the write-xor invariant generalizes to per-level exclusivity: a
+  frame is referenced as at most one of {writable, L1, L2, L3, L4}. On top of that sits
+  the genuinely new invariant — **hierarchical type-correctness**: `P2mLink`/`P2mUnlink`
+  install and remove page-table *entries*, stored as explicit edges, and **every live
+  entry must point exactly one level down** (an Lk table's entries reference L(k-1)
+  tables; an L1's reference writable leaves). It holds by construction — a link takes a
+  `get_type` reference on the child at the required level, so a mislevelled entry (a
+  writable page where a table belongs, a table at the wrong level) is refused before any
+  edge is recorded — and it is checked as a standing predicate (`MislevelledLink`) after
+  every transition. A link also self-references its parent, so a table stays typed while
+  it has any entry: it can't be freed, re-typed, or stranded under its children, and the
+  child can't be re-typed or freed under its parent. Because a child always sits one level
+  *below* its parent, the page-table graph is a DAG of depth ≤ 4 — no cycle is even
+  representable. Holds across 10k seeds (`run_ptab` builds L4→L3→L2→L1→leaf trees and tears
+  them down, reaching every level), is fuzzed through the integrated target, and folds
+  into domain teardown (which unlinks a domain's whole tree before reclaiming its frames).
+  Cross-domain shared page tables are deferred.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

@@ -1227,6 +1227,135 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
     out
 }
 
+/// A census of a finished page-table run: how many frames ended up typed at each paging
+/// level, how many ordinary leaves, the live edge count, and whether the hierarchical
+/// invariant held after every step.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PtabOutcome {
+    pub l4: u32,
+    pub l3: u32,
+    pub l2: u32,
+    pub l1: u32,
+    /// Frames typed writable — under this driver, the leaves an L1 table maps.
+    pub leaves: u32,
+    pub active_links: u32,
+    /// Whether the whole-system page invariant — including hierarchical
+    /// level-correctness — held after every step.
+    pub invariants_hold: bool,
+}
+
+impl PtabOutcome {
+    fn of(sys: &p2m::System, invariants_hold: bool) -> Self {
+        let mut o = PtabOutcome {
+            invariants_hold,
+            active_links: sys.active_links() as u32,
+            ..PtabOutcome::default()
+        };
+        for mfn in 0..sys.frame_count() as u32 {
+            match sys.current_type(mfn) {
+                Some(PageType::PageTable(PtLevel::L4)) => o.l4 += 1,
+                Some(PageType::PageTable(PtLevel::L3)) => o.l3 += 1,
+                Some(PageType::PageTable(PtLevel::L2)) => o.l2 += 1,
+                Some(PageType::PageTable(PtLevel::L1)) => o.l1 += 1,
+                Some(PageType::Writable) => o.leaves += 1,
+                None => {}
+            }
+        }
+        o
+    }
+}
+
+/// Try to install one valid page-table entry: pick a table `parent`, a free `slot`, and
+/// an *untyped* `child` the same domain owns, and link them. Choosing an untyped child
+/// means the link always establishes it one level down, so the driver actually grows
+/// trees rather than bouncing off type conflicts. On success the `(parent, slot)` edge is
+/// recorded so a later step can unlink it.
+fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) {
+    // Candidate parents: any frame currently typed as a page table.
+    let parents: Vec<u32> = (0..sys.frame_count() as u32)
+        .filter(|&m| matches!(sys.current_type(m), Some(PageType::PageTable(_))))
+        .collect();
+    if parents.is_empty() {
+        return;
+    }
+    let parent = parents[rng.below(parents.len() as u32) as usize];
+    let slot = rng.below(p2m::TABLE_SLOTS);
+    if sys.child_at(parent, slot).is_some() {
+        return; // slot occupied — leave it for another step
+    }
+    let owner = match sys.owner_of(parent) {
+        Some(o) => o,
+        None => return,
+    };
+    // Candidate children: untyped frames the same domain owns, other than the parent.
+    let children: Vec<u32> = (0..sys.frame_count() as u32)
+        .filter(|&m| m != parent && sys.owner_of(m) == Some(owner) && sys.current_type(m).is_none())
+        .collect();
+    if children.is_empty() {
+        return;
+    }
+    let child = children[rng.below(children.len() as u32) as usize];
+    if sys.link(owner, parent, slot, child).is_ok() {
+        links.push((parent, slot));
+    }
+}
+
+/// Drive the page-type [`p2m::System`] through a seed-derived stream that *builds
+/// page-table trees*: allocate frames, pin some as roots at each of the four levels, and
+/// link untyped children one level down to grow L4→L3→L2→L1→leaf chains, unlinking and
+/// freeing as it goes. This is where the hierarchical type invariant — every entry points
+/// exactly one level down — is stress-tested under interleaving: the core's `debug_assert!`
+/// fires on every transition, so a mislevelled edge surfaces here with the seed as the
+/// whole reproducer. This is the multi-level cousin of the write-xor stress in [`run_p2m`].
+pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
+    const DOMAINS: u16 = 2;
+    const FRAMES: u32 = 8;
+
+    let mut sys = p2m::System::new(DOMAINS as usize, FRAMES as usize);
+    let mut rng = Prng::new(seed);
+    let mut links: Vec<(u32, u32)> = Vec::new(); // (parent, slot) of live edges to unlink
+
+    let mut invariants_hold = true;
+    for _ in 0..steps {
+        let mfn = rng.below(FRAMES);
+        match rng.below(8) {
+            0 => {
+                let owner = rng.below(u32::from(DOMAINS)) as u16;
+                let _ = sys.allocate(owner, mfn);
+            }
+            1 => {
+                // Pin an untyped frame as a fresh root at a seed-chosen level.
+                if let Some(owner) = sys.owner_of(mfn) {
+                    let _ = sys.pin(owner, mfn, pt_level(rng.below(4)));
+                }
+            }
+            2..=4 => try_link(&mut sys, &mut rng, &mut links),
+            5 => {
+                if !links.is_empty() {
+                    let idx = rng.below(links.len() as u32) as usize;
+                    let (parent, slot) = links.swap_remove(idx);
+                    if let Some(owner) = sys.owner_of(parent) {
+                        let _ = sys.unlink(owner, parent, slot);
+                    }
+                }
+            }
+            6 => {
+                if let Some(owner) = sys.owner_of(mfn) {
+                    let _ = sys.unpin(owner, mfn);
+                }
+            }
+            _ => {
+                if let Some(owner) = sys.owner_of(mfn) {
+                    let _ = sys.free(owner, mfn);
+                }
+            }
+        }
+        invariants_hold &= sys.invariants_hold();
+    }
+
+    PtabOutcome::of(&sys, invariants_hold)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1722,5 +1851,50 @@ mod tests {
             outcomes.iter().any(|o| o.busy_refusals > 0),
             "no seed ever hit a busy-refusal — the refuse-if-busy path is uncovered"
         );
+    }
+
+    /// The multi-level page-table headline: no seeded interleaving of allocate/pin/link/
+    /// unlink/free ever breaks the page invariants — including the hierarchy, that every
+    /// live entry points exactly one paging level down. `invariants_hold` is evaluated in
+    /// release too, so this bites in any profile.
+    #[test]
+    fn ptab_invariants_hold_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            assert!(
+                run_ptab(seed, 256).invariants_hold,
+                "page-table hierarchy invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the page-table driver: same seed, same census exactly.
+    #[test]
+    fn ptab_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_ptab(seed, 256),
+                run_ptab(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The driver genuinely reaches real depth across the seed space: tables appear at
+    /// *every* level and ordinary leaves under L1s, and some run stands up a live edge.
+    /// If a level never appeared, the hierarchy invariant above would be proving itself
+    /// over trees the driver never actually builds.
+    #[test]
+    fn ptab_reaches_every_level() {
+        let outcomes: Vec<_> = (0..512u64).map(|s| run_ptab(s, 256)).collect();
+        for (name, reached) in [
+            ("L4", outcomes.iter().any(|o| o.l4 > 0)),
+            ("L3", outcomes.iter().any(|o| o.l3 > 0)),
+            ("L2", outcomes.iter().any(|o| o.l2 > 0)),
+            ("L1", outcomes.iter().any(|o| o.l1 > 0)),
+            ("leaf", outcomes.iter().any(|o| o.leaves > 0)),
+            ("edge", outcomes.iter().any(|o| o.active_links > 0)),
+        ] {
+            assert!(reached, "no seed ever produced a {name} — driver too weak");
+        }
     }
 }
