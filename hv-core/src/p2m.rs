@@ -182,13 +182,17 @@ struct Link {
     slot: u32,
     child: Mfn,
     /// Whether this entry maps its child *writably* — the paging entry's read/write bit.
-    /// Only meaningful for a leaf (an entry under an `L1` table); an interior entry always
-    /// references a page-table child regardless. A *writable* leaf holds a
-    /// [`PageType::Writable`] type reference on its child (so the child can never
-    /// simultaneously be a page table); a *read-only* leaf holds only a bare existence
-    /// reference — a reader is type-agnostic — exactly as a read-only grant map does. That
-    /// is what lets a read-only leaf point at a page table (the guest reading its own page
-    /// tables through the linear map) while the writable-xor-pagetable rule still holds.
+    /// For a leaf (an entry under an `L1` table) it drives the *type* taken on the child: a
+    /// *writable* leaf holds a [`PageType::Writable`] type reference on its child (so the
+    /// child can never simultaneously be a page table); a *read-only* leaf holds only a
+    /// bare existence reference — a reader is type-agnostic — exactly as a read-only grant
+    /// map does. That is what lets a read-only leaf point at a page table (the guest reading
+    /// its own page tables through the linear map) while the writable-xor-pagetable rule
+    /// still holds. For an *interior* entry the child is always a page-table node, so the
+    /// bit changes nothing about the type taken (never [`PageType::Writable`]); it is still
+    /// recorded because the integrating seam reads it to authorize a *foreign* entry at any
+    /// level (a read-write grant for a writable entry, any grant for a read-only one), and
+    /// on an interior entry it is the traversal read/write bit the MMU ANDs down the walk.
     writable: bool,
 }
 
@@ -668,8 +672,13 @@ impl System {
     /// entries pin and can then be unpinned and freed. Order-independent: a table keeps
     /// its page-table type as long as it has any live entry (each entry pins it), so
     /// every [`Self::unlink`] here finds its parent still a valid table and succeeds by
-    /// construction. Links are intra-domain (a link's parent and child share an owner),
-    /// so this touches nothing another domain holds.
+    /// construction. Keyed on the *parent*'s owner, so this releases every edge `owner`'s
+    /// tables hold — including its *outward foreign* edges (a leaf onto, or a node share
+    /// of, another domain's frame), dropping the reference each held on its child whoever
+    /// owns it. It never touches an edge whose parent another domain owns, so a *foreign*
+    /// domain's share of one of `owner`'s frames is left intact — which is exactly why
+    /// teardown refuses up front while such an inward foreign link stands
+    /// ([`Self::has_foreign_link_into`]).
     pub fn unlink_all(&mut self, owner: DomId) {
         for idx in 0..self.links.len() {
             let link = self.links[idx];

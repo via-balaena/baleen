@@ -131,7 +131,12 @@ pub enum HvCall {
     /// read-only (which may even point at a page table — the linear-map view). The caller
     /// must own `parent`; `child` may be a frame *another domain owns*, if that owner has
     /// granted it to the caller with matching permission (a read-write grant for a
-    /// writable entry, any grant for a read-only one).
+    /// writable entry, any grant for a read-only one). A foreign child may sit at **any**
+    /// level: a leaf shares a data page, an interior entry (`parent` an `Lk`, `k >= 2`)
+    /// shares the owner's `L(k-1)` *node* — and, transitively, the whole subtree beneath
+    /// it — the mechanism behind a shared address space. For an interior entry `writable`
+    /// is the traversal read/write bit the MMU ANDs down the walk; it gates the grant
+    /// permission required but never gives a writable-*type* reference on the node.
     P2mLink {
         parent: Mfn,
         slot: u32,
@@ -246,10 +251,12 @@ pub enum HvError {
     DomainBusy,
     /// A page-table entry into a frame another domain owns was refused: the caller holds
     /// no grant of that frame from its owner of the permission the entry needs — a
-    /// read-write grant for a writable entry, any grant for a read-only one — or tried to
-    /// share a page-table node rather than map a leaf. Cross-domain page-table sharing
-    /// needs the owner's consent, which a grant expresses — the isolation guard on the
-    /// page-table↔grant join, so it belongs to the seam.
+    /// read-write grant for a writable entry, any grant for a read-only one. This covers
+    /// both a foreign *leaf* (mapping another domain's data page) and a foreign *interior*
+    /// entry (sharing another domain's page-table node, and with it the subtree beneath):
+    /// either way cross-domain page-table sharing needs the owner's consent, which a grant
+    /// expresses — the isolation guard on the page-table↔grant join, so it belongs to the
+    /// seam.
     Unauthorized,
     /// A whole-domain *control* operation was refused for want of authority. Two axes:
     /// creating a domain ([`HvCall::DomainCreate`]) requires the global `may_create`
@@ -297,9 +304,13 @@ pub enum CrossViolation {
     /// A cross-domain page-table entry — a table maps a frame *another* domain owns —
     /// stands with no grant of matching permission from that owner to the mapping domain
     /// authorizing it (a read-write grant for a writable entry, any grant for a read-only
-    /// one). The isolation breach the page-table↔grant join exists to prevent: a domain
-    /// reaching into another's memory through its page tables without consent (or holding
-    /// the mapping after the grant was revoked).
+    /// one). Scanned for **every** edge at **every** level, so it covers a foreign *leaf*
+    /// (mapping a data page) and a foreign *interior* node (sharing a subtree) alike — a
+    /// node share is authorized by the one boundary-crossing edge, since the owner's own
+    /// subtree edges beneath are same-owner and need no grant (transitive consent). The
+    /// isolation breach the page-table↔grant join exists to prevent: a domain reaching
+    /// into another's memory through its page tables without consent (or holding the
+    /// mapping after the grant was revoked).
     UnauthorizedForeignLink { parent: Mfn, child: Mfn },
     /// A `Dead` domain that is not a clean shell — it still owns a frame, offers or holds a
     /// grant, has a non-`Free` port, or an online vCPU. A `Dead` slot must be provably
@@ -669,12 +680,31 @@ impl Hypervisor {
     /// frame is a plain [`crate::p2m::System::link`]. An entry into a frame *another
     /// domain owns* is only permitted when that owner has granted the frame to the caller
     /// with *matching* permission ([`grant::System::authorizes`]): a **writable** foreign
-    /// leaf needs a read-write grant, a **read-only** one only a read-only grant — a
-    /// domain cannot map a foreign page into its address space, at a given access, without
-    /// the owner's consent to that access. Foreign entries are leaves (an `L1` table maps
-    /// a data page), so a foreign child must go under an `L1` — sharing whole page-table
-    /// *subtrees* across domains is a later refinement. `p2m` enforces the type discipline;
-    /// this seam adds the authorization it is deliberately blind to.
+    /// entry needs a read-write grant, a **read-only** one only a read-only grant — a
+    /// domain cannot reach a foreign frame through its page tables, at a given access,
+    /// without the owner's consent to that access.
+    ///
+    /// The foreign child may sit at **any** paging level — it is not restricted to a leaf.
+    /// A foreign **leaf** (under an `L1`) maps another domain's data page; a foreign
+    /// **interior** entry (an `Lk`, `k >= 2`, pointing at the owner's `L(k-1)` node) shares
+    /// a whole page-table *subtree* — the mechanism behind a shared address space. The
+    /// authorization is *uniform across levels*: one grant of the child frame, at matching
+    /// permission, whether the child is a data page or a table node. Sharing a node is
+    /// **transitive consent**: the grant of the node frame authorizes the caller's walk
+    /// into the entire subtree beneath it, because every edge *inside* the owner's subtree
+    /// is same-owner and so needs no grant — only the one boundary-crossing edge does. The
+    /// `writable` bit on an interior entry is its read/write bit, an upper bound on the
+    /// caller's access that the MMU ANDs down the walk (past the fence); it never grants a
+    /// writable *type* reference on the node (a node is always typed as a page table), so a
+    /// read-only node grant can never yield write access to the leaves beneath.
+    ///
+    /// The grant and (for a foreign child) nothing else is checked *before* touching p2m,
+    /// so an unauthorized link is a no-op. `p2m` enforces the type discipline — including
+    /// carrying the levelling across the domain boundary (a foreign interior child must be,
+    /// or become, exactly the level below the parent) — and this seam adds the
+    /// authorization it is deliberately blind to. The standing
+    /// [`CrossViolation::UnauthorizedForeignLink`] invariant re-checks this authorization
+    /// for every edge at every level after the fact.
     fn p2m_link(
         &mut self,
         caller: DomId,
@@ -685,13 +715,15 @@ impl Hypervisor {
     ) -> Result<HvOutcome, HvError> {
         if let Some(owner) = self.p2m.owner_of(child) {
             if owner != caller {
-                // A foreign entry: it must be an authorized L1 leaf. Check the grant and
-                // the level *before* touching p2m, so an unauthorized link is a no-op. The
-                // grant must cover the entry's access — a writable entry needs a
-                // read-write grant, a read-only entry any grant of the frame.
-                if self.p2m.current_type(parent) != Some(PageType::PageTable(PtLevel::L1)) {
-                    return Err(HvError::Unauthorized);
-                }
+                // A foreign entry — a leaf onto a foreign data page, or an interior entry
+                // onto a foreign node (sharing that node's subtree). Either way it needs
+                // the owner's consent: a grant of the child frame at matching permission (a
+                // read-write grant for a writable entry, any grant for a read-only one),
+                // uniform across every paging level. Checked before touching p2m, so an
+                // unauthorized link is a no-op. The old leaf-only restriction (parent must
+                // be an `L1`) is gone: the type discipline in `p2m.link` carries the
+                // levelling across the boundary, so an `Lk`→foreign-`L(k-1)` node share is
+                // as sound as a leaf, and this same authorization covers it.
                 if !self.grant.authorizes(owner, caller, child, writable) {
                     return Err(HvError::Unauthorized);
                 }
@@ -2326,23 +2358,14 @@ mod tests {
             },
         )
         .unwrap();
-        // No grant → no authority to map domain 1's page.
+        // No grant → no authority to map domain 1's page as a leaf.
         assert_eq!(link5(&mut h), Err(HvError::Unauthorized));
         assert_eq!(h.p2m().child_at(0, 0), None);
         assert_eq!(h.p2m().current_type(5), None);
 
-        // Even *with* a grant, a foreign child may only be a leaf under an L1 — sharing a
-        // page-table node is not allowed. Grant it, but make domain 0's table an L2.
-        h.dispatch(
-            1,
-            HvCall::GrantAccess {
-                gref: 0,
-                grantee: 0,
-                frame: 5,
-                readonly: false,
-            },
-        )
-        .unwrap();
+        // The same holds one level up: an *interior* foreign entry — sharing domain 1's
+        // frame as a page-table node — is refused just as a leaf is when no grant stands.
+        // Make domain 0's frame 1 an L2 table and try to point it at the ungranted frame.
         h.dispatch(0, HvCall::P2mAllocate { mfn: 1 }).unwrap();
         h.dispatch(
             0,
@@ -2363,6 +2386,12 @@ mod tests {
                 }
             ),
             Err(HvError::Unauthorized)
+        );
+        assert_eq!(h.p2m().child_at(1, 0), None);
+        assert_eq!(
+            h.p2m().current_type(5),
+            None,
+            "the ungranted node was never typed"
         );
         assert!(h.invariants_hold());
     }
@@ -2442,6 +2471,344 @@ mod tests {
         assert!(h
             .dispatch(1, HvCall::DomainDestroy { target: 1, now: 0 })
             .is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    // ─── cross-domain page-table NODES (sharing a subtree, not just a leaf) ──────────
+
+    // Domain 1 builds a real subtree — an L1 table (frame 5) mapping a writable leaf (frame
+    // 6) — and grants that L1 *node* frame read-write to domain 0; domain 0 pins frame 2 as
+    // an L2 table that will point at domain 1's node. The stage for sharing a whole subtree.
+    fn foreign_node_stage(h: &mut Hypervisor) {
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 6 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mPin {
+                mfn: 5,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mLink {
+                parent: 5,
+                slot: 0,
+                child: 6,
+                writable: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 5,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 2,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+    }
+
+    // Domain 0 links its L2 table (frame 2) at slot 0 onto domain 1's L1 node (frame 5).
+    fn link_node(h: &mut Hypervisor, writable: bool) -> Result<HvOutcome, HvError> {
+        h.dispatch(
+            0,
+            HvCall::P2mLink {
+                parent: 2,
+                slot: 0,
+                child: 5,
+                writable,
+            },
+        )
+    }
+
+    #[test]
+    fn a_grant_authorized_foreign_node_shares_a_whole_subtree() {
+        let mut h = hv();
+        foreign_node_stage(&mut h);
+        // Before the share, domain 1's subtree is entirely intra-domain: node 5 → leaf 6.
+        assert_eq!(
+            h.p2m().current_type(5),
+            Some(PageType::PageTable(PtLevel::L1))
+        );
+        assert_eq!(h.p2m().current_type(6), Some(PageType::Writable));
+
+        // Domain 0 links its L2 onto domain 1's L1 node — an interior foreign entry.
+        // Authorized by the one grant of the node frame, it shares the whole subtree.
+        assert_eq!(link_node(&mut h, true), Ok(HvOutcome::Done));
+        assert_eq!(h.p2m().child_at(2, 0), Some(5));
+        // The node stays a page table (never writable-typed): an interior entry types its
+        // child as a table regardless of the entry's read/write bit, so a "writable" node
+        // share still cannot corrupt domain 1's table.
+        assert_eq!(
+            h.p2m().current_type(5),
+            Some(PageType::PageTable(PtLevel::L1))
+        );
+        assert!(h.invariants_hold());
+
+        // Transitive consent: domain 0 reaches domain 1's leaf (frame 6) through the shared
+        // node, yet holds NO grant of frame 6 — the leaf edge (5→6) is intra-domain to
+        // domain 1, so the seam never demands a grant for it. One node grant authorized the
+        // whole subtree beneath it.
+        assert!(!h.grant().authorizes(1, 0, 6, false));
+        assert!(!h.grant().authorizes(1, 0, 6, true));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_shared_node_exposes_a_multi_level_subtree_through_one_grant() {
+        let mut h = hv();
+        // Domain 1 builds a two-level subtree: L2 node (5) → L1 node (6) → writable leaf (7).
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 6 }).unwrap();
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 7 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mPin {
+                mfn: 5,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mLink {
+                parent: 5,
+                slot: 0,
+                child: 6,
+                writable: true,
+            },
+        )
+        .unwrap(); // L2 → L1
+        h.dispatch(
+            1,
+            HvCall::P2mLink {
+                parent: 6,
+                slot: 0,
+                child: 7,
+                writable: true,
+            },
+        )
+        .unwrap(); // L1 → writable leaf
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 5,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        // Domain 0 has an L3 table (frame 2) and a single grant of domain 1's L2 node.
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 2,
+                level: PtLevel::L3,
+            },
+        )
+        .unwrap();
+
+        // One grant of the L2 node authorizes domain 0's L3→L2 share; the interior edge and
+        // the leaf beneath (all intra-domain to domain 1) come along transitively, with no
+        // further grants required.
+        assert_eq!(
+            h.dispatch(
+                0,
+                HvCall::P2mLink {
+                    parent: 2,
+                    slot: 0,
+                    child: 5,
+                    writable: true
+                }
+            ),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(h.p2m().child_at(2, 0), Some(5));
+        assert_eq!(
+            h.p2m().current_type(5),
+            Some(PageType::PageTable(PtLevel::L2))
+        );
+        assert_eq!(
+            h.p2m().current_type(6),
+            Some(PageType::PageTable(PtLevel::L1))
+        );
+        assert_eq!(h.p2m().current_type(7), Some(PageType::Writable));
+        // Domain 0 holds a grant of only the L2 node — nothing of frames 6 or 7.
+        assert!(!h.grant().authorizes(1, 0, 6, false));
+        assert!(!h.grant().authorizes(1, 0, 7, false));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_readonly_node_share_needs_any_grant_but_a_writable_one_needs_read_write() {
+        let mut h = hv();
+        // Domain 1 builds an L1 subtree (node 5 → leaf 6) and grants the node *read-only*.
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 6 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mPin {
+                mfn: 5,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mLink {
+                parent: 5,
+                slot: 0,
+                child: 6,
+                writable: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 5,
+                readonly: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 2,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+
+        // A *writable* node share over a read-only grant is refused — domain 1 consented
+        // only to a read-only view of its subtree.
+        assert_eq!(link_node(&mut h, true), Err(HvError::Unauthorized));
+        assert_eq!(h.p2m().child_at(2, 0), None);
+
+        // A *read-only* node share is authorized by any grant. The node is still typed as a
+        // page table (a node must be walkable); domain 0's read-only entry means its view
+        // of the subtree is read-only — the writable bit ANDs down the walk, past the fence
+        // — so the leaf beneath (frame 6) stays writable-typed by domain 1's own entry, not
+        // domain 0's.
+        assert_eq!(link_node(&mut h, false), Ok(HvOutcome::Done));
+        assert_eq!(h.p2m().child_at(2, 0), Some(5));
+        assert_eq!(
+            h.p2m().current_type(5),
+            Some(PageType::PageTable(PtLevel::L1))
+        );
+        assert_eq!(h.p2m().current_type(6), Some(PageType::Writable));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_foreign_interior_link_still_enforces_the_level_below() {
+        let mut h = hv();
+        // Domain 1 makes frame 5 an L2 table and grants it read-write to domain 0.
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mPin {
+                mfn: 5,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 5,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        // Domain 0 also has an L2 table (frame 2).
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 2,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+
+        // An L2 entry must point one level down — at an L1. Domain 1's frame is already an
+        // L2, so although the grant authorizes the reference, the *levelling* refuses it
+        // (`TypePinned`): the hierarchy discipline carries across the domain boundary
+        // exactly as within a domain. This is also why no cross-domain cycle is
+        // representable — every edge, foreign included, strictly decreases level, so an
+        // up-edge (which is what a cycle would need) is exactly this mislevelling.
+        assert_eq!(
+            h.dispatch(
+                0,
+                HvCall::P2mLink {
+                    parent: 2,
+                    slot: 0,
+                    child: 5,
+                    writable: true
+                }
+            ),
+            Err(HvError::P2m(p2m::P2mError::TypePinned))
+        );
+        assert_eq!(h.p2m().child_at(2, 0), None);
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn sharing_a_node_blocks_revoke_and_the_owners_teardown() {
+        let mut h = hv();
+        foreign_node_stage(&mut h);
+        link_node(&mut h, true).unwrap();
+
+        // The owner (domain 1) cannot revoke the node grant while domain 0's interior entry
+        // relies on it — the revoke-block keys on the boundary edge, so it is level-agnostic.
+        assert_eq!(
+            h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }),
+            Err(HvError::Grant(grant::GrantError::InUse))
+        );
+        // Nor can domain 1 be torn down while a foreign domain shares its node — the
+        // refuse-if-busy precondition covers an inward foreign *node* link exactly as it
+        // does a foreign leaf. dom0 issues it (and controls domain 1), so the busy refusal
+        // bites, not authority.
+        assert_eq!(
+            h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Err(HvError::DomainBusy)
+        );
+
+        // Domain 0 unlinks its share; domain 1's own subtree still stands underneath.
+        h.dispatch(0, HvCall::P2mUnlink { parent: 2, slot: 0 })
+            .unwrap();
+        assert_eq!(
+            h.p2m().current_type(5),
+            Some(PageType::PageTable(PtLevel::L1)),
+            "domain 1's own node survives the foreign share going away"
+        );
+        // Now the grant is revocable and domain 1 can tear itself down cleanly.
+        assert!(h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }).is_ok());
+        assert!(h
+            .dispatch(1, HvCall::DomainDestroy { target: 1, now: 0 })
+            .is_ok());
+        assert!(h.is_clean_shell(1));
         assert!(h.invariants_hold());
     }
 
