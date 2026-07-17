@@ -150,8 +150,9 @@ pub enum HvCall {
     /// live grant map of one of `target`'s frames (that map holds a page reference
     /// teardown cannot revoke without yanking it out from under the mapper). `now` is a
     /// plain operation input, as for the scheduler ops: the core owns no clock, so
-    /// whoever builds the call stamps it. Privilege is deferred — any caller may issue
-    /// it for now.
+    /// whoever builds the call stamps it. **Authority:** a domain may tear *itself* down,
+    /// but destroying a *peer* requires the caller be privileged (a control domain);
+    /// otherwise [`HvError::Denied`], mutating nothing.
     DomainDestroy { target: DomId, now: Ticks },
 }
 
@@ -204,6 +205,12 @@ pub enum HvError {
     /// needs the owner's consent, which a grant expresses — the isolation guard on the
     /// page-table↔grant join, so it belongs to the seam.
     Unauthorized,
+    /// A whole-domain *control* operation on **another** domain was refused because the
+    /// caller is not privileged. Today the only such operation is [`HvCall::DomainDestroy`]:
+    /// a domain may tear *itself* down, but tearing down a peer requires being a control
+    /// domain (dom0). The **authority** guard — the third axis after ownership and consent
+    /// — enforced at the dispatch seam, which is where cross-domain authorization lives.
+    Denied,
 }
 
 /// A breach of a *cross-subsystem* invariant — one that relates two subsystems and so
@@ -243,6 +250,15 @@ pub struct Hypervisor {
     grant: grant::System,
     sched: sched::System,
     p2m: p2m::System,
+    /// Which domains are *privileged* — the control domains (Xen's dom0). A privileged
+    /// domain may issue whole-domain control operations against *other* domains (today,
+    /// [`HvCall::DomainDestroy`]); an ordinary domain may only act on itself. This is the
+    /// **authority** axis, the third alongside *ownership* (a domain acts on its own
+    /// resources) and *consent* (grants authorize cross-domain memory access) — and, like
+    /// those, it is a guard the seam checks, not something a guest can confer on itself.
+    /// Fixed at construction (domain 0 boots privileged, as dom0 does); delegable /
+    /// mutable privilege is a later refinement.
+    privileged: Vec<bool>,
 }
 
 impl Hypervisor {
@@ -250,7 +266,8 @@ impl Hypervisor {
     /// event-channel ports, `grants_per_domain` grant slots, and `vcpus_per_domain`
     /// virtual CPUs, scheduled over `num_pcpus` shared physical CPUs, with `num_frames`
     /// machine frames in the shared page pool. Every subsystem shares the same domain
-    /// count; the physical CPUs and machine frames are system-wide.
+    /// count; the physical CPUs and machine frames are system-wide. **Domain 0 boots
+    /// privileged** (the control domain, Xen's dom0); every other domain is unprivileged.
     pub fn new(
         num_domains: usize,
         ports_per_domain: usize,
@@ -265,6 +282,8 @@ impl Hypervisor {
             grant: grant::System::new(num_domains, grants_per_domain),
             sched: sched::System::new(num_domains, vcpus_per_domain, num_pcpus),
             p2m: p2m::System::new(num_domains, num_frames),
+            // Domain 0 is the boot control domain; the rest start unprivileged.
+            privileged: (0..num_domains).map(|d| d == 0).collect(),
         }
     }
 
@@ -426,7 +445,7 @@ impl Hypervisor {
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
 
-            HvCall::DomainDestroy { target, now } => self.domain_destroy(target, now),
+            HvCall::DomainDestroy { target, now } => self.domain_destroy(caller, target, now),
         }
     }
 
@@ -662,9 +681,17 @@ impl Hypervisor {
     }
 
     /// Tear a domain down across all four subsystems — the whole-system operation that
-    /// welds every seam. **Atomic, all-or-nothing, refuse-if-busy.** One precondition
-    /// gates everything: no *foreign* domain may hold a live grant map of one of
-    /// `target`'s frames ([`grant::System::has_foreign_map`]). If one does, teardown
+    /// welds every seam. **Atomic, all-or-nothing, refuse-if-busy.**
+    ///
+    /// **Authority gate first.** A domain may tear *itself* down, but destroying a *peer*
+    /// requires the caller be privileged (a control domain — Xen's dom0); otherwise the
+    /// call is refused with [`HvError::Denied`] before anything is inspected or touched, so
+    /// an unauthorized destroy is a true no-op. This is the authority axis — the third
+    /// after ownership and consent — and it lives at the seam because only the integrated
+    /// core sees both the acting `caller` and the `target`.
+    ///
+    /// Then one precondition gates the rest: no *foreign* domain may hold a live grant map
+    /// of one of `target`'s frames ([`grant::System::has_foreign_map`]). If one does, teardown
     /// would have to yank a page out from under the mapper, so it refuses with
     /// [`HvError::DomainBusy`] and mutates nothing. Otherwise every step below succeeds
     /// by construction — each is a bulk form of an existing invariant-safe transition —
@@ -694,9 +721,19 @@ impl Hypervisor {
     /// deferred dying-domain RCU teardown) is a design decision informed by the public
     /// Xen domain-destroy semantics and general OS knowledge — not `xen/`'s GPL
     /// implementation. See `CLEANROOM.md`.
-    fn domain_destroy(&mut self, target: DomId, now: Ticks) -> Result<HvOutcome, HvError> {
-        if target as usize >= self.domain_count() {
+    fn domain_destroy(
+        &mut self,
+        caller: DomId,
+        target: DomId,
+        now: Ticks,
+    ) -> Result<HvOutcome, HvError> {
+        if caller as usize >= self.domain_count() || target as usize >= self.domain_count() {
             return Err(HvError::BadDomain);
+        }
+        // The authority gate, before anything is inspected: a domain may destroy itself,
+        // but destroying a peer needs privilege. A refusal here mutates nothing.
+        if caller != target && !self.privileged[caller as usize] {
+            return Err(HvError::Denied);
         }
         // The precondition. Checked before any mutation, so a refusal is a true no-op. No
         // *foreign* domain may hold one of `target`'s frames — neither a live grant map
@@ -876,6 +913,13 @@ impl Hypervisor {
     /// A domain's credit balance, if it exists.
     pub fn balance(&self, dom: DomId) -> Option<u64> {
         self.credit.get(dom as usize).map(HvCore::balance)
+    }
+
+    /// Whether `dom` is a privileged control domain — one that may issue whole-domain
+    /// control operations (today, destroying another domain). Domain 0 boots privileged;
+    /// out-of-range domains read as unprivileged.
+    pub fn is_privileged(&self, dom: DomId) -> bool {
+        self.privileged.get(dom as usize).copied().unwrap_or(false)
     }
 
     /// The event-channel subsystem, for inspection.
@@ -1453,9 +1497,10 @@ mod tests {
         let handle = map_handle(&mut h, 1, 0, 0, true);
 
         // Destroying domain 0 must be refused: domain 1 holds a live map of its frame.
-        // Any caller may issue it (privilege deferred) — here a third party, domain 2.
+        // Domain 0 tears *itself* down (always authorized), so this isolates the busy
+        // refusal from the authority gate.
         assert_eq!(
-            h.dispatch(2, HvCall::DomainDestroy { target: 0, now: 0 }),
+            h.dispatch(0, HvCall::DomainDestroy { target: 0, now: 0 }),
             Err(HvError::DomainBusy)
         );
         // A refusal mutates nothing: the frame, grant, and map all stand.
@@ -1468,7 +1513,7 @@ mod tests {
         // Once domain 1 unmaps, the frame is no longer foreign-held and teardown runs.
         h.dispatch(1, HvCall::GrantUnmap { handle }).unwrap();
         assert!(h
-            .dispatch(2, HvCall::DomainDestroy { target: 0, now: 0 })
+            .dispatch(0, HvCall::DomainDestroy { target: 0, now: 0 })
             .is_ok());
         assert!(!h.p2m().is_allocated(2));
         assert!(!h.grant().is_granted(0, 0));
@@ -1993,25 +2038,84 @@ mod tests {
         foreign_link_stage(&mut h);
         link5(&mut h).unwrap();
         // Domain 1's frame is mapped into domain 0's table, so domain 1 cannot be torn
-        // down — the same refuse-if-busy rule as a live foreign grant map.
+        // down — the same refuse-if-busy rule as a live foreign grant map. Issued by the
+        // privileged control domain (dom0), so the busy refusal is what bites, not authority.
         assert_eq!(
-            h.dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 }),
+            h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 }),
             Err(HvError::DomainBusy)
         );
-        // But the *linker* can be destroyed: teardown unlinks its foreign entry, freeing
-        // domain 1's frame, and spares domain 1.
+        // But the *linker* (domain 0) can tear itself down: teardown unlinks its foreign
+        // entry, freeing domain 1's frame, and spares domain 1.
         assert_eq!(
-            h.dispatch(2, HvCall::DomainDestroy { target: 0, now: 0 }),
+            h.dispatch(0, HvCall::DomainDestroy { target: 0, now: 0 }),
             Ok(HvOutcome::Done)
         );
         assert!(h.is_torn_down(0));
         assert_eq!(h.p2m().owner_of(5), Some(1), "domain 1 keeps its frame");
         assert_eq!(h.p2m().current_type(5), None, "no longer foreign-mapped");
         assert!(h.invariants_hold());
-        // With the link gone, domain 1 can now be destroyed too.
+        // With the link gone, domain 1 can now tear itself down too.
         assert!(h
-            .dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 })
+            .dispatch(1, HvCall::DomainDestroy { target: 1, now: 0 })
             .is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn only_a_privileged_domain_or_the_target_itself_may_destroy_a_domain() {
+        let mut h = hv();
+        // Domain 0 boots as the control domain (dom0); 1 and 2 are ordinary.
+        assert!(h.is_privileged(0));
+        assert!(!h.is_privileged(1));
+        assert!(!h.is_privileged(2));
+
+        // Give domain 1 some state, so a denied teardown can be shown to touch nothing.
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 3 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mPin {
+                mfn: 3,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+
+        // An unprivileged peer (domain 2) may not destroy domain 1 — Denied, and a no-op.
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Err(HvError::Denied)
+        );
+        assert_eq!(
+            h.p2m().owner_of(3),
+            Some(1),
+            "a denied destroy mutates nothing"
+        );
+        assert!(h.p2m().is_pinned(3));
+        assert!(h.invariants_hold());
+
+        // The privileged control domain (dom0) may destroy the peer.
+        assert_eq!(
+            h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.is_torn_down(1));
+        assert!(!h.p2m().is_allocated(3));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn an_unprivileged_domain_may_still_tear_itself_down() {
+        let mut h = hv();
+        // Domain 2 is unprivileged, but a domain always has authority over *itself* —
+        // self-teardown never needs privilege.
+        assert!(!h.is_privileged(2));
+        h.dispatch(2, HvCall::P2mAllocate { mfn: 4 }).unwrap();
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 2, now: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.is_torn_down(2));
+        assert!(!h.p2m().is_allocated(4));
         assert!(h.invariants_hold());
     }
 

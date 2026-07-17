@@ -1038,9 +1038,13 @@ pub struct DestroyOutcome {
     pub teardowns: u32,
     /// Destroy calls refused because a foreign domain held a live map (`DomainBusy`).
     pub busy_refusals: u32,
-    /// Whether every destroy matched its precondition and left a proper empty shell:
-    /// refused exactly when a foreign map stood, and otherwise reduced the target to
-    /// nothing-live. A single mismatch flips this false for the whole run.
+    /// Destroy calls refused because the caller was neither the target nor privileged
+    /// (`Denied`) — the authority gate firing.
+    pub denials: u32,
+    /// Whether every destroy matched its authority + busy prediction and left a proper
+    /// shell: denied exactly when the caller lacked authority over the target, refused
+    /// (busy) exactly when authorized but a foreign map stood, and otherwise reduced the
+    /// target to nothing-live. A single mismatch flips this false for the whole run.
     pub postcondition_held: bool,
     /// Whether the integrated invariant held after every step, not just at the end.
     pub invariants_hold: bool,
@@ -1071,13 +1075,17 @@ fn is_empty_shell(hv: &Hypervisor, target: u16) -> bool {
 /// operation that welds every subsystem and both seams at once, so this is where it is
 /// stress-tested under interleaving.
 ///
-/// Each destroy is checked against its own precondition: [`grant::System::has_foreign_map`]
-/// predicts the outcome exactly — refuse (`DomainBusy`) iff a foreign domain holds a
-/// live map of one of the target's frames, tear down cleanly otherwise — and every
-/// clean teardown must leave an empty shell (`is_empty_shell`). The integrated
-/// invariant is asserted after every step, so a mis-ordered teardown (a freed port with
-/// a live peer, a freed on-CPU vCPU, a foreign-mapped freed frame, a deliverable event
-/// on an offlined vCPU) surfaces here with the seed as the whole reproducer.
+/// Each destroy is checked against two predictions. First the **authority gate**: a caller
+/// may destroy the target only if it *is* the target or is privileged (dom0), else `Denied`
+/// with no effect. Then, if authorized, the busy precondition
+/// ([`grant::System::has_foreign_map`]) predicts the rest exactly — refuse (`DomainBusy`)
+/// iff a foreign domain holds a live map of one of the target's frames, tear down cleanly
+/// otherwise — and every clean teardown must leave an empty shell (`is_empty_shell`).
+/// Callers are drawn across all domains (only domain 0 is privileged), so both the denied
+/// and the authorized paths are reached. The integrated invariant is asserted after every
+/// step, so a mis-ordered teardown (a freed port with a live peer, a freed on-CPU vCPU, a
+/// foreign-mapped freed frame, a deliverable event on an offlined vCPU) surfaces here with
+/// the seed as the whole reproducer.
 pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
     const DOMAINS: u16 = 3;
     const PORTS: u32 = 6;
@@ -1102,6 +1110,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
     let mut out = DestroyOutcome {
         teardowns: 0,
         busy_refusals: 0,
+        denials: 0,
         postcondition_held: true,
         invariants_hold: true,
     };
@@ -1195,24 +1204,33 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
             )),
             13 => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
             _ => {
-                // Tear a domain down. Its precondition predicts the outcome exactly, so
-                // check the two against each other and verify the resulting shape.
+                // Tear a domain down. Two predictions pin the outcome exactly: the
+                // authority gate (may the caller destroy this target?) and the busy
+                // precondition (does a foreign domain hold one of its frames?).
                 let target = rng.below(u32::from(DOMAINS)) as u16;
+                let authorized = caller == target || hv.is_privileged(caller);
                 let foreign = hv.grant().has_foreign_map(target);
                 match hv.dispatch(caller, HvCall::DomainDestroy { target, now }) {
                     Ok(HvOutcome::Done) => {
                         out.teardowns += 1;
-                        // A clean teardown must not have had a foreign map, and must
-                        // leave nothing live pointing into the target.
-                        if foreign || !is_empty_shell(&hv, target) {
+                        // A clean teardown must have been authorized, had no foreign map,
+                        // and left nothing live pointing into the target.
+                        if !authorized || foreign || !is_empty_shell(&hv, target) {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::DomainBusy) => {
                         out.busy_refusals += 1;
-                        // A refusal must have had a foreign map (and, being a no-op,
-                        // leaves the target as busy as it was — nothing to check here).
-                        if !foreign {
+                        // A busy refusal must have been authorized (the gate comes first)
+                        // and had a foreign map. Being a no-op, nothing else to check.
+                        if !authorized || !foreign {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::Denied) => {
+                        out.denials += 1;
+                        // A denial must have been unauthorized — a no-op, so nothing more.
+                        if authorized {
                             out.postcondition_held = false;
                         }
                     }
@@ -2045,12 +2063,13 @@ mod tests {
         }
     }
 
-    /// The driver genuinely reaches *both* teardown paths across the seed space: some
-    /// run refuses a destroy because a foreign domain holds a live map (`DomainBusy`),
-    /// and some run tears a domain down cleanly. If either stayed zero, the soundness
-    /// test above would be proving teardown over a path it never actually takes.
+    /// The driver genuinely reaches *every* teardown outcome across the seed space: some
+    /// run tears a domain down cleanly, some refuses because a foreign domain holds a live
+    /// map (`DomainBusy`), and some is denied for want of authority (`Denied`). If any
+    /// stayed zero, the soundness test above would be proving teardown over a path it never
+    /// actually takes.
     #[test]
-    fn destroy_reaches_both_the_busy_and_clean_paths() {
+    fn destroy_reaches_the_clean_busy_and_denied_paths() {
         let outcomes: Vec<_> = (0..256u64).map(|s| run_destroy(s, 256)).collect();
         assert!(
             outcomes.iter().any(|o| o.teardowns > 0),
@@ -2059,6 +2078,10 @@ mod tests {
         assert!(
             outcomes.iter().any(|o| o.busy_refusals > 0),
             "no seed ever hit a busy-refusal — the refuse-if-busy path is uncovered"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.denials > 0),
+            "no seed ever hit an authority denial — the privilege gate is uncovered"
         );
     }
 
