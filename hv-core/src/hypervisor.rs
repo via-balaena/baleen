@@ -126,8 +126,18 @@ pub enum HvCall {
     P2mUnpin { mfn: Mfn },
     /// Install a page-table entry: link `parent`'s `slot` to `child`, one paging level
     /// down. Refused unless `child` is (or can become) exactly the level below `parent`
-    /// — the hierarchy guard. Both frames must be the caller's.
-    P2mLink { parent: Mfn, slot: u32, child: Mfn },
+    /// — the hierarchy guard. `writable` is the entry's read/write bit for a *leaf* (an
+    /// entry under an `L1`): a writable leaf maps its child read-write, a read-only one
+    /// read-only (which may even point at a page table — the linear-map view). The caller
+    /// must own `parent`; `child` may be a frame *another domain owns*, if that owner has
+    /// granted it to the caller with matching permission (a read-write grant for a
+    /// writable entry, any grant for a read-only one).
+    P2mLink {
+        parent: Mfn,
+        slot: u32,
+        child: Mfn,
+        writable: bool,
+    },
     /// Remove the caller's page-table entry at `parent`'s `slot`, dropping the references
     /// the link held.
     P2mUnlink { parent: Mfn, slot: u32 },
@@ -188,10 +198,11 @@ pub enum HvError {
     /// subsystem.
     DomainBusy,
     /// A page-table entry into a frame another domain owns was refused: the caller holds
-    /// no read-write grant of that frame from its owner (or tried to share a page-table
-    /// node rather than map a leaf). Cross-domain page-table sharing needs the owner's
-    /// consent, which a grant expresses — the isolation guard on the page-table↔grant
-    /// join, so it belongs to the seam.
+    /// no grant of that frame from its owner of the permission the entry needs — a
+    /// read-write grant for a writable entry, any grant for a read-only one — or tried to
+    /// share a page-table node rather than map a leaf. Cross-domain page-table sharing
+    /// needs the owner's consent, which a grant expresses — the isolation guard on the
+    /// page-table↔grant join, so it belongs to the seam.
     Unauthorized,
 }
 
@@ -215,8 +226,9 @@ pub enum CrossViolation {
     /// pending bit set, so the event would never be observed.
     LostWakeup { dom: DomId, vcpu: Vcpu },
     /// A cross-domain page-table entry — a table maps a frame *another* domain owns —
-    /// stands with no read-write grant from that owner to the mapping domain authorizing
-    /// it. The isolation breach the page-table↔grant join exists to prevent: a domain
+    /// stands with no grant of matching permission from that owner to the mapping domain
+    /// authorizing it (a read-write grant for a writable entry, any grant for a read-only
+    /// one). The isolation breach the page-table↔grant join exists to prevent: a domain
     /// reaching into another's memory through its page tables without consent (or holding
     /// the mapping after the grant was revoked).
     UnauthorizedForeignLink { parent: Mfn, child: Mfn },
@@ -406,7 +418,8 @@ impl Hypervisor {
                 parent,
                 slot,
                 child,
-            } => self.p2m_link(caller, parent, slot, child),
+                writable,
+            } => self.p2m_link(caller, parent, slot, child, writable),
             HvCall::P2mUnlink { parent, slot } => self
                 .p2m
                 .unlink(caller, parent, slot)
@@ -487,32 +500,37 @@ impl Hypervisor {
     /// page-table↔grant half of cross-domain sharing. An entry into the caller's *own*
     /// frame is a plain [`crate::p2m::System::link`]. An entry into a frame *another
     /// domain owns* is only permitted when that owner has granted the frame to the caller
-    /// read-write ([`grant::System::authorizes`]): a domain cannot map a foreign page into
-    /// its address space without the owner's consent. Foreign entries are leaves (an `L1`
-    /// table maps a data page), so a foreign child must go under an `L1` — sharing whole
-    /// page-table *subtrees* across domains is a later refinement. `p2m` enforces the type
-    /// discipline; this seam adds the authorization it is deliberately blind to.
+    /// with *matching* permission ([`grant::System::authorizes`]): a **writable** foreign
+    /// leaf needs a read-write grant, a **read-only** one only a read-only grant — a
+    /// domain cannot map a foreign page into its address space, at a given access, without
+    /// the owner's consent to that access. Foreign entries are leaves (an `L1` table maps
+    /// a data page), so a foreign child must go under an `L1` — sharing whole page-table
+    /// *subtrees* across domains is a later refinement. `p2m` enforces the type discipline;
+    /// this seam adds the authorization it is deliberately blind to.
     fn p2m_link(
         &mut self,
         caller: DomId,
         parent: Mfn,
         slot: u32,
         child: Mfn,
+        writable: bool,
     ) -> Result<HvOutcome, HvError> {
         if let Some(owner) = self.p2m.owner_of(child) {
             if owner != caller {
                 // A foreign entry: it must be an authorized L1 leaf. Check the grant and
-                // the level *before* touching p2m, so an unauthorized link is a no-op.
+                // the level *before* touching p2m, so an unauthorized link is a no-op. The
+                // grant must cover the entry's access — a writable entry needs a
+                // read-write grant, a read-only entry any grant of the frame.
                 if self.p2m.current_type(parent) != Some(PageType::PageTable(PtLevel::L1)) {
                     return Err(HvError::Unauthorized);
                 }
-                if !self.grant.authorizes(owner, caller, child, true) {
+                if !self.grant.authorizes(owner, caller, child, writable) {
                     return Err(HvError::Unauthorized);
                 }
             }
         }
         self.p2m
-            .link(caller, parent, slot, child)
+            .link(caller, parent, slot, child, writable)
             .map(|()| HvOutcome::Done)
             .map_err(HvError::P2m)
     }
@@ -816,10 +834,12 @@ impl Hypervisor {
             }
         }
         // Page-table↔grant: every *cross-domain* page-table entry must be authorized by a
-        // read-write grant from the child frame's owner to the domain whose table maps it.
-        // An unauthorized foreign entry is a domain reaching into another's memory without
-        // consent — the isolation breach this join exists to prevent.
-        for (parent, _slot, child) in self.p2m.link_edges() {
+        // grant from the child frame's owner to the domain whose table maps it, of
+        // permission matching the entry's — a read-write grant for a writable entry, any
+        // grant for a read-only one. An unauthorized foreign entry is a domain reaching
+        // into another's memory without consent — the isolation breach this join exists to
+        // prevent.
+        for (parent, _slot, child, writable) in self.p2m.link_edges() {
             let (Some(child_owner), Some(parent_owner)) =
                 (self.p2m.owner_of(child), self.p2m.owner_of(parent))
             else {
@@ -828,7 +848,7 @@ impl Hypervisor {
             if child_owner != parent_owner
                 && !self
                     .grant
-                    .authorizes(child_owner, parent_owner, child, true)
+                    .authorizes(child_owner, parent_owner, child, writable)
             {
                 return Some(CrossViolation::UnauthorizedForeignLink { parent, child });
             }
@@ -1628,6 +1648,7 @@ mod tests {
                     parent,
                     slot: 0,
                     child,
+                    writable: true,
                 },
             )
             .unwrap();
@@ -1647,7 +1668,8 @@ mod tests {
                 HvCall::P2mLink {
                     parent: 0,
                     slot: 1,
-                    child: 4
+                    child: 4,
+                    writable: true
                 }
             ),
             Err(HvError::P2m(p2m::P2mError::TypePinned))
@@ -1681,6 +1703,7 @@ mod tests {
                 parent: 0,
                 slot: 0,
                 child: 1,
+                writable: true,
             },
         )
         .unwrap();
@@ -1690,6 +1713,7 @@ mod tests {
                 parent: 1,
                 slot: 0,
                 child: 2,
+                writable: true,
             },
         )
         .unwrap();
@@ -1741,8 +1765,99 @@ mod tests {
                 parent: 0,
                 slot: 0,
                 child: 5,
+                writable: true,
             },
         )
+    }
+
+    fn link5_ro(h: &mut Hypervisor) -> Result<HvOutcome, HvError> {
+        h.dispatch(
+            0,
+            HvCall::P2mLink {
+                parent: 0,
+                slot: 0,
+                child: 5,
+                writable: false,
+            },
+        )
+    }
+
+    // Domain 1 owns frame 5 and grants it *read-only* to domain 0; domain 0 owns frame 0
+    // and pins it as an L1 table. The stage for a read-only cross-domain leaf.
+    fn foreign_ro_link_stage(h: &mut Hypervisor) {
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 5,
+                readonly: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 0,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_readonly_grant_authorizes_a_readonly_foreign_leaf_but_not_a_writable_one() {
+        let mut h = hv();
+        foreign_ro_link_stage(&mut h);
+        // A read-only grant does NOT authorize a *writable* entry — that would let domain
+        // 0 write a page domain 1 only consented to share for reading.
+        assert_eq!(link5(&mut h), Err(HvError::Unauthorized));
+        assert_eq!(h.p2m().child_at(0, 0), None);
+
+        // But a read-only entry is authorized. It takes only an existence reference, so
+        // the frame is pinned against reuse yet stays untyped (a reader is type-agnostic).
+        assert_eq!(link5_ro(&mut h), Ok(HvOutcome::Done));
+        assert_eq!(h.p2m().child_at(0, 0), Some(5));
+        assert_eq!(h.p2m().current_type(5), None);
+        assert!(h.p2m().refs(5).unwrap() >= 1);
+        assert_eq!(
+            h.dispatch(1, HvCall::P2mFree { mfn: 5 }),
+            Err(HvError::P2m(p2m::P2mError::InUse))
+        );
+        assert!(h.invariants_hold());
+
+        // The revoke-block covers a read-only entry just as it does a writable one: domain
+        // 1 cannot end the grant while domain 0's read-only entry relies on it.
+        assert_eq!(
+            h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }),
+            Err(HvError::Grant(grant::GrantError::InUse))
+        );
+        // Unlink, and the grant is revocable and the frame reclaimable again.
+        h.dispatch(0, HvCall::P2mUnlink { parent: 0, slot: 0 })
+            .unwrap();
+        assert_eq!(h.p2m().current_type(5), None);
+        assert!(h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }).is_ok());
+        assert!(h.dispatch(1, HvCall::P2mFree { mfn: 5 }).is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_readwrite_grant_authorizes_a_readonly_foreign_leaf_too() {
+        let mut h = hv();
+        // The read-write stage grants frame 5 *read-write* to domain 0.
+        foreign_link_stage(&mut h);
+        // A read-only entry is permitted under a read-write grant — any grant covers
+        // read. And read-only, it leaves the frame untyped rather than writable-typed.
+        assert_eq!(link5_ro(&mut h), Ok(HvOutcome::Done));
+        assert_eq!(h.p2m().child_at(0, 0), Some(5));
+        assert_eq!(
+            h.p2m().current_type(5),
+            None,
+            "a read-only leaf does not type its child, even under a read-write grant"
+        );
+        assert!(h.invariants_hold());
     }
 
     #[test]
@@ -1814,7 +1929,8 @@ mod tests {
                 HvCall::P2mLink {
                     parent: 1,
                     slot: 0,
-                    child: 5
+                    child: 5,
+                    writable: true
                 }
             ),
             Err(HvError::Unauthorized)

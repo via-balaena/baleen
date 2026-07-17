@@ -1295,7 +1295,7 @@ fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) 
         return;
     }
     let child = children[rng.below(children.len() as u32) as usize];
-    if sys.link(owner, parent, slot, child).is_ok() {
+    if sys.link(owner, parent, slot, child, true).is_ok() {
         links.push((parent, slot));
     }
 }
@@ -1470,6 +1470,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                                 parent,
                                 slot,
                                 child: frame,
+                                writable: true,
                             },
                         )
                         .is_ok()
@@ -1501,6 +1502,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                             parent: table_of(linker),
                             slot,
                             child: frame,
+                            writable: true,
                         },
                     ) {
                         out.unauthorized += 1;

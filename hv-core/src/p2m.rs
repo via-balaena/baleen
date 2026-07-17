@@ -181,6 +181,15 @@ struct Link {
     parent: Mfn,
     slot: u32,
     child: Mfn,
+    /// Whether this entry maps its child *writably* — the paging entry's read/write bit.
+    /// Only meaningful for a leaf (an entry under an `L1` table); an interior entry always
+    /// references a page-table child regardless. A *writable* leaf holds a
+    /// [`PageType::Writable`] type reference on its child (so the child can never
+    /// simultaneously be a page table); a *read-only* leaf holds only a bare existence
+    /// reference — a reader is type-agnostic — exactly as a read-only grant map does. That
+    /// is what lets a read-only leaf point at a page table (the guest reading its own page
+    /// tables through the linear map) while the writable-xor-pagetable rule still holds.
+    writable: bool,
 }
 
 /// The whole-system page state: a flat table of machine frames plus every domain's
@@ -507,33 +516,46 @@ impl System {
     // ─── page-table entries (the hierarchy) ────────────────────────────────────
 
     /// Install a page-table entry: link `parent`'s `slot` to `child`. `parent` must be a
-    /// table the caller owns, at some level `L`k; the entry then references `child` at
-    /// **exactly the level below** — an `L(k-1)` table for `k >= 2`, or a writable leaf
-    /// under an `L1`. This is the whole paging hierarchy, and it is enforced by the type
-    /// system: the link takes a `get_type` reference on `child` at that required type, so
-    /// a `child` of the wrong kind (a writable page where a table belongs, a table at the
-    /// wrong level, an `L1`'s leaf that is really a page table) is refused with
-    /// [`P2mError::TypePinned`] before any edge is recorded.
+    /// table the caller owns, at some level `L`k. An **interior** entry (`k >= 2`)
+    /// references `child` at exactly the level below — an `L(k-1)` table. A **leaf** entry
+    /// (under an `L1`) maps an ordinary page, and `writable` is its read/write bit: a
+    /// *writable* leaf holds a [`PageType::Writable`] reference on `child` (so the child
+    /// can never simultaneously be a page table), while a *read-only* leaf holds only a
+    /// bare existence reference — a reader is type-agnostic, exactly as a read-only grant
+    /// map is. `writable` is ignored for an interior entry, whose child is a page table
+    /// regardless.
+    ///
+    /// The hierarchy is enforced by the type system: for an interior or writable-leaf
+    /// entry the link takes a `get_type` reference on `child` at the required type, so a
+    /// `child` of the wrong kind (a writable page where a table belongs, a table at the
+    /// wrong level, a *writable* `L1` leaf that is really a page table) is refused with
+    /// [`P2mError::TypePinned`] before any edge is recorded. A **read-only** leaf imposes
+    /// no type, so it may point at *any* allocated frame — writable data mapped read-only,
+    /// or even a page table the guest is reading through the linear map. That read-only
+    /// view coexisting with the page-table type is safe precisely because neither path can
+    /// write the frame; it is the whole reason the exclusivity rule is
+    /// writable-xor-pagetable and not reference-xor-pagetable.
     ///
     /// The link also takes a page-table reference on `parent` *itself*, so a table stays
     /// typed as long as it has any live entry — it cannot be freed, unpinned to untyped,
     /// or re-typed out from under its children (the reference on `child` likewise stops
-    /// the child being freed or re-typed while the parent points at it). Because a link's
-    /// child sits one level *below* its parent, the page-table graph is a DAG of depth at
-    /// most four — no cycle is representable.
+    /// the child being freed, or — for a writable leaf or interior entry — re-typed while
+    /// the parent points at it). Because a link's child sits one level *below* its parent,
+    /// the page-table graph is a DAG of depth at most four — no cycle is representable.
     ///
     /// The caller must own the *table* it is editing, but **`child` may belong to another
     /// domain** — a cross-domain (foreign) entry, the mechanism behind shared page tables
     /// and foreign memory mappings. `p2m` enforces only the type discipline here; whether
     /// the caller is *authorized* to reference a foreign frame is a cross-subsystem
-    /// question (it must hold a grant from the frame's owner), checked at the dispatch
-    /// seam — the same split as the grant↔page-type join.
+    /// question (it must hold a grant from the frame's owner, of matching writability),
+    /// checked at the dispatch seam — the same split as the grant↔page-type join.
     pub fn link(
         &mut self,
         caller: DomId,
         parent: Mfn,
         slot: u32,
         child: Mfn,
+        writable: bool,
     ) -> Result<(), P2mError> {
         if slot >= TABLE_SLOTS {
             return Err(P2mError::BadSlot);
@@ -567,15 +589,26 @@ impl System {
             return Err(P2mError::WrongState);
         }
 
-        // Take the child reference at the required level — this is the guard that makes
-        // the hierarchy hold: it fails unless `child` is (or can become) exactly the
-        // level below `parent`. Then take the parent self-reference, which cannot fail
-        // (`parent` is already that level). If the second acquire somehow overflowed,
-        // roll the first back so a rejected link mutates nothing.
-        let child_type = level.child_type();
-        self.get_type(child, child_type)?;
+        // Take the child reference. A read-only leaf takes only a bare existence
+        // reference (`get`) — type-agnostic, so it may point at any allocated frame
+        // including a page table (the linear-map view). Every other entry takes a typed
+        // reference at the required level (`get_type`) — the guard that makes the
+        // hierarchy hold: it fails unless `child` is (or can become) that exact type.
+        // Then take the parent self-reference, which cannot fail (`parent` is already
+        // that level). If the second acquire somehow overflowed, roll the first back so a
+        // rejected link mutates nothing.
+        let readonly_leaf = level == PtLevel::L1 && !writable;
+        if readonly_leaf {
+            self.get(child)?;
+        } else {
+            self.get_type(child, level.child_type())?;
+        }
         if let Err(e) = self.get_type(parent, PageType::PageTable(level)) {
-            let _ = self.put_type(child, child_type);
+            if readonly_leaf {
+                let _ = self.put(child);
+            } else {
+                let _ = self.put_type(child, level.child_type());
+            }
             return Err(e);
         }
         self.alloc_link(Link {
@@ -583,6 +616,7 @@ impl System {
             parent,
             slot,
             child,
+            writable,
         });
         self.check_invariants();
         Ok(())
@@ -606,6 +640,7 @@ impl System {
         };
         let idx = self.link_index(parent, slot).ok_or(P2mError::WrongState)?;
         let child = self.links[idx].child;
+        let writable = self.links[idx].writable;
         // Deactivate the edge first, then release both references. Neither release can
         // fail: the link took and held them, so they are exactly the ones it gives back.
         self.links[idx].active = false;
@@ -614,7 +649,13 @@ impl System {
             rc.is_ok(),
             "unlink could not release its parent ref: {rc:?}"
         );
-        let cc = self.put_type(child, level.child_type());
+        // Mirror exactly what the link took on `child`: a read-only leaf gave a bare
+        // existence reference, everything else a typed one at the level below.
+        let cc = if level == PtLevel::L1 && !writable {
+            self.put(child)
+        } else {
+            self.put_type(child, level.child_type())
+        };
         debug_assert!(cc.is_ok(), "unlink could not release its child ref: {cc:?}");
         self.check_invariants();
         Ok(())
@@ -751,15 +792,18 @@ impl System {
         self.links.iter().filter(|l| l.active).count()
     }
 
-    /// Every live page-table entry as a `(parent, slot, child)` triple. The integrating
-    /// layer uses this to reason about *cross-domain* entries — a link whose `parent` and
-    /// `child` have different owners — which `p2m` itself is deliberately blind to
-    /// (ownership authorization lives at the seam, not in the type discipline).
-    pub fn link_edges(&self) -> Vec<(Mfn, u32, Mfn)> {
+    /// Every live page-table entry as a `(parent, slot, child, writable)` tuple. The
+    /// integrating layer uses this to reason about *cross-domain* entries — a link whose
+    /// `parent` and `child` have different owners — which `p2m` itself is deliberately
+    /// blind to (ownership authorization lives at the seam, not in the type discipline).
+    /// `writable` is the entry's read/write bit, so the seam can require a grant of the
+    /// *matching* permission: a writable foreign leaf needs a read-write grant, a
+    /// read-only one only a read-only grant.
+    pub fn link_edges(&self) -> Vec<(Mfn, u32, Mfn, bool)> {
         self.links
             .iter()
             .filter(|l| l.active)
-            .map(|l| (l.parent, l.slot, l.child))
+            .map(|l| (l.parent, l.slot, l.child, l.writable))
             .collect()
     }
 
@@ -856,7 +900,15 @@ impl System {
         for link in self.links.iter().filter(|l| l.active) {
             let ok = match self.current_type(link.parent) {
                 Some(PageType::PageTable(level)) => {
-                    self.current_type(link.child) == Some(level.child_type())
+                    if level == PtLevel::L1 && !link.writable {
+                        // A read-only leaf imposes no type on its child — it may be
+                        // writable data, or a page table read through the linear map. The
+                        // bare reference the link holds keeps it allocated, which is all
+                        // the hierarchy requires of a read-only leaf.
+                        self.is_allocated(link.child)
+                    } else {
+                        self.current_type(link.child) == Some(level.child_type())
+                    }
                 }
                 // Parent is untyped, writable, or free — not a table at all.
                 _ => false,
@@ -1218,10 +1270,10 @@ mod tests {
             s.allocate(0, m).unwrap();
         }
         s.pin(0, root, PtLevel::L4).unwrap();
-        s.link(0, root, 0, l3).unwrap(); // L4 -> L3
-        s.link(0, l3, 0, l2).unwrap(); //   L3 -> L2
-        s.link(0, l2, 0, l1).unwrap(); //   L2 -> L1
-        s.link(0, l1, 0, leaf).unwrap(); // L1 -> writable leaf
+        s.link(0, root, 0, l3, true).unwrap(); // L4 -> L3
+        s.link(0, l3, 0, l2, true).unwrap(); //   L3 -> L2
+        s.link(0, l2, 0, l1, true).unwrap(); //   L2 -> L1
+        s.link(0, l1, 0, leaf, true).unwrap(); // L1 -> writable leaf
         (root, l3, l2, l1, leaf)
     }
 
@@ -1252,14 +1304,14 @@ mod tests {
 
         // An L4 entry must point at an L3 — pointing at the L2 frame is refused, since
         // the frame is already typed L2 and cannot also be L3.
-        assert_eq!(s.link(0, 0, 0, 2), Err(P2mError::TypePinned));
+        assert_eq!(s.link(0, 0, 0, 2, true), Err(P2mError::TypePinned));
         // Nothing was recorded, and the L2 table is untouched.
         assert_eq!(s.child_at(0, 0), None);
         assert_eq!(s.current_type(2), Some(PageType::PageTable(PtLevel::L2)));
         assert!(s.invariants_hold());
 
         // Frame 1 is untyped, so linking it as the L4's L3 child *establishes* it as L3.
-        s.link(0, 0, 0, 1).unwrap();
+        s.link(0, 0, 0, 1, true).unwrap();
         assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L3)));
         assert!(s.invariants_hold());
     }
@@ -1310,7 +1362,7 @@ mod tests {
         s.allocate(1, 6).unwrap();
         s.allocate(1, 7).unwrap();
         s.pin(1, 6, PtLevel::L1).unwrap();
-        s.link(1, 6, 0, 7).unwrap();
+        s.link(1, 6, 0, 7, true).unwrap();
 
         s.unlink_all(0);
         assert_eq!(s.active_links(), 1, "only domain 1's entry remains");
@@ -1333,16 +1385,16 @@ mod tests {
         s.pin(0, 0, PtLevel::L2).unwrap();
 
         // Slot out of range.
-        assert_eq!(s.link(0, 0, TABLE_SLOTS, 1), Err(P2mError::BadSlot));
+        assert_eq!(s.link(0, 0, TABLE_SLOTS, 1, true), Err(P2mError::BadSlot));
         // The caller must own the *table* it edits (though not necessarily the child).
-        assert_eq!(s.link(1, 0, 0, 1), Err(P2mError::NotYours));
+        assert_eq!(s.link(1, 0, 0, 1, true), Err(P2mError::NotYours));
         // Linking into a frame that is not a table is refused.
-        assert_eq!(s.link(0, 1, 0, 0), Err(P2mError::WrongState));
+        assert_eq!(s.link(0, 1, 0, 0, true), Err(P2mError::WrongState));
 
         // A good link, then a second into the same slot is refused (no in-place
         // overwrite); unlinking frees the slot again.
-        s.link(0, 0, 0, 1).unwrap();
-        assert_eq!(s.link(0, 0, 0, 1), Err(P2mError::WrongState));
+        s.link(0, 0, 0, 1, true).unwrap();
+        assert_eq!(s.link(0, 0, 0, 1, true), Err(P2mError::WrongState));
         assert_eq!(s.unlink(0, 0, 1), Err(P2mError::WrongState)); // no entry at slot 1
         s.unlink(0, 0, 0).unwrap();
         assert_eq!(s.child_at(0, 0), None);
@@ -1359,7 +1411,7 @@ mod tests {
         s.allocate(1, 2).unwrap(); // a frame domain 1 owns
         s.pin(0, 0, PtLevel::L1).unwrap();
 
-        s.link(0, 0, 0, 2).unwrap();
+        s.link(0, 0, 0, 2, true).unwrap();
         assert_eq!(s.child_at(0, 0), Some(2));
         // The foreign frame is now writable-typed and pinned alive by the entry — domain
         // 1 can neither free nor re-type it while domain 0's table points at it.
@@ -1374,6 +1426,94 @@ mod tests {
         assert!(!s.is_foreign_linked(2));
         assert_eq!(s.current_type(2), None);
         assert!(s.free(1, 2).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn a_readonly_leaf_maps_a_page_without_typing_it() {
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 2).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+
+        // A read-only leaf takes only a bare existence reference — the child stays
+        // untyped (a reader imposes no type), exactly as a read-only grant map does.
+        s.link(0, 0, 0, 2, false).unwrap();
+        assert_eq!(s.child_at(0, 0), Some(2));
+        assert_eq!(s.current_type(2), None, "a read-only leaf types nothing");
+        assert_eq!(s.refs(2), Some(1), "but it does pin the page against reuse");
+        // Pinned alive: its owner cannot free it while the entry stands.
+        assert_eq!(s.free(0, 2), Err(P2mError::InUse));
+
+        // Unlinking releases the bare reference and the page is reclaimable again.
+        s.unlink(0, 0, 0).unwrap();
+        assert_eq!(s.refs(2), Some(0));
+        assert!(s.free(0, 2).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn a_readonly_leaf_may_point_at_a_live_page_table() {
+        // The linear-map trick: a guest maps one of its own page tables read-only as an
+        // L1 leaf so it can *read* its PTEs, while the CPU still walks that same frame as
+        // a page table. Safe because neither path can write it — which is exactly why the
+        // exclusivity rule is writable-xor-pagetable, not reference-xor-pagetable.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap(); // the L1 table doing the read-only view
+        s.pin(0, 1, PtLevel::L2).unwrap(); // a page table being viewed read-only
+
+        // A *writable* leaf onto the page table is refused — that would let the guest
+        // write arbitrary PTEs, the type confusion the module exists to prevent.
+        assert_eq!(s.link(0, 0, 0, 1, true), Err(P2mError::TypePinned));
+        assert_eq!(s.child_at(0, 0), None);
+
+        // A *read-only* leaf onto the very same page table is fine: the frame stays a
+        // page table and simultaneously carries the leaf's bare reference.
+        s.link(0, 0, 0, 1, false).unwrap();
+        assert_eq!(s.child_at(0, 0), Some(1));
+        assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L2)));
+        assert_eq!(s.refs(1), Some(2), "the pin's ref plus the leaf's bare ref");
+        assert!(s.invariants_hold());
+
+        // Tear it down: unlink the leaf, then the table is unpinnable and freeable.
+        s.unlink(0, 0, 0).unwrap();
+        assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L2)));
+        s.unpin(0, 1).unwrap();
+        assert_eq!(s.current_type(1), None);
+        assert!(s.free(0, 1).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn readonly_and_writable_leaves_share_one_slot_only_serially() {
+        // Read-only and writable leaves onto the same untyped page: the writable one
+        // types it, the read-only one does not, and each releases exactly its own kind of
+        // reference on unlink.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 3).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+
+        // Writable leaf → child becomes writable-typed.
+        s.link(0, 0, 0, 3, true).unwrap();
+        assert_eq!(s.current_type(3), Some(PageType::Writable));
+        assert_eq!(s.type_refs(3, PageType::Writable), Some(1));
+        s.unlink(0, 0, 0).unwrap();
+        assert_eq!(
+            s.current_type(3),
+            None,
+            "writable ref released, not stranded"
+        );
+        assert_eq!(s.refs(3), Some(0));
+
+        // Read-only leaf into the same slot → child pinned but untyped.
+        s.link(0, 0, 0, 3, false).unwrap();
+        assert_eq!(s.current_type(3), None);
+        assert_eq!(s.refs(3), Some(1));
+        s.unlink(0, 0, 0).unwrap();
+        assert_eq!(s.refs(3), Some(0), "bare ref released, not a type ref");
         assert!(s.invariants_hold());
     }
 

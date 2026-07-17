@@ -221,6 +221,7 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                                 parent: mfn,
                                 slot,
                                 child,
+                                writable: true,
                             },
                         ));
                     }
@@ -360,8 +361,13 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
     let mut edges = p.link_edges();
     edges.sort_unstable();
     k.push(edges.len() as u64);
-    for (par, slot, ch) in edges {
-        k.extend([u64::from(par), u64::from(slot), u64::from(ch)]);
+    for (par, slot, ch, writable) in edges {
+        k.extend([
+            u64::from(par),
+            u64::from(slot),
+            u64::from(ch),
+            writable as u64,
+        ]);
     }
 
     k

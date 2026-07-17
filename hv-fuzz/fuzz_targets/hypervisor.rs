@@ -116,7 +116,7 @@ fuzz_target!(|data: &[u8]| {
             24 => HvCall::P2mUnpin { mfn },
             // Page-table entries — build and dismantle the hierarchy. A mislevelled link
             // is refused at the seam, so only well-formed edges ever take.
-            25 => HvCall::P2mLink { parent: mfn, slot, child },
+            25 => HvCall::P2mLink { parent: mfn, slot, child, writable: b & 1 == 0 },
             26 => HvCall::P2mUnlink { parent: mfn, slot },
             // Tear a whole domain down — all four subsystems and both seams at once.
             // Stale handles it leaves behind are already tolerated by the unmap arm.
