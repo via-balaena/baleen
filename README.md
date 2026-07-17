@@ -55,6 +55,19 @@ core:
 - **Automotive / static-partitioning wedge** has zero Xen legacy — it gets a thin
   native personality or virtio-only guest interfaces, and never links Xen at all.
 
+### x86 and ARM are co-equal targets
+
+Just as the *personality* keeps the core ABI-agnostic northbound, the `hv-hal` fence keeps
+it **architecture-agnostic southbound**. `hv-core` names no CPU architecture: its page
+tables are a generic 4-level hierarchy (what x86-64 *and* AArch64 both use), and it reaches
+hardware only through arch-neutral traits. The first `hv-metal` backend is **x86-64** (Intel
+VMX / EPT, the LAPIC) — so the M3–M5 milestones below describe it — but an **AArch64**
+backend (the ARM virtualization extensions at EL2, Stage-2 translation, the GIC) is an
+**equally first-class goal**, not an afterthought: it is a second implementation of the same
+`hv-hal` traits, and the diamonded brain above it does not change. This is a load-bearing
+design constraint — the fence's trait surface stays free of any architecture-specific
+concept, so the port is a new metal layer, never a rewrite.
+
 ## The architecture in one picture
 
 The core is sandwiched between two thin translation layers. Both are *personalities*
@@ -321,7 +334,9 @@ whole integrated core to depth 5 ≈ 1.40M) with zero violations.
   privilege (a capability model, mutable privilege) and domain-ID reuse policy stay
   deferred; the lifecycle now has both a birth and a death to build them on.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
-  mode. The first `unsafe`, weeks in rather than day one.
+  mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
+  AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
+  same `hv-hal` fence, per *x86 and ARM are co-equal targets* above.)
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into
   `hv-core` calls. The fence becomes real and load-bearing.
 - **M5**: PVH Linux boot — the vertical slice. The Xen **personality**

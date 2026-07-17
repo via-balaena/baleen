@@ -11,12 +11,22 @@
 //! * [`hv-sim`](../hv_sim/index.html) — a host implementation where guest memory is
 //!   a `Vec<u8>` and time is a counter you advance by hand. This is what makes
 //!   `cargo test` exercise the scheduler.
-//! * `hv-metal` (from M3) — the thin, fenced `unsafe` core that plugs real VMX,
-//!   page tables, and the APIC into the same traits.
+//! * `hv-metal` (from M3) — the thin, fenced `unsafe` core that plugs real hardware
+//!   virtualization, page tables, and the interrupt controller into the same traits.
 //!
 //! Because the seam is a set of traits, the same well-tested logic runs on your
 //! laptop and on the metal, and the only thing hardware can falsify is this thin
 //! translation layer.
+//!
+//! **Architecture-neutral by design — x86 and ARM are co-equal targets.** These trait
+//! signatures deliberately name no CPU architecture: `Gpa`/`Ticks` are plain integers,
+//! memory is bytes, a vCPU takes an interrupt vector and an entry point. The *first*
+//! `hv-metal` backend is x86-64 (Intel VMX / EPT, the LAPIC), but an AArch64 backend
+//! (the ARM virtualization extensions at EL2, Stage-2 translation, the GIC) is an equally
+//! first-class goal and plugs in behind exactly these traits — the portable brain above
+//! does not change. Keeping this surface free of any architecture-specific concept (a VMCS
+//! field, an `ept_*` type, a GIC redistributor) is what keeps that promise cheap, so it is
+//! a standing constraint on anything added here.
 
 #![no_std]
 
