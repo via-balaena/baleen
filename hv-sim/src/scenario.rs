@@ -872,7 +872,7 @@ fn bring_all_domains_live(hv: &mut Hypervisor, domains: u16) {
             0,
             HvCall::DomainCreate {
                 target,
-                privileged: false,
+                may_create: false,
             },
         )
         .unwrap();
@@ -1235,40 +1235,43 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
             )),
             13 => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
             14 => {
-                // Bring a slot to life — the birth half of the lifecycle. Predictions in
-                // the impl's order: the caller must be Live (gate), privileged (authority),
-                // and the target Dead (lifecycle). A create may mint a privileged child, so
-                // authority propagates beyond dom0. Because every domain starts Live, a
-                // successful create is necessarily the *rebirth* of a slot torn down earlier
-                // this run — closing the Dead→Live→Dead→Live cycle.
+                // Bring a slot to life — the birth half of the lifecycle. Predictions in the
+                // impl's order: the caller must be Live (gate), hold `may_create` (authority),
+                // and the target Dead (lifecycle). A create may mint a `may_create` child, so
+                // creation authority propagates beyond dom0, and the creator gains control of
+                // the child. Because every domain starts Live, a successful create is
+                // necessarily the *rebirth* of a slot torn down earlier this run — closing the
+                // Dead→Live→Dead→Live cycle.
                 let target = rng.below(u32::from(DOMAINS)) as u16;
-                let privileged = rng.below(2) == 0;
+                let may_create = rng.below(2) == 0;
                 let caller_live = hv.is_live(caller);
-                let caller_priv = hv.is_privileged(caller);
+                let caller_can_create = hv.may_create(caller);
                 let target_dead = !hv.is_live(target);
-                match hv.dispatch(caller, HvCall::DomainCreate { target, privileged }) {
+                match hv.dispatch(caller, HvCall::DomainCreate { target, may_create }) {
                     Ok(HvOutcome::Done) => {
                         out.creations += 1;
-                        // A birth: a live, privileged caller over a Dead target, and the
-                        // target is now Live with exactly the requested authority.
+                        // A birth: a live caller with may_create over a Dead target; the target
+                        // is now Live with the requested creation capability, and the creator
+                        // controls it (the root of every control edge).
                         let born_correctly = caller_live
-                            && caller_priv
+                            && caller_can_create
                             && target_dead
                             && hv.is_live(target)
-                            && hv.is_privileged(target) == privileged;
+                            && hv.may_create(target) == may_create
+                            && hv.controls(caller, target);
                         if !born_correctly {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::Denied) => {
-                        // A live but unprivileged caller — a no-op.
-                        if !caller_live || caller_priv {
+                        // A live caller lacking may_create — a no-op.
+                        if !caller_live || caller_can_create {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::AlreadyAlive) => {
-                        // A live, privileged caller aimed at a still-Live target — a no-op.
-                        if !(caller_live && caller_priv && !target_dead) {
+                        // A live may_create caller aimed at a still-Live target — a no-op.
+                        if !(caller_live && caller_can_create && !target_dead) {
                             out.postcondition_held = false;
                         }
                     }
@@ -1282,53 +1285,46 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                 }
             }
             _ => {
-                // Tear a domain down. Predictions pin the outcome exactly: caller liveness
-                // (the gate), the authority gate (may the caller destroy this target?),
-                // target liveness (is it alive to tear down?), and the busy precondition
-                // (does a foreign domain hold one of its frames?).
+                // Tear a domain down. Predictions pin the outcome exactly, in the impl's
+                // order: the caller must be Live (the dispatch gate — a caller torn down
+                // earlier can no longer act); then per-target authority (does the caller
+                // control this target, or is it the target itself?); then the busy
+                // precondition (does a foreign domain hold one of its frames?). Past the
+                // authority gate the target is provably Live (a control edge needs a live
+                // target), so there is no NotAlive-target path — destroying a Dead peer is
+                // Denied, since no one controls a Dead domain.
                 let target = rng.below(u32::from(DOMAINS)) as u16;
-                // The outcome is pinned by four predictions, in the impl's order: the caller
-                // must itself be Live (the dispatch gate — a caller torn down earlier this
-                // run can no longer act); then authority (may this caller destroy this
-                // target?); then target liveness (is it alive to tear down?); then the busy
-                // precondition (does a foreign domain hold one of its frames?).
                 let caller_live = hv.is_live(caller);
-                let authorized = caller == target || hv.is_privileged(caller);
-                let live = hv.is_live(target);
+                let authorized = caller == target || hv.controls(caller, target);
                 let foreign = hv.grant().has_foreign_map(target);
                 match hv.dispatch(caller, HvCall::DomainDestroy { target, now }) {
                     Ok(HvOutcome::Done) => {
                         out.teardowns += 1;
-                        // A clean teardown: a live caller, authorized, over a live target
-                        // with no foreign map, leaving nothing live pointing into it.
-                        if !(caller_live
-                            && authorized
-                            && live
-                            && !foreign
-                            && is_empty_shell(&hv, target))
-                        {
+                        // A clean teardown: a live, authorized caller over a target with no
+                        // foreign map, leaving nothing live pointing into it.
+                        if !(caller_live && authorized && !foreign && is_empty_shell(&hv, target)) {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::DomainBusy) => {
                         out.busy_refusals += 1;
-                        // A busy refusal: a live, authorized caller over a live, foreign-held
+                        // A busy refusal: a live, authorized caller over a foreign-held
                         // target. A no-op, so nothing else to check.
-                        if !(caller_live && authorized && live && foreign) {
+                        if !(caller_live && authorized && foreign) {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::Denied) => {
                         out.denials += 1;
-                        // A denial: a live but unauthorized caller — a no-op.
+                        // A denial: a live caller that neither is nor controls the target — a
+                        // no-op. (Includes aiming at a Dead peer: no one controls it.)
                         if !caller_live || authorized {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::NotAlive) => {
-                        // Not-alive: either the caller itself is Dead (the gate), or a live
-                        // authorized caller aimed at an already-Dead target. Both no-ops.
-                        if !(!caller_live || (authorized && !live)) {
+                        // The caller itself is Dead (the gate) — a no-op.
+                        if caller_live {
                             out.postcondition_held = false;
                         }
                     }

@@ -235,15 +235,16 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
             }
         }
         if cfg.create {
-            // Every (caller, target, privileged) triple — so the authority-denied path (an
-            // unprivileged caller, a no-op), the already-alive path, and the authorized
-            // Dead→Live birth (including minting a privileged child) are all explored. Only
-            // dom0 boots Live+privileged, so bringing a second domain up is the *only* way
-            // the enumeration reaches any two-live-domain state — the cross-domain seams
-            // depend on it.
+            // Every (caller, target, may_create) triple — so the authority-denied path (a
+            // caller without `may_create`, a no-op), the already-alive path, and the
+            // authorized Dead→Live birth (including minting a `may_create` child) are all
+            // explored. Only dom0 boots with `may_create`, so bringing a second domain up is
+            // the *only* way the enumeration reaches any two-live-domain state (and the
+            // creator gains control of it — the root of every control edge) — the
+            // cross-domain seams and the per-target authority both depend on it.
             for target in 0..doms {
-                for &privileged in &bools {
-                    v.push((caller, HvCall::DomainCreate { target, privileged }));
+                for &may_create in &bools {
+                    v.push((caller, HvCall::DomainCreate { target, may_create }));
                 }
             }
         }
@@ -394,13 +395,19 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
     }
     k.push(0xFFFF_0004);
 
-    // Domain lifecycle: liveness and privilege gate *every* transition (a Dead slot can do
-    // nothing; only a privileged domain may create/destroy a peer), so both are
-    // behaviourally live and must be part of the fingerprint — else two states differing
-    // only in who is alive or privileged would wrongly merge, dropping coverage.
+    // Domain lifecycle & authority gate *every* transition (a Dead slot can do nothing;
+    // only a `may_create` domain may create; only a controller may destroy a given peer),
+    // so liveness, `may_create`, and the whole control matrix are behaviourally live and
+    // must be part of the fingerprint — else two states differing only in who is alive, may
+    // create, or controls whom would wrongly merge, dropping coverage.
     for dom in 0..hv.domain_count() as u16 {
         k.push(hv.is_live(dom) as u64);
-        k.push(hv.is_privileged(dom) as u64);
+        k.push(hv.may_create(dom) as u64);
+    }
+    for holder in 0..hv.domain_count() as u16 {
+        for target in 0..hv.domain_count() as u16 {
+            k.push(hv.controls(holder, target) as u64);
+        }
     }
 
     k
@@ -656,7 +663,7 @@ mod tests {
             0,
             HvCall::DomainCreate {
                 target: 1,
-                privileged: false,
+                may_create: false,
             },
         )
         .unwrap();

@@ -18,11 +18,12 @@
 //! is caught by the same invariant — and `P2mLink` onto a frame another domain owns routes
 //! through the page-table↔grant authorization seam, so an *unauthorized* cross-domain entry
 //! is caught too. `DomainCreate`/`DomainDestroy` are the birth and death of a whole domain,
-//! welding every subsystem and seam at once — creation lifts a Dead slot to Live (privileged
-//! callers only), destroy tears a domain to a clean shell (refused when a foreign domain
-//! holds a live map) — so a mis-ordered teardown, a resource surviving a domain's death, or
-//! a self-elevation trips the same combined invariant, which now includes the lifecycle
-//! predicates (a Dead slot is a clean, unprivileged shell).
+//! welding every subsystem and seam at once — creation lifts a Dead slot to Live (`may_create`
+//! callers only, the creator gaining per-target control of the child), destroy tears a domain
+//! to a clean shell (refused when a foreign domain holds a live map) — so a mis-ordered
+//! teardown, a resource or capability surviving a domain's death, or a self-elevation trips the
+//! same combined invariant, which now includes the lifecycle/authority predicates (a Dead slot
+//! is a clean, authority-free shell; every control edge relates two live domains).
 //! The seeded mirrors in `hv-sim` (`run_hypervisor` broadly, `run_seam` wake-biased,
 //! `run_ptab` tree-building, `run_foreign` cross-domain, `run_destroy` lifecycle-cycling)
 //! make the properties deterministic.
@@ -65,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
             0,
             HvCall::DomainCreate {
                 target,
-                privileged: false,
+                may_create: false,
             },
         );
     }
@@ -167,11 +168,11 @@ fuzz_target!(|data: &[u8]| {
             },
             26 => HvCall::P2mUnlink { parent: mfn, slot },
             // Bring a slot to life (the birth half of the lifecycle) — a no-op unless the
-            // caller is a live control domain and `other` is a Dead slot. May mint a
-            // privileged child, so authority propagates beyond dom0.
+            // caller may_create and `other` is a Dead slot. The creator gains control of the
+            // child, and may mint a `may_create` child, so authority propagates beyond dom0.
             27 => HvCall::DomainCreate {
                 target: other,
-                privileged: b & 1 == 0,
+                may_create: b & 1 == 0,
             },
             // Tear a whole domain down — all four subsystems and both seams at once.
             // Stale handles it leaves behind are already tolerated by the unmap arm.

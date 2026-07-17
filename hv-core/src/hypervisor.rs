@@ -142,22 +142,25 @@ pub enum HvCall {
     /// the link held.
     P2mUnlink { parent: Mfn, slot: u32 },
 
-    /// Bring the `Dead` domain slot `target` to life as a fresh, empty `Live` domain,
-    /// stamping its `privileged` bit. The birth half of the domain lifecycle, the mirror
-    /// of [`HvCall::DomainDestroy`].
+    /// Bring the `Dead` domain slot `target` to life as a fresh, empty `Live` domain. The
+    /// caller becomes `target`'s controller (`controls[caller][target]`), and `may_create`
+    /// stamps whether the new domain itself holds the creation capability. The birth half of
+    /// the domain lifecycle, the mirror of [`HvCall::DomainDestroy`].
     ///
-    /// **Authority:** creation is a privileged control operation — only a privileged
-    /// caller (a control domain) may create a domain, else [`HvError::Denied`], mutating
-    /// nothing. This is what gives *privilege a provenance*: the sole way a domain ever
-    /// becomes privileged is a privileged domain creating it so (`privileged: true`), so
-    /// no domain can self-elevate. **Lifecycle:** `target` must currently be `Dead`, else
+    /// **Authority:** creation requires the *creation capability* — only a caller with
+    /// `may_create` may create a domain, else [`HvError::Denied`], mutating nothing. This is
+    /// what gives that capability a provenance: the sole way a domain gains `may_create` is a
+    /// domain that already has it creating it so (`may_create: true`), so none can
+    /// self-elevate. **Control:** on success the creator gains control of the child — the
+    /// root of every control edge — from which control is delegable (a later refinement).
+    /// **Lifecycle:** `target` must currently be `Dead`, else
     /// [`HvError::AlreadyAlive`]. A `Dead` slot is a provably-clean shell (owns no frame,
     /// offers or holds no grant, has no bound port or online vCPU — the standing
     /// [`CrossViolation::DeadDomainNotClean`] invariant), so a freshly created domain
     /// always starts empty; creation adds no resources, only lifts the slot to `Live` and
     /// records its authority. Self-creation cannot arise — the caller is `Live` and the
     /// target `Dead`, so they are never the same domain.
-    DomainCreate { target: DomId, privileged: bool },
+    DomainCreate { target: DomId, may_create: bool },
 
     /// Tear down domain `target` completely: close its every event-channel port,
     /// offline its every vCPU (closing on-CPU intervals at `now`), unmap its every
@@ -168,11 +171,13 @@ pub enum HvCall {
     /// teardown cannot revoke without yanking it out from under the mapper). `now` is a
     /// plain operation input, as for the scheduler ops: the core owns no clock, so
     /// whoever builds the call stamps it. **Authority:** a domain may tear *itself* down,
-    /// but destroying a *peer* requires the caller be privileged (a control domain);
-    /// otherwise [`HvError::Denied`], mutating nothing. **Lifecycle:** the death half of
-    /// the domain lifecycle (the mirror of [`HvCall::DomainCreate`]) — `target` must be
-    /// `Live`, else [`HvError::NotAlive`]; the slot drops to `Dead` and loses its
-    /// privilege, leaving a clean, unprivileged shell that only a later `DomainCreate` can
+    /// but destroying a *peer* requires the caller *control* that peer
+    /// (`controls[caller][target]`); otherwise [`HvError::Denied`], mutating nothing. A
+    /// `Dead` domain has no controller, so a peer destroy of one is always `Denied`, never
+    /// distinguishable from a live-but-uncontrolled target. **Lifecycle:** the death half of
+    /// the domain lifecycle (the mirror of [`HvCall::DomainCreate`]) — the slot drops to
+    /// `Dead` and loses all authority (its `may_create` and every control edge into or out
+    /// of it), leaving a clean, authority-free shell that only a later `DomainCreate` can
     /// revive.
     DomainDestroy { target: DomId, now: Ticks },
 }
@@ -226,20 +231,21 @@ pub enum HvError {
     /// needs the owner's consent, which a grant expresses — the isolation guard on the
     /// page-table↔grant join, so it belongs to the seam.
     Unauthorized,
-    /// A whole-domain *control* operation was refused because the caller is not
-    /// privileged. Two such operations: destroying **another** domain
-    /// ([`HvCall::DomainDestroy`] — a domain may tear *itself* down, but tearing down a
-    /// peer requires being a control domain), and creating one
-    /// ([`HvCall::DomainCreate`] — only a control domain may bring a slot to life, which is
-    /// what gives privilege its provenance). The **authority** guard — the third axis after
+    /// A whole-domain *control* operation was refused for want of authority. Two axes:
+    /// creating a domain ([`HvCall::DomainCreate`]) requires the global `may_create`
+    /// capability; destroying **another** domain ([`HvCall::DomainDestroy`]) requires a
+    /// *per-target* control capability over that specific peer (`controls[caller][target]`) —
+    /// a domain may always tear *itself* down. The **authority** guard — the third axis after
     /// ownership and consent — enforced at the dispatch seam, which is where cross-domain
-    /// authorization lives.
+    /// authorization lives. Since a `Dead` domain has no controller, destroying one is always
+    /// this error, never a liveness one.
     Denied,
-    /// An operation named a domain that must be `Live` but is `Dead`. Two shapes: a `Dead`
-    /// domain issued a hypercall at all (the caller-liveness gate — a `Dead` slot can do
-    /// nothing, which is what keeps [`CrossViolation::DeadDomainNotClean`] a standing
-    /// invariant), or [`HvCall::DomainDestroy`] targeted a slot that is not `Live` (there
-    /// is nothing to tear down). The lifecycle guard, enforced at the dispatch seam.
+    /// A `Dead` domain issued a hypercall — the caller-liveness gate. A `Dead` slot can do
+    /// nothing (which is what keeps [`CrossViolation::DeadDomainNotClean`] a standing
+    /// invariant); only [`HvCall::DomainCreate`] by a live `may_create` domain can revive it.
+    /// The lifecycle guard on the *caller*, enforced at the dispatch seam. (Destroying a
+    /// `Dead` *target* is not this error — a `Dead` domain has no controller, so it is
+    /// [`Self::Denied`].)
     NotAlive,
     /// A [`HvCall::DomainCreate`] targeted a slot that is already `Live`. Creation is
     /// `Dead` → `Live`; an already-live domain must be torn down before its slot can be
@@ -280,12 +286,19 @@ pub enum CrossViolation {
     /// forever, across every subsystem at once. Whole-domain and cross-subsystem, so it
     /// belongs to the integrated core, not any one subsystem.
     DeadDomainNotClean { dom: DomId },
-    /// A `Dead` domain that is still marked privileged. Privilege must imply `Live`: the
-    /// only way a domain becomes privileged is a privileged domain creating it so, and
-    /// teardown strips privilege on death — so a `Dead` privileged slot would mean
-    /// authority materialised without provenance. The state-predicate teeth of "no domain
-    /// self-elevated": privilege can only ride a `Live` domain a privileged creator raised.
-    PrivilegedDeadDomain { dom: DomId },
+    /// A `Dead` domain that still holds the `may_create` capability. It must imply `Live`:
+    /// the only way a domain gains `may_create` is a `may_create` domain creating it so, and
+    /// teardown strips it on death — so a `Dead` slot holding it would mean authority
+    /// materialised without provenance. The state-predicate teeth of "no domain
+    /// self-elevated": creation authority can only ride a `Live` domain a creator raised.
+    DeadDomainMayCreate { dom: DomId },
+    /// A control edge `controls[holder][target]` with a `Dead` endpoint — a `holder` that
+    /// cannot act or a `target` that no longer exists. A control capability must relate two
+    /// `Live` domains: it is rooted in creation and delegation (both requiring live
+    /// endpoints) and teardown clears every edge touching a domain, so a `Dead` endpoint
+    /// would mean a capability outlived the domain it named. The per-target authority's
+    /// standing invariant, the finer cousin of [`Self::DeadDomainMayCreate`].
+    ControlEdgeDeadEndpoint { holder: DomId, target: DomId },
 }
 
 /// Where a domain slot sits in its lifecycle. A slot is not a domain that always exists;
@@ -312,20 +325,31 @@ pub struct Hypervisor {
     p2m: p2m::System,
     /// Each domain slot's lifecycle state — the explicit `Dead`/`Live` machine that makes
     /// "doesn't exist yet" a first-class state. Domain 0 boots `Live` (the primordial
-    /// control domain); every other slot starts `Dead` and only a privileged
+    /// control domain); every other slot starts `Dead` and only a `may_create` domain's
     /// [`HvCall::DomainCreate`] brings it to life. Every hypercall requires a `Live`
     /// caller (the gate in [`Self::route`]), which is what keeps a `Dead` slot a provably
     /// clean shell — it can never acquire a resource to hold.
     life: Vec<DomainLife>,
-    /// Which domains are *privileged* — the control domains (Xen's dom0). A privileged
-    /// domain may issue whole-domain control operations against *other* domains (today,
-    /// [`HvCall::DomainDestroy`]); an ordinary domain may only act on itself. This is the
-    /// **authority** axis, the third alongside *ownership* (a domain acts on its own
-    /// resources) and *consent* (grants authorize cross-domain memory access) — and, like
-    /// those, it is a guard the seam checks, not something a guest can confer on itself.
-    /// Fixed at construction (domain 0 boots privileged, as dom0 does); delegable /
-    /// mutable privilege is a later refinement.
-    privileged: Vec<bool>,
+    /// Which domains hold the **creation** capability — may issue [`HvCall::DomainCreate`]
+    /// to bring a `Dead` slot to life. Domain 0 boots with it (the primordial control
+    /// domain, Xen's dom0); a creator decides whether each child inherits it. This is the
+    /// global half of the **authority** axis (the third alongside *ownership* and
+    /// *consent*): it gates only creation, and it has a provenance — the sole way to gain it
+    /// is a domain that already has it creating you so, so no domain can self-elevate.
+    /// Invariant: `may_create ⇒ Live` ([`CrossViolation::DeadDomainMayCreate`]).
+    may_create: Vec<bool>,
+    /// The per-target **control** relation — the *finer* half of authority. `controls[h][t]`
+    /// means domain `h` may issue whole-domain control operations against domain `t`
+    /// specifically ([`HvCall::DomainDestroy`], and delegating/revoking control of `t`) — a
+    /// capability over one named domain, not a blanket privilege over all. It is **rooted in
+    /// creation**: creating `t` gives the creator `controls[creator][t]`; from there it is
+    /// delegable. Pure least-privilege — there is no implicit transitivity, so a domain
+    /// controls exactly the domains it created or was delegated, and dom0 holds no blanket
+    /// power over domains it did not build. A control edge requires *both* endpoints `Live`
+    /// ([`CrossViolation::ControlEdgeDeadEndpoint`]); teardown clears every edge into and out
+    /// of a domain, so no capability outlives its target's (or holder's) life. `controls[d][d]`
+    /// is unused — a domain's authority over *itself* is inherent, not an edge.
+    controls: Vec<Vec<bool>>,
 }
 
 impl Hypervisor {
@@ -334,9 +358,10 @@ impl Hypervisor {
     /// virtual CPUs, scheduled over `num_pcpus` shared physical CPUs, with `num_frames`
     /// machine frames in the shared page pool. Every subsystem shares the same domain
     /// count; the physical CPUs and machine frames are system-wide. **Domain 0 boots
-    /// `Live` and privileged** (the control domain, Xen's dom0); **every other slot boots
-    /// `Dead`** — an empty shell that a privileged [`HvCall::DomainCreate`] must bring to
-    /// life before it can act.
+    /// `Live` with the creation capability** (the control domain, Xen's dom0); **every other
+    /// slot boots `Dead`** — an empty shell that a `may_create` domain's
+    /// [`HvCall::DomainCreate`] must bring to life before it can act. No control edges exist
+    /// at boot: dom0 gains `controls` over each domain only by creating it.
     pub fn new(
         num_domains: usize,
         ports_per_domain: usize,
@@ -351,8 +376,12 @@ impl Hypervisor {
             grant: grant::System::new(num_domains, grants_per_domain),
             sched: sched::System::new(num_domains, vcpus_per_domain, num_pcpus),
             p2m: p2m::System::new(num_domains, num_frames),
-            // Domain 0 is the boot control domain; the rest start unprivileged.
-            privileged: (0..num_domains).map(|d| d == 0).collect(),
+            // Domain 0 is the boot control domain: it may create. The rest cannot.
+            may_create: (0..num_domains).map(|d| d == 0).collect(),
+            // No control edges at boot — dom0 gains control of a domain by creating it.
+            controls: (0..num_domains)
+                .map(|_| alloc::vec![false; num_domains])
+                .collect(),
             // Domain 0 boots Live; every other slot is a Dead shell awaiting creation.
             life: (0..num_domains)
                 .map(|d| {
@@ -538,8 +567,8 @@ impl Hypervisor {
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
 
-            HvCall::DomainCreate { target, privileged } => {
-                self.domain_create(caller, target, privileged)
+            HvCall::DomainCreate { target, may_create } => {
+                self.domain_create(caller, target, may_create)
             }
             HvCall::DomainDestroy { target, now } => self.domain_destroy(caller, target, now),
         }
@@ -779,12 +808,17 @@ impl Hypervisor {
     /// Bring a `Dead` slot to life — the birth half of the domain lifecycle, the mirror of
     /// [`Self::domain_destroy`].
     ///
-    /// **Authority gate first.** Creation is a privileged control operation: only a
-    /// privileged caller (a control domain — the liveness gate already guaranteed the
-    /// caller is `Live` and in range) may create a domain, else [`HvError::Denied`], a true
-    /// no-op. This gate is the whole of privilege's *provenance* — the only transition that
-    /// ever sets a domain's `privileged` bit is this one, and it is itself privilege-gated,
-    /// so a domain can never self-elevate.
+    /// **Authority gate first.** Creation requires the *creation capability*: only a caller
+    /// with `may_create` (the liveness gate already guaranteed the caller is `Live` and in
+    /// range) may create a domain, else [`HvError::Denied`], a true no-op. This gate is the
+    /// whole of `may_create`'s *provenance* — the only transition that ever sets a domain's
+    /// `may_create` bit is this one, and it is itself gated on `may_create`, so a domain can
+    /// never self-elevate.
+    ///
+    /// **Control rooted here.** On success the caller becomes `target`'s controller
+    /// (`controls[caller][target]`), the root of every control edge: a domain controls what
+    /// it creates, and delegation flows from there. `may_create` stamps whether the child
+    /// may itself create.
     ///
     /// **Lifecycle guard.** `target` must be a `Dead` slot, else [`HvError::AlreadyAlive`].
     /// A `Dead` slot is a clean shell by the [`CrossViolation::DeadDomainNotClean`]
@@ -793,19 +827,20 @@ impl Hypervisor {
     /// domain always begins empty. That is the whole elegance: creation records authority
     /// and lifts the slot to `Live`, but adds *no* resources, because the invariant
     /// guarantees there is nothing to clear. Self-creation cannot occur: the caller is
-    /// `Live` and the target `Dead`, so `caller != target` always.
+    /// `Live` and the target `Dead`, so `caller != target` always — so the control edge it
+    /// records is never the unused self-edge.
     fn domain_create(
         &mut self,
         caller: DomId,
         target: DomId,
-        privileged: bool,
+        may_create: bool,
     ) -> Result<HvOutcome, HvError> {
         if target as usize >= self.domain_count() {
             return Err(HvError::BadDomain);
         }
-        // Authority: only a privileged control domain may create. A refusal mutates
-        // nothing — this is what gives privilege its provenance (no self-elevation).
-        if !self.privileged[caller as usize] {
+        // Authority: only a domain with the creation capability may create. A refusal
+        // mutates nothing — this is what gives may_create its provenance (no self-elevation).
+        if !self.may_create[caller as usize] {
             return Err(HvError::Denied);
         }
         // Lifecycle: the slot must be Dead. An already-live domain must be torn down first.
@@ -819,7 +854,9 @@ impl Hypervisor {
             "domain {target} was Dead but not a clean shell before creation"
         );
         self.life[target as usize] = DomainLife::Live;
-        self.privileged[target as usize] = privileged;
+        self.may_create[target as usize] = may_create;
+        // The creator controls what it creates — the root of every control edge.
+        self.controls[caller as usize][target as usize] = true;
         Ok(HvOutcome::Done)
     }
 
@@ -827,11 +864,14 @@ impl Hypervisor {
     /// welds every seam. **Atomic, all-or-nothing, refuse-if-busy.**
     ///
     /// **Authority gate first.** A domain may tear *itself* down, but destroying a *peer*
-    /// requires the caller be privileged (a control domain — Xen's dom0); otherwise the
+    /// requires the caller *control* that peer specifically (`controls[caller][target]` — a
+    /// capability rooted in having created it, or delegated to the caller); otherwise the
     /// call is refused with [`HvError::Denied`] before anything is inspected or touched, so
-    /// an unauthorized destroy is a true no-op. This is the authority axis — the third
-    /// after ownership and consent — and it lives at the seam because only the integrated
-    /// core sees both the acting `caller` and the `target`.
+    /// an unauthorized destroy is a true no-op. This is the *finer* authority axis — the
+    /// third after ownership and consent — per-target rather than a blanket privilege, and
+    /// it lives at the seam because only the integrated core sees both the acting `caller`
+    /// and the `target`. Teardown then clears every control edge into *and* out of `target`
+    /// (and its `may_create`), so no capability outlives the domain it named.
     ///
     /// Then one precondition gates the rest: no *foreign* domain may hold a live grant map
     /// of one of `target`'s frames ([`grant::System::has_foreign_map`]). If one does, teardown
@@ -854,7 +894,7 @@ impl Hypervisor {
     ///    entries torn down, pins dropped, foreign maps excluded by the precondition), so
     ///    each free succeeds.
     ///
-    /// What remains is a `Dead`, unprivileged, empty shell: domain slots are fixed-size
+    /// What remains is a `Dead`, authority-free, empty shell: domain slots are fixed-size
     /// and never removed, so peers left `Unbound { remote: target }` stay valid, and only a
     /// later [`Self::domain_create`] can revive it. Verification rides on the existing
     /// invariant net (a mis-ordered teardown trips grant↔p2m or evtchn↔sched, caught by the
@@ -879,19 +919,23 @@ impl Hypervisor {
         if caller as usize >= self.domain_count() || target as usize >= self.domain_count() {
             return Err(HvError::BadDomain);
         }
-        // The authority gate, before anything is inspected: a domain may destroy itself,
-        // but destroying a peer needs privilege. A refusal here mutates nothing. Checked
-        // before liveness, so an unprivileged caller cannot even probe whether a peer is
-        // alive — a denial reveals nothing about the target.
-        if caller != target && !self.privileged[caller as usize] {
+        // The authority gate, before anything is inspected: a domain may destroy itself, but
+        // destroying a peer needs a control capability over *that* peer specifically. A
+        // refusal here mutates nothing. Checked before liveness, so a caller that lacks
+        // control cannot even probe whether a peer is alive — a denial reveals nothing.
+        if caller != target && !self.controls[caller as usize][target as usize] {
             return Err(HvError::Denied);
         }
-        // Lifecycle: only a Live domain can be torn down. Destroying a Dead slot is
-        // NotAlive — there is nothing there. (The caller is Live by the dispatch gate, so a
-        // self-destroy always passes this.) Symmetric with create's Dead requirement.
-        if self.life[target as usize] != DomainLife::Live {
-            return Err(HvError::NotAlive);
-        }
+        // Past the authority gate the target is provably Live, so there is no NotAlive path
+        // here: a self-destroy has a Live caller (the dispatch gate), and a control edge
+        // requires a Live target (the ControlEdgeDeadEndpoint invariant). A Dead domain has
+        // no controller — its edges were cleared on death — so a peer destroy of it never
+        // gets past the gate: it is Denied, not NotAlive, which also means a caller that
+        // lacks control cannot tell a Dead target from a Live one.
+        debug_assert!(
+            self.life[target as usize] == DomainLife::Live,
+            "domain_destroy reached a Dead target {target} past the authority gate"
+        );
         // The precondition. Checked before any mutation, so a refusal is a true no-op. No
         // *foreign* domain may hold one of `target`'s frames — neither a live grant map
         // nor a live cross-domain page-table entry — since teardown would then have to
@@ -929,12 +973,18 @@ impl Hypervisor {
         self.p2m.unpin_all(target);
         self.p2m.free_all(target);
 
-        // The slot drops to Dead and loses its privilege — a clean, unprivileged shell that
-        // only a later DomainCreate can revive. Clearing privilege keeps "privileged ⇒
-        // Live" (PrivilegedDeadDomain) a standing invariant and gives a reborn slot a fresh
-        // authority, never a stale one inherited from a dead tenant.
+        // The slot drops to Dead and loses all authority — a clean, unprivileged shell that
+        // only a later DomainCreate can revive. Clearing `may_create` keeps "may_create ⇒
+        // Live" (DeadDomainMayCreate) standing; clearing every control edge into and out of
+        // `target` keeps "a control edge needs both endpoints Live" (ControlEdgeDeadEndpoint)
+        // standing — so a capability never outlives the domain it named, and a reborn slot
+        // gets fresh authority, never a stale one inherited from a dead tenant.
         self.life[target as usize] = DomainLife::Dead;
-        self.privileged[target as usize] = false;
+        self.may_create[target as usize] = false;
+        for h in 0..self.domain_count() {
+            self.controls[h][target as usize] = false; // edges *into* target (its controllers)
+            self.controls[target as usize][h] = false; // edges *out of* target (what it controlled)
+        }
 
         debug_assert!(
             self.is_clean_shell(target),
@@ -981,9 +1031,11 @@ impl Hypervisor {
     /// another domain owns) must be authorized by a read-write grant from that owner — no
     /// domain reaches into another's memory through its page tables without consent.
     ///
-    /// Domain lifecycle: every `Dead` slot is a provably-clean, unprivileged shell — it
-    /// owns no frame, offers or holds no grant, has no bound port or online vCPU, and is
-    /// not privileged. The whole-domain invariant that closes the create/destroy loop.
+    /// Domain lifecycle & authority: every `Dead` slot is a provably-clean, authority-free
+    /// shell — it owns no frame, offers or holds no grant, has no bound port or online vCPU,
+    /// holds no `may_create`, and sits on no control edge; and every control edge relates two
+    /// `Live` domains. The whole-domain invariants that close the create/destroy loop and
+    /// keep the per-target authority tied to life.
     /// The total live grant mappings, and writable ones, standing over `frame` — summed
     /// across every grant that names it. In a consistent state all such grants share the
     /// frame's owner (the misowned check enforces that), so this is the exact count of
@@ -1061,19 +1113,32 @@ impl Hypervisor {
                 return Some(CrossViolation::UnauthorizedForeignLink { parent, child });
             }
         }
-        // Domain lifecycle: a `Dead` slot must be a provably-clean, unprivileged shell.
+        // Domain lifecycle: a `Dead` slot must be a provably-clean, authority-free shell.
         // These graduate teardown's one-shot postcondition into standing invariants: the
         // liveness gate guarantees a `Dead` domain can never acquire a resource, so
-        // cleanliness holds forever, and clearing privilege on death keeps authority tied
-        // to life. `DeadDomainNotClean` is cross-subsystem (it reads all four); together
+        // cleanliness holds forever, and clearing authority on death keeps it tied to life.
+        // `DeadDomainNotClean` is cross-subsystem (it reads all four subsystems); together
         // with the create/destroy guards they give the lifecycle its full safety content.
         for dom in 0..self.domain_count() as DomId {
             if self.life[dom as usize] == DomainLife::Dead {
                 if !self.is_clean_shell(dom) {
                     return Some(CrossViolation::DeadDomainNotClean { dom });
                 }
-                if self.privileged[dom as usize] {
-                    return Some(CrossViolation::PrivilegedDeadDomain { dom });
+                if self.may_create[dom as usize] {
+                    return Some(CrossViolation::DeadDomainMayCreate { dom });
+                }
+            }
+        }
+        // Authority: every control edge must relate two `Live` domains. Rooted in creation
+        // and delegation (both requiring live endpoints) and cleared by teardown, so a
+        // `Dead` endpoint means a capability outlived the domain it named.
+        for holder in 0..self.domain_count() as DomId {
+            for target in 0..self.domain_count() as DomId {
+                if self.controls[holder as usize][target as usize]
+                    && (self.life[holder as usize] != DomainLife::Live
+                        || self.life[target as usize] != DomainLife::Live)
+                {
+                    return Some(CrossViolation::ControlEdgeDeadEndpoint { holder, target });
                 }
             }
         }
@@ -1102,13 +1167,26 @@ impl Hypervisor {
         self.credit.get(dom as usize).map(HvCore::balance)
     }
 
-    /// Whether `dom` is a privileged control domain — one that may issue whole-domain
-    /// control operations (creating or destroying another domain). Domain 0 boots
-    /// privileged; a domain gains privilege only by a privileged domain creating it so, and
-    /// loses it on teardown. Out-of-range domains read as unprivileged. Privilege always
-    /// implies `Live` (the [`CrossViolation::PrivilegedDeadDomain`] invariant).
-    pub fn is_privileged(&self, dom: DomId) -> bool {
-        self.privileged.get(dom as usize).copied().unwrap_or(false)
+    /// Whether `dom` holds the **creation** capability — may issue [`HvCall::DomainCreate`].
+    /// Domain 0 boots with it; a domain gains it only by a `may_create` domain creating it
+    /// so, and loses it on teardown. Out-of-range domains read as `false`. Always implies
+    /// `Live` (the [`CrossViolation::DeadDomainMayCreate`] invariant).
+    pub fn may_create(&self, dom: DomId) -> bool {
+        self.may_create.get(dom as usize).copied().unwrap_or(false)
+    }
+
+    /// Whether `holder` holds a **control** capability over `target` — may destroy it and
+    /// (later) delegate/revoke control of it. Rooted in creation (`holder` created `target`)
+    /// or delegation; cleared when either domain is torn down. A domain's authority over
+    /// *itself* is inherent and not represented as an edge, so `controls(d, d)` is always
+    /// `false`. Out-of-range domains read as `false`. Every `true` edge relates two `Live`
+    /// domains (the [`CrossViolation::ControlEdgeDeadEndpoint`] invariant).
+    pub fn controls(&self, holder: DomId, target: DomId) -> bool {
+        self.controls
+            .get(holder as usize)
+            .and_then(|row| row.get(target as usize))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Whether `dom` is a `Live` domain — one that has been created (or booted, for dom0)
@@ -1162,7 +1240,7 @@ mod tests {
             0,
             HvCall::DomainCreate {
                 target: 1,
-                privileged: false,
+                may_create: false,
             },
         )
         .unwrap();
@@ -1170,7 +1248,7 @@ mod tests {
             0,
             HvCall::DomainCreate {
                 target: 2,
-                privileged: false,
+                may_create: false,
             },
         )
         .unwrap();
@@ -2287,9 +2365,9 @@ mod tests {
     fn only_a_privileged_domain_or_the_target_itself_may_destroy_a_domain() {
         let mut h = hv();
         // Domain 0 boots as the control domain (dom0); 1 and 2 are ordinary.
-        assert!(h.is_privileged(0));
-        assert!(!h.is_privileged(1));
-        assert!(!h.is_privileged(2));
+        assert!(h.may_create(0));
+        assert!(!h.may_create(1));
+        assert!(!h.may_create(2));
 
         // Give domain 1 some state, so a denied teardown can be shown to touch nothing.
         h.dispatch(1, HvCall::P2mAllocate { mfn: 3 }).unwrap();
@@ -2330,7 +2408,7 @@ mod tests {
         let mut h = hv();
         // Domain 2 is unprivileged, but a domain always has authority over *itself* —
         // self-teardown never needs privilege.
-        assert!(!h.is_privileged(2));
+        assert!(!h.may_create(2));
         h.dispatch(2, HvCall::P2mAllocate { mfn: 4 }).unwrap();
         assert_eq!(
             h.dispatch(2, HvCall::DomainDestroy { target: 2, now: 0 }),
@@ -2347,11 +2425,11 @@ mod tests {
         // slot is a Dead, unprivileged, clean shell awaiting creation.
         let h = Hypervisor::new(3, 8, 6, 2, 2, 8);
         assert!(h.is_live(0));
-        assert!(h.is_privileged(0));
+        assert!(h.may_create(0));
         assert_eq!(h.life_of(0), Some(DomainLife::Live));
         for d in 1..3 {
             assert!(!h.is_live(d), "domain {d} should boot Dead");
-            assert!(!h.is_privileged(d));
+            assert!(!h.may_create(d));
             assert_eq!(h.life_of(d), Some(DomainLife::Dead));
         }
         assert_eq!(
@@ -2397,13 +2475,13 @@ mod tests {
                 0,
                 HvCall::DomainCreate {
                     target: 1,
-                    privileged: false,
+                    may_create: false,
                 },
             ),
             Ok(HvOutcome::Done)
         );
         assert!(h.is_live(1));
-        assert!(!h.is_privileged(1));
+        assert!(!h.may_create(1));
         // Now — and only now — domain 1 can act: what was NotAlive a moment ago succeeds.
         assert!(h.dispatch(1, HvCall::P2mAllocate { mfn: 0 }).is_ok());
         assert_eq!(h.p2m().owner_of(0), Some(1));
@@ -2418,7 +2496,7 @@ mod tests {
             0,
             HvCall::DomainCreate {
                 target: 1,
-                privileged: false,
+                may_create: false,
             },
         )
         .unwrap();
@@ -2428,7 +2506,7 @@ mod tests {
                 1,
                 HvCall::DomainCreate {
                     target: 2,
-                    privileged: false,
+                    may_create: false,
                 },
             ),
             Err(HvError::Denied)
@@ -2451,12 +2529,12 @@ mod tests {
             0,
             HvCall::DomainCreate {
                 target: 1,
-                privileged: true,
+                may_create: true,
             },
         )
         .unwrap();
         assert!(
-            h.is_privileged(1),
+            h.may_create(1),
             "privilege was conferred by a privileged creator"
         );
         // Domain 1, now privileged, can itself create domain 2 (unprivileged).
@@ -2465,11 +2543,11 @@ mod tests {
                 1,
                 HvCall::DomainCreate {
                     target: 2,
-                    privileged: false,
+                    may_create: false,
                 },
             )
             .is_ok());
-        assert!(h.is_live(2) && !h.is_privileged(2));
+        assert!(h.is_live(2) && !h.may_create(2));
         // Domain 2, unprivileged, cannot create domain 3 privileged — no self-elevation by
         // proxy: the authority to confer privilege is itself gated on privilege.
         assert_eq!(
@@ -2477,7 +2555,7 @@ mod tests {
                 2,
                 HvCall::DomainCreate {
                     target: 3,
-                    privileged: true,
+                    may_create: true,
                 },
             ),
             Err(HvError::Denied)
@@ -2485,8 +2563,8 @@ mod tests {
         assert!(!h.is_live(3));
         // The only privileged domains in reach are dom0 and the one it minted — privilege
         // never materialised without a privileged creator behind it.
-        assert!(h.is_privileged(0) && h.is_privileged(1));
-        assert!(!h.is_privileged(2) && !h.is_privileged(3));
+        assert!(h.may_create(0) && h.may_create(1));
+        assert!(!h.may_create(2) && !h.may_create(3));
         assert!(h.invariants_hold());
     }
 
@@ -2498,7 +2576,7 @@ mod tests {
                 0,
                 HvCall::DomainCreate {
                     target: 1,
-                    privileged: false,
+                    may_create: false,
                 },
             ),
             Err(HvError::AlreadyAlive)
@@ -2509,7 +2587,7 @@ mod tests {
                 0,
                 HvCall::DomainCreate {
                     target: 9,
-                    privileged: false,
+                    may_create: false,
                 },
             ),
             Err(HvError::BadDomain)
@@ -2518,13 +2596,30 @@ mod tests {
     }
 
     #[test]
-    fn destroying_a_dead_domain_is_not_alive() {
+    fn destroying_a_dead_peer_is_denied_no_one_controls_a_dead_domain() {
         let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
-        // Domain 1 is Dead; dom0 (privileged) tries to destroy it — nothing to tear down.
+        // Domain 1 is Dead — never created, so no domain controls it (control edges only
+        // exist between live domains). Even dom0, which *may create*, does not control a
+        // slot it never brought up, so destroying it is Denied by the authority gate — not
+        // NotAlive. A caller without control can't even tell a Dead target from a live one.
         assert_eq!(
             h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 }),
-            Err(HvError::NotAlive)
+            Err(HvError::Denied)
         );
+        // Bring it up (dom0 now controls it), and the destroy goes through.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        assert!(h.controls(0, 1));
+        assert!(h
+            .dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .is_ok());
+        assert!(!h.controls(0, 1), "teardown cleared the control edge");
         assert!(h.invariants_hold());
     }
 
@@ -2539,18 +2634,18 @@ mod tests {
             0,
             HvCall::DomainCreate {
                 target: 1,
-                privileged: true,
+                may_create: true,
             },
         )
         .unwrap();
         h.dispatch(1, HvCall::P2mAllocate { mfn: 0 }).unwrap();
-        assert!(h.is_live(1) && h.is_privileged(1));
+        assert!(h.is_live(1) && h.may_create(1));
 
         // Destroy it: the slot drops to Dead, loses its frame *and* its privilege.
         h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
             .unwrap();
         assert!(!h.is_live(1));
-        assert!(!h.is_privileged(1), "a torn-down domain loses privilege");
+        assert!(!h.may_create(1), "a torn-down domain loses privilege");
         assert!(h.is_clean_shell(1));
         assert_eq!(h.p2m().owner_of(0), None);
         assert!(h.invariants_hold());
@@ -2561,11 +2656,112 @@ mod tests {
             0,
             HvCall::DomainCreate {
                 target: 1,
-                privileged: false,
+                may_create: false,
             },
         )
         .unwrap();
-        assert!(h.is_live(1) && !h.is_privileged(1));
+        assert!(h.is_live(1) && !h.may_create(1));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn control_is_per_target_a_creator_controls_only_what_it_made() {
+        // Least-privilege: control is a per-target capability rooted in creation, with no
+        // implicit transitivity — so a creation "grandparent" does NOT control its
+        // grandchildren, and having `may_create` is not a blanket licence to destroy.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        // dom0 creates domain 1 as a control domain (may_create), and domain 2 directly.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 2,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        // Domain 1 creates domain 3. Now dom0 controls {1, 2}; domain 1 controls {3}.
+        h.dispatch(
+            1,
+            HvCall::DomainCreate {
+                target: 3,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        assert!(h.controls(0, 1) && h.controls(0, 2));
+        assert!(h.controls(1, 3));
+        // dom0 does NOT control its grandchild (domain 3) — it did not create it, and there
+        // is no blanket power. Even though dom0 may_create, destroying domain 3 is Denied.
+        assert!(!h.controls(0, 3));
+        assert_eq!(
+            h.dispatch(0, HvCall::DomainDestroy { target: 3, now: 0 }),
+            Err(HvError::Denied)
+        );
+        assert!(h.is_live(3), "the denied destroy was a no-op");
+        // Domain 1, the actual controller, can destroy domain 3.
+        assert!(h
+            .dispatch(1, HvCall::DomainDestroy { target: 3, now: 0 })
+            .is_ok());
+        assert!(!h.is_live(3));
+        // A domain with no control of a peer and no may_create obviously cannot destroy it:
+        // domain 2 cannot destroy domain 1.
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Err(HvError::Denied)
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn teardown_clears_control_edges_into_and_out_of_the_domain() {
+        // A capability must not outlive the domain it names, in either direction: destroying
+        // a domain drops both the edges by which others controlled it and the edges by which
+        // it controlled others.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        // dom0 → domain 1 (a control domain); domain 1 → domain 2 and domain 3.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: true,
+            },
+        )
+        .unwrap();
+        for t in [2u16, 3] {
+            h.dispatch(
+                1,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        assert!(h.controls(0, 1) && h.controls(1, 2) && h.controls(1, 3));
+
+        // Destroy domain 1. The edge *into* it (dom0→1) and the edges *out of* it (1→2, 1→3)
+        // all vanish; domains 2 and 3 survive but are now orphaned (no controller).
+        h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .unwrap();
+        assert!(!h.controls(0, 1), "edge into the destroyed domain cleared");
+        assert!(
+            !h.controls(1, 2) && !h.controls(1, 3),
+            "edges out of the destroyed domain cleared"
+        );
+        assert!(!h.may_create(1), "and it lost may_create");
+        assert!(h.is_live(2) && h.is_live(3), "peers it controlled survive");
+        // An orphaned domain has no controller, but always retains authority over itself.
+        assert!(h
+            .dispatch(2, HvCall::DomainDestroy { target: 2, now: 0 })
+            .is_ok());
         assert!(h.invariants_hold());
     }
 
