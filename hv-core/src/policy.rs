@@ -434,9 +434,12 @@ struct Share {
 /// has received *less* service per unit weight — `a.service / a.weight <
 /// b.service / b.weight` — tested by cross-multiplication in `u128` so it is exact
 /// and division-free. Both weights are at least [`MIN_WEIGHT`], so neither product is
-/// a divide-by-zero in disguise.
+/// a divide-by-zero in disguise. The products are `saturating_mul`: exact for every
+/// realistic (service, weight), and at pathological magnitudes (a `~u32::MAX` weight
+/// times a `~2^64` service) they clamp rather than overflow — a benign tie at the
+/// extreme instead of a debug panic / release wrap.
 fn more_deserving(a: Share, b: Share) -> bool {
-    a.service * b.weight < b.service * a.weight
+    a.service.saturating_mul(b.weight) < b.service.saturating_mul(a.weight)
 }
 
 #[cfg(test)]

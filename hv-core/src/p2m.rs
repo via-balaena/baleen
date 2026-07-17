@@ -418,8 +418,10 @@ impl System {
     /// [`P2mError::TypePinned`] if the frame is currently referenced as writable, or as a
     /// page table at a *different* level** — the exclusivity guard doing its job at pin
     /// time: a page being written must never become a page table, and a table has exactly
-    /// one level. A pinned table is the root of a subtree (nothing links to it); interior
-    /// tables will instead take their type from the parent that links them.
+    /// one level. Pinning is how a *root* table (one the CPU's `%cr3` names, with no
+    /// parent linking it) holds its own type; interior tables instead take their type from
+    /// a parent that links them. The two are not exclusive — a pinned table may also be
+    /// linked-to — a pin is just one more page-table reference held until [`Self::unpin`].
     pub fn pin(&mut self, caller: DomId, mfn: Mfn, level: PtLevel) -> Result<(), P2mError> {
         // Validate ownership and that it is not already pinned against an immutable
         // view, so a rejected pin mutates nothing.

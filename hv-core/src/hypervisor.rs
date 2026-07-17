@@ -757,22 +757,46 @@ impl Hypervisor {
     /// Page-table↔grant: every cross-domain page-table entry (a table mapping a frame
     /// another domain owns) must be authorized by a read-write grant from that owner — no
     /// domain reaches into another's memory through its page tables without consent.
+    /// The total live grant mappings, and writable ones, standing over `frame` — summed
+    /// across every grant that names it. In a consistent state all such grants share the
+    /// frame's owner (the misowned check enforces that), so this is the exact count of
+    /// grant references the frame must carry.
+    fn maps_over_frame(&self, frame: Frame) -> (u32, u32) {
+        let mut maps = 0u32;
+        let mut writable = 0u32;
+        for grantor in 0..self.grant.domain_count() as DomId {
+            for gref in 0..self.grant.entry_count(grantor) as GrantRef {
+                if self.grant.granted_frame(grantor, gref) == Some(frame) {
+                    maps = maps.saturating_add(self.grant.map_count(grantor, gref).unwrap_or(0));
+                    writable = writable
+                        .saturating_add(self.grant.writable_map_count(grantor, gref).unwrap_or(0));
+                }
+            }
+        }
+        (maps, writable)
+    }
+
     pub fn first_cross_violation(&self) -> Option<CrossViolation> {
         for grantor in 0..self.grant.domain_count() as DomId {
             for gref in 0..self.grant.entry_count(grantor) as GrantRef {
-                let maps = match self.grant.map_count(grantor, gref) {
-                    Some(m) if m > 0 => m,
+                match self.grant.map_count(grantor, gref) {
+                    Some(m) if m > 0 => {}
                     _ => continue, // inactive grant, or no live mappings — nothing to back
-                };
+                }
                 // Active with live maps ⟹ `granted_frame` is `Some`.
                 let frame = self.grant.granted_frame(grantor, gref).unwrap();
                 if self.p2m.owner_of(frame) != Some(grantor) {
                     return Some(CrossViolation::MisownedGrantMap { grantor, gref });
                 }
-                let writable_maps = self.grant.writable_map_count(grantor, gref).unwrap_or(0);
+                // The frame's references must back *every* mapping standing over it, not
+                // just this grant's — several grants (they share this owner) may map one
+                // frame, so compare against the summed totals. Page-table links and pins
+                // only add references, so `refs`/`writable_refs >= the summed maps` is the
+                // tightest a single-frame check can be.
+                let (total_maps, total_writable) = self.maps_over_frame(frame);
                 let refs = self.p2m.refs(frame).unwrap_or(0);
                 let writable_refs = self.p2m.type_refs(frame, PageType::Writable).unwrap_or(0);
-                if refs < maps || writable_refs < writable_maps {
+                if refs < total_maps || writable_refs < total_writable {
                     return Some(CrossViolation::UnbackedGrantMap { grantor, gref });
                 }
             }
@@ -1871,6 +1895,53 @@ mod tests {
         assert!(h
             .dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 })
             .is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn one_frame_mapped_by_two_grants_stays_backed() {
+        let mut h = hv();
+        // Domain 0 owns frame 3 and grants it read-write to domains 1 and 2 separately.
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 3 }).unwrap();
+        for (gref, grantee) in [(0u32, 1u16), (1, 2)] {
+            h.dispatch(
+                0,
+                HvCall::GrantAccess {
+                    gref,
+                    grantee,
+                    frame: 3,
+                    readonly: false,
+                },
+            )
+            .unwrap();
+        }
+        // Both map it writably — the frame now carries two writable references, and the
+        // seam's summed backing check must see both, not just one grant's.
+        let h1 = match h.dispatch(
+            1,
+            HvCall::GrantMap {
+                grantor: 0,
+                gref: 0,
+                writable: true,
+            },
+        ) {
+            Ok(HvOutcome::Handle(x)) => x,
+            other => panic!("expected a handle, got {other:?}"),
+        };
+        h.dispatch(
+            2,
+            HvCall::GrantMap {
+                grantor: 0,
+                gref: 1,
+                writable: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(h.p2m().type_refs(3, PageType::Writable), Some(2));
+        assert!(h.invariants_hold());
+        // Dropping one leaves the other still backed.
+        h.dispatch(1, HvCall::GrantUnmap { handle: h1 }).unwrap();
+        assert_eq!(h.p2m().type_refs(3, PageType::Writable), Some(1));
         assert!(h.invariants_hold());
     }
 
