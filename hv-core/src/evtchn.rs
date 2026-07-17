@@ -287,6 +287,22 @@ impl System {
         Ok(was_pending)
     }
 
+    // ─── teardown ─────────────────────────────────────────────────────────────
+
+    /// Close every port `dom` owns — the event-channel step of tearing a domain down.
+    /// An interdomain peer returns to `Unbound` still naming `dom`, which survives
+    /// teardown as an empty shell (so the peer is a valid, re-bindable half-open port,
+    /// not a ghost); every other bound port simply frees. Each [`Self::close`]
+    /// succeeds — only a `Free` port is rejected, and those are skipped.
+    pub fn close_all(&mut self, dom: DomId) {
+        for port in 0..self.port_count(dom) as Port {
+            if self.state_of(dom, port) != Some(PortState::Free) {
+                let r = self.close(dom, port);
+                debug_assert!(r.is_ok(), "close_all failed on a bound port: {r:?}");
+            }
+        }
+    }
+
     // ─── queries (the read side of the fence) ─────────────────────────────────
 
     /// Whether an event on this port would be delivered *now*: pending and not
@@ -615,6 +631,30 @@ mod tests {
         let mut s = sys();
         assert_eq!(s.alloc_unbound(9, 0), Err(EvtchnError::BadDomain));
         assert_eq!(s.send(0, 99), Err(EvtchnError::BadPort));
+    }
+
+    #[test]
+    fn close_all_frees_a_domains_ports_and_returns_peers_to_unbound() {
+        let mut s = sys();
+        // Domain 0 has an interdomain channel to domain 1, an IPI, and a VIRQ.
+        let unbound = s.alloc_unbound(1, 0).unwrap();
+        let inter = s.bind_interdomain(0, 1, unbound).unwrap();
+        s.bind_ipi(0, 2).unwrap();
+        s.bind_virq(0, 1, 7).unwrap();
+
+        s.close_all(0);
+        // Every port domain 0 held is now free...
+        for port in 0..s.port_count(0) as Port {
+            assert_eq!(s.state_of(0, port), Some(PortState::Free));
+        }
+        // ...and its interdomain peer is a valid half-open port pointing back at 0.
+        assert_eq!(
+            s.state_of(1, unbound),
+            Some(PortState::Unbound { remote: 0 }),
+            "the peer is re-bindable, not dangling"
+        );
+        let _ = inter;
+        assert!(s.invariants_hold());
     }
 
     #[test]

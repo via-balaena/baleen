@@ -329,7 +329,61 @@ impl System {
         }
     }
 
+    // ─── teardown ─────────────────────────────────────────────────────────────
+
+    /// Unmap *every* live mapping `grantee` holds, returning what each released
+    /// ([`Unmapped`]) so the caller can mirror the reverse page reference into the
+    /// page-type accounting — the grant side of tearing a domain down. Each unmap is
+    /// the ordinary single-mapping transition ([`Self::unmap`]), so the entry counts
+    /// stay consistent throughout; `grantee` owns every mapping it holds by
+    /// construction, so none can error.
+    pub fn drain_maps_of(&mut self, grantee: DomId) -> Vec<Unmapped> {
+        let mut released = Vec::new();
+        for handle in 0..self.maps.len() as GrantHandle {
+            let held = self.maps[handle as usize];
+            if held.active && held.grantee == grantee {
+                let u = self.unmap(grantee, handle).unwrap();
+                released.push(u);
+            }
+        }
+        released
+    }
+
+    /// Revoke *every* grant `grantor` offers — the last grant-side step of teardown.
+    /// By the time this runs each such grant has no live mappings: the caller has
+    /// already drained `grantor`'s own maps (its self-grants included) and refused the
+    /// teardown outright if any *foreign* map remained ([`Self::has_foreign_map`]). So
+    /// every [`Self::end_access`] here succeeds by construction.
+    pub fn revoke_all(&mut self, grantor: DomId) {
+        for gref in 0..self.entry_count(grantor) as GrantRef {
+            if self.is_granted(grantor, gref) {
+                let r = self.end_access(grantor, gref);
+                debug_assert!(r.is_ok(), "revoke_all hit a still-mapped grant: {r:?}");
+            }
+        }
+    }
+
     // ─── queries ──────────────────────────────────────────────────────────────
+
+    /// Whether any grant `target` offers is currently mapped by a *different* domain —
+    /// the domain-teardown precondition. A live foreign map holds a page reference that
+    /// [`Self::end_access`] and [`crate::p2m::System::free`] would strand, so a domain
+    /// with one outstanding cannot be destroyed. A domain's maps of its *own* grants do
+    /// not count: teardown unmaps those itself (they are `target`'s to release), so only
+    /// a foreign grantee blocks it. A grant map only ever stands over a frame the
+    /// grantor owns (the seam refuses a stale grant at map time), so this is exactly
+    /// "a foreign domain holds a live map of a frame `target` owns".
+    pub fn has_foreign_map(&self, target: DomId) -> bool {
+        self.maps
+            .iter()
+            .any(|m| m.active && m.grantor == target && m.grantee != target)
+    }
+
+    /// Whether `grantee` holds any live mapping — used to confirm a torn-down domain
+    /// holds none.
+    pub fn holds_any_map(&self, grantee: DomId) -> bool {
+        self.maps.iter().any(|m| m.active && m.grantee == grantee)
+    }
 
     /// Whether `gref` in `grantor` is an active grant.
     pub fn is_granted(&self, grantor: DomId, gref: GrantRef) -> bool {
@@ -594,6 +648,83 @@ mod tests {
         s.grant_access(0, 0, 1, 1, false).unwrap();
         s.end_access(0, 0).unwrap();
         assert_eq!(s.map(1, 0, 0, false), Err(GrantError::WrongState));
+    }
+
+    #[test]
+    fn has_foreign_map_sees_foreign_maps_but_not_self_maps() {
+        let mut s = sys();
+        // Domain 0 grants two frames: one to a foreign domain, one to itself.
+        s.grant_access(0, 0, 1, 100, false).unwrap(); // grantee 1 (foreign)
+        s.grant_access(0, 1, 0, 200, false).unwrap(); // grantee 0 (self)
+        assert!(!s.has_foreign_map(0), "no maps yet");
+
+        // A self-map must NOT count as a foreign hold — teardown unmaps it itself.
+        let self_h = s.map(0, 0, 1, false).unwrap();
+        assert!(
+            !s.has_foreign_map(0),
+            "a self-map is not a foreign hold on the domain"
+        );
+
+        // A foreign map does count.
+        let foreign_h = s.map(1, 0, 0, false).unwrap();
+        assert!(s.has_foreign_map(0), "domain 1's map blocks domain 0");
+        // ...but only against the domain that *offered* the mapped grant.
+        assert!(!s.has_foreign_map(1), "domain 1 offers no mapped grant");
+
+        // Dropping the foreign map clears it; the lingering self-map still doesn't count.
+        s.unmap(1, foreign_h).unwrap();
+        assert!(!s.has_foreign_map(0));
+        s.unmap(0, self_h).unwrap();
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn drain_maps_of_releases_every_mapping_a_domain_holds() {
+        let mut s = sys();
+        // Domains 0 and 2 each grant a frame to domain 1, which maps both (one
+        // writable). Domain 1 also holds nothing of its own here.
+        s.grant_access(0, 0, 1, 10, false).unwrap();
+        s.grant_access(2, 0, 1, 20, false).unwrap();
+        s.map(1, 0, 0, true).unwrap();
+        s.map(1, 2, 0, false).unwrap();
+        assert_eq!(s.map_count(0, 0), Some(1));
+        assert_eq!(s.map_count(2, 0), Some(1));
+        assert!(s.holds_any_map(1));
+
+        let released = s.drain_maps_of(1);
+        assert_eq!(released.len(), 2, "both mappings drained");
+        assert!(released.contains(&Unmapped {
+            frame: 10,
+            writable: true
+        }));
+        assert!(released.contains(&Unmapped {
+            frame: 20,
+            writable: false
+        }));
+        // The grants those maps stood over now show zero live mappings again.
+        assert_eq!(s.map_count(0, 0), Some(0));
+        assert_eq!(s.map_count(2, 0), Some(0));
+        assert!(
+            !s.holds_any_map(1),
+            "domain 1 holds nothing after the drain"
+        );
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn revoke_all_ends_every_grant_a_domain_offers() {
+        let mut s = sys();
+        s.grant_access(0, 0, 1, 1, false).unwrap();
+        s.grant_access(0, 3, 2, 2, true).unwrap();
+        // A grant offered by a *different* domain must survive domain 0's revoke.
+        s.grant_access(1, 0, 0, 3, false).unwrap();
+        assert!(s.is_granted(0, 0) && s.is_granted(0, 3) && s.is_granted(1, 0));
+
+        s.revoke_all(0);
+        assert!(!s.is_granted(0, 0), "domain 0's grants are gone");
+        assert!(!s.is_granted(0, 3));
+        assert!(s.is_granted(1, 0), "another domain's grant is untouched");
+        assert!(s.invariants_hold());
     }
 
     #[test]

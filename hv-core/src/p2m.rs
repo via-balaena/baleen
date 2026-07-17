@@ -386,6 +386,34 @@ impl System {
         Ok(())
     }
 
+    // ─── teardown ─────────────────────────────────────────────────────────────
+
+    /// Unpin every page-table frame `owner` owns — the first page step of tearing a
+    /// domain down, so its page tables can then be freed. Each such frame is pinned and
+    /// owned by `owner`, so every [`Self::unpin`] succeeds by construction.
+    pub fn unpin_all(&mut self, owner: DomId) {
+        for mfn in 0..self.frames.len() as Mfn {
+            if self.owner_of(mfn) == Some(owner) && self.is_pinned(mfn) {
+                let r = self.unpin(owner, mfn);
+                debug_assert!(r.is_ok(), "unpin_all hit a non-unpinnable frame: {r:?}");
+            }
+        }
+    }
+
+    /// Free every frame `owner` owns — the final page step of teardown. By the time
+    /// this runs every reference into `owner`'s frames is gone: its own grant maps were
+    /// drained, its pins dropped by [`Self::unpin_all`], and the teardown refused up
+    /// front if any foreign map remained. So each [`Self::free`] succeeds by
+    /// construction.
+    pub fn free_all(&mut self, owner: DomId) {
+        for mfn in 0..self.frames.len() as Mfn {
+            if self.owner_of(mfn) == Some(owner) {
+                let r = self.free(owner, mfn);
+                debug_assert!(r.is_ok(), "free_all hit a still-referenced frame: {r:?}");
+            }
+        }
+    }
+
     // ─── queries ──────────────────────────────────────────────────────────────
 
     /// Whether `mfn` is allocated.
@@ -653,6 +681,35 @@ mod tests {
             s.put_type(0, PageType::PageTable),
             Err(P2mError::WrongState)
         );
+    }
+
+    #[test]
+    fn unpin_all_and_free_all_clear_a_domains_frames() {
+        let mut s = sys();
+        // Domain 0 owns three frames: one pinned as a page table, one plainly owned,
+        // one owned with an untyped existence reference it will drop before teardown.
+        s.allocate(0, 0).unwrap();
+        s.pin(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.allocate(0, 2).unwrap();
+        // A frame owned by a *different* domain must survive domain 0's teardown.
+        s.allocate(1, 5).unwrap();
+
+        // Unpin first, so the pinned frame becomes freeable...
+        s.unpin_all(0);
+        assert!(!s.is_pinned(0));
+        assert_eq!(s.refs(0), Some(0));
+        // ...then free every frame domain 0 owns.
+        s.free_all(0);
+        assert!(!s.is_allocated(0));
+        assert!(!s.is_allocated(1));
+        assert!(!s.is_allocated(2));
+        assert_eq!(
+            s.owner_of(5),
+            Some(1),
+            "another domain's frame is untouched"
+        );
+        assert!(s.invariants_hold());
     }
 
     #[test]

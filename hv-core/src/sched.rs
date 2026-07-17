@@ -254,6 +254,21 @@ impl System {
         Ok(())
     }
 
+    // ─── teardown ─────────────────────────────────────────────────────────────
+
+    /// Take every vCPU `dom` owns offline — the scheduler step of tearing a domain
+    /// down. Any physical CPU one of them occupies is freed and its on-CPU interval
+    /// closed at `now`. Each [`Self::offline`] succeeds — only an already-`Offline`
+    /// vCPU is rejected, and those are skipped.
+    pub fn offline_all(&mut self, dom: DomId, now: Ticks) {
+        for vcpu in 0..self.vcpu_count(dom) as Vcpu {
+            if self.state_of(dom, vcpu) != Some(RunState::Offline) {
+                let r = self.offline(dom, vcpu, now);
+                debug_assert!(r.is_ok(), "offline_all failed on a live vCPU: {r:?}");
+            }
+        }
+    }
+
     // ─── queries (the read side of the fence) ─────────────────────────────────
 
     /// The run state of a vCPU, if the ids are in range.
@@ -563,6 +578,28 @@ mod tests {
         // A fresh interval reports the new dispatch time, not the old one.
         s.run(0, 0, 1, 200).unwrap();
         assert_eq!(s.on_cpu_since(0, 0), Some(200));
+    }
+
+    #[test]
+    fn offline_all_takes_down_every_vcpu_and_frees_their_pcpus() {
+        let mut s = sys();
+        // Domain 0: vCPU 0 running on pCPU 1, vCPU 1 merely runnable.
+        s.admit(0, 0).unwrap();
+        s.run(0, 0, 1, 100).unwrap();
+        s.admit(0, 1).unwrap();
+        // Domain 1 has a vCPU running on pCPU 0 that must survive domain 0's teardown.
+        s.admit(1, 0).unwrap();
+        s.run(1, 0, 0, 100).unwrap();
+
+        s.offline_all(0, 160);
+        assert_eq!(s.state_of(0, 0), Some(RunState::Offline));
+        assert_eq!(s.state_of(0, 1), Some(RunState::Offline));
+        assert_eq!(s.occupant(1), None, "domain 0's pCPU is freed");
+        assert_eq!(s.runtime(0, 0), Some(60), "its interval was closed at now");
+        // Domain 1 is untouched.
+        assert_eq!(s.occupant(0), Some((1, 0)));
+        assert_eq!(s.state_of(1, 0), Some(RunState::Running { pcpu: 0 }));
+        assert!(s.invariants_hold());
     }
 
     #[test]
