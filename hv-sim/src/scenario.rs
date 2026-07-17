@@ -1071,6 +1071,17 @@ pub struct DestroyOutcome {
     /// Destroy calls refused because the caller was neither the target nor privileged
     /// (`Denied`) — the authority gate firing.
     pub denials: u32,
+    /// `ControlRevoke` calls refused by the *chain restriction* (`Denied`): a live caller that
+    /// *does* control `target` but named a `from` outside its own delegation subtree — the
+    /// exact wart closed by hierarchical revocation (a delegatee trying to revoke its delegator,
+    /// a sibling, or the creator's Root from below). Distinct from the authority denial (a
+    /// caller with no control at all); non-zero witnesses the restriction genuinely bites.
+    pub chain_denials: u32,
+    /// `ControlRevoke` (or delegator-death) calls that *cascaded*: a single revoke removed more
+    /// than one control edge over its target — the revoked edge plus at least one edge delegated
+    /// beneath it. Non-zero witnesses that subtree cascades, not just single-edge removals, are
+    /// reached under interleaving.
+    pub cascades: u32,
     /// Whether every destroy matched its authority + busy prediction and left a proper
     /// shell: denied exactly when the caller lacked authority over the target, refused
     /// (busy) exactly when authorized but a foreign map stood, and otherwise reduced the
@@ -1099,6 +1110,15 @@ fn subtree_contains(hv: &Hypervisor, caller: u16, node: u16, target: u16) -> boo
         }
     }
     false
+}
+
+/// The number of present control edges over `target` — the size of `target`'s delegation
+/// tree. Sampling it before and after a revoke witnesses a genuine *cascade*: a revoke that
+/// dropped the tree by more than one edge removed a whole subtree, not just its top.
+fn control_tree_size(hv: &Hypervisor, target: u16) -> u32 {
+    (0..hv.domain_count() as u16)
+        .filter(|&h| hv.controls(h, target))
+        .count() as u32
 }
 
 /// Whether `target` has been reduced to an empty but still-existent shell — the
@@ -1143,12 +1163,17 @@ fn is_empty_shell(hv: &Hypervisor, target: u16) -> bool {
 /// unprivileged shell) — is asserted after every step, so a mis-ordered teardown or a
 /// resource surviving a domain's death surfaces here with the seed as the whole reproducer.
 pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
-    const DOMAINS: u16 = 3;
+    // Four domains, not three: a two-deep delegation chain over a fixed target needs three
+    // controllers plus the target, so four is the smallest world where the driver can build a
+    // chain an *ancestor* can prune (a cascade removing a genuine subtree) and a *delegatee* can
+    // be refused revoking its delegator (a chain-restricted denial). Three domains under-exercise
+    // the hierarchy — they can barely form a `Via` edge and never a depth-2 chain.
+    const DOMAINS: u16 = 4;
     const PORTS: u32 = 6;
     const GRANTS: u32 = 4;
     const VCPUS: u32 = 2;
     const PCPUS: u32 = 2;
-    const FRAMES: u32 = 6;
+    const FRAMES: u32 = 8;
 
     let mut hv = Hypervisor::new(
         DOMAINS as usize,
@@ -1170,6 +1195,8 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
         delegations: 0,
         busy_refusals: 0,
         denials: 0,
+        chain_denials: 0,
+        cascades: 0,
         postcondition_held: true,
         invariants_hold: true,
     };
@@ -1367,11 +1394,17 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                 // May revoke iff live, controls the target, and `from` is within its subtree.
                 let may_revoke =
                     caller_live && caller_controls && subtree_contains(&hv, caller, from, target);
+                let tree_before = control_tree_size(&hv, target);
                 match hv.dispatch(caller, HvCall::ControlRevoke { target, from }) {
                     Ok(HvOutcome::Done) => {
                         // A live caller revoking within its own subtree; `from`'s edge is gone.
                         if !may_revoke || hv.controls(from, target) {
                             out.postcondition_held = false;
+                        }
+                        // A cascade: the revoke dropped the tree by more than one edge, so it
+                        // removed a whole subtree (the revoked edge plus its delegatees).
+                        if tree_before.saturating_sub(control_tree_size(&hv, target)) > 1 {
+                            out.cascades += 1;
                         }
                     }
                     Err(hv_core::HvError::Denied) => {
@@ -1379,6 +1412,12 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                         // *outside* its subtree (an upward/sibling/non-edge revoke) — a no-op.
                         if !caller_live || may_revoke {
                             out.postcondition_held = false;
+                        }
+                        // The wart-closing case: the caller *does* control the target but was
+                        // refused because `from` lay outside its subtree (an upward/sibling
+                        // revoke). The chain restriction, not the authority gate, fired.
+                        if caller_live && caller_controls && !may_revoke {
+                            out.chain_denials += 1;
                         }
                     }
                     Err(hv_core::HvError::NotAlive) => {
@@ -2363,6 +2402,19 @@ mod tests {
         assert!(
             outcomes.iter().any(|o| o.delegations > 0),
             "no seed ever delegated control — the delegable-authority path is uncovered"
+        );
+        // A chain-restricted denial proves the wart-closing path is reached: a caller that
+        // controls the target but is refused for aiming outside its own subtree (revoking a
+        // delegator/sibling/Root from below).
+        assert!(
+            outcomes.iter().any(|o| o.chain_denials > 0),
+            "no seed ever hit a chain-restricted revoke denial — the hierarchy is uncovered"
+        );
+        // A cascade proves subtree removal is reached: a single revoke that took more than one
+        // edge with it (the revoked edge plus a delegatee beneath).
+        assert!(
+            outcomes.iter().any(|o| o.cascades > 0),
+            "no seed ever cascaded a revoke — subtree removal is uncovered"
         );
     }
 

@@ -26,7 +26,9 @@
 //! to a clean shell (refused when a foreign domain holds a live map) — so a mis-ordered
 //! teardown, a resource or capability surviving a domain's death, or a self-elevation trips the
 //! same combined invariant, which now includes the lifecycle/authority predicates (a Dead slot
-//! is a clean, authority-free shell; every control edge relates two live domains).
+//! is a clean, authority-free shell; every control edge relates two live domains *and* traces
+//! acyclically to a creation root — so an orphaned or cyclic delegation, or a
+//! chain-restricted/cascading revoke that left an edge dangling, is caught here too).
 //! The seeded mirrors in `hv-sim` (`run_hypervisor` broadly, `run_seam` wake-biased,
 //! `run_ptab` tree-building, `run_foreign` cross-domain, `run_destroy` lifecycle-cycling)
 //! make the properties deterministic.
@@ -178,8 +180,11 @@ fuzz_target!(|data: &[u8]| {
                 may_create: b & 1 == 0,
             },
             // Delegate / revoke control of `other` to/from `caller` — the mutable authority
-            // axis. A no-op unless the caller controls `other`; the seam's guards (self-edge,
-            // Dead recipient) refuse the rest, so only well-formed edges ever take.
+            // axis. Grant is a no-op unless the caller controls `other` (the seam's guards —
+            // self-edge, Dead recipient — refuse the rest), and stamps provenance `Via(caller)`.
+            // Revoke is chain-restricted and cascading: refused unless the caller may act within
+            // its own delegation subtree, and it sweeps the subtree it roots — so only
+            // well-rooted, acyclic edges ever survive.
             28 => HvCall::ControlGrant {
                 target: other,
                 to: caller,

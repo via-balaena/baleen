@@ -35,7 +35,7 @@ use std::collections::HashMap;
 use hv_core::evtchn::PortState;
 use hv_core::p2m::{PageType, PtLevel};
 use hv_core::sched::RunState;
-use hv_core::{HvCall, HvOutcome, Hypervisor};
+use hv_core::{Control, HvCall, HvOutcome, Hypervisor};
 
 /// Which subsystems' hypercalls the enumeration drives, plus the tiny universe sizes.
 #[derive(Debug, Clone)]
@@ -425,9 +425,19 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
         k.push(hv.is_live(dom) as u64);
         k.push(hv.may_create(dom) as u64);
     }
+    // Fingerprint each control edge's *provenance*, not just its presence: two states
+    // differing only in who delegated an edge are behaviourally distinct — they permit
+    // different chain-restricted revokes (an ancestor may prune where a non-ancestor is
+    // Denied) — so keying presence alone would wrongly merge them and drop coverage
+    // (design-lesson #7). Absent=0, Root=1, Via(d)=2+d, an injective tag per cell value.
     for holder in 0..hv.domain_count() as u16 {
         for target in 0..hv.domain_count() as u16 {
-            k.push(hv.controls(holder, target) as u64);
+            let tag = match hv.control_edge(holder, target) {
+                Control::Absent => 0,
+                Control::Root => 1,
+                Control::Via(d) => 2 + u64::from(d),
+            };
+            k.push(tag);
         }
     }
 
@@ -592,6 +602,27 @@ mod tests {
         }
     }
 
+    /// The delegation forest in focus: create + destroy + delegate over *four* domains, every
+    /// other subsystem off. Four is the smallest world that can form a depth-2 delegation chain
+    /// over a fixed target (creator → delegate → sub-delegate = three controllers + the target),
+    /// so it is the smallest world where chain-restricted revocation, subtree cascades, and
+    /// delegator-death cascades have real content — a two-domain world cannot even *represent* a
+    /// `Via` edge. The control matrix is orthogonal to frames/ports/vCPUs (they meet only
+    /// through create/destroy liveness), so dropping p2m keeps the state space tractable while
+    /// still covering the whole authority structure: every reachable delegation tree is proven
+    /// to keep each edge live-endpointed *and* rooted acyclically
+    /// (`ControlEdgeDeadEndpoint` + `ControlEdgeOrphaned`).
+    fn delegation_cfg(depth: u32) -> Config {
+        Config {
+            domains: 4,
+            create: true,
+            destroy: true,
+            delegate: true,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
     fn all_cfg(depth: u32) -> Config {
         Config {
             evtchn: true,
@@ -652,6 +683,18 @@ mod tests {
         assert!(states > 200, "suspiciously few states explored: {states}");
     }
 
+    /// The delegation forest, exhaustively (shallow): every reachable configuration of a
+    /// four-domain create/destroy/delegate world keeps every control edge live-endpointed and
+    /// rooted acyclically — a proof of `ControlEdgeOrphaned` (and its liveness cousin) over the
+    /// full authority structure, including `Via` chains a two-domain world cannot form. The CI
+    /// depth is kept modest so the suite stays quick; the deep twin below runs far enough to
+    /// build, cascade, and prune depth-2 chains.
+    #[test]
+    fn the_delegation_forest_is_exhaustively_sound() {
+        let states = expect_clean(&delegation_cfg(4));
+        assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
     /// The deep grant↔page-type / page-table↔grant sweep. Depth 7 is enough to reach a
     /// cross-domain page-table *node* share (a foreign interior entry, an `L2` pointing at
     /// another domain's `L1` node) and everything under it, so this exhaustively proves the
@@ -666,6 +709,17 @@ mod tests {
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn domain_lifecycle_deep() {
         expect_no_violation(&lifecycle_cfg(12));
+    }
+
+    /// The deep delegation-forest sweep. Depth 8 over four domains is enough to build a
+    /// depth-2 delegation chain (create the target, create two intermediaries, delegate
+    /// creator → A → B) and then exercise every revoke and destroy against it — so it
+    /// exhaustively proves chain-restricted revocation, subtree cascades, and delegator-death
+    /// cascades never leave an orphaned or cyclic edge.
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn delegation_forest_deep() {
+        expect_no_violation(&delegation_cfg(8));
     }
 
     #[test]
