@@ -165,10 +165,32 @@ impl Frame {
     const FREE: Self = Frame::Free;
 }
 
-/// The whole-system page state: a flat table of machine frames plus the domain count,
-/// so every count can be cross-checked and every owner validated.
+/// How many entry slots a page-table frame has. A real x86-64 table holds 512; the
+/// model only needs enough to build a branching tree and exercise the hierarchy, so it
+/// stays small and the `links` table stays bounded.
+pub const TABLE_SLOTS: u32 = 8;
+
+/// One live page-table *entry* — a directed edge from a `parent` table's `slot` to the
+/// `child` frame it references. Held in one global table (like the grant module's live
+/// mappings) so the hierarchy can be cross-checked against the frame types after every
+/// transition. Slots are reused once inactive, so the table stays bounded by peak
+/// concurrent links.
+#[derive(Debug, Clone, Copy, Default)]
+struct Link {
+    active: bool,
+    parent: Mfn,
+    slot: u32,
+    child: Mfn,
+}
+
+/// The whole-system page state: a flat table of machine frames plus every domain's
+/// page-table links, so every count can be cross-checked, every owner validated, and
+/// every page-table edge checked level-correct.
 pub struct System {
     frames: Vec<Frame>,
+    /// Live page-table entries across all frames — the tree structure whose
+    /// level-correctness is the hierarchical invariant.
+    links: Vec<Link>,
     num_domains: usize,
 }
 
@@ -193,6 +215,8 @@ pub enum P2mError {
     NotYours,
     /// A reference count would overflow.
     Overflow,
+    /// A page-table entry slot is out of range for a table.
+    BadSlot,
 }
 
 /// A named invariant breach, carrying the frame it was found at.
@@ -209,6 +233,12 @@ pub enum Violation {
     /// A frame is pinned as a page table but holds no page-table reference — the pin
     /// bit and the page-table count have fallen out of step.
     PinnedNotPageTyped { mfn: usize },
+    /// A live page-table entry is *mislevelled*: its parent is not a page table, or its
+    /// child is not typed as the level directly below the parent (an `L(k-1)` table, or
+    /// a writable leaf under an `L1`). The hierarchical type-confusion the multi-level
+    /// invariant exists to prevent — a table whose entries the CPU would walk into a
+    /// frame of the wrong kind.
+    MislevelledLink { parent: usize, slot: usize },
 }
 
 impl System {
@@ -216,6 +246,7 @@ impl System {
     pub fn new(num_domains: usize, num_frames: usize) -> Self {
         System {
             frames: (0..num_frames).map(|_| Frame::FREE).collect(),
+            links: Vec::new(),
             num_domains,
         }
     }
@@ -470,7 +501,137 @@ impl System {
         Ok(())
     }
 
+    // ─── page-table entries (the hierarchy) ────────────────────────────────────
+
+    /// Install a page-table entry: link `parent`'s `slot` to `child`. `parent` must be a
+    /// table the caller owns, at some level `L`k; the entry then references `child` at
+    /// **exactly the level below** — an `L(k-1)` table for `k >= 2`, or a writable leaf
+    /// under an `L1`. This is the whole paging hierarchy, and it is enforced by the type
+    /// system: the link takes a `get_type` reference on `child` at that required type, so
+    /// a `child` of the wrong kind (a writable page where a table belongs, a table at the
+    /// wrong level, an `L1`'s leaf that is really a page table) is refused with
+    /// [`P2mError::TypePinned`] before any edge is recorded.
+    ///
+    /// The link also takes a page-table reference on `parent` *itself*, so a table stays
+    /// typed as long as it has any live entry — it cannot be freed, unpinned to untyped,
+    /// or re-typed out from under its children (the reference on `child` likewise stops
+    /// the child being freed or re-typed while the parent points at it). Because a link's
+    /// child sits one level *below* its parent, the page-table graph is a DAG of depth at
+    /// most four — no cycle is representable.
+    pub fn link(
+        &mut self,
+        caller: DomId,
+        parent: Mfn,
+        slot: u32,
+        child: Mfn,
+    ) -> Result<(), P2mError> {
+        if slot >= TABLE_SLOTS {
+            return Err(P2mError::BadSlot);
+        }
+        // The caller must own both the table it is editing and the frame it points at
+        // (a domain builds its own page tables over its own memory; cross-domain shared
+        // page tables are a later refinement). Validate everything against an immutable
+        // view first, so a rejected link mutates nothing.
+        let level = match self.frame(parent)? {
+            Frame::Allocated {
+                owner, pt_level, ..
+            } => {
+                if *owner != caller {
+                    return Err(P2mError::NotYours);
+                }
+                // `parent` must actually be a page table now — read its level.
+                if self.current_type(parent) != Some(PageType::PageTable(*pt_level)) {
+                    return Err(P2mError::WrongState);
+                }
+                *pt_level
+            }
+            Frame::Free => return Err(P2mError::WrongState),
+        };
+        match self.frame(child)? {
+            Frame::Allocated { owner, .. } => {
+                if *owner != caller {
+                    return Err(P2mError::NotYours);
+                }
+            }
+            Frame::Free => return Err(P2mError::WrongState),
+        }
+        // The slot must be empty — an entry is never overwritten in place (unlink it
+        // first), which keeps a live edge from being silently re-pointed.
+        if self.link_index(parent, slot).is_some() {
+            return Err(P2mError::WrongState);
+        }
+
+        // Take the child reference at the required level — this is the guard that makes
+        // the hierarchy hold: it fails unless `child` is (or can become) exactly the
+        // level below `parent`. Then take the parent self-reference, which cannot fail
+        // (`parent` is already that level). If the second acquire somehow overflowed,
+        // roll the first back so a rejected link mutates nothing.
+        let child_type = level.child_type();
+        self.get_type(child, child_type)?;
+        if let Err(e) = self.get_type(parent, PageType::PageTable(level)) {
+            let _ = self.put_type(child, child_type);
+            return Err(e);
+        }
+        self.alloc_link(Link {
+            active: true,
+            parent,
+            slot,
+            child,
+        });
+        self.check_invariants();
+        Ok(())
+    }
+
+    /// Remove the page-table entry at `parent`'s `slot`, dropping the two references the
+    /// [`Self::link`] took — the child's level reference and the parent's self-reference.
+    /// Only the owner may edit its tables. Once a table's last entry is unlinked (and it
+    /// is unpinned, with no parent still pointing at it) it becomes untyped and freeable.
+    pub fn unlink(&mut self, caller: DomId, parent: Mfn, slot: u32) -> Result<(), P2mError> {
+        let level = match self.frame(parent)? {
+            Frame::Allocated {
+                owner, pt_level, ..
+            } => {
+                if *owner != caller {
+                    return Err(P2mError::NotYours);
+                }
+                *pt_level
+            }
+            Frame::Free => return Err(P2mError::WrongState),
+        };
+        let idx = self.link_index(parent, slot).ok_or(P2mError::WrongState)?;
+        let child = self.links[idx].child;
+        // Deactivate the edge first, then release both references. Neither release can
+        // fail: the link took and held them, so they are exactly the ones it gives back.
+        self.links[idx].active = false;
+        let rc = self.put_type(parent, PageType::PageTable(level));
+        debug_assert!(
+            rc.is_ok(),
+            "unlink could not release its parent ref: {rc:?}"
+        );
+        let cc = self.put_type(child, level.child_type());
+        debug_assert!(cc.is_ok(), "unlink could not release its child ref: {cc:?}");
+        self.check_invariants();
+        Ok(())
+    }
+
     // ─── teardown ─────────────────────────────────────────────────────────────
+
+    /// Remove every page-table entry `owner`'s tables hold — the page-table-structure
+    /// step of tearing a domain down, so its tables lose the self-references their
+    /// entries pin and can then be unpinned and freed. Order-independent: a table keeps
+    /// its page-table type as long as it has any live entry (each entry pins it), so
+    /// every [`Self::unlink`] here finds its parent still a valid table and succeeds by
+    /// construction. Links are intra-domain (a link's parent and child share an owner),
+    /// so this touches nothing another domain holds.
+    pub fn unlink_all(&mut self, owner: DomId) {
+        for idx in 0..self.links.len() {
+            let link = self.links[idx];
+            if link.active && self.owner_of(link.parent) == Some(owner) {
+                let r = self.unlink(owner, link.parent, link.slot);
+                debug_assert!(r.is_ok(), "unlink_all hit a non-removable entry: {r:?}");
+            }
+        }
+    }
 
     /// Unpin every page-table frame `owner` owns — the first page step of tearing a
     /// domain down, so its page tables can then be freed. Each such frame is pinned and
@@ -574,6 +735,16 @@ impl System {
         matches!(self.frame(mfn), Ok(Frame::Allocated { pinned: true, .. }))
     }
 
+    /// The frame a table's `slot` currently points at, if there is a live entry there.
+    pub fn child_at(&self, parent: Mfn, slot: u32) -> Option<Mfn> {
+        self.link_index(parent, slot).map(|i| self.links[i].child)
+    }
+
+    /// Total live page-table entries across the whole system.
+    pub fn active_links(&self) -> usize {
+        self.links.iter().filter(|l| l.active).count()
+    }
+
     /// Number of frames in the table.
     pub fn frame_count(&self) -> usize {
         self.frames.len()
@@ -623,6 +794,25 @@ impl System {
                 }
             }
         }
+        // The hierarchy: every live entry points from a table to a frame of exactly the
+        // level below it. `link` establishes this by construction (it takes the child's
+        // type reference at the required level and the parent's at its own), so a breach
+        // here means the type bookkeeping and the recorded edges have fallen out of step.
+        for link in self.links.iter().filter(|l| l.active) {
+            let ok = match self.current_type(link.parent) {
+                Some(PageType::PageTable(level)) => {
+                    self.current_type(link.child) == Some(level.child_type())
+                }
+                // Parent is untyped, writable, or free — not a table at all.
+                _ => false,
+            };
+            if !ok {
+                return Some(Violation::MislevelledLink {
+                    parent: link.parent as usize,
+                    slot: link.slot as usize,
+                });
+            }
+        }
         None
     }
 
@@ -648,6 +838,23 @@ impl System {
 
     fn frame_mut(&mut self, mfn: Mfn) -> Result<&mut Frame, P2mError> {
         self.frames.get_mut(mfn as usize).ok_or(P2mError::BadFrame)
+    }
+
+    /// The index of the live entry at `(parent, slot)`, if any.
+    fn link_index(&self, parent: Mfn, slot: u32) -> Option<usize> {
+        self.links
+            .iter()
+            .position(|l| l.active && l.parent == parent && l.slot == slot)
+    }
+
+    /// Record a link, reusing an inactive slot if one is free so the table stays bounded
+    /// by peak concurrent links.
+    fn alloc_link(&mut self, link: Link) {
+        if let Some(i) = self.links.iter().position(|l| !l.active) {
+            self.links[i] = link;
+        } else {
+            self.links.push(link);
+        }
     }
 }
 
@@ -944,6 +1151,148 @@ mod tests {
         assert_eq!(s.refs(7), Some(0));
         // With the pin gone the frame is free to be taken writable.
         assert!(s.get_type(7, PageType::Writable).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    // Build the canonical L4→L3→L2→L1→leaf chain owned by domain 0 over frames
+    // [root, l3, l2, l1, leaf] and return it. Each interior frame is typed purely by
+    // being linked; only the root is pinned.
+    fn linked_chain(s: &mut System) -> (Mfn, Mfn, Mfn, Mfn, Mfn) {
+        let (root, l3, l2, l1, leaf) = (0, 1, 2, 3, 4);
+        for m in [root, l3, l2, l1, leaf] {
+            s.allocate(0, m).unwrap();
+        }
+        s.pin(0, root, PtLevel::L4).unwrap();
+        s.link(0, root, 0, l3).unwrap(); // L4 -> L3
+        s.link(0, l3, 0, l2).unwrap(); //   L3 -> L2
+        s.link(0, l2, 0, l1).unwrap(); //   L2 -> L1
+        s.link(0, l1, 0, leaf).unwrap(); // L1 -> writable leaf
+        (root, l3, l2, l1, leaf)
+    }
+
+    #[test]
+    fn a_full_four_level_chain_types_every_frame_by_its_level() {
+        let mut s = System::new(2, 8);
+        let (root, l3, l2, l1, leaf) = linked_chain(&mut s);
+        assert_eq!(s.current_type(root), Some(PageType::PageTable(PtLevel::L4)));
+        assert_eq!(s.current_type(l3), Some(PageType::PageTable(PtLevel::L3)));
+        assert_eq!(s.current_type(l2), Some(PageType::PageTable(PtLevel::L2)));
+        assert_eq!(s.current_type(l1), Some(PageType::PageTable(PtLevel::L1)));
+        // The leaf under an L1 is ordinary writable memory.
+        assert_eq!(s.current_type(leaf), Some(PageType::Writable));
+        assert_eq!(s.child_at(root, 0), Some(l3));
+        assert_eq!(s.child_at(l1, 0), Some(leaf));
+        assert_eq!(s.active_links(), 4);
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn a_link_refuses_a_child_of_the_wrong_level() {
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.allocate(0, 2).unwrap();
+        s.pin(0, 0, PtLevel::L4).unwrap(); // an L4 table
+        s.pin(0, 2, PtLevel::L2).unwrap(); // and, separately, an L2 table
+
+        // An L4 entry must point at an L3 — pointing at the L2 frame is refused, since
+        // the frame is already typed L2 and cannot also be L3.
+        assert_eq!(s.link(0, 0, 0, 2), Err(P2mError::TypePinned));
+        // Nothing was recorded, and the L2 table is untouched.
+        assert_eq!(s.child_at(0, 0), None);
+        assert_eq!(s.current_type(2), Some(PageType::PageTable(PtLevel::L2)));
+        assert!(s.invariants_hold());
+
+        // Frame 1 is untyped, so linking it as the L4's L3 child *establishes* it as L3.
+        s.link(0, 0, 0, 1).unwrap();
+        assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L3)));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn a_linked_table_cannot_be_freed_retyped_or_stranded() {
+        let mut s = System::new(2, 8);
+        let (root, l3, l2, _l1, _leaf) = linked_chain(&mut s);
+
+        // A child cannot be freed while its parent points at it (the reference the link
+        // holds keeps it alive) — the cross-level use-after-free the hierarchy prevents.
+        assert_eq!(s.free(0, l3), Err(P2mError::InUse));
+        // Nor re-typed to another level while linked.
+        assert_eq!(
+            s.get_type(l3, PageType::PageTable(PtLevel::L2)),
+            Err(P2mError::TypePinned)
+        );
+        // A table with a live entry holds a self-reference, so it too cannot be freed —
+        // even after it is unpinned, its children keep it a table.
+        s.unpin(0, root).unwrap();
+        assert_eq!(s.current_type(root), Some(PageType::PageTable(PtLevel::L4)));
+        assert_eq!(s.free(0, root), Err(P2mError::InUse));
+        assert!(s.invariants_hold());
+
+        // A table stays typed while it still has *any* child: unlinking L2→L1 alone does
+        // not untype the L1, because the L1 keeps a self-reference from its own live
+        // entry down to the leaf. The tree must be torn down leaf-upward.
+        s.unlink(0, l2, 0).unwrap();
+        assert_eq!(
+            s.current_type(_l1),
+            Some(PageType::PageTable(PtLevel::L1)),
+            "the L1 is still a table — it still points at the leaf"
+        );
+        // Unlink the L1's own entry, and now it is untyped and reclaimable.
+        s.unlink(0, _l1, 0).unwrap();
+        assert_eq!(s.current_type(_l1), None, "no entries left, so untyped");
+        assert_eq!(s.current_type(_leaf), None, "the leaf is ordinary again");
+        assert!(s.free(0, _l1).is_ok());
+        assert!(s.free(0, _leaf).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn unlink_all_dismantles_a_domains_whole_tree() {
+        let mut s = System::new(2, 8);
+        let (root, ..) = linked_chain(&mut s);
+        // A frame owned by another domain, linked in its own little table, must survive.
+        s.allocate(1, 6).unwrap();
+        s.allocate(1, 7).unwrap();
+        s.pin(1, 6, PtLevel::L1).unwrap();
+        s.link(1, 6, 0, 7).unwrap();
+
+        s.unlink_all(0);
+        assert_eq!(s.active_links(), 1, "only domain 1's entry remains");
+        // Domain 0's tree is now just types held by pins/links that are gone — unpin the
+        // root and every frame it owned is freeable.
+        s.unpin(0, root).unwrap();
+        for m in 0..5 {
+            assert!(s.free(0, m).is_ok(), "frame {m} should be freeable");
+        }
+        // Domain 1 is untouched.
+        assert_eq!(s.child_at(6, 0), Some(7));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn link_rejects_bad_slots_foreign_frames_and_occupied_slots() {
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.allocate(1, 2).unwrap(); // owned by domain 1
+        s.pin(0, 0, PtLevel::L2).unwrap();
+
+        // Slot out of range.
+        assert_eq!(s.link(0, 0, TABLE_SLOTS, 1), Err(P2mError::BadSlot));
+        // The caller must own both the table and the child.
+        assert_eq!(s.link(1, 0, 0, 1), Err(P2mError::NotYours)); // not domain 1's table
+        assert_eq!(s.link(0, 0, 0, 2), Err(P2mError::NotYours)); // child is domain 1's
+                                                                 // Linking into a frame that is not a table is refused.
+        assert_eq!(s.link(0, 1, 0, 0), Err(P2mError::WrongState));
+
+        // A good link, then a second into the same slot is refused (no in-place
+        // overwrite); unlinking frees the slot again.
+        s.link(0, 0, 0, 1).unwrap();
+        assert_eq!(s.link(0, 0, 0, 1), Err(P2mError::WrongState));
+        assert_eq!(s.unlink(0, 0, 1), Err(P2mError::WrongState)); // no entry at slot 1
+        s.unlink(0, 0, 0).unwrap();
+        assert_eq!(s.child_at(0, 0), None);
         assert!(s.invariants_hold());
     }
 

@@ -124,6 +124,13 @@ pub enum HvCall {
     P2mPin { mfn: Mfn, level: PtLevel },
     /// Unpin one of the caller's page-table frames, dropping the pin's reference.
     P2mUnpin { mfn: Mfn },
+    /// Install a page-table entry: link `parent`'s `slot` to `child`, one paging level
+    /// down. Refused unless `child` is (or can become) exactly the level below `parent`
+    /// — the hierarchy guard. Both frames must be the caller's.
+    P2mLink { parent: Mfn, slot: u32, child: Mfn },
+    /// Remove the caller's page-table entry at `parent`'s `slot`, dropping the references
+    /// the link held.
+    P2mUnlink { parent: Mfn, slot: u32 },
 
     /// Tear down domain `target` completely: close its every event-channel port,
     /// offline its every vCPU (closing on-CPU intervals at `now`), unmap its every
@@ -386,6 +393,20 @@ impl Hypervisor {
                 .unpin(caller, mfn)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
+            HvCall::P2mLink {
+                parent,
+                slot,
+                child,
+            } => self
+                .p2m
+                .link(caller, parent, slot, child)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mUnlink { parent, slot } => self
+                .p2m
+                .unlink(caller, parent, slot)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
 
             HvCall::DomainDestroy { target, now } => self.domain_destroy(target, now),
         }
@@ -539,9 +560,10 @@ impl Hypervisor {
     ///    does — this is the one cross-subsystem step, and it clears `target`'s *own*
     ///    maps (its self-grants included) so the next step's grants are unmapped.
     /// 3. **revoke** every grant `target` offers (grant) — now all unmapped.
-    /// 4. **unpin** then **free** every frame `target` owns (p2m) — every reference into
-    ///    them is gone (own maps drained, pins dropped, foreign maps excluded by the
-    ///    precondition), so each free succeeds.
+    /// 4. **unlink** its page-table entries, then **unpin** and **free** every frame it
+    ///    owns (p2m) — every reference into them is gone (own maps drained, page-table
+    ///    entries torn down, pins dropped, foreign maps excluded by the precondition), so
+    ///    each free succeeds.
     ///
     /// What remains is an empty but still-existent shell: domain slots are fixed-size
     /// and never removed, so peers left `Unbound { remote: target }` stay valid.
@@ -583,8 +605,11 @@ impl Hypervisor {
             );
         }
 
-        // 3. Revoke every grant it offers (all unmapped now), then 4. reclaim its frames.
+        // 3. Revoke every grant it offers (all unmapped now), then 4. reclaim its frames:
+        //    tear down its page-table structure (each entry pins its table, so this must
+        //    precede unpin/free), drop its pins, and free every frame it owns.
         self.grant.revoke_all(target);
+        self.p2m.unlink_all(target);
         self.p2m.unpin_all(target);
         self.p2m.free_all(target);
 
@@ -1429,6 +1454,109 @@ mod tests {
             h.dispatch(0, HvCall::DomainDestroy { target: 9, now: 0 }),
             Err(HvError::BadDomain)
         );
+    }
+
+    #[test]
+    fn a_page_table_tree_builds_and_dismantles_through_dispatch() {
+        let mut h = hv();
+        // Domain 0 allocates five frames and builds L4→L3→L2→L1→leaf, pinning the root.
+        for mfn in 0..5 {
+            h.dispatch(0, HvCall::P2mAllocate { mfn }).unwrap();
+        }
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 0,
+                level: PtLevel::L4,
+            },
+        )
+        .unwrap();
+        for (parent, child) in [(0, 1), (1, 2), (2, 3), (3, 4)] {
+            h.dispatch(
+                0,
+                HvCall::P2mLink {
+                    parent,
+                    slot: 0,
+                    child,
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            h.p2m().current_type(1),
+            Some(PageType::PageTable(PtLevel::L3))
+        );
+        assert_eq!(h.p2m().current_type(4), Some(PageType::Writable));
+        assert!(h.invariants_hold());
+
+        // A mis-levelled link is refused at the seam: frame 4 is a writable leaf, so
+        // pointing the L4 root at it (which would demand it be an L3) fails.
+        assert_eq!(
+            h.dispatch(
+                0,
+                HvCall::P2mLink {
+                    parent: 0,
+                    slot: 1,
+                    child: 4
+                }
+            ),
+            Err(HvError::P2m(p2m::P2mError::TypePinned))
+        );
+        // Unlink the leaf, and it becomes an ordinary freeable frame again.
+        h.dispatch(0, HvCall::P2mUnlink { parent: 3, slot: 0 })
+            .unwrap();
+        assert_eq!(h.p2m().current_type(4), None);
+        assert!(h.dispatch(0, HvCall::P2mFree { mfn: 4 }).is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn destroying_a_domain_tears_down_its_page_table_tree() {
+        let mut h = hv();
+        // Domain 1 builds a small L2→L1→leaf tree, then is destroyed wholesale.
+        for mfn in 0..3 {
+            h.dispatch(1, HvCall::P2mAllocate { mfn }).unwrap();
+        }
+        h.dispatch(
+            1,
+            HvCall::P2mPin {
+                mfn: 0,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mLink {
+                parent: 0,
+                slot: 0,
+                child: 1,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mLink {
+                parent: 1,
+                slot: 0,
+                child: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(h.p2m().active_links(), 2);
+
+        // Teardown unlinks the whole tree, unpins, and frees every frame — no entry pins
+        // a frame the free step then chokes on.
+        assert_eq!(
+            h.dispatch(1, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(h.p2m().active_links(), 0);
+        assert!(!h.p2m().is_allocated(0));
+        assert!(!h.p2m().is_allocated(1));
+        assert!(!h.p2m().is_allocated(2));
+        assert!(h.is_torn_down(1));
+        assert!(h.invariants_hold());
     }
 
     #[test]
