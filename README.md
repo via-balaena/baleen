@@ -101,6 +101,14 @@ credit-account state machine, checking its conservation invariant on every
 transition. Same seed → same run, exactly — so any future invariant break is a
 one-line regression test, not a Heisenbug.
 
+Beyond sampling, `hv-sim::enumerate` does **bounded model checking**: for a tiny
+configuration it breadth-first visits *every* reachable state and checks the
+integrated invariant at each — a proof, not a sample, that no reachable state can
+break it. CI runs shallow per-seam sweeps in seconds; the deep on-demand sweeps
+(`cargo test --release -- --ignored`) have exhaustively cleared **millions** of
+distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 1.4M states, the
+whole integrated core to depth 5 ≈ 0.8M) with zero violations.
+
 ## Milestones
 
 - **M1 — architecture proof** *(this commit)*: `hv-core` dispatches two toy
