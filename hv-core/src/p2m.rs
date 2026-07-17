@@ -103,6 +103,11 @@ enum Frame {
         writable_refs: u32,
         /// How many references require the frame to be a page table.
         pagetable_refs: u32,
+        /// Whether the owner has *pinned* this frame as a page table — a persistent
+        /// page-table type reference held until explicitly unpinned (Xen's
+        /// `PGT_pinned`). One of possibly several page-table references, so `pinned`
+        /// implies `pagetable_refs >= 1` but not the reverse.
+        pinned: bool,
     },
 }
 
@@ -151,6 +156,9 @@ pub enum Violation {
     /// The typed references outnumber the total references — a typed reference that is
     /// not also an existence reference, which should be impossible.
     TypedExceedsRefs { mfn: usize },
+    /// A frame is pinned as a page table but holds no page-table reference — the pin
+    /// bit and the page-table count have fallen out of step.
+    PinnedNotPageTyped { mfn: usize },
 }
 
 impl System {
@@ -183,6 +191,7 @@ impl System {
             refs: 0,
             writable_refs: 0,
             pagetable_refs: 0,
+            pinned: false,
         };
         self.check_invariants();
         Ok(())
@@ -297,9 +306,69 @@ impl System {
         Ok(())
     }
 
+    /// Pin a frame as a page table (Xen's `MMUEXT_PIN_TABLE`): take a persistent
+    /// page-table type reference, held until [`Self::unpin`]. Only the owner may pin
+    /// its own page tables. **Fails with [`P2mError::TypePinned`] if the frame is
+    /// currently referenced as writable** (e.g. a foreign domain writably maps it) —
+    /// which is the write-xor-pagetable safety guard doing its job at pin time: a page
+    /// being written must never become a page table.
+    pub fn pin(&mut self, caller: DomId, mfn: Mfn) -> Result<(), P2mError> {
+        // Validate ownership and that it is not already pinned against an immutable
+        // view, so a rejected pin mutates nothing.
+        match self.frame(mfn)? {
+            Frame::Allocated { owner, pinned, .. } => {
+                if *owner != caller {
+                    return Err(P2mError::NotYours);
+                }
+                if *pinned {
+                    return Err(P2mError::WrongState);
+                }
+            }
+            Frame::Free => return Err(P2mError::WrongState),
+        }
+        // Take the page-table type reference — this enforces the exclusivity (fails
+        // `TypePinned` if writable) and takes an existence reference. Set the pin bit
+        // only once it succeeds. Order matters: `get_type` re-establishes the invariant
+        // with the bit still clear, which satisfies `pinned ⇒ pagetable_refs >= 1`
+        // vacuously; setting the bit after keeps every intermediate state consistent.
+        self.get_type(mfn, PageType::PageTable)?;
+        if let Frame::Allocated { pinned, .. } = self.frame_mut(mfn).unwrap() {
+            *pinned = true;
+        }
+        self.check_invariants();
+        Ok(())
+    }
+
+    /// Unpin a frame (Xen's `MMUEXT_UNPIN_TABLE`): drop the persistent page-table type
+    /// reference [`Self::pin`] took. Only the owner may unpin, and only a pinned frame
+    /// can be unpinned — so exactly one unpin matches each pin.
+    pub fn unpin(&mut self, caller: DomId, mfn: Mfn) -> Result<(), P2mError> {
+        match self.frame(mfn)? {
+            Frame::Allocated { owner, pinned, .. } => {
+                if *owner != caller {
+                    return Err(P2mError::NotYours);
+                }
+                if !*pinned {
+                    return Err(P2mError::WrongState);
+                }
+            }
+            Frame::Free => return Err(P2mError::WrongState),
+        }
+        // Clear the pin bit *before* releasing the reference, so no intermediate state
+        // ever shows a pinned frame with no page-table reference. `put_type` cannot fail
+        // here — a pinned frame always holds its page-table reference.
+        if let Frame::Allocated { pinned, .. } = self.frame_mut(mfn).unwrap() {
+            *pinned = false;
+        }
+        self.put_type(mfn, PageType::PageTable)?;
+        self.check_invariants();
+        Ok(())
+    }
+
     /// Free a frame back to the pool. **Fails with [`P2mError::InUse`] while any
     /// reference is live** — this guard is what stops a frame being reallocated while
-    /// something still points at it. Only the owner may free it.
+    /// something still points at it (a pinned frame holds its page-table reference, so
+    /// it must be unpinned first). Only the owner may free it.
     pub fn free(&mut self, caller: DomId, mfn: Mfn) -> Result<(), P2mError> {
         match *self.frame(mfn)? {
             Frame::Allocated { owner, refs, .. } => {
@@ -377,6 +446,11 @@ impl System {
         }
     }
 
+    /// Whether a frame is pinned as a page table.
+    pub fn is_pinned(&self, mfn: Mfn) -> bool {
+        matches!(self.frame(mfn), Ok(Frame::Allocated { pinned: true, .. }))
+    }
+
     /// Number of frames in the table.
     pub fn frame_count(&self) -> usize {
         self.frames.len()
@@ -408,6 +482,7 @@ impl System {
                 refs,
                 writable_refs,
                 pagetable_refs,
+                pinned,
             } = *frame
             {
                 if owner as usize >= self.num_domains {
@@ -418,6 +493,9 @@ impl System {
                 }
                 if writable_refs + pagetable_refs > refs {
                     return Some(Violation::TypedExceedsRefs { mfn: m });
+                }
+                if pinned && pagetable_refs == 0 {
+                    return Some(Violation::PinnedNotPageTyped { mfn: m });
                 }
             }
         }
@@ -584,6 +662,97 @@ mod tests {
         assert_eq!(s.allocate(0, 99), Err(P2mError::BadFrame));
         assert_eq!(s.get(99), Err(P2mError::BadFrame));
         assert_eq!(s.free(0, 99), Err(P2mError::BadFrame));
+    }
+
+    #[test]
+    fn pin_types_the_frame_as_a_page_table() {
+        let mut s = sys();
+        s.allocate(0, 2).unwrap();
+        s.pin(0, 2).unwrap();
+        assert!(s.is_pinned(2));
+        assert_eq!(s.current_type(2), Some(PageType::PageTable));
+        assert_eq!(s.type_refs(2, PageType::PageTable), Some(1));
+        // The pin took an existence reference with the type reference.
+        assert_eq!(s.refs(2), Some(1));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn pinning_twice_is_refused() {
+        let mut s = sys();
+        s.allocate(0, 0).unwrap();
+        s.pin(0, 0).unwrap();
+        assert_eq!(s.pin(0, 0), Err(P2mError::WrongState));
+        // Still pinned exactly once.
+        assert_eq!(s.type_refs(0, PageType::PageTable), Some(1));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn cannot_pin_a_frame_that_is_referenced_writable() {
+        let mut s = sys();
+        s.allocate(0, 1).unwrap();
+        s.get_type(1, PageType::Writable).unwrap();
+        // A page being written must never become a page table.
+        assert_eq!(s.pin(0, 1), Err(P2mError::TypePinned));
+        assert!(!s.is_pinned(1));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn cannot_writable_type_a_pinned_frame() {
+        let mut s = sys();
+        s.allocate(0, 3).unwrap();
+        s.pin(0, 3).unwrap();
+        // The reverse: a live page table can't be taken writable.
+        assert_eq!(s.get_type(3, PageType::Writable), Err(P2mError::TypePinned));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn only_the_owner_may_pin_or_unpin() {
+        let mut s = sys();
+        s.allocate(1, 4).unwrap();
+        assert_eq!(s.pin(2, 4), Err(P2mError::NotYours));
+        s.pin(1, 4).unwrap();
+        assert_eq!(s.unpin(2, 4), Err(P2mError::NotYours));
+        assert!(s.unpin(1, 4).is_ok());
+    }
+
+    #[test]
+    fn unpin_requires_a_prior_pin() {
+        let mut s = sys();
+        s.allocate(0, 5).unwrap();
+        assert_eq!(s.unpin(0, 5), Err(P2mError::WrongState));
+        s.pin(0, 5).unwrap();
+        s.unpin(0, 5).unwrap();
+        // The pin is spent — unpinning again is refused.
+        assert_eq!(s.unpin(0, 5), Err(P2mError::WrongState));
+    }
+
+    #[test]
+    fn a_pinned_frame_cannot_be_freed_until_unpinned() {
+        let mut s = sys();
+        s.allocate(0, 6).unwrap();
+        s.pin(0, 6).unwrap();
+        assert_eq!(s.free(0, 6), Err(P2mError::InUse));
+        s.unpin(0, 6).unwrap();
+        assert!(s.free(0, 6).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn pin_unpin_round_trip_leaves_a_clean_frame() {
+        let mut s = sys();
+        s.allocate(0, 7).unwrap();
+        s.pin(0, 7).unwrap();
+        s.unpin(0, 7).unwrap();
+        assert!(!s.is_pinned(7));
+        assert_eq!(s.current_type(7), None);
+        assert_eq!(s.refs(7), Some(0));
+        // With the pin gone the frame is free to be taken writable.
+        assert!(s.get_type(7, PageType::Writable).is_ok());
+        assert!(s.invariants_hold());
     }
 
     #[test]
