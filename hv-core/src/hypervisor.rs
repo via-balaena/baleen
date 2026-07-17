@@ -152,7 +152,7 @@ pub enum HvCall {
     /// what gives that capability a provenance: the sole way a domain gains `may_create` is a
     /// domain that already has it creating it so (`may_create: true`), so none can
     /// self-elevate. **Control:** on success the creator gains control of the child — the
-    /// root of every control edge — from which control is delegable (a later refinement).
+    /// root of every control edge — from which control is delegable ([`HvCall::ControlGrant`]).
     /// **Lifecycle:** `target` must currently be `Dead`, else
     /// [`HvError::AlreadyAlive`]. A `Dead` slot is a provably-clean shell (owns no frame,
     /// offers or holds no grant, has no bound port or online vCPU — the standing
@@ -180,6 +180,26 @@ pub enum HvCall {
     /// of it), leaving a clean, authority-free shell that only a later `DomainCreate` can
     /// revive.
     DomainDestroy { target: DomId, now: Ticks },
+
+    /// Delegate control of domain `target` to domain `to` — the *mutable/delegable* half of
+    /// authority. The caller must itself control `target` (`controls[caller][target]`), else
+    /// [`HvError::Denied`]: a domain can only hand out authority it holds. On success `to`
+    /// gains `controls[to][target]` (idempotent if it already did), so `to` may thereafter
+    /// destroy `target` and delegate control of it onward. `to` must be `Live` (a capability
+    /// cannot rest on a `Dead` holder — [`HvError::NotAlive`]) and must differ from `target`
+    /// (a domain's authority over *itself* is inherent, never a delegable edge —
+    /// [`HvError::Denied`]). Flat delegation: any controller may delegate, and revocation is
+    /// unrestricted; hierarchical (chain-restricted) revocation is a later refinement.
+    ControlGrant { target: DomId, to: DomId },
+    /// Revoke domain `from`'s control of domain `target` — the inverse of
+    /// [`HvCall::ControlGrant`]. The caller must control `target` (else [`HvError::Denied`]);
+    /// then `controls[from][target]` is cleared (idempotent if `from` did not control it, so
+    /// revoking a non-edge — including one whose `from` is already `Dead` — is a successful
+    /// no-op). Flat model: a controller may revoke *any* edge over `target`, including the
+    /// creator's or its own (renouncing control); this can never fabricate authority, only
+    /// remove it, so provenance is preserved. Restricting revocation to one's own delegations
+    /// is the deferred hierarchical refinement.
+    ControlRevoke { target: DomId, from: DomId },
 }
 
 /// The success value of a routed hypercall.
@@ -240,12 +260,14 @@ pub enum HvError {
     /// authorization lives. Since a `Dead` domain has no controller, destroying one is always
     /// this error, never a liveness one.
     Denied,
-    /// A `Dead` domain issued a hypercall — the caller-liveness gate. A `Dead` slot can do
-    /// nothing (which is what keeps [`CrossViolation::DeadDomainNotClean`] a standing
-    /// invariant); only [`HvCall::DomainCreate`] by a live `may_create` domain can revive it.
-    /// The lifecycle guard on the *caller*, enforced at the dispatch seam. (Destroying a
-    /// `Dead` *target* is not this error — a `Dead` domain has no controller, so it is
-    /// [`Self::Denied`].)
+    /// An operation named a domain that must be `Live` but is `Dead`. Chiefly the
+    /// caller-liveness gate — a `Dead` slot can issue no hypercall (which is what keeps
+    /// [`CrossViolation::DeadDomainNotClean`] a standing invariant); only
+    /// [`HvCall::DomainCreate`] by a live `may_create` domain can revive it. Also the
+    /// delegation recipient: [`HvCall::ControlGrant`] to a `Dead` `to` is refused, since a
+    /// capability cannot rest on a `Dead` holder. The lifecycle guard, at the dispatch seam.
+    /// (Destroying a `Dead` *target* is not this error — a `Dead` domain has no controller,
+    /// so it is [`Self::Denied`].)
     NotAlive,
     /// A [`HvCall::DomainCreate`] targeted a slot that is already `Live`. Creation is
     /// `Dead` → `Live`; an already-live domain must be torn down before its slot can be
@@ -571,6 +593,8 @@ impl Hypervisor {
                 self.domain_create(caller, target, may_create)
             }
             HvCall::DomainDestroy { target, now } => self.domain_destroy(caller, target, now),
+            HvCall::ControlGrant { target, to } => self.control_grant(caller, target, to),
+            HvCall::ControlRevoke { target, from } => self.control_revoke(caller, target, from),
         }
     }
 
@@ -990,6 +1014,66 @@ impl Hypervisor {
             self.is_clean_shell(target),
             "domain {target} is not an empty shell after teardown"
         );
+        Ok(HvOutcome::Done)
+    }
+
+    /// Delegate control of `target` to `to` — the mutable half of the authority axis, the
+    /// analog for control capabilities of what a grant is for memory. The caller may hand out
+    /// only authority it holds (`controls[caller][target]`), so delegation can never fabricate
+    /// authority — every edge still traces back through a chain of delegations to the creation
+    /// that rooted it. `to` must be `Live` (a capability cannot rest on a `Dead` holder) and
+    /// distinct from `target` (self-authority is inherent, never an edge). Idempotent: if `to`
+    /// already controls `target`, this is a successful no-op.
+    fn control_grant(
+        &mut self,
+        caller: DomId,
+        target: DomId,
+        to: DomId,
+    ) -> Result<HvOutcome, HvError> {
+        if target as usize >= self.domain_count() || to as usize >= self.domain_count() {
+            return Err(HvError::BadDomain);
+        }
+        // Authority: the caller can only delegate control it actually holds. Checked before
+        // anything else, so a caller without control learns nothing about `target` or `to`.
+        if !self.controls[caller as usize][target as usize] {
+            return Err(HvError::Denied);
+        }
+        // A domain's authority over itself is inherent and never represented as an edge, so
+        // control of `target` cannot be delegated to `target` — that keeps the diagonal
+        // permanently empty (ControlEdgeDeadEndpoint scans it too).
+        if to == target {
+            return Err(HvError::Denied);
+        }
+        // The recipient must be a live domain — otherwise the new edge would rest on a Dead
+        // holder, breaking ControlEdgeDeadEndpoint. (The target is Live by that same
+        // invariant, since the caller controls it.)
+        if self.life[to as usize] != DomainLife::Live {
+            return Err(HvError::NotAlive);
+        }
+        self.controls[to as usize][target as usize] = true;
+        Ok(HvOutcome::Done)
+    }
+
+    /// Revoke `from`'s control of `target` — the inverse of [`Self::control_grant`]. The
+    /// caller must control `target`; then the edge is cleared. Revocation only ever *removes*
+    /// authority, so it cannot break provenance no matter which edge it targets — the flat
+    /// model lets any controller revoke any edge (the creator's, a peer's, or its own).
+    /// Idempotent: revoking an edge that is not there (including one whose `from` is `Dead`,
+    /// already cleared) succeeds and changes nothing.
+    fn control_revoke(
+        &mut self,
+        caller: DomId,
+        target: DomId,
+        from: DomId,
+    ) -> Result<HvOutcome, HvError> {
+        if target as usize >= self.domain_count() || from as usize >= self.domain_count() {
+            return Err(HvError::BadDomain);
+        }
+        // Authority: only a controller of `target` may revoke control over it.
+        if !self.controls[caller as usize][target as usize] {
+            return Err(HvError::Denied);
+        }
+        self.controls[from as usize][target as usize] = false;
         Ok(HvOutcome::Done)
     }
 
@@ -2762,6 +2846,166 @@ mod tests {
         assert!(h
             .dispatch(2, HvCall::DomainDestroy { target: 2, now: 0 })
             .is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn control_can_be_delegated_and_revoked() {
+        // Delegation makes control mutable: a controller hands control of a domain to a
+        // peer, which can then destroy it; revocation takes it back.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        // dom0 creates domain 1 (the controlled domain) and domain 2 (a would-be delegate).
+        for t in [1u16, 2] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        // Domain 2 does not control domain 1, so it cannot destroy it — nor delegate it.
+        assert!(!h.controls(2, 1));
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Err(HvError::Denied)
+        );
+        assert_eq!(
+            h.dispatch(2, HvCall::ControlGrant { target: 1, to: 2 }),
+            Err(HvError::Denied),
+            "a domain cannot delegate authority it does not hold"
+        );
+
+        // dom0, which controls domain 1, delegates that control to domain 2.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlGrant { target: 1, to: 2 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.controls(2, 1));
+        assert!(
+            h.controls(0, 1),
+            "delegation shares control, it does not move it"
+        );
+
+        // Now domain 2 may destroy domain 1. But first show revoke works: dom0 revokes
+        // domain 2's freshly granted control, and the destroy is denied again.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlRevoke { target: 1, from: 2 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(!h.controls(2, 1));
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 }),
+            Err(HvError::Denied)
+        );
+        // Re-delegate, and this time domain 2 tears domain 1 down.
+        h.dispatch(0, HvCall::ControlGrant { target: 1, to: 2 })
+            .unwrap();
+        assert!(h
+            .dispatch(2, HvCall::DomainDestroy { target: 1, now: 0 })
+            .is_ok());
+        assert!(!h.is_live(1));
+        // Teardown cleared every edge over domain 1, including the delegated one.
+        assert!(!h.controls(0, 1) && !h.controls(2, 1));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn delegation_guards_the_recipient_and_the_self_edge() {
+        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
+        // dom0 controls domain 1 (created it); domain 2 stays Dead.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        // Delegating to a Dead domain is refused — a capability can't rest on a Dead holder.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlGrant { target: 1, to: 2 }),
+            Err(HvError::NotAlive)
+        );
+        assert!(!h.controls(2, 1));
+        // Delegating control of a domain to *itself* is refused — self-authority is inherent,
+        // never an edge, so the diagonal stays empty.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlGrant { target: 1, to: 1 }),
+            Err(HvError::Denied)
+        );
+        assert!(!h.controls(1, 1));
+        // An out-of-range recipient is BadDomain.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlGrant { target: 1, to: 9 }),
+            Err(HvError::BadDomain)
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn revoking_a_nonexistent_edge_is_a_successful_noop() {
+        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
+        for t in [1u16, 2] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        // dom0 controls domain 1; domain 2 does not. Revoking domain 2's (absent) control of
+        // domain 1 is idempotent — it succeeds and changes nothing.
+        assert!(!h.controls(2, 1));
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlRevoke { target: 1, from: 2 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(!h.controls(2, 1));
+        // But a caller that does not control the target cannot revoke over it at all.
+        assert_eq!(
+            h.dispatch(2, HvCall::ControlRevoke { target: 1, from: 0 }),
+            Err(HvError::Denied)
+        );
+        assert!(h.controls(0, 1), "the unauthorized revoke was a no-op");
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn control_delegates_onward_in_a_chain() {
+        // A delegate is a full controller: it may delegate onward. dom0 → 1, then 1 → 2, so
+        // domain 2 controls the target without dom0 delegating to it directly.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        // Target is domain 3; domains 1 and 2 are the delegation chain.
+        for t in [1u16, 2, 3] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        // dom0 controls domain 3 (created it); delegate that to domain 1.
+        h.dispatch(0, HvCall::ControlGrant { target: 3, to: 1 })
+            .unwrap();
+        // Domain 1, now a controller of domain 3, delegates onward to domain 2.
+        assert_eq!(
+            h.dispatch(1, HvCall::ControlGrant { target: 3, to: 2 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.controls(2, 3));
+        // Flat revocation: domain 2 may revoke even dom0's original control of domain 3
+        // (a wart the deferred hierarchical model would fix — but it is sound: revocation
+        // only removes authority, never fabricates it).
+        h.dispatch(2, HvCall::ControlRevoke { target: 3, from: 0 })
+            .unwrap();
+        assert!(!h.controls(0, 3));
+        assert!(h.controls(1, 3) && h.controls(2, 3));
         assert!(h.invariants_hold());
     }
 

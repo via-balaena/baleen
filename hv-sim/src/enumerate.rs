@@ -57,6 +57,7 @@ pub struct Config {
     pub p2m: bool,
     pub create: bool,
     pub destroy: bool,
+    pub delegate: bool,
     /// Maximum hypercall depth from the initial state to explore.
     pub depth: u32,
     /// Safety cap: stop after this many distinct states (a partial result).
@@ -81,6 +82,7 @@ impl Config {
             p2m: false,
             create: false,
             destroy: false,
+            delegate: false,
             depth: 5,
             max_states: 1_500_000,
         }
@@ -249,12 +251,31 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
             }
         }
         if cfg.destroy {
-            // Every (caller, target) pair — so both the authority-denied path (an
-            // unprivileged caller destroying a peer, a no-op) and the authorized path
-            // (dom0 or a self-destroy) are exhaustively explored. Domain 0 is privileged
-            // in the enumerated `Hypervisor`, as it boots.
+            // Every (caller, target) pair — so both the authority-denied path (a caller with
+            // no control of the peer, a no-op) and the authorized path (a controller or a
+            // self-destroy) are exhaustively explored.
             for target in 0..doms {
                 v.push((caller, HvCall::DomainDestroy { target, now: NOW }));
+            }
+        }
+        if cfg.delegate {
+            // Every (caller, target, other) triple for both delegate and revoke — so the
+            // authority-denied paths (a caller that does not control `target`), the guards
+            // (a Dead or self recipient), and the successful edge mutations are all explored.
+            // Delegation makes the control matrix *mutable*, so this is what proves the
+            // ControlEdgeDeadEndpoint invariant holds over every reachable edge configuration,
+            // not just the ones creation alone can reach.
+            for target in 0..doms {
+                for other in 0..doms {
+                    v.push((caller, HvCall::ControlGrant { target, to: other }));
+                    v.push((
+                        caller,
+                        HvCall::ControlRevoke {
+                            target,
+                            from: other,
+                        },
+                    ));
+                }
             }
         }
     }
@@ -565,6 +586,7 @@ mod tests {
             p2m: true,
             create: true,
             destroy: true,
+            delegate: true,
             depth,
             ..Config::tiny()
         }
@@ -578,6 +600,7 @@ mod tests {
             p2m: true,
             create: true,
             destroy: true,
+            delegate: true,
             depth,
             ..Config::tiny()
         }

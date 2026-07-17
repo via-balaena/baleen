@@ -1060,6 +1060,11 @@ pub struct DestroyOutcome {
     /// was *torn down earlier this run* has been reborn — so this counting non-zero
     /// witnesses the full Dead→Live→Dead→Live lifecycle cycle, not just one-way teardown.
     pub creations: u32,
+    /// `ControlGrant` calls that delegated control to a domain that did not already hold it
+    /// (a real edge added). Non-zero witnesses that the delegable-authority path is reached:
+    /// a domain destroying a peer it controls only because control was *delegated* to it, not
+    /// because it created it.
+    pub delegations: u32,
     /// Destroy calls refused because a foreign domain held a live map (`DomainBusy`).
     pub busy_refusals: u32,
     /// Destroy calls refused because the caller was neither the target nor privileged
@@ -1140,6 +1145,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
     let mut out = DestroyOutcome {
         teardowns: 0,
         creations: 0,
+        delegations: 0,
         busy_refusals: 0,
         denials: 0,
         postcondition_held: true,
@@ -1156,7 +1162,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
         let pcpu = rng.below(PCPUS);
         let mfn = rng.below(FRAMES);
 
-        match rng.below(17) {
+        match rng.below(19) {
             0 => {
                 let remote = rng.below(u32::from(DOMAINS)) as u16;
                 drop_ok(hv.dispatch(caller, HvCall::EvtchnAllocUnbound { remote }));
@@ -1282,6 +1288,77 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                         }
                     }
                     other => panic!("unexpected create outcome {other:?}"),
+                }
+            }
+            15 => {
+                // Delegate control of `target` to `to` — the mutable half of authority.
+                // Predictions in the impl's order: caller Live (gate); caller controls
+                // `target` (authority); `to != target` (no self-edge); `to` Live (recipient).
+                let target = rng.below(u32::from(DOMAINS)) as u16;
+                let to = rng.below(u32::from(DOMAINS)) as u16;
+                let caller_live = hv.is_live(caller);
+                let caller_controls = hv.controls(caller, target);
+                let to_live = hv.is_live(to);
+                let already = hv.controls(to, target);
+                match hv.dispatch(caller, HvCall::ControlGrant { target, to }) {
+                    Ok(HvOutcome::Done) => {
+                        // A live caller that controls `target`, a live recipient distinct
+                        // from `target`, which now controls `target`.
+                        let ok = caller_live
+                            && caller_controls
+                            && to != target
+                            && to_live
+                            && hv.controls(to, target);
+                        if !ok {
+                            out.postcondition_held = false;
+                        }
+                        if !already {
+                            out.delegations += 1; // a genuinely new edge
+                        }
+                    }
+                    Err(hv_core::HvError::Denied) => {
+                        // Live caller either lacking control of `target`, or `to == target`.
+                        if !caller_live || (caller_controls && to != target) {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::NotAlive) => {
+                        // The caller is Dead (gate), or a live authorized caller aimed at a
+                        // Dead recipient (`to != target` since `target` is live here).
+                        if caller_live && !(caller_controls && to != target && !to_live) {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    other => panic!("unexpected control-grant outcome {other:?}"),
+                }
+            }
+            16 => {
+                // Revoke `from`'s control of `target`. Predictions: caller Live (gate);
+                // caller controls `target` (authority); then the edge is cleared (idempotent).
+                let target = rng.below(u32::from(DOMAINS)) as u16;
+                let from = rng.below(u32::from(DOMAINS)) as u16;
+                let caller_live = hv.is_live(caller);
+                let caller_controls = hv.controls(caller, target);
+                match hv.dispatch(caller, HvCall::ControlRevoke { target, from }) {
+                    Ok(HvOutcome::Done) => {
+                        // A live, controlling caller; the edge is now gone.
+                        if !(caller_live && caller_controls) || hv.controls(from, target) {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::Denied) => {
+                        // A live caller that does not control `target` — a no-op.
+                        if !caller_live || caller_controls {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::NotAlive) => {
+                        // The caller itself is Dead (the gate) — a no-op.
+                        if caller_live {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    other => panic!("unexpected control-revoke outcome {other:?}"),
                 }
             }
             _ => {
@@ -2184,6 +2261,12 @@ mod tests {
         assert!(
             outcomes.iter().any(|o| o.creations > 0),
             "no seed ever recreated a torn-down domain — the lifecycle cycle is uncovered"
+        );
+        // A genuinely-new delegation edge proves the mutable/delegable authority path is
+        // reached — a domain gaining control of a peer it did not create.
+        assert!(
+            outcomes.iter().any(|o| o.delegations > 0),
+            "no seed ever delegated control — the delegable-authority path is uncovered"
         );
     }
 

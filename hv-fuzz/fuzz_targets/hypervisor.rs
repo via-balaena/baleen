@@ -88,7 +88,7 @@ fuzz_target!(|data: &[u8]| {
         let slot = u32::from(a) % TABLE_SLOTS;
         now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 29 {
+        let call = match op % 31 {
             0 => HvCall::CreditGrant {
                 amount: u32::from(a),
             },
@@ -173,6 +173,17 @@ fuzz_target!(|data: &[u8]| {
             27 => HvCall::DomainCreate {
                 target: other,
                 may_create: b & 1 == 0,
+            },
+            // Delegate / revoke control of `other` to/from `caller` — the mutable authority
+            // axis. A no-op unless the caller controls `other`; the seam's guards (self-edge,
+            // Dead recipient) refuse the rest, so only well-formed edges ever take.
+            28 => HvCall::ControlGrant {
+                target: other,
+                to: caller,
+            },
+            29 => HvCall::ControlRevoke {
+                target: other,
+                from: caller,
             },
             // Tear a whole domain down — all four subsystems and both seams at once.
             // Stale handles it leaves behind are already tolerated by the unmap arm.
