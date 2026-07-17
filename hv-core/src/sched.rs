@@ -91,6 +91,7 @@ impl VirtualCpu {
 }
 
 /// One domain's fixed-size table of virtual CPUs.
+#[derive(Clone)]
 struct Domain {
     vcpus: Vec<VirtualCpu>,
 }
@@ -98,6 +99,7 @@ struct Domain {
 /// The whole-system scheduler state: every domain's vCPUs plus the physical-CPU
 /// occupancy table, in one place, so pCPU exclusivity is checkable after every
 /// transition.
+#[derive(Clone)]
 pub struct System {
     domains: Vec<Domain>,
     /// Who is running on each physical CPU: `Some((dom, vcpu))` or idle. The

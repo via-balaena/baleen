@@ -224,6 +224,7 @@ pub enum CrossViolation {
 
 /// The integrated hypervisor core: per-domain credit plus the whole-system subsystems,
 /// behind one dispatch entry point.
+#[derive(Clone)]
 pub struct Hypervisor {
     credit: Vec<HvCore>,
     evtchn: evtchn::System,

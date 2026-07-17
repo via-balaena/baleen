@@ -96,6 +96,7 @@ impl GrantEntry {
 }
 
 /// One domain's grant table (the grants *it* offers to others).
+#[derive(Clone)]
 struct DomainGrants {
     entries: Vec<GrantEntry>,
 }
@@ -113,6 +114,7 @@ struct Mapping {
 
 /// The whole-system grant state: every domain's grant table plus the global table
 /// of live mappings, so refcounts can be cross-checked against reality.
+#[derive(Clone)]
 pub struct System {
     domains: Vec<DomainGrants>,
     maps: Vec<Mapping>,
@@ -447,6 +449,43 @@ impl System {
     /// Total live mappings across the whole system.
     pub fn active_maps(&self) -> usize {
         self.maps.iter().filter(|m| m.active).count()
+    }
+
+    /// The full state of a grant slot, if active: `(grantee, frame, readonly, maps,
+    /// writable_maps)`. A canonical read of an `Access` entry for state inspection (e.g.
+    /// the exhaustive enumerator's state key) — no dead fields, `None` for a free slot.
+    pub fn grant_entry(
+        &self,
+        grantor: DomId,
+        gref: GrantRef,
+    ) -> Option<(DomId, Frame, bool, u32, u32)> {
+        match self.entry(grantor, gref) {
+            Ok(GrantEntry::Access {
+                grantee,
+                frame,
+                readonly,
+                maps,
+                writable_maps,
+            }) => Some((*grantee, *frame, *readonly, *maps, *writable_maps)),
+            _ => None,
+        }
+    }
+
+    /// Number of map-handle slots the system currently holds (active or reclaimable). The
+    /// handle namespace `[0, handle_slots)` a state inspector iterates to read every live
+    /// mapping by handle — the handle layout is behaviourally live ([`Self::unmap`] acts
+    /// on a specific handle), so a faithful state key must include it.
+    pub fn handle_slots(&self) -> usize {
+        self.maps.len()
+    }
+
+    /// The live mapping at `handle`, if any: `(grantee, grantor, gref, writable)`. `None`
+    /// for a reclaimed or out-of-range slot.
+    pub fn mapping_at(&self, handle: GrantHandle) -> Option<(DomId, DomId, GrantRef, bool)> {
+        match self.maps.get(handle as usize) {
+            Some(m) if m.active => Some((m.grantee, m.grantor, m.gref, m.writable)),
+            _ => None,
+        }
     }
 
     /// Number of domains.

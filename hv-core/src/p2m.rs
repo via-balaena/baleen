@@ -186,6 +186,7 @@ struct Link {
 /// The whole-system page state: a flat table of machine frames plus every domain's
 /// page-table links, so every count can be cross-checked, every owner validated, and
 /// every page-table edge checked level-correct.
+#[derive(Clone)]
 pub struct System {
     frames: Vec<Frame>,
     /// Live page-table entries across all frames — the tree structure whose

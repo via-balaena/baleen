@@ -80,12 +80,14 @@ impl EventChannel {
 }
 
 /// One domain's fixed-size port table.
+#[derive(Clone)]
 struct Domain {
     ports: Vec<EventChannel>,
 }
 
 /// The whole-system event-channel state — every domain's ports in one place, so the
 /// reciprocity invariant is checkable after every transition.
+#[derive(Clone)]
 pub struct System {
     domains: Vec<Domain>,
 }

@@ -100,4 +100,5 @@ impl VcpuOps for RecordingVcpu {
     }
 }
 
+pub mod enumerate;
 pub mod scenario;

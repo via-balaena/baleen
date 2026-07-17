@@ -114,7 +114,7 @@ impl Hypercall {
 /// illustration of the ABI-decode seam — kept and fuzzed as a worked example, but
 /// superseded by the typed [`crate::HvCall`] dispatch that a real personality (M5)
 /// will decode guest wire-format calls into.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct HvCore {
     balance: u64,
     granted: u64,
