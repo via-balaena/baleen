@@ -690,7 +690,6 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
     let mut rng = Prng::new(seed);
     let clock = ManualClock::new();
     let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee/owner, handle) of live maps
-    let mut typed: Vec<(u32, PageType)> = Vec::new(); // (mfn, type) of live p2m typed refs
 
     for _ in 0..steps {
         // Crank the clock so scheduler run/preempt intervals span seed-derived gaps.
@@ -704,7 +703,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         let pcpu = rng.below(PCPUS);
         let mfn = rng.below(FRAMES);
 
-        match rng.below(27) {
+        match rng.below(23) {
             0 => drop_ok(hv.dispatch(
                 caller,
                 HvCall::CreditGrant {
@@ -803,25 +802,6 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
             19 => drop_ok(hv.dispatch(caller, HvCall::SchedWake { vcpu })),
             20 => drop_ok(hv.dispatch(caller, HvCall::SchedOffline { vcpu, now })),
             21 => drop_ok(hv.dispatch(caller, HvCall::P2mAllocate { mfn })),
-            22 => drop_ok(hv.dispatch(caller, HvCall::P2mGet { mfn })),
-            23 => drop_ok(hv.dispatch(caller, HvCall::P2mPut { mfn })),
-            24 => {
-                let ty = if rng.below(2) == 0 {
-                    PageType::Writable
-                } else {
-                    PageType::PageTable
-                };
-                if hv.dispatch(caller, HvCall::P2mGetType { mfn, ty }).is_ok() {
-                    typed.push((mfn, ty));
-                }
-            }
-            25 => {
-                if !typed.is_empty() {
-                    let idx = rng.below(typed.len() as u32) as usize;
-                    let (m, ty) = typed.swap_remove(idx);
-                    drop_ok(hv.dispatch(caller, HvCall::P2mPutType { mfn: m, ty }));
-                }
-            }
             _ => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
         }
     }
@@ -1219,9 +1199,7 @@ mod tests {
             summaries.iter().any(|s| s.allocated_frames > 0),
             "no seed allocated a machine frame"
         );
-        assert!(
-            summaries.iter().any(|s| s.typed_frames > 0),
-            "no seed pinned a machine frame's type"
-        );
+        // Typed frames arise only from writable grant maps through the seam, which
+        // lands in a later commit; until then no dispatch path pins a frame's type.
     }
 }

@@ -30,6 +30,18 @@
 //! reallocate-while-mapped use-after-free. These are the same whole-system,
 //! checked-every-transition discipline as [`crate::evtchn`] and [`crate::grant`].
 //!
+//! **The reference count is a single scalar, so every acquire must be balanced by
+//! exactly one release.** That balance is not something a guest can be trusted to
+//! keep: [`System::get`]/[`System::put`] and [`System::get_type`]/[`System::put_type`]
+//! are *internal* primitives, driven only by higher-level operations that gate the
+//! release on proof of the acquire — a grant map is released only by unmapping its
+//! handle, a page-table pin only by unpinning. They are deliberately **not** exposed
+//! as guest hypercalls (a raw "drop a reference" call would let one domain release a
+//! reference another domain holds, freeing or re-typing a page out from under it —
+//! exactly the class of bug this module exists to prevent). The guest-facing surface
+//! is only allocate and free; references appear and vanish underneath, always in
+//! balanced pairs. This is how Xen's own scalar `count_info` stays sound.
+//!
 //! **What lives here vs. what does not.** The core owns the *accounting* — the counts,
 //! the type exclusivity, the lifecycle. It does *not* own the actual page tables, the
 //! EPT/NPT shadowing, or how a guest physical address resolves to a machine frame:
@@ -82,8 +94,10 @@ enum Frame {
     Allocated {
         /// The domain the frame belongs to.
         owner: DomId,
-        /// Total live references pinning the frame's existence. While non-zero the
-        /// frame cannot be freed.
+        /// Outstanding references pinning the frame's existence, *beyond* ownership
+        /// itself (grant maps, later page-table pins). While non-zero the frame cannot
+        /// be freed — so ownership alone (`refs == 0`) is freeable, but a page anything
+        /// else still holds is not.
         refs: u32,
         /// How many references require the frame to be writable.
         writable_refs: u32,
@@ -150,10 +164,12 @@ impl System {
 
     // ─── transitions ─────────────────────────────────────────────────────────
 
-    /// Allocate a free frame to `owner`, giving it the single existence reference the
-    /// owner holds by owning it. The frame must be free — an allocated frame is never
-    /// re-owned in place (free it first), which is what stops a live reference being
-    /// silently transferred to a different domain.
+    /// Allocate a free frame to `owner`. Ownership is the `Allocated` *state* itself,
+    /// not a counted reference — so a freshly allocated frame starts with `refs == 0`
+    /// and every reference thereafter belongs to something *else* pinning the page (a
+    /// grant map, later a page-table pin). The frame must be free — an allocated frame
+    /// is never re-owned in place (free it first), which is what stops a live reference
+    /// being silently transferred to a different domain.
     pub fn allocate(&mut self, owner: DomId, mfn: Mfn) -> Result<(), P2mError> {
         if owner as usize >= self.num_domains {
             return Err(P2mError::BadDomain);
@@ -164,7 +180,7 @@ impl System {
         }
         *frame = Frame::Allocated {
             owner,
-            refs: 1,
+            refs: 0,
             writable_refs: 0,
             pagetable_refs: 0,
         };
@@ -442,12 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn allocate_owns_the_frame_with_one_reference() {
+    fn allocate_owns_the_frame_with_no_outstanding_references() {
         let mut s = sys();
         s.allocate(1, 4).unwrap();
         assert!(s.is_allocated(4));
         assert_eq!(s.owner_of(4), Some(1));
-        assert_eq!(s.refs(4), Some(1));
+        // Ownership is the state itself, not a counted reference.
+        assert_eq!(s.refs(4), Some(0));
         assert_eq!(s.current_type(4), None);
     }
 
@@ -488,26 +505,24 @@ mod tests {
         s.get_type(1, PageType::Writable).unwrap();
         s.get_type(1, PageType::Writable).unwrap();
         assert_eq!(s.type_refs(1, PageType::Writable), Some(2));
-        // Each typed reference also took an existence reference: 1 (alloc) + 2.
-        assert_eq!(s.refs(1), Some(3));
+        // Each typed reference also took an existence reference (ownership adds none).
+        assert_eq!(s.refs(1), Some(2));
 
         s.put_type(1, PageType::Writable).unwrap();
         assert_eq!(s.type_refs(1, PageType::Writable), Some(1));
         assert_eq!(s.current_type(1), Some(PageType::Writable));
         s.put_type(1, PageType::Writable).unwrap();
         assert_eq!(s.current_type(1), None);
-        assert_eq!(s.refs(1), Some(1));
+        assert_eq!(s.refs(1), Some(0));
         assert!(s.invariants_hold());
     }
 
     #[test]
     fn free_is_refused_while_referenced_then_allowed() {
         let mut s = sys();
-        s.allocate(2, 3).unwrap();
-        s.get(3).unwrap(); // refs now 2
+        s.allocate(2, 3).unwrap(); // refs 0 — ownership only
+        s.get(3).unwrap(); // an outstanding reference: refs 1
 
-        assert_eq!(s.free(2, 3), Err(P2mError::InUse));
-        s.put(3).unwrap(); // refs 1 (the allocation reference)
         assert_eq!(s.free(2, 3), Err(P2mError::InUse));
         s.put(3).unwrap(); // refs 0
         assert!(s.free(2, 3).is_ok());
@@ -518,8 +533,7 @@ mod tests {
     #[test]
     fn only_the_owner_may_free() {
         let mut s = sys();
-        s.allocate(1, 5).unwrap();
-        s.put(5).unwrap(); // drop the allocation reference so refs == 0
+        s.allocate(1, 5).unwrap(); // refs 0 — freeable by the owner right away
         assert_eq!(s.free(2, 5), Err(P2mError::NotYours));
         assert!(s.free(1, 5).is_ok());
     }
@@ -528,7 +542,8 @@ mod tests {
     fn put_cannot_strand_a_typed_reference() {
         let mut s = sys();
         s.allocate(0, 6).unwrap();
-        // alloc ref (1) + one writable typed ref (1) → refs 2, writable 1.
+        // One bare existence ref plus one writable typed ref → refs 2, writable 1.
+        s.get(6).unwrap();
         s.get_type(6, PageType::Writable).unwrap();
         assert_eq!(s.refs(6), Some(2));
 
@@ -576,13 +591,12 @@ mod tests {
         let mut s = sys();
         s.allocate(0, 7).unwrap();
         s.get_type(7, PageType::PageTable).unwrap();
-        s.put_type(7, PageType::PageTable).unwrap();
-        s.put(7).unwrap(); // drop allocation reference
+        s.put_type(7, PageType::PageTable).unwrap(); // refs back to 0
         s.free(0, 7).unwrap();
         // A fresh owner gets a clean frame — no stale type or count survives free.
         s.allocate(1, 7).unwrap();
         assert_eq!(s.owner_of(7), Some(1));
-        assert_eq!(s.refs(7), Some(1));
+        assert_eq!(s.refs(7), Some(0));
         assert_eq!(s.current_type(7), None);
         assert!(s.invariants_hold());
     }

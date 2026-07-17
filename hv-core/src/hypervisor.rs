@@ -29,7 +29,7 @@ use hv_hal::Ticks;
 
 use crate::evtchn::{self, Port, Vcpu, Virq};
 use crate::grant::{self, Frame, GrantHandle, GrantRef};
-use crate::p2m::{self, Mfn, PageType};
+use crate::p2m::{self, Mfn};
 use crate::sched::{self, Pcpu};
 use crate::{HError, HvCore};
 
@@ -106,16 +106,15 @@ pub enum HvCall {
     SchedOffline { vcpu: Vcpu, now: Ticks },
 
     /// Allocate a free machine frame to the caller.
+    ///
+    /// Allocate and free are the *only* guest-facing page operations. The reference
+    /// and type counts a frame carries are moved solely by higher-level operations
+    /// (grant maps, later page-table pins) whose release is gated on proof of the
+    /// acquire — never by a raw guest hypercall, which could drop a reference another
+    /// domain holds. See [`crate::p2m`] for why that keeps the scalar count sound.
     P2mAllocate { mfn: Mfn },
-    /// Take a bare existence reference on a machine frame.
-    P2mGet { mfn: Mfn },
-    /// Drop a bare existence reference on a machine frame.
-    P2mPut { mfn: Mfn },
-    /// Take a typed reference on a machine frame — writable-xor-pagetable enforced.
-    P2mGetType { mfn: Mfn, ty: PageType },
-    /// Drop a typed reference on a machine frame.
-    P2mPutType { mfn: Mfn, ty: PageType },
-    /// Free one of the caller's machine frames back to the pool.
+    /// Free one of the caller's machine frames back to the pool (refused while anything
+    /// still references it).
     P2mFree { mfn: Mfn },
 }
 
@@ -323,26 +322,6 @@ impl Hypervisor {
                 .allocate(caller, mfn)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
-            HvCall::P2mGet { mfn } => self
-                .p2m
-                .get(mfn)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::P2m),
-            HvCall::P2mPut { mfn } => self
-                .p2m
-                .put(mfn)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::P2m),
-            HvCall::P2mGetType { mfn, ty } => self
-                .p2m
-                .get_type(mfn, ty)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::P2m),
-            HvCall::P2mPutType { mfn, ty } => self
-                .p2m
-                .put_type(mfn, ty)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::P2m),
             HvCall::P2mFree { mfn } => self
                 .p2m
                 .free(caller, mfn)
@@ -514,45 +493,18 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_types_and_frees_through_dispatch() {
+    fn a_frame_allocates_and_frees_through_dispatch() {
         let mut h = hv();
-        // Domain 1 allocates frame 3 and types it writable.
+        // Domain 1 allocates frame 3 — ownership only, no outstanding references.
         h.dispatch(1, HvCall::P2mAllocate { mfn: 3 }).unwrap();
-        h.dispatch(
-            1,
-            HvCall::P2mGetType {
-                mfn: 3,
-                ty: PageType::Writable,
-            },
-        )
-        .unwrap();
-        assert_eq!(h.p2m().current_type(3), Some(PageType::Writable));
-        // While it is writable, no one can pin it as a page table.
-        assert_eq!(
-            h.dispatch(
-                1,
-                HvCall::P2mGetType {
-                    mfn: 3,
-                    ty: PageType::PageTable
-                }
-            ),
-            Err(HvError::P2m(p2m::P2mError::TypePinned))
-        );
+        assert_eq!(h.p2m().owner_of(3), Some(1));
         // A different domain cannot free frame 3 — it is not the owner.
         assert_eq!(
             h.dispatch(0, HvCall::P2mFree { mfn: 3 }),
             Err(HvError::P2m(p2m::P2mError::NotYours))
         );
-        // Release the type and the allocation reference, then the owner frees it.
-        h.dispatch(
-            1,
-            HvCall::P2mPutType {
-                mfn: 3,
-                ty: PageType::Writable,
-            },
-        )
-        .unwrap();
-        h.dispatch(1, HvCall::P2mPut { mfn: 3 }).unwrap();
+        // The owner frees it. (References are taken only by the grant seam, so a bare
+        // allocation is freeable straight away.)
         assert!(h.dispatch(1, HvCall::P2mFree { mfn: 3 }).is_ok());
         assert!(!h.p2m().is_allocated(3));
         assert!(h.invariants_hold());
@@ -592,9 +544,9 @@ mod tests {
             ),
             Err(HvError::Sched(sched::SchedError::WrongState))
         );
-        // Getting a reference on an unallocated frame is a page-type WrongState.
+        // Freeing an unallocated frame is a page-type WrongState.
         assert_eq!(
-            h.dispatch(0, HvCall::P2mGet { mfn: 0 }),
+            h.dispatch(0, HvCall::P2mFree { mfn: 0 }),
             Err(HvError::P2m(p2m::P2mError::WrongState))
         );
     }
