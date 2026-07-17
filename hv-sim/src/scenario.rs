@@ -9,7 +9,7 @@
 //! whole reproducer. This is the FoundationDB discipline shrunk to a laptop.
 
 use hv_core::evtchn::{PortState, System};
-use hv_core::p2m::PageType;
+use hv_core::p2m::{PageType, PtLevel};
 use hv_core::{
     grant, p2m, policy, prng::Prng, sched, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor,
 };
@@ -352,7 +352,7 @@ impl P2mOutcome {
                 o.total_refs += u64::from(sys.refs(mfn).unwrap_or(0));
                 match sys.current_type(mfn) {
                     Some(PageType::Writable) => o.writable_typed += 1,
-                    Some(PageType::PageTable) => o.pagetable_typed += 1,
+                    Some(PageType::PageTable(_)) => o.pagetable_typed += 1,
                     None => {}
                 }
                 if sys.is_pinned(mfn) {
@@ -397,7 +397,7 @@ pub fn run_p2m(seed: u64, steps: u32) -> P2mOutcome {
                 let ty = if rng.below(2) == 0 {
                     PageType::Writable
                 } else {
-                    PageType::PageTable
+                    PageType::PageTable(pt_level(rng.below(4)))
                 };
                 if sys.get_type(mfn, ty).is_ok() {
                     typed.push((mfn, ty));
@@ -411,7 +411,7 @@ pub fn run_p2m(seed: u64, steps: u32) -> P2mOutcome {
                 }
             }
             6 => {
-                let _ = sys.pin(owner, mfn);
+                let _ = sys.pin(owner, mfn, pt_level(rng.below(4)));
             }
             7 => {
                 let _ = sys.unpin(owner, mfn);
@@ -841,7 +841,13 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
             20 => drop_ok(hv.dispatch(caller, HvCall::SchedOffline { vcpu, now })),
             21 => drop_ok(hv.dispatch(caller, HvCall::P2mAllocate { mfn })),
             22 => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
-            23 => drop_ok(hv.dispatch(caller, HvCall::P2mPin { mfn })),
+            23 => drop_ok(hv.dispatch(
+                caller,
+                HvCall::P2mPin {
+                    mfn,
+                    level: pt_level(mfn),
+                },
+            )),
             _ => drop_ok(hv.dispatch(caller, HvCall::P2mUnpin { mfn })),
         }
     }
@@ -853,6 +859,17 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
 /// send on a free port), and that is part of what the sim exercises.
 fn drop_ok(result: Result<HvOutcome, hv_core::HvError>) {
     let _ = result;
+}
+
+/// Map a seed-derived number to a paging level, so a run spreads pins and page-table
+/// references across all four levels rather than collapsing to one.
+fn pt_level(n: u32) -> PtLevel {
+    match n % 4 {
+        0 => PtLevel::L1,
+        1 => PtLevel::L2,
+        2 => PtLevel::L3,
+        _ => PtLevel::L4,
+    }
 }
 
 /// A comparable summary of a finished event↔scheduler seam run. The counts are
@@ -1169,7 +1186,13 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
             9 => drop_ok(hv.dispatch(caller, HvCall::SchedRun { vcpu, pcpu, now })),
             10 => drop_ok(hv.dispatch(caller, HvCall::SchedBlock { vcpu, now })),
             11 => drop_ok(hv.dispatch(caller, HvCall::P2mAllocate { mfn })),
-            12 => drop_ok(hv.dispatch(caller, HvCall::P2mPin { mfn })),
+            12 => drop_ok(hv.dispatch(
+                caller,
+                HvCall::P2mPin {
+                    mfn,
+                    level: pt_level(mfn),
+                },
+            )),
             13 => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
             _ => {
                 // Tear a domain down. Its precondition predicts the outcome exactly, so

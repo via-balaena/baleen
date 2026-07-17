@@ -23,10 +23,19 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use hv_core::p2m::{PageType, System};
+use hv_core::p2m::{PageType, PtLevel, System};
 
 const DOMAINS: usize = 3;
 const FRAMES: usize = 6;
+
+fn pt_level(n: u8) -> PtLevel {
+    match n % 4 {
+        0 => PtLevel::L1,
+        1 => PtLevel::L2,
+        2 => PtLevel::L3,
+        _ => PtLevel::L4,
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     let mut sys = System::new(DOMAINS, FRAMES);
@@ -40,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         let ty = if a & 1 == 0 {
             PageType::Writable
         } else {
-            PageType::PageTable
+            PageType::PageTable(pt_level(a >> 1))
         };
 
         match op % 9 {
@@ -65,7 +74,7 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             6 => {
-                let _ = sys.pin(owner, mfn);
+                let _ = sys.pin(owner, mfn, pt_level(a));
             }
             7 => {
                 let _ = sys.unpin(owner, mfn);

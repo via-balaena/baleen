@@ -29,7 +29,7 @@ use hv_hal::Ticks;
 
 use crate::evtchn::{self, Port, Vcpu, Virq};
 use crate::grant::{self, Frame, GrantHandle, GrantRef};
-use crate::p2m::{self, Mfn, PageType};
+use crate::p2m::{self, Mfn, PageType, PtLevel};
 use crate::sched::{self, Pcpu};
 use crate::{HError, HvCore};
 
@@ -116,11 +116,12 @@ pub enum HvCall {
     /// Free one of the caller's machine frames back to the pool (refused while anything
     /// still references it).
     P2mFree { mfn: Mfn },
-    /// Pin one of the caller's frames as a page table — a persistent page-table type
-    /// reference held until unpinned. Refused if the frame is referenced writable. This
-    /// and unpin are balanced by the pin bit (unpin proves the pin), so they are sound
-    /// as guest calls where the raw type primitives are not.
-    P2mPin { mfn: Mfn },
+    /// Pin one of the caller's frames as a page table at `level` — a persistent
+    /// page-table type reference held until unpinned. Refused if the frame is referenced
+    /// writable, or already a page table at another level. This and unpin are balanced by
+    /// the pin bit (unpin proves the pin), so they are sound as guest calls where the raw
+    /// type primitives are not.
+    P2mPin { mfn: Mfn, level: PtLevel },
     /// Unpin one of the caller's page-table frames, dropping the pin's reference.
     P2mUnpin { mfn: Mfn },
 
@@ -375,9 +376,9 @@ impl Hypervisor {
                 .free(caller, mfn)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
-            HvCall::P2mPin { mfn } => self
+            HvCall::P2mPin { mfn, level } => self
                 .p2m
-                .pin(caller, mfn)
+                .pin(caller, mfn, level)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
             HvCall::P2mUnpin { mfn } => self
@@ -911,8 +912,18 @@ mod tests {
         let mut h = hv();
         // Domain 0 owns frame 2 and pins it as a page table.
         h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
-        h.dispatch(0, HvCall::P2mPin { mfn: 2 }).unwrap();
-        assert_eq!(h.p2m().current_type(2), Some(PageType::PageTable));
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 2,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.p2m().current_type(2),
+            Some(PageType::PageTable(PtLevel::L1))
+        );
         // It grants that frame read-write to domain 1.
         h.dispatch(
             0,
@@ -952,7 +963,10 @@ mod tests {
             ),
             Ok(HvOutcome::Handle(_))
         ));
-        assert_eq!(h.p2m().current_type(2), Some(PageType::PageTable));
+        assert_eq!(
+            h.p2m().current_type(2),
+            Some(PageType::PageTable(PtLevel::L1))
+        );
         assert!(h.invariants_hold());
     }
 
@@ -984,7 +998,13 @@ mod tests {
         assert_eq!(h.p2m().current_type(3), Some(PageType::Writable));
         // The owner cannot pin a page someone is writing.
         assert_eq!(
-            h.dispatch(0, HvCall::P2mPin { mfn: 3 }),
+            h.dispatch(
+                0,
+                HvCall::P2mPin {
+                    mfn: 3,
+                    level: PtLevel::L1
+                }
+            ),
             Err(HvError::P2m(p2m::P2mError::TypePinned))
         );
         assert!(!h.p2m().is_pinned(3));
@@ -997,10 +1017,23 @@ mod tests {
         h.dispatch(0, HvCall::P2mAllocate { mfn: 4 }).unwrap();
         // Only the owner may pin.
         assert_eq!(
-            h.dispatch(1, HvCall::P2mPin { mfn: 4 }),
+            h.dispatch(
+                1,
+                HvCall::P2mPin {
+                    mfn: 4,
+                    level: PtLevel::L4
+                }
+            ),
             Err(HvError::P2m(p2m::P2mError::NotYours))
         );
-        h.dispatch(0, HvCall::P2mPin { mfn: 4 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 4,
+                level: PtLevel::L4,
+            },
+        )
+        .unwrap();
         assert!(h.p2m().is_pinned(4));
         // A pinned frame cannot be freed until unpinned.
         assert_eq!(
@@ -1320,7 +1353,14 @@ mod tests {
         // it self-grants read-only and self-maps; and holds a writable map of domain 0's
         // frame 4 (a map it holds over *another* domain's frame — legal, must be drained).
         h.dispatch(1, HvCall::P2mAllocate { mfn: 2 }).unwrap();
-        h.dispatch(1, HvCall::P2mPin { mfn: 2 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::P2mPin {
+                mfn: 2,
+                level: PtLevel::L2,
+            },
+        )
+        .unwrap();
         h.dispatch(1, HvCall::P2mAllocate { mfn: 3 }).unwrap();
         h.dispatch(
             1,

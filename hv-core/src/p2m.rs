@@ -72,16 +72,60 @@ pub type DomId = u16;
 /// A machine frame number — an index into the [`System`]'s frame table.
 pub type Mfn = u32;
 
-/// A page type a frame can be referenced as. These two are mutually exclusive: a
-/// frame referenced as one can never simultaneously be referenced as the other, which
-/// is the whole safety property. They stand in for Xen's wider set of exclusive
-/// `PGT_*` classes.
+/// The level of a page table in the paging hierarchy — Xen's `PGT_l1..l4` classes.
+/// A four-level tree (as on x86-64): an `L4` table's entries point to `L3` tables,
+/// `L3`→`L2`, `L2`→`L1`, and an `L1` table's entries map ordinary [`PageType::Writable`]
+/// leaves. The levels are *ordered and strictly decreasing along a link*, which is what
+/// makes the page-table graph acyclic by construction (the linking discipline arrives
+/// with the hierarchical invariant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PtLevel {
+    /// Bottom level — its entries map ordinary pages.
+    L1,
+    /// Points to `L1` tables.
+    L2,
+    /// Points to `L2` tables.
+    L3,
+    /// Top level (the root the CPU's `%cr3` names) — points to `L3` tables.
+    L4,
+}
+
+impl PtLevel {
+    /// The type a *present entry* of a table at this level must reference: an `L(k-1)`
+    /// page table for `k >= 2`, and an ordinary writable leaf for `L1`. This single rule
+    /// is the whole paging hierarchy — the linking discipline (and its invariant) will
+    /// enforce it holds for every live edge.
+    pub fn child_type(self) -> PageType {
+        match self {
+            PtLevel::L1 => PageType::Writable,
+            PtLevel::L2 => PageType::PageTable(PtLevel::L1),
+            PtLevel::L3 => PageType::PageTable(PtLevel::L2),
+            PtLevel::L4 => PageType::PageTable(PtLevel::L3),
+        }
+    }
+}
+
+/// A page type a frame can be referenced as. All of these are mutually exclusive: a
+/// frame referenced as one can never simultaneously be referenced as another, which is
+/// the whole safety property. `PageTable` carries the paging [`PtLevel`], so the family
+/// is `Writable` plus one type per level — Xen's mutually-exclusive `PGT_*` classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
     /// Ordinary writable memory — the guest may store to it.
     Writable,
-    /// A page table the CPU walks — must be immutable to the guest while live.
-    PageTable,
+    /// A page table the CPU walks at level [`PtLevel`] — must be immutable to the guest
+    /// while live, and (once linked) may only reference frames of the level below it.
+    PageTable(PtLevel),
+}
+
+impl PageType {
+    /// The paging level this type is a page table at, or `None` if it is `Writable`.
+    pub fn level(self) -> Option<PtLevel> {
+        match self {
+            PageType::Writable => None,
+            PageType::PageTable(level) => Some(level),
+        }
+    }
 }
 
 /// One machine frame's accounting.
@@ -101,8 +145,14 @@ enum Frame {
         refs: u32,
         /// How many references require the frame to be writable.
         writable_refs: u32,
-        /// How many references require the frame to be a page table.
+        /// How many references require the frame to be a page table *at `pt_level`*.
         pagetable_refs: u32,
+        /// Which paging level this frame is a page table at. Meaningful only while
+        /// `pagetable_refs > 0` (as `dispatched_at` is meaningful only while a vCPU
+        /// runs); a frame with no page-table references carries no level, and the next
+        /// page-table reference sets it afresh. A single field, so a frame can never be
+        /// two levels at once — level-exclusivity is enforced by construction.
+        pt_level: PtLevel,
         /// Whether the owner has *pinned* this frame as a page table — a persistent
         /// page-table type reference held until explicitly unpinned (Xen's
         /// `PGT_pinned`). One of possibly several page-table references, so `pinned`
@@ -191,6 +241,9 @@ impl System {
             refs: 0,
             writable_refs: 0,
             pagetable_refs: 0,
+            // No page-table reference yet, so the level is a placeholder the first
+            // `get_type(PageTable(..))` overwrites; `L1` is as good as any.
+            pt_level: PtLevel::L1,
             pinned: false,
         };
         self.check_invariants();
@@ -241,30 +294,43 @@ impl System {
 
     /// Take a typed reference (Xen's `get_page_type`): acquire the frame *as* `ty`,
     /// taking an existence reference at the same time. **Fails with
-    /// [`P2mError::TypePinned`] if the frame is already referenced as the other type**
-    /// — this is the guard that makes writable-xor-pagetable hold by construction.
+    /// [`P2mError::TypePinned`] if the frame is already referenced as any *other* type**
+    /// — the conflicting writable type, or a page table at a *different level*. This one
+    /// guard makes both writable-xor-pagetable and level-exclusivity hold by
+    /// construction: a frame is only ever referenced as one type, at one level.
     pub fn get_type(&mut self, mfn: Mfn, ty: PageType) -> Result<(), P2mError> {
         match self.frame_mut(mfn)? {
             Frame::Allocated {
                 refs,
                 writable_refs,
                 pagetable_refs,
+                pt_level,
                 ..
             } => {
-                // The conflicting type must have no live references at all.
+                // Any incompatible live type blocks the acquire. For a writable request
+                // that is any page-table reference; for a page-table request it is any
+                // writable reference *or* a page table already live at another level.
                 let conflict = match ty {
-                    PageType::Writable => *pagetable_refs,
-                    PageType::PageTable => *writable_refs,
+                    PageType::Writable => *pagetable_refs > 0,
+                    PageType::PageTable(level) => {
+                        *writable_refs > 0 || (*pagetable_refs > 0 && *pt_level != level)
+                    }
                 };
-                if conflict > 0 {
+                if conflict {
                     return Err(P2mError::TypePinned);
                 }
-                // Bump the existence and typed counts together, overflow-checked
-                // before either is written so a rejected call mutates nothing.
+                // Bump the existence and typed counts together, overflow-checked before
+                // either is written so a rejected call mutates nothing. A page-table
+                // reference taken from zero also stamps the frame's level.
                 let new_refs = refs.checked_add(1).ok_or(P2mError::Overflow)?;
                 let slot = match ty {
                     PageType::Writable => &mut *writable_refs,
-                    PageType::PageTable => &mut *pagetable_refs,
+                    PageType::PageTable(level) => {
+                        if *pagetable_refs == 0 {
+                            *pt_level = level;
+                        }
+                        &mut *pagetable_refs
+                    }
                 };
                 let new_typed = slot.checked_add(1).ok_or(P2mError::Overflow)?;
                 *slot = new_typed;
@@ -286,11 +352,20 @@ impl System {
                 refs,
                 writable_refs,
                 pagetable_refs,
+                pt_level,
                 ..
             } => {
                 let slot = match ty {
                     PageType::Writable => &mut *writable_refs,
-                    PageType::PageTable => &mut *pagetable_refs,
+                    // A page-table release must name the level the frame is actually
+                    // held at — releasing an `L2` reference from an `L3` frame is a
+                    // caller error, not a silent decrement of the wrong count.
+                    PageType::PageTable(level) => {
+                        if *pagetable_refs == 0 || *pt_level != level {
+                            return Err(P2mError::WrongState);
+                        }
+                        &mut *pagetable_refs
+                    }
                 };
                 if *slot == 0 {
                     return Err(P2mError::WrongState);
@@ -306,13 +381,15 @@ impl System {
         Ok(())
     }
 
-    /// Pin a frame as a page table (Xen's `MMUEXT_PIN_TABLE`): take a persistent
-    /// page-table type reference, held until [`Self::unpin`]. Only the owner may pin
-    /// its own page tables. **Fails with [`P2mError::TypePinned`] if the frame is
-    /// currently referenced as writable** (e.g. a foreign domain writably maps it) —
-    /// which is the write-xor-pagetable safety guard doing its job at pin time: a page
-    /// being written must never become a page table.
-    pub fn pin(&mut self, caller: DomId, mfn: Mfn) -> Result<(), P2mError> {
+    /// Pin a frame as a page table at `level` (Xen's `MMUEXT_PIN_TABLE`): validate it as
+    /// an `L`k table and take a persistent page-table type reference, held until
+    /// [`Self::unpin`]. Only the owner may pin its own page tables. **Fails with
+    /// [`P2mError::TypePinned`] if the frame is currently referenced as writable, or as a
+    /// page table at a *different* level** — the exclusivity guard doing its job at pin
+    /// time: a page being written must never become a page table, and a table has exactly
+    /// one level. A pinned table is the root of a subtree (nothing links to it); interior
+    /// tables will instead take their type from the parent that links them.
+    pub fn pin(&mut self, caller: DomId, mfn: Mfn, level: PtLevel) -> Result<(), P2mError> {
         // Validate ownership and that it is not already pinned against an immutable
         // view, so a rejected pin mutates nothing.
         match self.frame(mfn)? {
@@ -326,12 +403,13 @@ impl System {
             }
             Frame::Free => return Err(P2mError::WrongState),
         }
-        // Take the page-table type reference — this enforces the exclusivity (fails
-        // `TypePinned` if writable) and takes an existence reference. Set the pin bit
-        // only once it succeeds. Order matters: `get_type` re-establishes the invariant
-        // with the bit still clear, which satisfies `pinned ⇒ pagetable_refs >= 1`
-        // vacuously; setting the bit after keeps every intermediate state consistent.
-        self.get_type(mfn, PageType::PageTable)?;
+        // Take the page-table type reference at `level` — this enforces the exclusivity
+        // (fails `TypePinned` if writable, or a page table at another level) and takes an
+        // existence reference. Set the pin bit only once it succeeds. Order matters:
+        // `get_type` re-establishes the invariant with the bit still clear, which
+        // satisfies `pinned ⇒ pagetable_refs >= 1` vacuously; setting the bit after keeps
+        // every intermediate state consistent.
+        self.get_type(mfn, PageType::PageTable(level))?;
         if let Frame::Allocated { pinned, .. } = self.frame_mut(mfn).unwrap() {
             *pinned = true;
         }
@@ -354,13 +432,19 @@ impl System {
             }
             Frame::Free => return Err(P2mError::WrongState),
         }
+        // Release the pin at whatever level the frame is held — a pinned frame always
+        // holds a page-table reference, so its `pt_level` is live and current.
+        let level = match self.frame(mfn).unwrap() {
+            Frame::Allocated { pt_level, .. } => *pt_level,
+            Frame::Free => unreachable!("a pinned frame is allocated"),
+        };
         // Clear the pin bit *before* releasing the reference, so no intermediate state
         // ever shows a pinned frame with no page-table reference. `put_type` cannot fail
         // here — a pinned frame always holds its page-table reference.
         if let Frame::Allocated { pinned, .. } = self.frame_mut(mfn).unwrap() {
             *pinned = false;
         }
-        self.put_type(mfn, PageType::PageTable)?;
+        self.put_type(mfn, PageType::PageTable(level))?;
         self.check_invariants();
         Ok(())
     }
@@ -437,35 +521,46 @@ impl System {
         }
     }
 
-    /// The number of references of `ty` a frame currently holds, if it is allocated.
+    /// The number of references of `ty` a frame currently holds, if it is allocated. A
+    /// page-table type at a level the frame is *not* held at reads as zero — the frame
+    /// carries references at exactly one level.
     pub fn type_refs(&self, mfn: Mfn, ty: PageType) -> Option<u32> {
         match self.frame(mfn) {
             Ok(Frame::Allocated {
                 writable_refs,
                 pagetable_refs,
+                pt_level,
                 ..
             }) => Some(match ty {
                 PageType::Writable => *writable_refs,
-                PageType::PageTable => *pagetable_refs,
+                PageType::PageTable(level) => {
+                    if *pagetable_refs > 0 && *pt_level == level {
+                        *pagetable_refs
+                    } else {
+                        0
+                    }
+                }
             }),
             _ => None,
         }
     }
 
-    /// The frame's current type — the one with live references — or `None` if it is
-    /// free or allocated but untyped. Well-defined precisely because the two type
-    /// counts are never both non-zero.
+    /// The frame's current type — the one with live references, page tables carrying
+    /// their level — or `None` if it is free or allocated but untyped. Well-defined
+    /// precisely because a frame is never referenced as two types (or two levels) at
+    /// once.
     pub fn current_type(&self, mfn: Mfn) -> Option<PageType> {
         match self.frame(mfn) {
             Ok(Frame::Allocated {
                 writable_refs,
                 pagetable_refs,
+                pt_level,
                 ..
             }) => {
                 if *writable_refs > 0 {
                     Some(PageType::Writable)
                 } else if *pagetable_refs > 0 {
-                    Some(PageType::PageTable)
+                    Some(PageType::PageTable(*pt_level))
                 } else {
                     None
                 }
@@ -511,6 +606,7 @@ impl System {
                 writable_refs,
                 pagetable_refs,
                 pinned,
+                pt_level: _,
             } = *frame
             {
                 if owner as usize >= self.num_domains {
@@ -589,7 +685,7 @@ mod tests {
 
         // The whole point: cannot take a page-table reference while writable is live.
         assert_eq!(
-            s.get_type(0, PageType::PageTable),
+            s.get_type(0, PageType::PageTable(PtLevel::L1)),
             Err(P2mError::TypePinned)
         );
         assert_eq!(s.current_type(0), Some(PageType::Writable));
@@ -597,10 +693,47 @@ mod tests {
         // Drop the writable reference; now it may be typed as a page table.
         s.put_type(0, PageType::Writable).unwrap();
         assert_eq!(s.current_type(0), None);
-        s.get_type(0, PageType::PageTable).unwrap();
-        assert_eq!(s.current_type(0), Some(PageType::PageTable));
+        s.get_type(0, PageType::PageTable(PtLevel::L1)).unwrap();
+        assert_eq!(s.current_type(0), Some(PageType::PageTable(PtLevel::L1)));
         // And now the reverse is refused.
         assert_eq!(s.get_type(0, PageType::Writable), Err(P2mError::TypePinned));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn a_frame_is_never_two_page_table_levels_at_once() {
+        let mut s = sys();
+        s.allocate(0, 0).unwrap();
+        // Take an L2 reference; the frame is now an L2 table.
+        s.get_type(0, PageType::PageTable(PtLevel::L2)).unwrap();
+        assert_eq!(s.current_type(0), Some(PageType::PageTable(PtLevel::L2)));
+
+        // A *different* level is refused just like the writable/page-table conflict —
+        // a table has exactly one level.
+        assert_eq!(
+            s.get_type(0, PageType::PageTable(PtLevel::L3)),
+            Err(P2mError::TypePinned)
+        );
+        assert_eq!(
+            s.get_type(0, PageType::PageTable(PtLevel::L1)),
+            Err(P2mError::TypePinned)
+        );
+        // The same level stacks, and reads back only at that level.
+        s.get_type(0, PageType::PageTable(PtLevel::L2)).unwrap();
+        assert_eq!(s.type_refs(0, PageType::PageTable(PtLevel::L2)), Some(2));
+        assert_eq!(s.type_refs(0, PageType::PageTable(PtLevel::L3)), Some(0));
+
+        // Once every L2 reference is gone the frame is free to be typed at a new level.
+        s.put_type(0, PageType::PageTable(PtLevel::L2)).unwrap();
+        s.put_type(0, PageType::PageTable(PtLevel::L2)).unwrap();
+        assert_eq!(s.current_type(0), None);
+        s.get_type(0, PageType::PageTable(PtLevel::L3)).unwrap();
+        assert_eq!(s.current_type(0), Some(PageType::PageTable(PtLevel::L3)));
+        // Releasing at the wrong level is refused, not a silent decrement.
+        assert_eq!(
+            s.put_type(0, PageType::PageTable(PtLevel::L2)),
+            Err(P2mError::WrongState)
+        );
         assert!(s.invariants_hold());
     }
 
@@ -678,7 +811,7 @@ mod tests {
         s.get_type(0, PageType::Writable).unwrap();
         // Held as writable, but no page-table reference to drop.
         assert_eq!(
-            s.put_type(0, PageType::PageTable),
+            s.put_type(0, PageType::PageTable(PtLevel::L1)),
             Err(P2mError::WrongState)
         );
     }
@@ -689,7 +822,7 @@ mod tests {
         // Domain 0 owns three frames: one pinned as a page table, one plainly owned,
         // one owned with an untyped existence reference it will drop before teardown.
         s.allocate(0, 0).unwrap();
-        s.pin(0, 0).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
         s.allocate(0, 1).unwrap();
         s.allocate(0, 2).unwrap();
         // A frame owned by a *different* domain must survive domain 0's teardown.
@@ -725,10 +858,11 @@ mod tests {
     fn pin_types_the_frame_as_a_page_table() {
         let mut s = sys();
         s.allocate(0, 2).unwrap();
-        s.pin(0, 2).unwrap();
+        // Pin it as an L4 table (a root the CPU's %cr3 would name).
+        s.pin(0, 2, PtLevel::L4).unwrap();
         assert!(s.is_pinned(2));
-        assert_eq!(s.current_type(2), Some(PageType::PageTable));
-        assert_eq!(s.type_refs(2, PageType::PageTable), Some(1));
+        assert_eq!(s.current_type(2), Some(PageType::PageTable(PtLevel::L4)));
+        assert_eq!(s.type_refs(2, PageType::PageTable(PtLevel::L4)), Some(1));
         // The pin took an existence reference with the type reference.
         assert_eq!(s.refs(2), Some(1));
         assert!(s.invariants_hold());
@@ -738,10 +872,10 @@ mod tests {
     fn pinning_twice_is_refused() {
         let mut s = sys();
         s.allocate(0, 0).unwrap();
-        s.pin(0, 0).unwrap();
-        assert_eq!(s.pin(0, 0), Err(P2mError::WrongState));
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        assert_eq!(s.pin(0, 0, PtLevel::L1), Err(P2mError::WrongState));
         // Still pinned exactly once.
-        assert_eq!(s.type_refs(0, PageType::PageTable), Some(1));
+        assert_eq!(s.type_refs(0, PageType::PageTable(PtLevel::L1)), Some(1));
         assert!(s.invariants_hold());
     }
 
@@ -751,7 +885,7 @@ mod tests {
         s.allocate(0, 1).unwrap();
         s.get_type(1, PageType::Writable).unwrap();
         // A page being written must never become a page table.
-        assert_eq!(s.pin(0, 1), Err(P2mError::TypePinned));
+        assert_eq!(s.pin(0, 1, PtLevel::L1), Err(P2mError::TypePinned));
         assert!(!s.is_pinned(1));
         assert!(s.invariants_hold());
     }
@@ -760,7 +894,7 @@ mod tests {
     fn cannot_writable_type_a_pinned_frame() {
         let mut s = sys();
         s.allocate(0, 3).unwrap();
-        s.pin(0, 3).unwrap();
+        s.pin(0, 3, PtLevel::L2).unwrap();
         // The reverse: a live page table can't be taken writable.
         assert_eq!(s.get_type(3, PageType::Writable), Err(P2mError::TypePinned));
         assert!(s.invariants_hold());
@@ -770,8 +904,8 @@ mod tests {
     fn only_the_owner_may_pin_or_unpin() {
         let mut s = sys();
         s.allocate(1, 4).unwrap();
-        assert_eq!(s.pin(2, 4), Err(P2mError::NotYours));
-        s.pin(1, 4).unwrap();
+        assert_eq!(s.pin(2, 4, PtLevel::L1), Err(P2mError::NotYours));
+        s.pin(1, 4, PtLevel::L1).unwrap();
         assert_eq!(s.unpin(2, 4), Err(P2mError::NotYours));
         assert!(s.unpin(1, 4).is_ok());
     }
@@ -781,7 +915,7 @@ mod tests {
         let mut s = sys();
         s.allocate(0, 5).unwrap();
         assert_eq!(s.unpin(0, 5), Err(P2mError::WrongState));
-        s.pin(0, 5).unwrap();
+        s.pin(0, 5, PtLevel::L3).unwrap();
         s.unpin(0, 5).unwrap();
         // The pin is spent — unpinning again is refused.
         assert_eq!(s.unpin(0, 5), Err(P2mError::WrongState));
@@ -791,7 +925,7 @@ mod tests {
     fn a_pinned_frame_cannot_be_freed_until_unpinned() {
         let mut s = sys();
         s.allocate(0, 6).unwrap();
-        s.pin(0, 6).unwrap();
+        s.pin(0, 6, PtLevel::L1).unwrap();
         assert_eq!(s.free(0, 6), Err(P2mError::InUse));
         s.unpin(0, 6).unwrap();
         assert!(s.free(0, 6).is_ok());
@@ -802,7 +936,8 @@ mod tests {
     fn pin_unpin_round_trip_leaves_a_clean_frame() {
         let mut s = sys();
         s.allocate(0, 7).unwrap();
-        s.pin(0, 7).unwrap();
+        // Unpin must release at the frame's own level — pin L3, unpin, clean.
+        s.pin(0, 7, PtLevel::L3).unwrap();
         s.unpin(0, 7).unwrap();
         assert!(!s.is_pinned(7));
         assert_eq!(s.current_type(7), None);
@@ -816,8 +951,8 @@ mod tests {
     fn a_frame_recycles_cleanly_through_owners() {
         let mut s = sys();
         s.allocate(0, 7).unwrap();
-        s.get_type(7, PageType::PageTable).unwrap();
-        s.put_type(7, PageType::PageTable).unwrap(); // refs back to 0
+        s.get_type(7, PageType::PageTable(PtLevel::L2)).unwrap();
+        s.put_type(7, PageType::PageTable(PtLevel::L2)).unwrap(); // refs back to 0
         s.free(0, 7).unwrap();
         // A fresh owner gets a clean frame — no stale type or count survives free.
         s.allocate(1, 7).unwrap();

@@ -30,7 +30,17 @@
 
 use libfuzzer_sys::fuzz_target;
 
+use hv_core::p2m::PtLevel;
 use hv_core::{HvCall, HvOutcome, Hypervisor};
+
+fn pt_level(n: u8) -> PtLevel {
+    match n % 4 {
+        0 => PtLevel::L1,
+        1 => PtLevel::L2,
+        2 => PtLevel::L3,
+        _ => PtLevel::L4,
+    }
+}
 
 const DOMAINS: usize = 3;
 const PORTS: usize = 8;
@@ -96,7 +106,7 @@ fuzz_target!(|data: &[u8]| {
             20 => HvCall::SchedOffline { vcpu, now },
             21 => HvCall::P2mAllocate { mfn },
             22 => HvCall::P2mFree { mfn },
-            23 => HvCall::P2mPin { mfn },
+            23 => HvCall::P2mPin { mfn, level: pt_level(b) },
             24 => HvCall::P2mUnpin { mfn },
             // Tear a whole domain down — all four subsystems and both seams at once.
             // Stale handles it leaves behind are already tolerated by the unmap arm.
