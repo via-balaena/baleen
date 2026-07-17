@@ -116,6 +116,13 @@ pub enum HvCall {
     /// Free one of the caller's machine frames back to the pool (refused while anything
     /// still references it).
     P2mFree { mfn: Mfn },
+    /// Pin one of the caller's frames as a page table — a persistent page-table type
+    /// reference held until unpinned. Refused if the frame is referenced writable. This
+    /// and unpin are balanced by the pin bit (unpin proves the pin), so they are sound
+    /// as guest calls where the raw type primitives are not.
+    P2mPin { mfn: Mfn },
+    /// Unpin one of the caller's page-table frames, dropping the pin's reference.
+    P2mUnpin { mfn: Mfn },
 }
 
 /// The success value of a routed hypercall.
@@ -352,6 +359,16 @@ impl Hypervisor {
             HvCall::P2mFree { mfn } => self
                 .p2m
                 .free(caller, mfn)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mPin { mfn } => self
+                .p2m
+                .pin(caller, mfn)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::P2m),
+            HvCall::P2mUnpin { mfn } => self
+                .p2m
+                .unpin(caller, mfn)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
         }
@@ -694,6 +711,113 @@ mod tests {
             ),
             Err(HvError::StaleGrant)
         );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn pinning_a_frame_blocks_a_foreign_writable_grant_map() {
+        let mut h = hv();
+        // Domain 0 owns frame 2 and pins it as a page table.
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
+        h.dispatch(0, HvCall::P2mPin { mfn: 2 }).unwrap();
+        assert_eq!(h.p2m().current_type(2), Some(PageType::PageTable));
+        // It grants that frame read-write to domain 1.
+        h.dispatch(
+            0,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 2,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        // A writable map is refused: the frame is a live page table. This exercises the
+        // seam's rollback — grant.map committed, p2m.get_type(Writable) hit TypePinned,
+        // and the grant map was undone, so nothing is left half-done.
+        assert_eq!(
+            h.dispatch(
+                1,
+                HvCall::GrantMap {
+                    grantor: 0,
+                    gref: 0,
+                    writable: true
+                }
+            ),
+            Err(HvError::P2m(p2m::P2mError::TypePinned))
+        );
+        assert_eq!(h.grant().map_count(0, 0), Some(0)); // rolled back — no live map
+        assert!(h.invariants_hold());
+        // A read-only map of the same page table is fine — a reader is type-agnostic.
+        assert!(matches!(
+            h.dispatch(
+                1,
+                HvCall::GrantMap {
+                    grantor: 0,
+                    gref: 0,
+                    writable: false
+                }
+            ),
+            Ok(HvOutcome::Handle(_))
+        ));
+        assert_eq!(h.p2m().current_type(2), Some(PageType::PageTable));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_writably_mapped_frame_cannot_be_pinned() {
+        let mut h = hv();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 3 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::GrantAccess {
+                gref: 1,
+                grantee: 1,
+                frame: 3,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        match h.dispatch(
+            1,
+            HvCall::GrantMap {
+                grantor: 0,
+                gref: 1,
+                writable: true,
+            },
+        ) {
+            Ok(HvOutcome::Handle(_)) => {}
+            other => panic!("expected a handle, got {other:?}"),
+        }
+        assert_eq!(h.p2m().current_type(3), Some(PageType::Writable));
+        // The owner cannot pin a page someone is writing.
+        assert_eq!(
+            h.dispatch(0, HvCall::P2mPin { mfn: 3 }),
+            Err(HvError::P2m(p2m::P2mError::TypePinned))
+        );
+        assert!(!h.p2m().is_pinned(3));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn pin_and_unpin_through_dispatch() {
+        let mut h = hv();
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 4 }).unwrap();
+        // Only the owner may pin.
+        assert_eq!(
+            h.dispatch(1, HvCall::P2mPin { mfn: 4 }),
+            Err(HvError::P2m(p2m::P2mError::NotYours))
+        );
+        h.dispatch(0, HvCall::P2mPin { mfn: 4 }).unwrap();
+        assert!(h.p2m().is_pinned(4));
+        // A pinned frame cannot be freed until unpinned.
+        assert_eq!(
+            h.dispatch(0, HvCall::P2mFree { mfn: 4 }),
+            Err(HvError::P2m(p2m::P2mError::InUse))
+        );
+        h.dispatch(0, HvCall::P2mUnpin { mfn: 4 }).unwrap();
+        assert!(!h.p2m().is_pinned(4));
+        assert!(h.dispatch(0, HvCall::P2mFree { mfn: 4 }).is_ok());
         assert!(h.invariants_hold());
     }
 
