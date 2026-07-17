@@ -705,6 +705,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         PCPUS as usize,
         FRAMES as usize,
     );
+    bring_all_domains_live(&mut hv, DOMAINS);
     let mut rng = Prng::new(seed);
     let clock = ManualClock::new();
     let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee/owner, handle) of live maps
@@ -861,6 +862,23 @@ fn drop_ok(result: Result<HvOutcome, hv_core::HvError>) {
     let _ = result;
 }
 
+/// Bring every domain `1..domains` to life (dom0, the boot control domain, creates each),
+/// so a driver whose stream assumes all domains can act has live domains to drive. Only
+/// dom0 boots `Live`; every other slot must be created first. Drivers that specifically
+/// exercise the lifecycle (`run_destroy`) instead weave create into their stream.
+fn bring_all_domains_live(hv: &mut Hypervisor, domains: u16) {
+    for target in 1..domains {
+        hv.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target,
+                privileged: false,
+            },
+        )
+        .unwrap();
+    }
+}
+
 /// Map a seed-derived number to a paging level, so a run spreads pins and page-table
 /// references across all four levels rather than collapsing to one.
 fn pt_level(n: u32) -> PtLevel {
@@ -916,6 +934,7 @@ pub fn run_seam(seed: u64, steps: u32) -> SeamOutcome {
         PCPUS as usize,
         FRAMES as usize,
     );
+    bring_all_domains_live(&mut hv, DOMAINS);
     let clock = ManualClock::new();
     let mut rng = Prng::new(seed);
 
@@ -1102,6 +1121,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
         PCPUS as usize,
         FRAMES as usize,
     );
+    bring_all_domains_live(&mut hv, DOMAINS);
     let clock = ManualClock::new();
     let mut rng = Prng::new(seed);
     let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee, handle) of live maps
@@ -1208,29 +1228,48 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                 // authority gate (may the caller destroy this target?) and the busy
                 // precondition (does a foreign domain hold one of its frames?).
                 let target = rng.below(u32::from(DOMAINS)) as u16;
+                // The outcome is pinned by four predictions, in the impl's order: the caller
+                // must itself be Live (the dispatch gate — a caller torn down earlier this
+                // run can no longer act); then authority (may this caller destroy this
+                // target?); then target liveness (is it alive to tear down?); then the busy
+                // precondition (does a foreign domain hold one of its frames?).
+                let caller_live = hv.is_live(caller);
                 let authorized = caller == target || hv.is_privileged(caller);
+                let live = hv.is_live(target);
                 let foreign = hv.grant().has_foreign_map(target);
                 match hv.dispatch(caller, HvCall::DomainDestroy { target, now }) {
                     Ok(HvOutcome::Done) => {
                         out.teardowns += 1;
-                        // A clean teardown must have been authorized, had no foreign map,
-                        // and left nothing live pointing into the target.
-                        if !authorized || foreign || !is_empty_shell(&hv, target) {
+                        // A clean teardown: a live caller, authorized, over a live target
+                        // with no foreign map, leaving nothing live pointing into it.
+                        if !(caller_live
+                            && authorized
+                            && live
+                            && !foreign
+                            && is_empty_shell(&hv, target))
+                        {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::DomainBusy) => {
                         out.busy_refusals += 1;
-                        // A busy refusal must have been authorized (the gate comes first)
-                        // and had a foreign map. Being a no-op, nothing else to check.
-                        if !authorized || !foreign {
+                        // A busy refusal: a live, authorized caller over a live, foreign-held
+                        // target. A no-op, so nothing else to check.
+                        if !(caller_live && authorized && live && foreign) {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::Denied) => {
                         out.denials += 1;
-                        // A denial must have been unauthorized — a no-op, so nothing more.
-                        if authorized {
+                        // A denial: a live but unauthorized caller — a no-op.
+                        if !caller_live || authorized {
+                            out.postcondition_held = false;
+                        }
+                    }
+                    Err(hv_core::HvError::NotAlive) => {
+                        // Not-alive: either the caller itself is Dead (the gate), or a live
+                        // authorized caller aimed at an already-Dead target. Both no-ops.
+                        if !(!caller_live || (authorized && !live)) {
                             out.postcondition_held = false;
                         }
                     }
@@ -1446,6 +1485,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
     const FIRST_DATA: u32 = 2;
 
     let mut hv = Hypervisor::new(DOMAINS as usize, 1, GRANTS as usize, 1, 1, FRAMES as usize);
+    bring_all_domains_live(&mut hv, DOMAINS);
     // Stand up one L1 table per domain, and hand each data frame to an owner.
     for (dom, table) in [(0u16, TABLE0), (1u16, TABLE1)] {
         hv.dispatch(dom, HvCall::P2mAllocate { mfn: table })
