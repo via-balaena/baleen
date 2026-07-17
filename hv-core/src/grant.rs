@@ -41,8 +41,14 @@ use alloc::vec::Vec;
 pub type DomId = u16;
 /// A grant reference — an index into a grantor's grant table.
 pub type GrantRef = u32;
-/// A guest frame number (which page is being granted).
-pub type Frame = u64;
+/// A machine frame number — which physical page is being granted. Narrowed to the
+/// [`crate::p2m::Mfn`] width so a grant and the page-type subsystem name the *same*
+/// frame once they are joined at the dispatch seam (a grant map then takes a real p2m
+/// reference on this frame). The guest-physical→machine translation that sits above
+/// this — a grantor names a GFN in its own address space, which Xen resolves to an MFN
+/// on map — is a personality/guest-memory concern deferred to a later milestone; the
+/// core models the machine-frame accounting the safety property actually turns on.
+pub type Frame = u32;
 /// A handle returned by [`System::map`], naming one live mapping.
 ///
 /// A bare slot index, reclaimed by [`System::unmap`] and reused by the next map

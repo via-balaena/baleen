@@ -40,7 +40,7 @@ fuzz_target!(|data: &[u8]| {
 
         match op % 6 {
             0 => {
-                let _ = sys.grant_access(dom, gref, grantee, u64::from(a), b & 1 == 0);
+                let _ = sys.grant_access(dom, gref, grantee, u32::from(a), b & 1 == 0);
             }
             1 => {
                 let _ = sys.end_access(dom, gref);

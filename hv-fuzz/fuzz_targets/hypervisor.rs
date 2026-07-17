@@ -57,7 +57,7 @@ fuzz_target!(|data: &[u8]| {
             7 => HvCall::EvtchnSend { port },
             8 => HvCall::EvtchnMask { port },
             9 => HvCall::EvtchnConsume { port },
-            10 => HvCall::GrantAccess { gref, grantee: other, frame: u64::from(a), readonly: b & 1 == 0 },
+            10 => HvCall::GrantAccess { gref, grantee: other, frame: u32::from(a), readonly: b & 1 == 0 },
             11 => HvCall::GrantEndAccess { gref },
             12 => {
                 if let Ok(HvOutcome::Handle(h)) =

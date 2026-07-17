@@ -210,7 +210,7 @@ pub fn run_grant(seed: u64, steps: u32) -> GrantOutcome {
             0 => {
                 let grantee = rng.below(u32::from(DOMAINS)) as u16;
                 let readonly = rng.below(2) == 0;
-                let frame = u64::from(rng.below(64));
+                let frame = rng.below(64);
                 let _ = sys.grant_access(grantor, gref, grantee, frame, readonly);
             }
             1 => {
@@ -758,7 +758,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
                     HvCall::GrantAccess {
                         gref,
                         grantee,
-                        frame: u64::from(rng.below(64)),
+                        frame: rng.below(64),
                         readonly: rng.below(2) == 0,
                     },
                 ));
