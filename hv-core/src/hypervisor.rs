@@ -182,28 +182,33 @@ pub enum HvCall {
     /// distinguishable from a live-but-uncontrolled target. **Lifecycle:** the death half of
     /// the domain lifecycle (the mirror of [`HvCall::DomainCreate`]) — the slot drops to
     /// `Dead` and loses all authority (its `may_create` and every control edge into or out
-    /// of it), leaving a clean, authority-free shell that only a later `DomainCreate` can
+    /// of it), *and* everything it had delegated cascades away (a torn-down delegator orphans
+    /// no one), leaving a clean, authority-free shell that only a later `DomainCreate` can
     /// revive.
     DomainDestroy { target: DomId, now: Ticks },
 
     /// Delegate control of domain `target` to domain `to` — the *mutable/delegable* half of
     /// authority. The caller must itself control `target` (`controls[caller][target]`), else
     /// [`HvError::Denied`]: a domain can only hand out authority it holds. On success `to`
-    /// gains `controls[to][target]` (idempotent if it already did), so `to` may thereafter
-    /// destroy `target` and delegate control of it onward. `to` must be `Live` (a capability
-    /// cannot rest on a `Dead` holder — [`HvError::NotAlive`]) and must differ from `target`
-    /// (a domain's authority over *itself* is inherent, never a delegable edge —
-    /// [`HvError::Denied`]). Flat delegation: any controller may delegate, and revocation is
-    /// unrestricted; hierarchical (chain-restricted) revocation is a later refinement.
+    /// gains a [`Control::Via`]`(caller)` edge — control of `target` with the caller recorded
+    /// as its delegator — so `to` may thereafter destroy `target` and delegate control of it
+    /// onward, and its provenance traces back through the caller to the creation `Root`. `to`
+    /// must be `Live` (a capability cannot rest on a `Dead` holder — [`HvError::NotAlive`]) and
+    /// must differ from `target` (a domain's authority over *itself* is inherent, never a
+    /// delegable edge — [`HvError::Denied`]). Idempotent and provenance-preserving: if `to`
+    /// already controls `target`, this is a no-op that keeps its existing provenance rather than
+    /// re-parenting it — which is what keeps the delegation tree acyclic.
     ControlGrant { target: DomId, to: DomId },
     /// Revoke domain `from`'s control of domain `target` — the inverse of
-    /// [`HvCall::ControlGrant`]. The caller must control `target` (else [`HvError::Denied`]);
-    /// then `controls[from][target]` is cleared (idempotent if `from` did not control it, so
-    /// revoking a non-edge — including one whose `from` is already `Dead` — is a successful
-    /// no-op). Flat model: a controller may revoke *any* edge over `target`, including the
-    /// creator's or its own (renouncing control); this can never fabricate authority, only
-    /// remove it, so provenance is preserved. Restricting revocation to one's own delegations
-    /// is the deferred hierarchical refinement.
+    /// [`HvCall::ControlGrant`], **chain-restricted and cascading**. The caller must control
+    /// `target` (else [`HvError::Denied`]) *and* may revoke only within its own subtree of
+    /// `target`'s delegation tree: `from` must be the caller itself (renounce) or a domain the
+    /// caller delegated to transitively. Revoking *upward* — a delegatee stripping its own
+    /// delegator, a sibling, or the creator's `Root` from below — or naming a non-controller is
+    /// [`HvError::Denied`], mutating nothing. An ancestor (up to the creator) may prune any
+    /// descendant, and the revoke **cascades**: `from`'s whole delegated subtree over `target`
+    /// is removed with it, so nothing is orphaned. Still only ever removes authority; the
+    /// restriction is the policy refinement that closes the flat model's revoke-anyone wart.
     ControlRevoke { target: DomId, from: DomId },
 }
 
@@ -332,6 +337,20 @@ pub enum CrossViolation {
     /// would mean a capability outlived the domain it named. The per-target authority's
     /// standing invariant, the finer cousin of [`Self::DeadDomainMayCreate`].
     ControlEdgeDeadEndpoint { holder: DomId, target: DomId },
+    /// A control edge `controls[holder][target]` whose delegation provenance does not trace
+    /// cleanly back to a creation [`Control::Root`] — either a [`Control::Via`] edge whose
+    /// delegator no longer controls `target` (an *orphan*, the delegator's edge gone without
+    /// this one cascading away with it), or a provenance chain that never reaches a `Root`
+    /// within `domain_count` steps (a *cycle*, which no legitimate transition can build). The
+    /// state-predicate teeth of the delegation forest: [`Control::Root`] is stamped only by a
+    /// controlling creator, [`Control::Via`] only by a controlling delegator over a fresh
+    /// recipient, and every revoke/teardown cascades so no edge is left dangling — so a well-
+    /// rooted, acyclic tree is maintained by construction, and this invariant checks it holds
+    /// in every reachable state. The stored-provenance upgrade of what was, under flat
+    /// delegation, only a by-construction guard property. Sits *beside*
+    /// [`Self::ControlEdgeDeadEndpoint`] (liveness of the two endpoints); together they pin
+    /// the full authority structure — live endpoints *and* a legitimate root.
+    ControlEdgeOrphaned { holder: DomId, target: DomId },
 }
 
 /// Where a domain slot sits in its lifecycle. A slot is not a domain that always exists;
@@ -345,6 +364,33 @@ pub enum DomainLife {
     /// A live domain: it may issue hypercalls and hold resources across every subsystem.
     /// Domain 0 boots `Live`; every other slot is born `Dead`.
     Live,
+}
+
+/// The provenance of a control edge — how a holder came to control a target. This is the
+/// per-cell value of the `controls` relation, which turns the bare adjacency matrix into a
+/// **delegation forest**: for each target, its controllers form one tree, rooted at the
+/// creator's [`Self::Root`] edge, with each [`Self::Via`] edge recording the delegator that
+/// handed it out. That stored provenance is what makes "every control edge traces back to a
+/// creation root" a *checkable state predicate* ([`CrossViolation::ControlEdgeOrphaned`])
+/// rather than a mere by-construction guard, and it is what lets revocation be restricted to
+/// a controller's own subtree (chain-restricted / hierarchical revocation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// No control edge — the holder does not control the target.
+    Absent,
+    /// The creator's edge, stamped at [`HvCall::DomainCreate`]: the single root of the
+    /// target's delegation tree. A `Root` has no delegator and is never overwritten (a
+    /// re-delegation to a domain that already controls the target is an idempotent no-op),
+    /// which is what keeps the tree acyclic and pins a unique root per target.
+    Root,
+    /// A delegated edge: `Via(d)` means domain `d` delegated this control via
+    /// [`HvCall::ControlGrant`]. `d` is the holder's parent in the target's delegation tree.
+    /// A `Via` edge is only ever created attaching a *fresh* controller (one that did not
+    /// already control the target) beneath an already-present delegator, so it can never
+    /// close a cycle — acyclicity follows from the transition, not from any ordering on
+    /// domains. Revoking `d`'s edge (or tearing `d` down) cascades this edge away, so a
+    /// `Via(d)` never outlives its delegator's control.
+    Via(DomId),
 }
 
 /// The integrated hypervisor core: per-domain credit plus the whole-system subsystems,
@@ -372,17 +418,26 @@ pub struct Hypervisor {
     /// Invariant: `may_create ⇒ Live` ([`CrossViolation::DeadDomainMayCreate`]).
     may_create: Vec<bool>,
     /// The per-target **control** relation — the *finer* half of authority. `controls[h][t]`
-    /// means domain `h` may issue whole-domain control operations against domain `t`
-    /// specifically ([`HvCall::DomainDestroy`], and delegating/revoking control of `t`) — a
-    /// capability over one named domain, not a blanket privilege over all. It is **rooted in
-    /// creation**: creating `t` gives the creator `controls[creator][t]`; from there it is
-    /// delegable. Pure least-privilege — there is no implicit transitivity, so a domain
-    /// controls exactly the domains it created or was delegated, and dom0 holds no blanket
-    /// power over domains it did not build. A control edge requires *both* endpoints `Live`
+    /// records whether (and *how*) domain `h` may issue whole-domain control operations
+    /// against domain `t` specifically ([`HvCall::DomainDestroy`], and delegating/revoking
+    /// control of `t`) — a capability over one named domain, not a blanket privilege over all.
+    /// It is **rooted in creation**: creating `t` stamps the creator's [`Control::Root`] edge;
+    /// from there [`HvCall::ControlGrant`] delegates [`Control::Via`] edges. Pure
+    /// least-privilege — there is no implicit transitivity, so a domain controls exactly the
+    /// domains it created or was delegated, and dom0 holds no blanket power over domains it did
+    /// not build.
+    ///
+    /// Each cell is a [`Control`] carrying its **provenance**, so the column for a target is a
+    /// **delegation tree** rooted at that target's creator: this is what makes revocation
+    /// *chain-restricted* (a controller may revoke only within the subtree it delegated, never
+    /// its own delegator's edge upward) and what upgrades "every edge traces to a creation
+    /// root" from a guard property into the checked [`CrossViolation::ControlEdgeOrphaned`]
+    /// state invariant. A control edge also requires *both* endpoints `Live`
     /// ([`CrossViolation::ControlEdgeDeadEndpoint`]); teardown clears every edge into and out
-    /// of a domain, so no capability outlives its target's (or holder's) life. `controls[d][d]`
-    /// is unused — a domain's authority over *itself* is inherent, not an edge.
-    controls: Vec<Vec<bool>>,
+    /// of a domain *and* cascades away everything that domain had delegated, so no capability
+    /// outlives its target's (or holder's, or delegator's) life. `controls[d][d]` is always
+    /// [`Control::Absent`] — a domain's authority over *itself* is inherent, not an edge.
+    controls: Vec<Vec<Control>>,
 }
 
 impl Hypervisor {
@@ -413,7 +468,7 @@ impl Hypervisor {
             may_create: (0..num_domains).map(|d| d == 0).collect(),
             // No control edges at boot — dom0 gains control of a domain by creating it.
             controls: (0..num_domains)
-                .map(|_| alloc::vec![false; num_domains])
+                .map(|_| alloc::vec![Control::Absent; num_domains])
                 .collect(),
             // Domain 0 boots Live; every other slot is a Dead shell awaiting creation.
             life: (0..num_domains)
@@ -911,8 +966,12 @@ impl Hypervisor {
         );
         self.life[target as usize] = DomainLife::Live;
         self.may_create[target as usize] = may_create;
-        // The creator controls what it creates — the root of every control edge.
-        self.controls[caller as usize][target as usize] = true;
+        // The creator controls what it creates — the *root* of the target's delegation tree,
+        // the sole edge with no delegator behind it. Every other edge over `target` will be a
+        // `Via` delegated (transitively) from here, so this stamp is what roots the provenance
+        // that ControlEdgeOrphaned checks. `caller != target` always (a Live caller, a Dead
+        // target), so this never writes the unused self-diagonal.
+        self.controls[caller as usize][target as usize] = Control::Root;
         Ok(HvOutcome::Done)
     }
 
@@ -927,7 +986,9 @@ impl Hypervisor {
     /// third after ownership and consent — per-target rather than a blanket privilege, and
     /// it lives at the seam because only the integrated core sees both the acting `caller`
     /// and the `target`. Teardown then clears every control edge into *and* out of `target`
-    /// (and its `may_create`), so no capability outlives the domain it named.
+    /// (and its `may_create`), and cascades away everything `target` had *delegated* to others
+    /// (now orphaned — see [`Self::sweep_orphaned_control_edges`]), so no capability outlives
+    /// the domain it named or the delegator that handed it out.
     ///
     /// Then one precondition gates the rest: no *foreign* domain may hold a live grant map
     /// of one of `target`'s frames ([`grant::System::has_foreign_map`]). If one does, teardown
@@ -979,7 +1040,7 @@ impl Hypervisor {
         // destroying a peer needs a control capability over *that* peer specifically. A
         // refusal here mutates nothing. Checked before liveness, so a caller that lacks
         // control cannot even probe whether a peer is alive — a denial reveals nothing.
-        if caller != target && !self.controls[caller as usize][target as usize] {
+        if caller != target && self.controls[caller as usize][target as usize] == Control::Absent {
             return Err(HvError::Denied);
         }
         // Past the authority gate the target is provably Live, so there is no NotAlive path
@@ -1037,10 +1098,19 @@ impl Hypervisor {
         // gets fresh authority, never a stale one inherited from a dead tenant.
         self.life[target as usize] = DomainLife::Dead;
         self.may_create[target as usize] = false;
+        let t = target as usize;
         for h in 0..self.domain_count() {
-            self.controls[h][target as usize] = false; // edges *into* target (its controllers)
-            self.controls[target as usize][h] = false; // edges *out of* target (what it controlled)
+            self.controls[h][t] = Control::Absent; // edges *into* target (its controllers)
+            self.controls[t][h] = Control::Absent; // edges *out of* target (what it controlled)
         }
+        // `target` may also have been a *delegator*: an edge `controls[x][t2] == Via(target)`
+        // over some *other* target `t2` is now orphaned — its delegator's own edge just went
+        // Absent above. The same fixpoint the revoke cascade uses removes every such edge and
+        // everything delegated beneath it, so no authority `target` handed out outlives it
+        // (ControlEdgeOrphaned stays standing). This is the delegator-death half of the
+        // cascade — the analog of the row/column clearing just above, for the third way a
+        // domain touches the matrix (as a Via provenance pointer, not an endpoint).
+        self.sweep_orphaned_control_edges();
 
         debug_assert!(
             self.is_clean_shell(target),
@@ -1051,11 +1121,23 @@ impl Hypervisor {
 
     /// Delegate control of `target` to `to` — the mutable half of the authority axis, the
     /// analog for control capabilities of what a grant is for memory. The caller may hand out
-    /// only authority it holds (`controls[caller][target]`), so delegation can never fabricate
-    /// authority — every edge still traces back through a chain of delegations to the creation
-    /// that rooted it. `to` must be `Live` (a capability cannot rest on a `Dead` holder) and
-    /// distinct from `target` (self-authority is inherent, never an edge). Idempotent: if `to`
-    /// already controls `target`, this is a successful no-op.
+    /// only authority it holds (`controls[caller][target]` present), so delegation can never
+    /// fabricate authority — the new edge is stamped [`Control::Via`]`(caller)`, recording the
+    /// caller as its delegator, so every edge still traces back through a chain of delegations
+    /// to the creation [`Control::Root`] that rooted it. `to` must be `Live` (a capability
+    /// cannot rest on a `Dead` holder) and distinct from `target` (self-authority is inherent,
+    /// never an edge).
+    ///
+    /// **Idempotent, and that is load-bearing.** If `to` already controls `target` (via anyone,
+    /// or as the `Root`), this is a successful no-op that *preserves the existing provenance* —
+    /// it never re-parents an established controller. That is precisely what keeps the
+    /// delegation tree acyclic: a `Via` edge is only ever created attaching a controller that
+    /// did *not* previously control `target` (a fresh leaf, nobody's ancestor) beneath an
+    /// already-present delegator, so no `ControlGrant` interleaving can ever close a cycle —
+    /// acyclicity falls out of the transition, with no ordering on domains needed (contrast the
+    /// page-table level trick). Re-parenting an existing controller is the one move that could
+    /// forge a cycle, so forbidding it (by preserving provenance here) is what buys the
+    /// [`CrossViolation::ControlEdgeOrphaned`] invariant.
     fn control_grant(
         &mut self,
         caller: DomId,
@@ -1067,7 +1149,7 @@ impl Hypervisor {
         }
         // Authority: the caller can only delegate control it actually holds. Checked before
         // anything else, so a caller without control learns nothing about `target` or `to`.
-        if !self.controls[caller as usize][target as usize] {
+        if self.controls[caller as usize][target as usize] == Control::Absent {
             return Err(HvError::Denied);
         }
         // A domain's authority over itself is inherent and never represented as an edge, so
@@ -1082,16 +1164,43 @@ impl Hypervisor {
         if self.life[to as usize] != DomainLife::Live {
             return Err(HvError::NotAlive);
         }
-        self.controls[to as usize][target as usize] = true;
+        // Idempotent, provenance-preserving: if `to` already controls `target` (via anyone, or
+        // as the Root), keep its original provenance rather than re-parenting it under
+        // `caller`. Re-parenting an existing controller is the only move that could forge a
+        // cycle, so preserving provenance here is what keeps the delegation tree acyclic.
+        if self.controls[to as usize][target as usize] != Control::Absent {
+            return Ok(HvOutcome::Done);
+        }
+        // A fresh delegation: record `caller` as `to`'s delegator for `target`. `to` was not
+        // previously in `target`'s tree, so it attaches as a leaf and closes no cycle.
+        self.controls[to as usize][target as usize] = Control::Via(caller);
         Ok(HvOutcome::Done)
     }
 
-    /// Revoke `from`'s control of `target` — the inverse of [`Self::control_grant`]. The
-    /// caller must control `target`; then the edge is cleared. Revocation only ever *removes*
-    /// authority, so it cannot break provenance no matter which edge it targets — the flat
-    /// model lets any controller revoke any edge (the creator's, a peer's, or its own).
-    /// Idempotent: revoking an edge that is not there (including one whose `from` is `Dead`,
-    /// already cleared) succeeds and changes nothing.
+    /// Revoke `from`'s control of `target` — the inverse of [`Self::control_grant`], now
+    /// **chain-restricted and cascading**. The caller must control `target` (else
+    /// [`HvError::Denied`]), and may revoke only *within its own subtree* of `target`'s
+    /// delegation tree: `from` must be the caller itself (renouncing its own edge) or a domain
+    /// the caller delegated to, transitively (`from` lies in the subtree the caller roots — see
+    /// [`Self::control_subtree_contains`]). It may never revoke *upward* — a delegatee cannot
+    /// strip its own delegator, nor a sibling, nor the creator's `Root` from below; any such
+    /// attempt (including naming a domain that does not control `target` at all) is
+    /// [`HvError::Denied`], mutating nothing. An *ancestor* — up to the creator holding the
+    /// `Root` — may prune any descendant.
+    ///
+    /// Revocation **cascades**: removing `from`'s edge removes the whole subtree it roots for
+    /// `target`, since every edge beneath `from` was delegated (transitively) *through* it and
+    /// would otherwise be orphaned. Renounce (`from == caller`) and prune (`from` a descendant)
+    /// are the very same operation on the tree. The cascade is the one fixpoint
+    /// [`Self::sweep_orphaned_control_edges`] — clear `from`'s edge, then sweep every edge whose
+    /// delegator just went `Absent` — shared with delegator-death in teardown. It keeps
+    /// [`CrossViolation::ControlEdgeOrphaned`] standing: no edge is ever left without a live
+    /// delegator tracing to a `Root`.
+    ///
+    /// Still only ever *removes* authority, so it can never fabricate any; the restriction is a
+    /// *policy* refinement (who may revoke whom) layered on the already-sound core, closing the
+    /// flat model's wart where any controller could revoke any edge, its own delegator's
+    /// included.
     fn control_revoke(
         &mut self,
         caller: DomId,
@@ -1101,12 +1210,80 @@ impl Hypervisor {
         if target as usize >= self.domain_count() || from as usize >= self.domain_count() {
             return Err(HvError::BadDomain);
         }
-        // Authority: only a controller of `target` may revoke control over it.
-        if !self.controls[caller as usize][target as usize] {
+        // Authority: only a controller of `target` may revoke control over it. Checked first,
+        // so a caller without control learns nothing (matching control_grant). This is also
+        // subsumed by the subtree check below — a caller not in the tree roots an empty
+        // subtree — but kept explicit to name the authority axis.
+        if self.controls[caller as usize][target as usize] == Control::Absent {
             return Err(HvError::Denied);
         }
-        self.controls[from as usize][target as usize] = false;
+        // Chain restriction: the caller may revoke `from` only within its own subtree — `from`
+        // is the caller itself (renounce) or a domain the caller delegated to transitively.
+        // Revoking upward (a delegator, the Root from below), across (a sibling or unrelated
+        // controller), or a non-edge is Denied. This is the hierarchical refinement — the flat
+        // model skipped straight to the clear below.
+        if !self.control_subtree_contains(caller, from, target) {
+            return Err(HvError::Denied);
+        }
+        // Cascade: drop `from`'s edge, then sweep away everything it had delegated beneath it
+        // (now orphaned). Renounce and prune are the same tree operation.
+        self.controls[from as usize][target as usize] = Control::Absent;
+        self.sweep_orphaned_control_edges();
         Ok(HvOutcome::Done)
+    }
+
+    /// Whether `node` lies in the subtree that `caller` roots in `target`'s delegation tree —
+    /// i.e. `node == caller` (a controller renouncing its own edge) or `caller` is a
+    /// transitive delegator of `node` (`caller` handed `node`'s control down, directly or
+    /// through intermediaries). Walks `node`'s provenance chain *upward* — each
+    /// [`Control::Via`]`(d)` points at the delegator `d` — until it reaches `caller` (contained),
+    /// a [`Control::Root`] or [`Control::Absent`] cell (not contained: the walk left `caller`'s
+    /// subtree without finding it). The chain restriction on [`Self::control_revoke`]: a
+    /// controller may act only within the subtree it delegated, never on an ancestor's edge.
+    ///
+    /// The tree is acyclic ([`CrossViolation::ControlEdgeOrphaned`]), so the walk terminates;
+    /// the `domain_count` bound is a defensive backstop that treats a (never-reachable) cycle
+    /// as "not contained" rather than looping forever.
+    fn control_subtree_contains(&self, caller: DomId, node: DomId, target: DomId) -> bool {
+        let t = target as usize;
+        let mut cur = node;
+        for _ in 0..=self.domain_count() {
+            if cur == caller {
+                return true;
+            }
+            match self.controls[cur as usize][t] {
+                Control::Via(parent) => cur = parent,
+                Control::Root | Control::Absent => return false,
+            }
+        }
+        false
+    }
+
+    /// Remove every orphaned control edge — every [`Control::Via`]`(d)` whose delegator `d`'s
+    /// own edge over that target has gone [`Control::Absent`] — iterating to a fixpoint so a
+    /// whole orphaned subtree collapses, not just its top. This is the single cascade primitive
+    /// behind two transitions: [`Self::control_revoke`] (after clearing the revoked edge, its
+    /// delegatees are orphaned) and [`Self::domain_destroy`] (a torn-down delegator orphans
+    /// everything it delegated). Because a well-formed pre-state has every `Via` parent present,
+    /// the only edges this clears are those whose provenance chain passed through a just-removed
+    /// edge — exactly the intended subtree(s) — so it needs no explicit root argument. Tiny
+    /// domain counts make the repeated O(n²) sweep negligible.
+    fn sweep_orphaned_control_edges(&mut self) {
+        let n = self.domain_count();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for t in 0..n {
+                for h in 0..n {
+                    if let Control::Via(parent) = self.controls[h][t] {
+                        if self.controls[parent as usize][t] == Control::Absent {
+                            self.controls[h][t] = Control::Absent;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Whether `target` is a clean shell: it holds no event-channel port, no online vCPU,
@@ -1149,9 +1326,11 @@ impl Hypervisor {
     ///
     /// Domain lifecycle & authority: every `Dead` slot is a provably-clean, authority-free
     /// shell — it owns no frame, offers or holds no grant, has no bound port or online vCPU,
-    /// holds no `may_create`, and sits on no control edge; and every control edge relates two
-    /// `Live` domains. The whole-domain invariants that close the create/destroy loop and
-    /// keep the per-target authority tied to life.
+    /// holds no `may_create`, and sits on no control edge; every control edge relates two
+    /// `Live` domains; and every control edge's provenance traces acyclically back to a
+    /// creation `Root` (no delegation outlives its delegator's, no cycle). The whole-domain
+    /// invariants that close the create/destroy loop and keep the per-target authority — and
+    /// its delegation forest — tied to life.
     /// The total live grant mappings, and writable ones, standing over `frame` — summed
     /// across every grant that names it. In a consistent state all such grants share the
     /// frame's owner (the misowned check enforces that), so this is the exact count of
@@ -1245,16 +1424,57 @@ impl Hypervisor {
                 }
             }
         }
-        // Authority: every control edge must relate two `Live` domains. Rooted in creation
-        // and delegation (both requiring live endpoints) and cleared by teardown, so a
-        // `Dead` endpoint means a capability outlived the domain it named.
+        // Authority (liveness): every present control edge must relate two `Live` domains.
+        // Rooted in creation and delegation (both requiring live endpoints) and cleared by
+        // teardown, so a `Dead` endpoint means a capability outlived the domain it named.
         for holder in 0..self.domain_count() as DomId {
             for target in 0..self.domain_count() as DomId {
-                if self.controls[holder as usize][target as usize]
+                if self.controls[holder as usize][target as usize] != Control::Absent
                     && (self.life[holder as usize] != DomainLife::Live
                         || self.life[target as usize] != DomainLife::Live)
                 {
                     return Some(CrossViolation::ControlEdgeDeadEndpoint { holder, target });
+                }
+            }
+        }
+        // Authority (provenance): every present control edge must trace acyclically to a
+        // creation `Root`. Walk the edge's provenance up the delegation tree — each `Via(d)`
+        // points at the delegator `d` — and it must reach a `Root` within `domain_count`
+        // steps: a `Via` whose delegator's cell is `Absent` is an *orphan* (a delegation that
+        // outlived its delegator's — which revoke/teardown cascades exist to prevent), and a
+        // chain that never reaches a `Root` is a *cycle* (which no transition can build, since
+        // a `Via` only ever attaches a fresh leaf). This is the stored-provenance invariant —
+        // the checked-state upgrade of the flat model's by-construction "every edge traces to a
+        // root" guard property. It sits beside the liveness check above; neither subsumes the
+        // other (a present-but-dead edge is DeadEndpoint; a live-but-unrooted edge is this).
+        let n = self.domain_count();
+        for holder in 0..n as DomId {
+            for target in 0..n as DomId {
+                if self.controls[holder as usize][target as usize] == Control::Absent {
+                    continue;
+                }
+                let mut cur = holder as usize;
+                let t = target as usize;
+                let mut steps = 0;
+                loop {
+                    match self.controls[cur][t] {
+                        Control::Root => break, // reached the creation root — well-formed
+                        Control::Absent => {
+                            // A Via edge whose delegator's cell is gone: an orphan.
+                            return Some(CrossViolation::ControlEdgeOrphaned { holder, target });
+                        }
+                        Control::Via(parent) => {
+                            cur = parent as usize;
+                            steps += 1;
+                            if steps > n {
+                                // Walked past every domain without a Root: a cycle.
+                                return Some(CrossViolation::ControlEdgeOrphaned {
+                                    holder,
+                                    target,
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1292,17 +1512,28 @@ impl Hypervisor {
     }
 
     /// Whether `holder` holds a **control** capability over `target` — may destroy it and
-    /// (later) delegate/revoke control of it. Rooted in creation (`holder` created `target`)
-    /// or delegation; cleared when either domain is torn down. A domain's authority over
-    /// *itself* is inherent and not represented as an edge, so `controls(d, d)` is always
-    /// `false`. Out-of-range domains read as `false`. Every `true` edge relates two `Live`
-    /// domains (the [`CrossViolation::ControlEdgeDeadEndpoint`] invariant).
+    /// delegate/revoke control of it. Rooted in creation (`holder` created `target`) or
+    /// delegation; cleared when either domain is torn down (or `holder`'s delegator is). A
+    /// domain's authority over *itself* is inherent and not represented as an edge, so
+    /// `controls(d, d)` is always `false`. Out-of-range domains read as `false`. Every `true`
+    /// edge relates two `Live` domains ([`CrossViolation::ControlEdgeDeadEndpoint`]) and traces
+    /// to a creation `Root` ([`CrossViolation::ControlEdgeOrphaned`]). This is the presence
+    /// query; [`Self::control_edge`] exposes the provenance behind a present edge.
     pub fn controls(&self, holder: DomId, target: DomId) -> bool {
+        self.control_edge(holder, target) != Control::Absent
+    }
+
+    /// The **provenance** of `holder`'s control of `target` — [`Control::Absent`] (no edge),
+    /// [`Control::Root`] (the creator's edge, no delegator), or [`Control::Via`]`(d)` (`d`
+    /// delegated it). The finer companion to [`Self::controls`], exposing the delegation tree:
+    /// the chain restriction on revocation and the delegation forest's acyclicity both live in
+    /// this provenance. Out-of-range domains read as `Absent`.
+    pub fn control_edge(&self, holder: DomId, target: DomId) -> Control {
         self.controls
             .get(holder as usize)
             .and_then(|row| row.get(target as usize))
             .copied()
-            .unwrap_or(false)
+            .unwrap_or(Control::Absent)
     }
 
     /// Whether `dom` is a `Live` domain — one that has been created (or booted, for dom0)
@@ -3312,7 +3543,7 @@ mod tests {
     }
 
     #[test]
-    fn revoking_a_nonexistent_edge_is_a_successful_noop() {
+    fn revoking_a_non_delegatee_is_denied() {
         let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
         for t in [1u16, 2] {
             h.dispatch(
@@ -3324,15 +3555,17 @@ mod tests {
             )
             .unwrap();
         }
-        // dom0 controls domain 1; domain 2 does not. Revoking domain 2's (absent) control of
-        // domain 1 is idempotent — it succeeds and changes nothing.
+        // dom0 controls domain 1 (as Root); domain 2 does not control it at all — so domain 2
+        // is not in dom0's delegation subtree for target 1. Under the chain-restricted model,
+        // naming a non-controller as `from` is Denied (it is outside the caller's subtree),
+        // not a silent no-op — and it mutates nothing regardless.
         assert!(!h.controls(2, 1));
         assert_eq!(
             h.dispatch(0, HvCall::ControlRevoke { target: 1, from: 2 }),
-            Ok(HvOutcome::Done)
+            Err(HvError::Denied)
         );
         assert!(!h.controls(2, 1));
-        // But a caller that does not control the target cannot revoke over it at all.
+        // And a caller that does not control the target cannot revoke over it at all.
         assert_eq!(
             h.dispatch(2, HvCall::ControlRevoke { target: 1, from: 0 }),
             Err(HvError::Denied)
@@ -3366,13 +3599,243 @@ mod tests {
             Ok(HvOutcome::Done)
         );
         assert!(h.controls(2, 3));
-        // Flat revocation: domain 2 may revoke even dom0's original control of domain 3
-        // (a wart the deferred hierarchical model would fix — but it is sound: revocation
-        // only removes authority, never fabricates it).
-        h.dispatch(2, HvCall::ControlRevoke { target: 3, from: 0 })
+        // Provenance is recorded: dom0 is the Root, 1 was delegated Via(0), 2 Via(1).
+        assert_eq!(h.control_edge(0, 3), Control::Root);
+        assert_eq!(h.control_edge(1, 3), Control::Via(0));
+        assert_eq!(h.control_edge(2, 3), Control::Via(1));
+        // Chain-restricted revocation (the wart, now closed): domain 2 may NOT revoke its
+        // delegator (domain 1) nor the creator (dom0) — those are *upward*, outside 2's
+        // subtree — so both are Denied and mutate nothing.
+        assert_eq!(
+            h.dispatch(2, HvCall::ControlRevoke { target: 3, from: 0 }),
+            Err(HvError::Denied)
+        );
+        assert_eq!(
+            h.dispatch(2, HvCall::ControlRevoke { target: 3, from: 1 }),
+            Err(HvError::Denied)
+        );
+        assert!(
+            h.controls(0, 3) && h.controls(1, 3) && h.controls(2, 3),
+            "the chain is intact — no upward revoke succeeded"
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn an_ancestor_prunes_a_descendant_subtree_and_it_cascades() {
+        // The headline of chain-restricted revocation: an ancestor may prune a middle node,
+        // and the prune cascades to everything the pruned node delegated — while the ancestor
+        // and its own edge survive. Needs a depth-2 chain, so four domains: dom0 (Root over
+        // target 3) → 1 (Via 0) → 2 (Via 1).
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        for t in [1u16, 2, 3] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
             .unwrap();
-        assert!(!h.controls(0, 3));
-        assert!(h.controls(1, 3) && h.controls(2, 3));
+        }
+        h.dispatch(0, HvCall::ControlGrant { target: 3, to: 1 })
+            .unwrap();
+        h.dispatch(1, HvCall::ControlGrant { target: 3, to: 2 })
+            .unwrap();
+        assert!(h.controls(0, 3) && h.controls(1, 3) && h.controls(2, 3));
+        // dom0, an ancestor of domain 1, prunes domain 1. Domain 2 was delegated *through* 1,
+        // so it cascades away too — but dom0's own Root edge stays.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlRevoke { target: 3, from: 1 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.controls(0, 3), "the pruning ancestor keeps its own edge");
+        assert!(
+            !h.controls(1, 3) && !h.controls(2, 3),
+            "the pruned node and its whole delegated subtree are gone"
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn renouncing_ones_own_edge_cascades_ones_delegations() {
+        // Renounce (from == caller) is the same tree operation as prune: it removes the
+        // caller's own edge *and* everything it delegated (which would otherwise orphan).
+        // dom0 (Root over target 1) delegates to domain 2, then renounces — both go.
+        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
+        for t in [1u16, 2] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        h.dispatch(0, HvCall::ControlGrant { target: 1, to: 2 })
+            .unwrap();
+        assert!(h.controls(0, 1) && h.controls(2, 1));
+        // dom0 renounces its own control of domain 1. Domain 2 held it only Via(0), so it
+        // orphans and cascades away — nobody controls domain 1 afterward.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlRevoke { target: 1, from: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(
+            !h.controls(0, 1) && !h.controls(2, 1),
+            "renounce cascaded the whole subtree — no orphan left"
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_delegate_may_still_prune_within_its_own_subtree() {
+        // Chain restriction is *directional*, not a blanket "only the creator revokes": a
+        // delegate is a full controller *within its subtree*. Domain 1 (delegated control of
+        // target 3) delegates onward to 2, then revokes 2 — its own delegatee. Allowed.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        for t in [1u16, 2, 3] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        h.dispatch(0, HvCall::ControlGrant { target: 3, to: 1 })
+            .unwrap();
+        h.dispatch(1, HvCall::ControlGrant { target: 3, to: 2 })
+            .unwrap();
+        // Domain 1 prunes its own delegatee, domain 2. Within its subtree — allowed.
+        assert_eq!(
+            h.dispatch(1, HvCall::ControlRevoke { target: 3, from: 2 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(!h.controls(2, 3), "domain 1 pruned its own delegatee");
+        assert!(
+            h.controls(0, 3) && h.controls(1, 3),
+            "the rest of the chain is untouched"
+        );
+        // But domain 1 still may not revoke dom0 above it.
+        assert_eq!(
+            h.dispatch(1, HvCall::ControlRevoke { target: 3, from: 0 }),
+            Err(HvError::Denied)
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_sibling_cannot_revoke_a_sibling() {
+        // Two independent delegatees of the same delegator are siblings; neither is in the
+        // other's subtree, so neither may revoke the other. dom0 (Root over target 3)
+        // delegates to both 1 and 2; domain 1 tries to revoke domain 2 → Denied.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        for t in [1u16, 2, 3] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        h.dispatch(0, HvCall::ControlGrant { target: 3, to: 1 })
+            .unwrap();
+        h.dispatch(0, HvCall::ControlGrant { target: 3, to: 2 })
+            .unwrap();
+        assert_eq!(h.control_edge(1, 3), Control::Via(0));
+        assert_eq!(h.control_edge(2, 3), Control::Via(0));
+        assert_eq!(
+            h.dispatch(1, HvCall::ControlRevoke { target: 3, from: 2 }),
+            Err(HvError::Denied)
+        );
+        assert!(h.controls(2, 3), "a sibling revoke changed nothing");
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn re_delegating_an_existing_controller_preserves_its_provenance() {
+        // Idempotence is provenance-preserving and that is load-bearing: re-delegating to a
+        // domain that already controls the target must NOT re-parent it, else a cycle could
+        // form. dom0 → 1 → 2 over target 3; then dom0 tries to delegate 3 to domain 2 again.
+        // Domain 2 keeps Via(1), not Via(0) — no re-parent, no cycle.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        for t in [1u16, 2, 3] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        h.dispatch(0, HvCall::ControlGrant { target: 3, to: 1 })
+            .unwrap();
+        h.dispatch(1, HvCall::ControlGrant { target: 3, to: 2 })
+            .unwrap();
+        assert_eq!(h.control_edge(2, 3), Control::Via(1));
+        // dom0 re-delegates control of 3 to domain 2 — a successful no-op that preserves 2's
+        // original delegator (domain 1), never re-parenting it under dom0.
+        assert_eq!(
+            h.dispatch(0, HvCall::ControlGrant { target: 3, to: 2 }),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(
+            h.control_edge(2, 3),
+            Control::Via(1),
+            "provenance preserved — no re-parent"
+        );
+        // And re-delegating to the Root holder never demotes the Root to a Via.
+        assert_eq!(
+            h.dispatch(1, HvCall::ControlGrant { target: 3, to: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(
+            h.control_edge(0, 3),
+            Control::Root,
+            "Root is never overwritten"
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn destroying_a_delegator_cascades_its_delegations() {
+        // Delegator-death: tearing down a domain must not leave behind edges it had delegated
+        // (they would orphan). dom0 delegates control of target 3 to domain 1, which delegates
+        // onward to domain 2. Destroying domain 1 (a live delegator) must cascade domain 2's
+        // Via(1) edge away — even though domain 2 is neither endpoint of the destroy.
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        for t in [1u16, 2, 3] {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        h.dispatch(0, HvCall::ControlGrant { target: 3, to: 1 })
+            .unwrap();
+        h.dispatch(1, HvCall::ControlGrant { target: 3, to: 2 })
+            .unwrap();
+        assert_eq!(h.control_edge(2, 3), Control::Via(1));
+        // dom0 destroys domain 1. Domain 1's own edges clear (endpoint), and domain 2's edge —
+        // delegated *through* the now-dead 1 — cascades away, so no orphan survives.
+        h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .unwrap();
+        assert!(!h.is_live(1));
+        assert!(!h.controls(1, 3), "the dead delegator's own edge is gone");
+        assert!(
+            !h.controls(2, 3),
+            "the edge delegated through the dead delegator cascaded away — no orphan"
+        );
+        assert!(h.controls(0, 3), "dom0's Root over target 3 is untouched");
         assert!(h.invariants_hold());
     }
 

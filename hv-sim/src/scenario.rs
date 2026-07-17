@@ -11,7 +11,8 @@
 use hv_core::evtchn::{PortState, System};
 use hv_core::p2m::{PageType, PtLevel};
 use hv_core::{
-    grant, p2m, policy, prng::Prng, sched, HvCall, HvCore, HvOutcome, Hypercall, Hypervisor,
+    grant, p2m, policy, prng::Prng, sched, Control, HvCall, HvCore, HvOutcome, Hypercall,
+    Hypervisor,
 };
 use hv_hal::TimeSource;
 
@@ -1079,6 +1080,27 @@ pub struct DestroyOutcome {
     pub invariants_hold: bool,
 }
 
+/// An *independent* re-derivation, from the sim side through the public [`Hypervisor::control_edge`]
+/// query, of whether `node` lies in the subtree `caller` roots in `target`'s delegation tree —
+/// i.e. `node == caller` (renounce) or `caller` is a transitive delegator of `node`. This is the
+/// oracle for chain-restricted revocation: a `ControlRevoke { target, from }` by `caller`
+/// succeeds iff `from` is in `caller`'s subtree, and is `Denied` otherwise. Written from
+/// scratch (walking `Via` provenance upward) so it is a genuine cross-check of the core's own
+/// `control_subtree_contains`, not a call into it.
+fn subtree_contains(hv: &Hypervisor, caller: u16, node: u16, target: u16) -> bool {
+    let mut cur = node;
+    for _ in 0..=hv.domain_count() {
+        if cur == caller {
+            return true;
+        }
+        match hv.control_edge(cur, target) {
+            Control::Via(parent) => cur = parent,
+            Control::Root | Control::Absent => return false,
+        }
+    }
+    false
+}
+
 /// Whether `target` has been reduced to an empty but still-existent shell — the
 /// teardown postcondition, checked from the sim through public queries: it holds no
 /// port, no online vCPU, offers or holds no grant, and owns no frame.
@@ -1333,22 +1355,29 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                 }
             }
             16 => {
-                // Revoke `from`'s control of `target`. Predictions: caller Live (gate);
-                // caller controls `target` (authority); then the edge is cleared (idempotent).
+                // Revoke `from`'s control of `target` — now chain-restricted and cascading.
+                // Predictions in the impl's order: caller Live (gate); caller controls `target`
+                // (authority); then `from` must lie in caller's own subtree (`subtree_contains`,
+                // an independent oracle) — else Denied. On success `from`'s edge, and its whole
+                // delegated subtree, are gone.
                 let target = rng.below(u32::from(DOMAINS)) as u16;
                 let from = rng.below(u32::from(DOMAINS)) as u16;
                 let caller_live = hv.is_live(caller);
                 let caller_controls = hv.controls(caller, target);
+                // May revoke iff live, controls the target, and `from` is within its subtree.
+                let may_revoke =
+                    caller_live && caller_controls && subtree_contains(&hv, caller, from, target);
                 match hv.dispatch(caller, HvCall::ControlRevoke { target, from }) {
                     Ok(HvOutcome::Done) => {
-                        // A live, controlling caller; the edge is now gone.
-                        if !(caller_live && caller_controls) || hv.controls(from, target) {
+                        // A live caller revoking within its own subtree; `from`'s edge is gone.
+                        if !may_revoke || hv.controls(from, target) {
                             out.postcondition_held = false;
                         }
                     }
                     Err(hv_core::HvError::Denied) => {
-                        // A live caller that does not control `target` — a no-op.
-                        if !caller_live || caller_controls {
+                        // A live caller that either does not control `target`, or aimed `from`
+                        // *outside* its subtree (an upward/sibling/non-edge revoke) — a no-op.
+                        if !caller_live || may_revoke {
                             out.postcondition_held = false;
                         }
                     }
