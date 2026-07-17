@@ -123,6 +123,18 @@ pub enum HvCall {
     P2mPin { mfn: Mfn },
     /// Unpin one of the caller's page-table frames, dropping the pin's reference.
     P2mUnpin { mfn: Mfn },
+
+    /// Tear down domain `target` completely: close its every event-channel port,
+    /// offline its every vCPU (closing on-CPU intervals at `now`), unmap its every
+    /// grant map, revoke its every grant, unpin and free its every frame — leaving an
+    /// empty but still-existent domain shell. Atomic and all-or-nothing: refused with
+    /// [`HvError::DomainBusy`], mutating nothing, if any *foreign* domain still holds a
+    /// live grant map of one of `target`'s frames (that map holds a page reference
+    /// teardown cannot revoke without yanking it out from under the mapper). `now` is a
+    /// plain operation input, as for the scheduler ops: the core owns no clock, so
+    /// whoever builds the call stamps it. Privilege is deferred — any caller may issue
+    /// it for now.
+    DomainDestroy { target: DomId, now: Ticks },
 }
 
 /// The success value of a routed hypercall.
@@ -160,6 +172,13 @@ pub enum HvError {
     /// Refused at the seam so it can never reference another domain's page. Not a
     /// single subsystem's error: it is the grant↔page-type join that catches it.
     StaleGrant,
+    /// A [`HvCall::DomainDestroy`] was refused because the target is still busy: a
+    /// *foreign* domain holds a live grant map of one of the target's frames. Teardown
+    /// is all-or-nothing and never force-unmaps a live mapping, so it refuses rather
+    /// than tear a page out from under another domain — and mutates nothing. Whole-domain,
+    /// spanning grant tables and page-type accounting, so it belongs to the seam, not one
+    /// subsystem.
+    DomainBusy,
 }
 
 /// A breach of a *cross-subsystem* invariant — one that relates two subsystems and so
@@ -366,6 +385,8 @@ impl Hypervisor {
                 .unpin(caller, mfn)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::P2m),
+
+            HvCall::DomainDestroy { target, now } => self.domain_destroy(target, now),
         }
     }
 
@@ -497,6 +518,99 @@ impl Hypervisor {
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Sched),
         }
+    }
+
+    /// Tear a domain down across all four subsystems — the whole-system operation that
+    /// welds every seam. **Atomic, all-or-nothing, refuse-if-busy.** One precondition
+    /// gates everything: no *foreign* domain may hold a live grant map of one of
+    /// `target`'s frames ([`grant::System::has_foreign_map`]). If one does, teardown
+    /// would have to yank a page out from under the mapper, so it refuses with
+    /// [`HvError::DomainBusy`] and mutates nothing. Otherwise every step below succeeds
+    /// by construction — each is a bulk form of an existing invariant-safe transition —
+    /// so there is nothing to roll back.
+    ///
+    /// The order matters, and only for making each step's precondition hold in turn:
+    ///
+    /// 1. **close** every port (evtchn) and **offline** every vCPU (sched) — stop the
+    ///    domain talking and running; peers fall back to `Unbound`, pCPUs are freed.
+    /// 2. **drain** every grant map `target` holds (grant), mirroring each released page
+    ///    reference back into the page-type counts exactly as [`Self::grant_unmap`]
+    ///    does — this is the one cross-subsystem step, and it clears `target`'s *own*
+    ///    maps (its self-grants included) so the next step's grants are unmapped.
+    /// 3. **revoke** every grant `target` offers (grant) — now all unmapped.
+    /// 4. **unpin** then **free** every frame `target` owns (p2m) — every reference into
+    ///    them is gone (own maps drained, pins dropped, foreign maps excluded by the
+    ///    precondition), so each free succeeds.
+    ///
+    /// What remains is an empty but still-existent shell: domain slots are fixed-size
+    /// and never removed, so peers left `Unbound { remote: target }` stay valid.
+    /// Verification rides on the existing invariant net (a mis-ordered teardown trips
+    /// grant↔p2m or evtchn↔sched, caught by the `dispatch` cross-check) plus a
+    /// debug-time postcondition that nothing live points into `target` any more.
+    ///
+    /// Provenance: the refuse-if-busy lifecycle (rather than force-unmap, or Xen's
+    /// deferred dying-domain RCU teardown) is a design decision informed by the public
+    /// Xen domain-destroy semantics and general OS knowledge — not `xen/`'s GPL
+    /// implementation. See `CLEANROOM.md`.
+    fn domain_destroy(&mut self, target: DomId, now: Ticks) -> Result<HvOutcome, HvError> {
+        if target as usize >= self.domain_count() {
+            return Err(HvError::BadDomain);
+        }
+        // The single precondition. Checked before any mutation, so a refusal is a true
+        // no-op.
+        if self.grant.has_foreign_map(target) {
+            return Err(HvError::DomainBusy);
+        }
+
+        // 1. Stop it talking and running.
+        self.evtchn.close_all(target);
+        self.sched.offline_all(target, now);
+
+        // 2. Release every grant map it holds, mirroring each page-reference drop into
+        //    the page-type accounting — the reverse of what the map acquired, exactly as
+        //    grant_unmap does for a single mapping. These releases cannot fail: a live
+        //    map always took the reference this now returns.
+        for released in self.grant.drain_maps_of(target) {
+            let mirror = if released.writable {
+                self.p2m.put_type(released.frame, PageType::Writable)
+            } else {
+                self.p2m.put(released.frame)
+            };
+            debug_assert!(
+                mirror.is_ok(),
+                "teardown could not release a drained map's page reference: {mirror:?}"
+            );
+        }
+
+        // 3. Revoke every grant it offers (all unmapped now), then 4. reclaim its frames.
+        self.grant.revoke_all(target);
+        self.p2m.unpin_all(target);
+        self.p2m.free_all(target);
+
+        debug_assert!(
+            self.is_torn_down(target),
+            "domain {target} is not an empty shell after teardown"
+        );
+        Ok(HvOutcome::Done)
+    }
+
+    /// Whether `target` has been reduced to an empty shell: it holds no event-channel
+    /// port, no online vCPU, offers or holds no grant, and owns no frame. The teardown
+    /// postcondition — "nothing live points into `target`" — checked in debug builds
+    /// after [`Self::domain_destroy`], riding atop the standing invariant net which
+    /// already catches the ordering bugs (a freed port with a live peer, a freed on-CPU
+    /// vCPU, a foreign-mapped freed frame, a deliverable event on an offlined vCPU).
+    fn is_torn_down(&self, target: DomId) -> bool {
+        let no_ports = (0..self.evtchn.port_count(target) as Port)
+            .all(|p| self.evtchn.state_of(target, p) == Some(evtchn::PortState::Free));
+        let no_vcpus = (0..self.sched.vcpu_count(target) as Vcpu)
+            .all(|v| self.sched.state_of(target, v) == Some(sched::RunState::Offline));
+        let no_grants = (0..self.grant.entry_count(target) as GrantRef)
+            .all(|g| !self.grant.is_granted(target, g));
+        let no_maps = !self.grant.holds_any_map(target);
+        let no_frames =
+            (0..self.p2m.frame_count() as Mfn).all(|m| self.p2m.owner_of(m) != Some(target));
+        no_ports && no_vcpus && no_grants && no_maps && no_frames
     }
 
     /// The first cross-subsystem invariant breach, or `None` if both seams are
@@ -1070,6 +1184,211 @@ mod tests {
             "a vCPU with a deliverable event must not block onto it"
         );
         assert!(h.invariants_hold());
+    }
+
+    // Map a grant, returning the handle (panicking on any other outcome).
+    fn map_handle(
+        h: &mut Hypervisor,
+        grantee: DomId,
+        grantor: DomId,
+        gref: u32,
+        writable: bool,
+    ) -> GrantHandle {
+        match h.dispatch(
+            grantee,
+            HvCall::GrantMap {
+                grantor,
+                gref,
+                writable,
+            },
+        ) {
+            Ok(HvOutcome::Handle(x)) => x,
+            other => panic!("expected a handle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn domain_destroy_is_refused_while_a_foreign_map_is_live_and_mutates_nothing() {
+        let mut h = hv();
+        // Domain 0 owns frame 2, grants it writable to domain 1, which maps it.
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 2,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        let handle = map_handle(&mut h, 1, 0, 0, true);
+
+        // Destroying domain 0 must be refused: domain 1 holds a live map of its frame.
+        // Any caller may issue it (privilege deferred) — here a third party, domain 2.
+        assert_eq!(
+            h.dispatch(2, HvCall::DomainDestroy { target: 0, now: 0 }),
+            Err(HvError::DomainBusy)
+        );
+        // A refusal mutates nothing: the frame, grant, and map all stand.
+        assert_eq!(h.p2m().owner_of(2), Some(0));
+        assert!(h.grant().is_granted(0, 0));
+        assert_eq!(h.grant().map_count(0, 0), Some(1));
+        assert_eq!(h.p2m().current_type(2), Some(PageType::Writable));
+        assert!(h.invariants_hold());
+
+        // Once domain 1 unmaps, the frame is no longer foreign-held and teardown runs.
+        h.dispatch(1, HvCall::GrantUnmap { handle }).unwrap();
+        assert!(h
+            .dispatch(2, HvCall::DomainDestroy { target: 0, now: 0 })
+            .is_ok());
+        assert!(!h.p2m().is_allocated(2));
+        assert!(!h.grant().is_granted(0, 0));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn domain_destroy_is_not_blocked_by_the_targets_own_self_map() {
+        let mut h = hv();
+        // Domain 0 grants its own frame to *itself* and maps it — map_count is 1, but a
+        // self-map is the domain's own to release, not a foreign hold. Teardown unmaps
+        // it itself, so this must NOT count as busy.
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 1 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 0,
+                frame: 1,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        let _self_handle = map_handle(&mut h, 0, 0, 0, true);
+        assert_eq!(h.grant().map_count(0, 0), Some(1));
+        assert!(
+            !h.grant().has_foreign_map(0),
+            "a self-map is not a foreign hold"
+        );
+
+        // So teardown is not refused — it drains its own map, revokes, and frees.
+        assert_eq!(
+            h.dispatch(0, HvCall::DomainDestroy { target: 0, now: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.is_torn_down(0));
+        assert!(!h.p2m().is_allocated(1));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn domain_destroy_sweeps_all_four_subsystems_and_spares_others() {
+        let mut h = hv();
+        // Build domain 1 up across every subsystem, then tear it all down at once.
+
+        // evtchn: an interdomain channel to domain 0, and an IPI port.
+        let unbound = match h.dispatch(0, HvCall::EvtchnAllocUnbound { remote: 1 }) {
+            Ok(HvOutcome::Port(p)) => p,
+            other => panic!("expected a port, got {other:?}"),
+        };
+        h.dispatch(
+            1,
+            HvCall::EvtchnBindInterdomain {
+                remote: 0,
+                remote_port: unbound,
+            },
+        )
+        .unwrap();
+        h.dispatch(1, HvCall::EvtchnBindIpi { vcpu: 1 }).unwrap();
+
+        // sched: vCPU 0 running on a pCPU, vCPU 1 blocked.
+        h.dispatch(1, HvCall::SchedAdmit { vcpu: 0 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::SchedRun {
+                vcpu: 0,
+                pcpu: 0,
+                now: 100,
+            },
+        )
+        .unwrap();
+        h.dispatch(1, HvCall::SchedAdmit { vcpu: 1 }).unwrap();
+        h.dispatch(1, HvCall::SchedBlock { vcpu: 1, now: 100 })
+            .unwrap();
+
+        // p2m + grant: domain 1 owns frame 2 pinned as a page table; owns frame 3 which
+        // it self-grants read-only and self-maps; and holds a writable map of domain 0's
+        // frame 4 (a map it holds over *another* domain's frame — legal, must be drained).
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 2 }).unwrap();
+        h.dispatch(1, HvCall::P2mPin { mfn: 2 }).unwrap();
+        h.dispatch(1, HvCall::P2mAllocate { mfn: 3 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 3,
+                readonly: true,
+            },
+        )
+        .unwrap();
+        let _self_map = map_handle(&mut h, 1, 1, 0, false);
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 4 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 4,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        let _foreign_map = map_handle(&mut h, 1, 0, 0, true);
+        // Domain 0's frame 4 now carries domain 1's writable reference.
+        assert_eq!(h.p2m().current_type(4), Some(PageType::Writable));
+        assert_eq!(h.sched().occupant(0), Some((1, 0)));
+
+        // Tear domain 1 down.
+        assert_eq!(
+            h.dispatch(
+                1,
+                HvCall::DomainDestroy {
+                    target: 1,
+                    now: 160
+                }
+            ),
+            Ok(HvOutcome::Done)
+        );
+
+        // Domain 1 is an empty shell across every subsystem.
+        assert!(h.is_torn_down(1));
+        assert_eq!(h.sched().occupant(0), None, "its pCPU is freed");
+        assert!(!h.p2m().is_allocated(2), "its pinned frame is freed");
+        assert!(!h.p2m().is_allocated(3), "its self-granted frame is freed");
+        assert!(!h.grant().holds_any_map(1), "it holds no maps");
+
+        // Everything else is spared. Domain 0 keeps frame 4 (its reference dropped when
+        // domain 1's map was drained), its grant of it survives (unmapped now), and its
+        // interdomain peer fell back to a valid, re-bindable Unbound port.
+        assert_eq!(h.p2m().owner_of(4), Some(0));
+        assert_eq!(h.p2m().refs(4), Some(0));
+        assert!(h.grant().is_granted(0, 0));
+        assert_eq!(h.grant().map_count(0, 0), Some(0));
+        assert_eq!(
+            h.evtchn().state_of(0, unbound),
+            Some(evtchn::PortState::Unbound { remote: 1 })
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn domain_destroy_of_a_nonexistent_target_is_bad_domain() {
+        let mut h = hv();
+        assert_eq!(
+            h.dispatch(0, HvCall::DomainDestroy { target: 9, now: 0 }),
+            Err(HvError::BadDomain)
+        );
     }
 
     #[test]
