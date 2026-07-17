@@ -179,6 +179,21 @@ one-line regression test, not a Heisenbug.
   pin), the second consumer of the "release gated on proof of acquire" discipline. This
   completes the page-type foundation — both halves of the exclusivity are now produced by
   real guest operations and exercised across the seed space and fuzzers.
+- **Event ↔ scheduler seam** *(landed)*: the second cross-subsystem invariant. The two
+  oldest subsystems didn't talk — `evtchn::send` set a pending bit, and a vCPU that had
+  called `SchedBlock` sat `Blocked`, so a signal to a sleeping vCPU's port was a **lost
+  wakeup**, the classic bug class. They are now welded at the dispatch seam (subsystems
+  stay pure and mutually ignorant): a `send`/`unmask` that makes a port *deliverable*
+  (pending and unmasked) wakes the vCPU it notify-targets if that vCPU is `Blocked` —
+  interdomain/unbound ports wake vCPU 0 (Xen's `notify_vcpu_id` default), VIRQ/IPI ports
+  their bound vCPU. A *masked* port defers the wake to the later `unmask`. And a `block`
+  is refused when a deliverable event already waits — Xen's `SCHEDOP_block` re-check —
+  so a vCPU can't sleep *onto* work it already has. The safety invariant — **no
+  deliverable event rests on a `Blocked` vCPU** — is debug-asserted after every dispatch,
+  holds across 10k seeds (`run_seam` biases the stream to actually fire the wake, and
+  observes it), and is fuzzed through the integrated target. Only the *scheduler* wakeup
+  is the core's business; *injecting* the interrupt into an already-running vCPU stays
+  the HAL's job, past the fence.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

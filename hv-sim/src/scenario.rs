@@ -855,6 +855,162 @@ fn drop_ok(result: Result<HvOutcome, hv_core::HvError>) {
     let _ = result;
 }
 
+/// A comparable summary of a finished event↔scheduler seam run. The counts are
+/// *observed transitions*, not a resting census: a fired wake looks identical at rest
+/// to a manual one, so the only way to prove the seam path is reached is to watch it
+/// happen.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SeamOutcome {
+    /// Times a send or unmask actually woke a `Blocked` vCPU through the seam
+    /// (`Blocked` → `Runnable` across the signalling dispatch).
+    pub wakes: u32,
+    /// Times a block was a no-op because the vCPU already held a deliverable event —
+    /// the block-race half of the invariant (Xen's `SCHEDOP_block` re-check).
+    pub block_noops: u32,
+    /// vCPUs still `Blocked` at the end.
+    pub blocked: u32,
+    /// Whether the integrated invariant — including no-lost-wakeup — held after every
+    /// step, not just at the end.
+    pub invariants_hold: bool,
+}
+
+/// Drive the integrated [`Hypervisor`] through a seed-derived stream *biased to fire the
+/// event↔scheduler seam*: every vCPU gets an IPI port and one interdomain channel is
+/// established, so a blocked vCPU can always be woken by signalling a port that
+/// notify-targets it. The loop blocks, signals, masks/unmasks, and churns run state on
+/// the *same* vCPUs, so blocks and sends actually align — where the generic
+/// `run_hypervisor` only rarely does. It observes each send/unmask for a real
+/// `Blocked` → `Runnable` wake and each block for a work-pending no-op, so a test can
+/// assert the seam path is genuinely exercised, while the integrated invariant is
+/// checked after every step.
+pub fn run_seam(seed: u64, steps: u32) -> SeamOutcome {
+    const DOMAINS: u16 = 2;
+    const VCPUS: u32 = 2;
+    const PCPUS: u32 = 2;
+    const PORTS: u32 = 8;
+    const GRANTS: u32 = 1;
+    const FRAMES: u32 = 1;
+
+    let mut hv = Hypervisor::new(
+        DOMAINS as usize,
+        PORTS as usize,
+        GRANTS as usize,
+        VCPUS as usize,
+        PCPUS as usize,
+        FRAMES as usize,
+    );
+    let clock = ManualClock::new();
+    let mut rng = Prng::new(seed);
+
+    // Admit every vCPU and give it an IPI port — so any vCPU the loop blocks can be
+    // woken by signalling its own port, keeping the wake path reachable from every
+    // state. `ipi[dom][vcpu]` is that port.
+    let mut ipi = [[0u32; VCPUS as usize]; DOMAINS as usize];
+    for dom in 0..DOMAINS {
+        for vcpu in 0..VCPUS {
+            hv.dispatch(dom, HvCall::SchedAdmit { vcpu }).unwrap();
+            if let Ok(HvOutcome::Port(p)) = hv.dispatch(dom, HvCall::EvtchnBindIpi { vcpu }) {
+                ipi[dom as usize][vcpu as usize] = p;
+            }
+        }
+    }
+    // One interdomain channel: domain 1 opens a port for domain 0, domain 0 binds it.
+    // Signalling domain 0's end wakes domain 1's vCPU 0 (the interdomain notify
+    // default) — the cross-domain wake, distinct from the same-domain IPI path.
+    let inter = match hv.dispatch(1, HvCall::EvtchnAllocUnbound { remote: 0 }) {
+        Ok(HvOutcome::Port(u)) => match hv.dispatch(
+            0,
+            HvCall::EvtchnBindInterdomain {
+                remote: 1,
+                remote_port: u,
+            },
+        ) {
+            Ok(HvOutcome::Port(l)) => Some(l),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let mut out = SeamOutcome {
+        invariants_hold: true,
+        ..SeamOutcome::default()
+    };
+
+    for _ in 0..steps {
+        clock.advance(1 + u64::from(rng.below(8)));
+        let now = clock.now();
+        let dom = rng.below(u32::from(DOMAINS)) as u16;
+        let vcpu = rng.below(VCPUS);
+        let pcpu = rng.below(PCPUS);
+        let p = ipi[dom as usize][vcpu as usize];
+
+        match rng.below(8) {
+            0 => {
+                // Block this vCPU. If it was runnable/running yet stayed put, the seam
+                // refused the block because a deliverable event already targets it.
+                let before = hv.sched().state_of(dom, vcpu);
+                drop_ok(hv.dispatch(dom, HvCall::SchedBlock { vcpu, now }));
+                let after = hv.sched().state_of(dom, vcpu);
+                let was_blockable = matches!(
+                    before,
+                    Some(sched::RunState::Runnable) | Some(sched::RunState::Running { .. })
+                );
+                if was_blockable && after == before {
+                    out.block_noops += 1;
+                }
+            }
+            1 => {
+                // Signal this vCPU's own IPI — its notify target is exactly `vcpu`.
+                let before = hv.sched().state_of(dom, vcpu);
+                drop_ok(hv.dispatch(dom, HvCall::EvtchnSend { port: p }));
+                if woke(before, hv.sched().state_of(dom, vcpu)) {
+                    out.wakes += 1;
+                }
+            }
+            2 => drop_ok(hv.dispatch(dom, HvCall::EvtchnMask { port: p })),
+            3 => {
+                // Unmask — the deferred deliverable edge; may wake a vCPU that blocked
+                // while its port was pending-but-masked.
+                let before = hv.sched().state_of(dom, vcpu);
+                drop_ok(hv.dispatch(dom, HvCall::EvtchnUnmask { port: p }));
+                if woke(before, hv.sched().state_of(dom, vcpu)) {
+                    out.wakes += 1;
+                }
+            }
+            4 => drop_ok(hv.dispatch(dom, HvCall::SchedWake { vcpu })),
+            5 => drop_ok(hv.dispatch(dom, HvCall::SchedRun { vcpu, pcpu, now })),
+            6 => drop_ok(hv.dispatch(dom, HvCall::SchedPreempt { vcpu, now })),
+            _ => {
+                // Signal the interdomain channel's sender end — wakes domain 1's vCPU 0
+                // if it is blocked (the cross-domain path).
+                if let Some(l) = inter {
+                    let before = hv.sched().state_of(1, 0);
+                    drop_ok(hv.dispatch(0, HvCall::EvtchnSend { port: l }));
+                    if woke(before, hv.sched().state_of(1, 0)) {
+                        out.wakes += 1;
+                    }
+                }
+            }
+        }
+
+        out.invariants_hold &= hv.invariants_hold();
+    }
+
+    for dom in 0..DOMAINS {
+        for vcpu in 0..VCPUS {
+            if hv.sched().state_of(dom, vcpu) == Some(sched::RunState::Blocked) {
+                out.blocked += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Whether a run-state pair is a seam wake: `Blocked` before, `Runnable` after.
+fn woke(before: Option<sched::RunState>, after: Option<sched::RunState>) -> bool {
+    before == Some(sched::RunState::Blocked) && after == Some(sched::RunState::Runnable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1255,6 +1411,51 @@ mod tests {
         assert!(
             summaries.iter().any(|s| s.pinned_frames > 0),
             "no seed pinned a frame as a page table"
+        );
+    }
+
+    /// The event↔scheduler seam headline: across many seeds of blocking, signalling,
+    /// masking, and churning the *same* vCPUs, the integrated invariant — no deliverable
+    /// event ever resting on a `Blocked` vCPU — holds after every single step, not just
+    /// at the end. This is the seam's soundness under interleaving, with the seed as the
+    /// whole reproducer.
+    #[test]
+    fn seam_invariant_holds_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            assert!(
+                run_seam(seed, 256).invariants_hold,
+                "event↔scheduler invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the seam driver: same seed, same observed counts exactly.
+    #[test]
+    fn seam_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_seam(seed, 256),
+                run_seam(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The driver genuinely exercises the seam, not just the invariant: across the seed
+    /// space some run actually wakes a `Blocked` vCPU through a send/unmask, and some run
+    /// hits the block-race no-op (a vCPU declining to sleep on a deliverable event). If
+    /// either stayed zero, the invariant above would be proving the seam over states the
+    /// seam never reaches.
+    #[test]
+    fn seam_actually_fires_both_paths() {
+        let outcomes: Vec<_> = (0..256u64).map(|s| run_seam(s, 256)).collect();
+        assert!(
+            outcomes.iter().any(|o| o.wakes > 0),
+            "no seed ever woke a blocked vCPU through the seam — driver too weak"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.block_noops > 0),
+            "no seed ever hit the block-with-pending-event no-op — driver too weak"
         );
     }
 }

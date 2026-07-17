@@ -9,9 +9,12 @@
 //! target real machine frames, so grant maps take page references through the seam and
 //! the *cross-subsystem* invariant is exercised too. After every dispatch the combined
 //! invariant is checked: one assertion covering the whole core, including that every
-//! live grant mapping stays owned and backed by the page-type counts. Unlike the
-//! per-subsystem targets, this one explores cross-subsystem interleavings. The seeded
-//! mirror in `hv-sim` (`run_hypervisor`) makes the property deterministic.
+//! live grant mapping stays owned and backed by the page-type counts, and that no
+//! deliverable event is left on a `Blocked` vCPU. Unlike the per-subsystem targets, this
+//! one explores cross-subsystem interleavings — both seams the `Hypervisor` owns:
+//! `EvtchnSend`/`EvtchnUnmask`/`SchedBlock` route through the event↔scheduler seam, so a
+//! *lost wakeup* is caught here too. The seeded mirrors in `hv-sim` (`run_hypervisor`
+//! broadly, `run_seam` with a wake-biased stream) make the properties deterministic.
 //!
 //! Run it (needs nightly + `cargo install cargo-fuzz`):
 //!
