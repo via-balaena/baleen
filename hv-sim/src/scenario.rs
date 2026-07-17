@@ -1356,6 +1356,164 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
     PtabOutcome::of(&sys, invariants_hold)
 }
 
+/// A census of a finished cross-domain page-table run. The counts are *observed
+/// outcomes*, so a test can prove the authorized foreign-link path is reached, the
+/// unauthorized one is refused, and a grant can't be revoked out from under a live entry.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignOutcome {
+    /// Cross-domain entries successfully installed (a domain mapped another's frame).
+    pub links: u32,
+    /// Foreign links refused for want of a grant (`HvError::Unauthorized`).
+    pub unauthorized: u32,
+    /// Grant revocations refused because a live foreign entry still relied on the grant.
+    pub revoke_blocks: u32,
+    /// Whether the integrated invariant — including foreign-link authorization — held
+    /// after every step.
+    pub invariants_hold: bool,
+}
+
+/// Drive the integrated [`Hypervisor`] through a seed-derived stream *biased to exercise
+/// cross-domain page-table sharing*. Two domains each own an `L1` table; the loop grants
+/// data frames across the domain boundary, maps granted foreign frames into the other
+/// domain's table, unlinks them, and revokes grants. It also attempts *unauthorized*
+/// foreign links (no grant) to witness the isolation guard firing. The authorization
+/// invariant — every cross-domain entry backed by a live grant — is checked after every
+/// step, so a breach surfaces here with the seed as the whole reproducer.
+pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
+    const DOMAINS: u16 = 2;
+    const GRANTS: u32 = 6;
+    const FRAMES: u32 = 8;
+    // Frame `d` is domain `d`'s L1 table; the rest are data frames to grant and map.
+    const TABLE0: u32 = 0;
+    const TABLE1: u32 = 1;
+    const FIRST_DATA: u32 = 2;
+
+    let mut hv = Hypervisor::new(DOMAINS as usize, 1, GRANTS as usize, 1, 1, FRAMES as usize);
+    // Stand up one L1 table per domain, and hand each data frame to an owner.
+    for (dom, table) in [(0u16, TABLE0), (1u16, TABLE1)] {
+        hv.dispatch(dom, HvCall::P2mAllocate { mfn: table })
+            .unwrap();
+        hv.dispatch(
+            dom,
+            HvCall::P2mPin {
+                mfn: table,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+    }
+    for mfn in FIRST_DATA..FRAMES {
+        let owner = (mfn % u32::from(DOMAINS)) as u16;
+        hv.dispatch(owner, HvCall::P2mAllocate { mfn }).unwrap();
+    }
+    let table_of = |dom: u16| if dom == 0 { TABLE0 } else { TABLE1 };
+
+    let mut rng = Prng::new(seed);
+    let mut grants: Vec<(u16, u32, u16, u32)> = Vec::new(); // (grantor, gref, grantee, frame)
+    let mut links: Vec<(u16, u32, u32)> = Vec::new(); // (linker, parent table, slot)
+    let mut out = ForeignOutcome {
+        invariants_hold: true,
+        ..ForeignOutcome::default()
+    };
+
+    for _ in 0..steps {
+        match rng.below(6) {
+            0 => {
+                // Grant a data frame to the *other* domain, so it can be foreign-mapped.
+                let frame = FIRST_DATA + rng.below(FRAMES - FIRST_DATA);
+                let grantor = (frame % u32::from(DOMAINS)) as u16;
+                let grantee = 1 - grantor;
+                let gref = rng.below(GRANTS);
+                if hv
+                    .dispatch(
+                        grantor,
+                        HvCall::GrantAccess {
+                            gref,
+                            grantee,
+                            frame,
+                            readonly: false,
+                        },
+                    )
+                    .is_ok()
+                {
+                    grants.push((grantor, gref, grantee, frame));
+                }
+            }
+            1 => {
+                // Revoke a grant. A refusal here is the seam blocking revocation while a
+                // foreign entry still relies on it (no grant *maps* exist in this run).
+                if !grants.is_empty() {
+                    let idx = rng.below(grants.len() as u32) as usize;
+                    let (grantor, gref, ..) = grants[idx];
+                    match hv.dispatch(grantor, HvCall::GrantEndAccess { gref }) {
+                        Ok(_) => {
+                            grants.swap_remove(idx);
+                        }
+                        Err(hv_core::HvError::Grant(grant::GrantError::InUse)) => {
+                            out.revoke_blocks += 1
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            2 | 3 => {
+                // Map a granted foreign frame into the grantee's table.
+                if !grants.is_empty() {
+                    let idx = rng.below(grants.len() as u32) as usize;
+                    let (_grantor, _gref, grantee, frame) = grants[idx];
+                    let parent = table_of(grantee);
+                    let slot = rng.below(8);
+                    if hv
+                        .dispatch(
+                            grantee,
+                            HvCall::P2mLink {
+                                parent,
+                                slot,
+                                child: frame,
+                            },
+                        )
+                        .is_ok()
+                    {
+                        out.links += 1;
+                        links.push((grantee, parent, slot));
+                    }
+                }
+            }
+            4 => {
+                // Unlink a live foreign entry.
+                if !links.is_empty() {
+                    let idx = rng.below(links.len() as u32) as usize;
+                    let (linker, parent, slot) = links.swap_remove(idx);
+                    let _ = hv.dispatch(linker, HvCall::P2mUnlink { parent, slot });
+                }
+            }
+            _ => {
+                // Attempt an *unauthorized* foreign link: map the other domain's data
+                // frame with no grant behind it. Witness the isolation guard.
+                let linker = rng.below(u32::from(DOMAINS)) as u16;
+                let foreign = 1 - linker;
+                let frame = FIRST_DATA + rng.below(FRAMES - FIRST_DATA);
+                if (frame % u32::from(DOMAINS)) as u16 == foreign {
+                    let slot = rng.below(8);
+                    if let Err(hv_core::HvError::Unauthorized) = hv.dispatch(
+                        linker,
+                        HvCall::P2mLink {
+                            parent: table_of(linker),
+                            slot,
+                            child: frame,
+                        },
+                    ) {
+                        out.unauthorized += 1;
+                    }
+                }
+            }
+        }
+        out.invariants_hold &= hv.invariants_hold();
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1896,5 +2054,51 @@ mod tests {
         ] {
             assert!(reached, "no seed ever produced a {name} — driver too weak");
         }
+    }
+
+    /// The cross-domain headline: no seeded interleaving of granting, foreign-mapping,
+    /// unlinking, and revoking ever leaves an unauthorized cross-domain page-table entry
+    /// standing — the isolation invariant holds after every step across the seed space.
+    #[test]
+    fn foreign_authorization_holds_across_many_seeds() {
+        for seed in 0..10_000u64 {
+            assert!(
+                run_foreign(seed, 256).invariants_hold,
+                "foreign-link authorization invariant violated on seed {seed}"
+            );
+        }
+    }
+
+    /// Seeded replay for the cross-domain driver: same seed, same observed counts exactly.
+    #[test]
+    fn foreign_same_seed_replays_identically() {
+        for seed in [0u64, 1, 42, 0xB0BA, u64::MAX] {
+            assert_eq!(
+                run_foreign(seed, 256),
+                run_foreign(seed, 256),
+                "seed {seed} was not reproducible"
+            );
+        }
+    }
+
+    /// The driver genuinely reaches each path across the seed space: some run installs a
+    /// live cross-domain entry, some run is refused for want of a grant, and some run
+    /// blocks a revoke because a foreign entry still relies on the grant. If any stayed
+    /// zero, the invariant above would be proving isolation over states never reached.
+    #[test]
+    fn foreign_reaches_authorized_unauthorized_and_revoke_block() {
+        let outcomes: Vec<_> = (0..256u64).map(|s| run_foreign(s, 256)).collect();
+        assert!(
+            outcomes.iter().any(|o| o.links > 0),
+            "no seed ever installed a cross-domain entry — driver too weak"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.unauthorized > 0),
+            "no seed ever hit the unauthorized refusal — the isolation guard is uncovered"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.revoke_blocks > 0),
+            "no seed ever blocked a revoke under a live foreign entry — path uncovered"
+        );
     }
 }

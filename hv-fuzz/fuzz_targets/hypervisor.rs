@@ -15,12 +15,14 @@
 //! `EvtchnSend`/`EvtchnUnmask`/`SchedBlock` route through the event↔scheduler seam, so a
 //! *lost wakeup* is caught here too. `P2mLink`/`P2mUnlink` build and dismantle multi-level
 //! page tables, so a *mislevelled* entry (a table pointing at a frame of the wrong level)
-//! is caught by the same invariant. `DomainDestroy` is the whole-domain teardown that
-//! welds all four subsystems and both seams at once — refused when a foreign domain holds
-//! a live map, tearing the domain to an empty shell otherwise — so a mis-ordered teardown
-//! trips the same combined invariant. The seeded mirrors in `hv-sim` (`run_hypervisor`
-//! broadly, `run_seam` wake-biased, `run_ptab` tree-building, `run_destroy` teardown-biased)
-//! make the properties deterministic.
+//! is caught by the same invariant — and `P2mLink` onto a frame another domain owns routes
+//! through the page-table↔grant authorization seam, so an *unauthorized* cross-domain entry
+//! is caught too. `DomainDestroy` is the whole-domain teardown that welds every subsystem
+//! and seam at once — refused when a foreign domain holds a live map, tearing the domain to
+//! an empty shell otherwise — so a mis-ordered teardown trips the same combined invariant.
+//! The seeded mirrors in `hv-sim` (`run_hypervisor` broadly, `run_seam` wake-biased,
+//! `run_ptab` tree-building, `run_foreign` cross-domain, `run_destroy` teardown-biased) make
+//! the properties deterministic.
 //!
 //! Run it (needs nightly + `cargo install cargo-fuzz`):
 //!

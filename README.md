@@ -232,7 +232,27 @@ one-line regression test, not a Heisenbug.
   representable. Holds across 10k seeds (`run_ptab` builds L4→L3→L2→L1→leaf trees and tears
   them down, reaching every level), is fuzzed through the integrated target, and folds
   into domain teardown (which unlinks a domain's whole tree before reclaiming its frames).
-  Cross-domain shared page tables are deferred.
+- **Cross-domain shared page tables** *(landed)*: a domain may now map a frame **another
+  domain owns** into its own page table — the mechanism behind shared page tables and
+  foreign memory mappings. Relaxing the ownership check quietly removes *isolation*, so the
+  real content is a new checked invariant that replaces it: `p2m::link` now permits a
+  foreign child (enforcing only the type discipline — the foreign frame is kept alive and
+  write-locked, so its owner can neither free nor re-type it while the entry maps it), and
+  the dispatch seam adds the **authorization** it is blind to. A cross-domain entry is
+  allowed only when the frame's owner has granted it read-write to the mapping domain
+  (`grant::authorizes`) — Xen's grant-mapped foreign page — and is restricted to `L1`
+  leaves (sharing a page-table *node* is deferred). A grant can't be revoked while a
+  foreign entry relies on it (the frame is in use), and the new cross-subsystem invariant
+  **every cross-domain entry is backed by a live read-write grant**
+  (`CrossViolation::UnauthorizedForeignLink`) is checked after every dispatch — the
+  page-table↔grant join, the core's *third* cross-subsystem seam. It extends domain
+  teardown too: a domain whose frame is foreign-mapped can't be destroyed
+  (`has_foreign_link_into`, the page-table cousin of the foreign-grant-map precondition),
+  while a mapper's own foreign entries are released by the existing `unlink_all`. Holds
+  across 10k seeds (`run_foreign` grants, maps, unlinks, and revokes across the domain
+  boundary, reaching the authorized, unauthorized, and revoke-blocked paths) and is fuzzed
+  through the integrated target. Read-only foreign leaves and shared page-table nodes
+  deferred.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into
