@@ -4,8 +4,9 @@
 //! Fuzz the page-type accounting state machine.
 //!
 //! The input byte stream is decoded into a sequence of allocate/get/put/get_type/
-//! put_type/free operations over a small fixed frame table; live typed references are
-//! tracked so put_type targets a type the frame actually holds. After every transition
+//! put_type/pin/unpin/free operations over a small fixed frame table; live typed
+//! references are tracked so put_type targets a type the frame actually holds. After
+//! every transition
 //! the whole-system invariants are checked — reference coherence, owner integrity, and
 //! above all that no frame is ever referenced as writable and as a page table at once
 //! (the type-confusion this module exists to prevent, the shape of Xen's `PGT_*`
@@ -42,7 +43,7 @@ fuzz_target!(|data: &[u8]| {
             PageType::PageTable
         };
 
-        match op % 7 {
+        match op % 9 {
             0 => {
                 let _ = sys.allocate(owner, mfn);
             }
@@ -62,6 +63,12 @@ fuzz_target!(|data: &[u8]| {
                     let (m, t) = typed.swap_remove(usize::from(a) % typed.len());
                     let _ = sys.put_type(m, t);
                 }
+            }
+            6 => {
+                let _ = sys.pin(owner, mfn);
+            }
+            7 => {
+                let _ = sys.unpin(owner, mfn);
             }
             _ => {
                 let _ = sys.free(owner, mfn);

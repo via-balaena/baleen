@@ -335,6 +335,8 @@ pub struct P2mOutcome {
     pub writable_typed: u32,
     /// Frames currently typed as a page table.
     pub pagetable_typed: u32,
+    /// Frames currently pinned as a page table.
+    pub pinned: u32,
     /// Total existence references across all allocated frames.
     pub total_refs: u64,
     /// Whether the system's invariants hold at the end — asserted in release too.
@@ -353,6 +355,9 @@ impl P2mOutcome {
                     Some(PageType::PageTable) => o.pagetable_typed += 1,
                     None => {}
                 }
+                if sys.is_pinned(mfn) {
+                    o.pinned += 1;
+                }
             }
         }
         o.invariants_hold = sys.invariants_hold();
@@ -361,12 +366,12 @@ impl P2mOutcome {
 }
 
 /// Drive the page-type [`p2m::System`] through a seed-derived stream of allocate / get
-/// / put / get_type / put_type / free operations across a few domains and frames,
-/// tracking live typed references so put_type targets a type the frame actually holds.
-/// Same discipline as the others: the core's `debug_assert!` fires on every transition,
-/// so a broken writable-xor-pagetable exclusivity surfaces here with the seed as the
-/// whole reproducer. This is where a page racing between writable and page-table use —
-/// the shape of Xen's `PGT_*` typecount XSAs — is stress-tested.
+/// / put / get_type / put_type / pin / unpin / free operations across a few domains and
+/// frames, tracking live typed references so put_type targets a type the frame actually
+/// holds. Same discipline as the others: the core's `debug_assert!` fires on every
+/// transition, so a broken writable-xor-pagetable exclusivity surfaces here with the
+/// seed as the whole reproducer. This is where a page racing between writable and
+/// page-table use — the shape of Xen's `PGT_*` typecount XSAs — is stress-tested.
 pub fn run_p2m(seed: u64, steps: u32) -> P2mOutcome {
     const DOMAINS: u16 = 3;
     const FRAMES: u32 = 6;
@@ -378,7 +383,7 @@ pub fn run_p2m(seed: u64, steps: u32) -> P2mOutcome {
     for _ in 0..steps {
         let owner = rng.below(u32::from(DOMAINS)) as u16;
         let mfn = rng.below(FRAMES);
-        match rng.below(7) {
+        match rng.below(9) {
             0 => {
                 let _ = sys.allocate(owner, mfn);
             }
@@ -404,6 +409,12 @@ pub fn run_p2m(seed: u64, steps: u32) -> P2mOutcome {
                     let (m, ty) = typed.swap_remove(idx);
                     let _ = sys.put_type(m, ty);
                 }
+            }
+            6 => {
+                let _ = sys.pin(owner, mfn);
+            }
+            7 => {
+                let _ = sys.unpin(owner, mfn);
             }
             _ => {
                 let _ = sys.free(owner, mfn);
@@ -614,6 +625,8 @@ pub struct HvSummary {
     pub allocated_frames: u32,
     /// Machine frames currently carrying a type (writable or page table).
     pub typed_frames: u32,
+    /// Machine frames currently pinned as a page table.
+    pub pinned_frames: u32,
     /// Whether every subsystem's invariants hold at the end.
     pub invariants_hold: bool,
 }
@@ -659,6 +672,9 @@ impl HvSummary {
                 s.allocated_frames += 1;
                 if p.current_type(mfn).is_some() {
                     s.typed_frames += 1;
+                }
+                if p.is_pinned(mfn) {
+                    s.pinned_frames += 1;
                 }
             }
         }
@@ -706,7 +722,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         let pcpu = rng.below(PCPUS);
         let mfn = rng.below(FRAMES);
 
-        match rng.below(23) {
+        match rng.below(25) {
             0 => drop_ok(hv.dispatch(
                 caller,
                 HvCall::CreditGrant {
@@ -824,7 +840,9 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
             19 => drop_ok(hv.dispatch(caller, HvCall::SchedWake { vcpu })),
             20 => drop_ok(hv.dispatch(caller, HvCall::SchedOffline { vcpu, now })),
             21 => drop_ok(hv.dispatch(caller, HvCall::P2mAllocate { mfn })),
-            _ => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
+            22 => drop_ok(hv.dispatch(caller, HvCall::P2mFree { mfn })),
+            23 => drop_ok(hv.dispatch(caller, HvCall::P2mPin { mfn })),
+            _ => drop_ok(hv.dispatch(caller, HvCall::P2mUnpin { mfn })),
         }
     }
 
@@ -1050,18 +1068,22 @@ mod tests {
     }
 
     /// The generator actually reaches typed frames of *both* kinds across the seed
-    /// space — the exclusivity invariant only means something once frames are being
-    /// pinned as writable and as page tables.
+    /// space, and pins some — the exclusivity invariant only means something once
+    /// frames are being taken writable, taken as page tables, and pinned.
     #[test]
     fn p2m_seeds_reach_both_types() {
         let outcomes: Vec<_> = (0..256u64).map(|s| run_p2m(s, 256)).collect();
         assert!(
             outcomes.iter().any(|o| o.writable_typed > 0),
-            "no seed ever pinned a frame writable — generator too weak"
+            "no seed ever typed a frame writable — generator too weak"
         );
         assert!(
             outcomes.iter().any(|o| o.pagetable_typed > 0),
-            "no seed ever pinned a frame as a page table — generator too weak"
+            "no seed ever typed a frame as a page table — generator too weak"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.pinned > 0),
+            "no seed ever pinned a frame — generator too weak"
         );
     }
 
@@ -1227,6 +1249,12 @@ mod tests {
         assert!(
             summaries.iter().any(|s| s.typed_frames > 0),
             "no seed pinned a frame's type via a writable grant map"
+        );
+        // Page-table typing arrives only through pin (MMUEXT_PIN_TABLE) — reaching it
+        // proves the guest can now produce the *other* half of the write-xor conflict.
+        assert!(
+            summaries.iter().any(|s| s.pinned_frames > 0),
+            "no seed pinned a frame as a page table"
         );
     }
 }

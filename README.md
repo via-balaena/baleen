@@ -167,6 +167,18 @@ one-line regression test, not a Heisenbug.
   invariant — every live mapping is owned and backed by matching references — is
   debug-asserted after every dispatch and holds across 10k seeds. Subsystems stay pure
   and mutually ignorant; the `Hypervisor` owns the join.
+- **Page-table pin/unpin** *(landed)*: `P2mPin`/`P2mUnpin` (Xen's `MMUEXT_PIN_TABLE`) —
+  the operation that turns one of a domain's own frames into a page table, holding a
+  persistent page-table type reference until unpinned. This is what finally makes the
+  **write-xor-pagetable** invariant reachable end-to-end through the dispatch seam: pin a
+  frame, and a foreign domain's *writable* grant map of it is refused (`TypePinned`) with
+  the grant map rolled back; conversely a writably-mapped frame cannot be pinned — so a
+  page is never a page table and writable at once, the exact escape (guest forges a PTE)
+  the whole `p2m` module exists to prevent. Unlike the raw type primitives, pin/unpin are
+  guest-facing and *sound*: owner-gated, and balanced by a pin bit (unpin proves a prior
+  pin), the second consumer of the "release gated on proof of acquire" discipline. This
+  completes the page-type foundation — both halves of the exclusivity are now produced by
+  real guest operations and exercised across the seed space and fuzzers.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

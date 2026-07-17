@@ -50,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
         let mfn = u32::from(a) % FRAMES as u32;
         now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 23 {
+        let call = match op % 25 {
             0 => HvCall::CreditGrant { amount: u32::from(a) },
             1 => HvCall::CreditSpend { amount: u32::from(a) },
             2 => HvCall::EvtchnAllocUnbound { remote: other },
@@ -88,7 +88,9 @@ fuzz_target!(|data: &[u8]| {
             19 => HvCall::SchedWake { vcpu },
             20 => HvCall::SchedOffline { vcpu, now },
             21 => HvCall::P2mAllocate { mfn },
-            _ => HvCall::P2mFree { mfn },
+            22 => HvCall::P2mFree { mfn },
+            23 => HvCall::P2mPin { mfn },
+            _ => HvCall::P2mUnpin { mfn },
         };
 
         let _ = hv.dispatch(caller, call);
