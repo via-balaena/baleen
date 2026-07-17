@@ -238,17 +238,30 @@ impl System {
     /// the target is the peer; for an IPI it is the port itself. `Unbound`, `Virq`,
     /// and `Free` ports cannot be sent by a guest.
     pub fn send(&mut self, dom: DomId, port: Port) -> Result<(), EvtchnError> {
-        let (target_dom, target_port) = match self.chan(dom, port)?.state {
-            PortState::Interdomain {
-                remote,
-                remote_port,
-            } => (remote, remote_port),
-            PortState::Ipi { .. } => (dom, port),
-            _ => return Err(EvtchnError::WrongState),
-        };
+        // Validate the source ids with precise errors first, then resolve the target
+        // from its state — the same rule [`Self::send_target`] exposes to the seam.
+        self.chan(dom, port)?;
+        let (target_dom, target_port) =
+            self.send_target(dom, port).ok_or(EvtchnError::WrongState)?;
         self.chan_mut(target_dom, target_port).unwrap().pending = true;
         self.check_invariants();
         Ok(())
+    }
+
+    /// The `(dom, port)` a [`Self::send`] on this port would signal: the peer for an
+    /// `Interdomain` port, the port itself for an `Ipi`. `None` for a port a guest
+    /// cannot send on (`Unbound`, `Virq`, `Free`) — the same states `send` rejects
+    /// with `WrongState`. The single source of the target rule, shared by `send` and
+    /// read by [`crate::Hypervisor`] so a signal can wake whoever it just made pending.
+    pub fn send_target(&self, dom: DomId, port: Port) -> Option<(DomId, Port)> {
+        match self.chan(dom, port).ok()?.state {
+            PortState::Interdomain {
+                remote,
+                remote_port,
+            } => Some((remote, remote_port)),
+            PortState::Ipi { .. } => Some((dom, port)),
+            _ => None,
+        }
     }
 
     /// Mask a bound port (suppresses delivery, not the pending bit).

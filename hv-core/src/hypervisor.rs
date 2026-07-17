@@ -162,9 +162,10 @@ pub enum HvError {
     StaleGrant,
 }
 
-/// A breach of a *cross-subsystem* invariant — one that relates grant tables to the
-/// page-type counts and so belongs to neither subsystem alone. This is the seam's own
-/// safety net: it catches a grant mapping that the page-type accounting is not backing.
+/// A breach of a *cross-subsystem* invariant — one that relates two subsystems and so
+/// belongs to neither alone. This is the seams' own safety net, spanning both joins the
+/// `Hypervisor` owns: grant tables ↔ page-type accounting, and event channels ↔ the
+/// scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossViolation {
     /// A grant with live mappings whose frame is not backed by matching page
@@ -175,6 +176,11 @@ pub enum CrossViolation {
     /// A grant with live mappings whose frame is no longer owned by the grantor — the
     /// confused-deputy shape (a stale grant that slipped past the map-time owner check).
     MisownedGrantMap { grantor: DomId, gref: GrantRef },
+    /// A vCPU left `Blocked` while a *deliverable* (pending, unmasked) event
+    /// notify-targets it — the lost-wakeup shape the event→scheduler seam exists to
+    /// prevent. No future signal edge will wake a vCPU that is already asleep with the
+    /// pending bit set, so the event would never be observed.
+    LostWakeup { dom: DomId, vcpu: Vcpu },
 }
 
 /// The integrated hypervisor core: per-domain credit plus the whole-system subsystems,
@@ -214,14 +220,15 @@ impl Hypervisor {
     /// the acting domain throughout. Errors are the subsystem's own, tagged.
     ///
     /// Each subsystem re-establishes its own invariant inside every transition; this
-    /// wrapper adds the one check no single subsystem can make — that the grant↔page-type
-    /// seam is still consistent after the call. Like the rest, it is a `debug_assert!`,
-    /// so it costs nothing on the metal yet fires on every simulated interleaving.
+    /// wrapper adds the checks no single subsystem can make — that both cross-subsystem
+    /// seams are still consistent after the call (grant↔page-type, and event↔scheduler).
+    /// Like the rest, it is a `debug_assert!`, so it costs nothing on the metal yet fires
+    /// on every simulated interleaving.
     pub fn dispatch(&mut self, caller: DomId, call: HvCall) -> Result<HvOutcome, HvError> {
         let outcome = self.route(caller, call);
         debug_assert!(
             self.first_cross_violation().is_none(),
-            "grant↔page-type cross-invariant violated after dispatch: {:?}",
+            "cross-subsystem invariant violated after dispatch: {:?}",
             self.first_cross_violation()
         );
         outcome
@@ -268,21 +275,13 @@ impl Hypervisor {
                 .close(caller, port)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Evtchn),
-            HvCall::EvtchnSend { port } => self
-                .evtchn
-                .send(caller, port)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::Evtchn),
+            HvCall::EvtchnSend { port } => self.evtchn_send(caller, port),
             HvCall::EvtchnMask { port } => self
                 .evtchn
                 .mask(caller, port)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Evtchn),
-            HvCall::EvtchnUnmask { port } => self
-                .evtchn
-                .unmask(caller, port)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::Evtchn),
+            HvCall::EvtchnUnmask { port } => self.evtchn_unmask(caller, port),
             HvCall::EvtchnConsume { port } => self
                 .evtchn
                 .consume(caller, port)
@@ -335,11 +334,7 @@ impl Hypervisor {
                 .preempt(caller, vcpu, now)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Sched),
-            HvCall::SchedBlock { vcpu, now } => self
-                .sched
-                .block(caller, vcpu, now)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::Sched),
+            HvCall::SchedBlock { vcpu, now } => self.sched_block(caller, vcpu, now),
             HvCall::SchedWake { vcpu } => self
                 .sched
                 .wake(caller, vcpu)
@@ -440,11 +435,81 @@ impl Hypervisor {
         Ok(HvOutcome::Done)
     }
 
-    /// The first grant↔page-type cross-invariant breach, or `None` if the seam is
-    /// consistent. For every grant with live mappings, the frame it offers must be
+    /// Signal a port, then wake its target if the signal made it deliverable — the
+    /// event→scheduler half of the seam. `evtchn::send` sets the pending bit on the
+    /// port's *target* (the peer for an interdomain port, the port itself for an IPI);
+    /// if that target is now deliverable, the vCPU it notify-targets must not stay
+    /// `Blocked`. A *masked* target is pending but not deliverable, so its wake is
+    /// deferred to the later [`Self::evtchn_unmask`].
+    fn evtchn_send(&mut self, caller: DomId, port: Port) -> Result<HvOutcome, HvError> {
+        self.evtchn.send(caller, port).map_err(HvError::Evtchn)?;
+        // `send` leaves the source port's state untouched, so its target is unchanged;
+        // resolve it now to find whose pending bit was just set, and wake if deliverable.
+        if let Some((tdom, tport)) = self.evtchn.send_target(caller, port) {
+            self.wake_if_deliverable(tdom, tport);
+        }
+        Ok(HvOutcome::Done)
+    }
+
+    /// Unmask a port, then deliver the wake it may have deferred. Unmasking an
+    /// already-pending port is the *other* edge into deliverability (besides `send`):
+    /// a vCPU that blocked while this port was pending-but-masked is stranded until the
+    /// unmask, so the unmask must wake it.
+    fn evtchn_unmask(&mut self, caller: DomId, port: Port) -> Result<HvOutcome, HvError> {
+        self.evtchn.unmask(caller, port).map_err(HvError::Evtchn)?;
+        self.wake_if_deliverable(caller, port);
+        Ok(HvOutcome::Done)
+    }
+
+    /// Wake the vCPU that port `(dom, port)` notify-targets, if the port is deliverable
+    /// now and that vCPU is `Blocked`. The scheduler half of event delivery: a signal
+    /// that makes a port deliverable must not leave its target asleep. Only a `Blocked`
+    /// target is a lost wakeup — `sched::wake` rejects any other state, which we ignore;
+    /// *injecting* the interrupt into an already-running vCPU is the HAL's job, past the
+    /// fence. The core moves the scheduler; the metal does the upcall.
+    fn wake_if_deliverable(&mut self, dom: DomId, port: Port) {
+        if self.evtchn.deliverable(dom, port) {
+            if let Some(vcpu) = self.evtchn.notify_target(dom, port) {
+                let _ = self.sched.wake(dom, vcpu);
+            }
+        }
+    }
+
+    /// Block a vCPU — unless it already has work waiting. The scheduler→event half of
+    /// the seam: if a deliverable event already notify-targets this vCPU, blocking it
+    /// would strand that event (no future signal edge wakes an already-asleep vCPU), so
+    /// the block is a no-op and the vCPU keeps running. This is Xen's `SCHEDOP_block`
+    /// re-check, and it is the second half of maintaining "no deliverable event rests on
+    /// a `Blocked` vCPU": `evtchn_send`/`evtchn_unmask` keep it true from the event side,
+    /// this keeps it true from the scheduler side. Only a `Runnable`/`Running` vCPU — one
+    /// the block would otherwise accept — short-circuits; a bad id or an
+    /// `Offline`/`Blocked` vCPU still gets the scheduler's own precise error.
+    fn sched_block(&mut self, caller: DomId, vcpu: Vcpu, now: Ticks) -> Result<HvOutcome, HvError> {
+        match self.sched.state_of(caller, vcpu) {
+            Some(sched::RunState::Running { .. }) | Some(sched::RunState::Runnable)
+                if self.evtchn.has_deliverable_for(caller, vcpu) =>
+            {
+                Ok(HvOutcome::Done)
+            }
+            _ => self
+                .sched
+                .block(caller, vcpu, now)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
+        }
+    }
+
+    /// The first cross-subsystem invariant breach, or `None` if both seams are
+    /// consistent.
+    ///
+    /// Grant↔page-type: for every grant with live mappings, the frame it offers must be
     /// owned by the grantor and carry at least as many existence references as it has
     /// mappings, and at least as many writable-type references as it has writable
     /// mappings — so no mapping outlives, or out-types, its backing.
+    ///
+    /// Event↔scheduler: no deliverable (pending, unmasked) event may rest on a `Blocked`
+    /// vCPU — a signal that made a port deliverable must have woken the vCPU it
+    /// notify-targets, so a still-`Blocked` target is a lost wakeup.
     pub fn first_cross_violation(&self) -> Option<CrossViolation> {
         for grantor in 0..self.grant.domain_count() as DomId {
             for gref in 0..self.grant.entry_count(grantor) as GrantRef {
@@ -462,6 +527,19 @@ impl Hypervisor {
                 let writable_refs = self.p2m.type_refs(frame, PageType::Writable).unwrap_or(0);
                 if refs < maps || writable_refs < writable_maps {
                     return Some(CrossViolation::UnbackedGrantMap { grantor, gref });
+                }
+            }
+        }
+        // Event↔scheduler: a deliverable event must never rest on a `Blocked` vCPU.
+        for dom in 0..self.evtchn.domain_count() as DomId {
+            for port in 0..self.evtchn.port_count(dom) as Port {
+                if !self.evtchn.deliverable(dom, port) {
+                    continue;
+                }
+                if let Some(vcpu) = self.evtchn.notify_target(dom, port) {
+                    if self.sched.state_of(dom, vcpu) == Some(sched::RunState::Blocked) {
+                        return Some(CrossViolation::LostWakeup { dom, vcpu });
+                    }
                 }
             }
         }
@@ -871,6 +949,126 @@ mod tests {
         // allocation is freeable straight away.)
         assert!(h.dispatch(1, HvCall::P2mFree { mfn: 3 }).is_ok());
         assert!(!h.p2m().is_allocated(3));
+        assert!(h.invariants_hold());
+    }
+
+    // Bind an interdomain channel and block the receiver's vCPU, returning the
+    // (receiver_dom, receiver_port, sender_dom, sender_port) needed to signal it. The
+    // receiver here is domain 1, vCPU 0 (the interdomain notify-target default).
+    fn blocked_interdomain_receiver(h: &mut Hypervisor) -> (u16, Port, u16, Port) {
+        let unbound = match h.dispatch(1, HvCall::EvtchnAllocUnbound { remote: 0 }) {
+            Ok(HvOutcome::Port(p)) => p,
+            other => panic!("expected a port, got {other:?}"),
+        };
+        let local = match h.dispatch(
+            0,
+            HvCall::EvtchnBindInterdomain {
+                remote: 1,
+                remote_port: unbound,
+            },
+        ) {
+            Ok(HvOutcome::Port(p)) => p,
+            other => panic!("expected a port, got {other:?}"),
+        };
+        h.dispatch(1, HvCall::SchedAdmit { vcpu: 0 }).unwrap();
+        h.dispatch(1, HvCall::SchedBlock { vcpu: 0, now: 10 })
+            .unwrap();
+        assert_eq!(h.sched().state_of(1, 0), Some(sched::RunState::Blocked));
+        (1, unbound, 0, local)
+    }
+
+    #[test]
+    fn a_send_wakes_a_blocked_interdomain_peer() {
+        let mut h = hv();
+        let (rdom, _rport, sdom, sport) = blocked_interdomain_receiver(&mut h);
+        // The sender signals; the peer goes deliverable, so the blocked receiver vCPU
+        // must be woken to Runnable — the lost-wakeup gap, now closed at the seam.
+        h.dispatch(sdom, HvCall::EvtchnSend { port: sport })
+            .unwrap();
+        assert_eq!(h.sched().state_of(rdom, 0), Some(sched::RunState::Runnable));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn an_ipi_send_wakes_its_bound_vcpu() {
+        let mut h = hv();
+        // Domain 0 binds an IPI port to vCPU 1, which then blocks.
+        let p = match h.dispatch(0, HvCall::EvtchnBindIpi { vcpu: 1 }) {
+            Ok(HvOutcome::Port(p)) => p,
+            other => panic!("expected a port, got {other:?}"),
+        };
+        h.dispatch(0, HvCall::SchedAdmit { vcpu: 1 }).unwrap();
+        h.dispatch(0, HvCall::SchedBlock { vcpu: 1, now: 5 })
+            .unwrap();
+        assert_eq!(h.sched().state_of(0, 1), Some(sched::RunState::Blocked));
+        // The IPI targets its bound vCPU, so sending it wakes vCPU 1 specifically.
+        h.dispatch(0, HvCall::EvtchnSend { port: p }).unwrap();
+        assert_eq!(h.sched().state_of(0, 1), Some(sched::RunState::Runnable));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_masked_send_defers_the_wake_until_unmask() {
+        let mut h = hv();
+        let p = match h.dispatch(0, HvCall::EvtchnBindIpi { vcpu: 1 }) {
+            Ok(HvOutcome::Port(p)) => p,
+            other => panic!("expected a port, got {other:?}"),
+        };
+        // Mask the port, then signal it: pending is set but the event is not
+        // deliverable, so blocking vCPU 1 is legal and it stays asleep.
+        h.dispatch(0, HvCall::EvtchnMask { port: p }).unwrap();
+        h.dispatch(0, HvCall::SchedAdmit { vcpu: 1 }).unwrap();
+        h.dispatch(0, HvCall::EvtchnSend { port: p }).unwrap();
+        h.dispatch(0, HvCall::SchedBlock { vcpu: 1, now: 5 })
+            .unwrap();
+        assert_eq!(
+            h.sched().state_of(0, 1),
+            Some(sched::RunState::Blocked),
+            "a masked (undeliverable) event must not wake, and must permit the block"
+        );
+        assert!(h.invariants_hold());
+        // Unmasking is the deferred deliverable edge — it must now wake vCPU 1.
+        h.dispatch(0, HvCall::EvtchnUnmask { port: p }).unwrap();
+        assert_eq!(h.sched().state_of(0, 1), Some(sched::RunState::Runnable));
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn blocking_with_a_deliverable_event_pending_is_a_noop() {
+        let mut h = hv();
+        // Domain 0's vCPU 1 has an IPI port and is running on a physical CPU.
+        let p = match h.dispatch(0, HvCall::EvtchnBindIpi { vcpu: 1 }) {
+            Ok(HvOutcome::Port(p)) => p,
+            other => panic!("expected a port, got {other:?}"),
+        };
+        h.dispatch(0, HvCall::SchedAdmit { vcpu: 1 }).unwrap();
+        h.dispatch(
+            0,
+            HvCall::SchedRun {
+                vcpu: 1,
+                pcpu: 0,
+                now: 100,
+            },
+        )
+        .unwrap();
+        // Signal it while it runs — a running vCPU is not a lost wakeup (delivery to it
+        // is the HAL's job), so nothing changes but the pending bit.
+        h.dispatch(0, HvCall::EvtchnSend { port: p }).unwrap();
+        assert!(h.evtchn().deliverable(0, p));
+        assert_eq!(
+            h.sched().state_of(0, 1),
+            Some(sched::RunState::Running { pcpu: 0 })
+        );
+        // Now it tries to block with that event already deliverable: the block is a
+        // no-op (Xen's SCHEDOP_block re-check), so it keeps running rather than sleeping
+        // on work it already has — the block-race half of the invariant.
+        h.dispatch(0, HvCall::SchedBlock { vcpu: 1, now: 130 })
+            .unwrap();
+        assert_eq!(
+            h.sched().state_of(0, 1),
+            Some(sched::RunState::Running { pcpu: 0 }),
+            "a vCPU with a deliverable event must not block onto it"
+        );
         assert!(h.invariants_hold());
     }
 
