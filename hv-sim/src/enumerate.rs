@@ -233,6 +233,10 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
             }
         }
         if cfg.destroy {
+            // Every (caller, target) pair — so both the authority-denied path (an
+            // unprivileged caller destroying a peer, a no-op) and the authorized path
+            // (dom0 or a self-destroy) are exhaustively explored. Domain 0 is privileged
+            // in the enumerated `Hypervisor`, as it boots.
             for target in 0..doms {
                 v.push((caller, HvCall::DomainDestroy { target, now: NOW }));
             }

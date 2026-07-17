@@ -220,8 +220,24 @@ whole integrated core to depth 5 ≈ 1.40M) with zero violations.
   occupancy, a freed foreign-mapped frame trips the grant↔page-type seam, a deliverable
   event on an offlined vCPU trips lost-wakeup. Holds across 10k seeds (`run_destroy`
   builds domains up and tears them down mid-flight, reaching both the busy-refusal and
-  clean-teardown paths) and is fuzzed through the integrated target. Privilege and
-  domain-ID reuse are deferred (no domain *creation* yet).
+  clean-teardown paths) and is fuzzed through the integrated target.
+- **Privilege model** *(landed)*: the authority floor beneath teardown. `DomainDestroy`
+  had no authority check — *any* domain could destroy *any* other, a hole under every
+  memory-isolation invariant. Introduce **authority** as the third axis after *ownership*
+  (a domain acts on its own resources) and *consent* (grants authorize cross-domain
+  memory): a per-domain privileged bit (domain 0 boots privileged, as Xen's dom0 does),
+  and a gate checked *first* in `domain_destroy` — a domain may tear *itself* down, but
+  destroying a peer requires being a control domain, else `HvError::Denied`, a true no-op.
+  It lives at the dispatch seam because only the integrated core sees both the acting
+  caller and the target. Authorization is a transition *guard*, not a state predicate (an
+  unprivileged peer-destroy would leave a valid state — the point is it must never
+  *happen*), so its correctness is "denies/allows correctly, and a denial mutates nothing":
+  unit-tested, driven by `run_destroy` (which now predicts and checks the authority outcome
+  and witnesses the denied path), and model-checked — the grant↔p2m depth-7 sweep still
+  closes at exactly 1,143,997 states (the gate adds no reachable states and every denied
+  destroy is invariant-preserving). A finer capability model (A may control specifically B)
+  and delegable/mutable privilege are deferred; domain *creation* / ID reuse remains the
+  natural next lifecycle step, now with an authority floor to stand on.
 - **Multi-level page tables** *(landed)*: deepen `p2m` from a single page-table type into
   the full four-level hierarchy (Xen's `PGT_l1..l4`). A page-table type now carries its
   paging **level**, and the write-xor invariant generalizes to per-level exclusivity: a
