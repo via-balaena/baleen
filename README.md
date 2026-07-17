@@ -146,12 +146,27 @@ one-line regression test, not a Heisenbug.
   reference is live and vice-versa, so a frame is never usable as both writable memory
   and a page table at once (the exact shape of the `PGT_*` typecount bugs that let a
   guest forge a PTE and escape). Reference coherence (typed ≤ total) and owner
-  integrity ride alongside; a frame can only be freed once nothing references it.
-  Joined the one `HvCall` seam, folded into the integrated `invariants_hold()`,
-  property-tested (`hv-core`), seeded-simulated (`hv-sim`), and fuzzed (`hv-fuzz`) —
-  the seventh fuzz target. This brings `hv-core`'s pure brain to **four** whole-system
-  state machines, credit accounting, and a scheduling policy over them — all green on
-  a laptop before any hardware exists.
+  integrity ride alongside; a frame can only be freed once nothing references it. The
+  reference-moving primitives are *internal* — the guest-facing surface is only allocate
+  and free, because a raw "drop a reference" hypercall would let one domain release a
+  reference another holds; every acquire is balanced by exactly one release, gated on
+  proof of the acquire, which is how a scalar count stays sound (as in Xen). Folded into
+  the integrated `invariants_hold()`, property-tested (`hv-core`), seeded-simulated
+  (`hv-sim`), and fuzzed (`hv-fuzz`) — the seventh fuzz target. This brings `hv-core`'s
+  pure brain to **four** whole-system state machines, credit accounting, and a
+  scheduling policy over them — all green on a laptop before any hardware exists.
+- **Grant ↔ page-type seam** *(landed)*: the first invariant that spans *two*
+  subsystems. Grant tables and page-type accounting describe the same physical pages,
+  so a grant map now takes a real page reference through the seam — a **writable** map
+  pins the frame's writable type (it can never simultaneously be a page table); a
+  **read-only** map takes an existence reference only (a reader is type-agnostic). This
+  closes the gap *between* the subsystems: the owner can no longer free or re-type a
+  frame while a foreign domain maps it — the cross-domain use-after-free / type-confusion
+  XSA shape. A stale grant (frame freed and reallocated after granting) is refused at map
+  time by re-checking ownership, closing a confused-deputy hole. A cross-subsystem
+  invariant — every live mapping is owned and backed by matching references — is
+  debug-asserted after every dispatch and holds across 10k seeds. Subsystems stay pure
+  and mutually ignorant; the `Hypervisor` owns the join.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one.
 - **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into

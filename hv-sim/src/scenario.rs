@@ -668,9 +668,11 @@ impl HvSummary {
 }
 
 /// Drive the whole integrated [`Hypervisor`] through a seed-derived stream of typed
-/// hypercalls across all three subsystems, tracking live grant handles so unmaps go
-/// to their owners. One loop exercises credit, event channels, and grant tables
-/// through the single dispatch seam; one invariant check covers the lot.
+/// hypercalls across all four subsystems, tracking live grants and handles so maps and
+/// unmaps target real grants and their owners. One loop exercises credit, event
+/// channels, grant tables, and page-type accounting through the single dispatch seam —
+/// grants target real machine frames, so grant maps take page references and the
+/// grant↔page-type cross-invariant is exercised too; one check covers the lot.
 pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
     const DOMAINS: u16 = 3;
     const PORTS: u32 = 8;
@@ -690,6 +692,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
     let mut rng = Prng::new(seed);
     let clock = ManualClock::new();
     let mut handles: Vec<(u16, u32)> = Vec::new(); // (grantee/owner, handle) of live maps
+    let mut grants: Vec<(u16, u32, u16, bool)> = Vec::new(); // (grantor, gref, grantee, readonly)
 
     for _ in 0..steps {
         // Crank the clock so scheduler run/preempt intervals span seed-derived gaps.
@@ -751,33 +754,49 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
             }
             9 => drop_ok(hv.dispatch(caller, HvCall::EvtchnConsume { port })),
             10 => {
+                // Build a *mappable* grant: the grantor owns the frame it grants
+                // (allocate it first, best-effort), so a later map can take a real page
+                // reference through the seam. Record it so the map arm can target it as
+                // the right grantee — otherwise a random (grantor, gref) almost never
+                // names a live grant and the coupled path is never exercised.
+                let frame = mfn;
+                let _ = hv.dispatch(caller, HvCall::P2mAllocate { mfn: frame });
                 let grantee = rng.below(u32::from(DOMAINS)) as u16;
-                drop_ok(hv.dispatch(
-                    caller,
-                    HvCall::GrantAccess {
-                        gref,
-                        grantee,
-                        // Grant a real machine frame (the caller must own it for a map
-                        // to take, so grants target the shared p2m frame set), coupling
-                        // the grant and page-type subsystems through the seam.
-                        frame: rng.below(FRAMES),
-                        readonly: rng.below(2) == 0,
-                    },
-                ));
+                let readonly = rng.below(2) == 0;
+                if hv
+                    .dispatch(
+                        caller,
+                        HvCall::GrantAccess {
+                            gref,
+                            grantee,
+                            frame,
+                            readonly,
+                        },
+                    )
+                    .is_ok()
+                {
+                    grants.push((caller, gref, grantee, readonly));
+                }
             }
             11 => drop_ok(hv.dispatch(caller, HvCall::GrantEndAccess { gref })),
             12 => {
-                let grantor = rng.below(u32::from(DOMAINS)) as u16;
-                // The caller maps, so the caller owns the resulting handle.
-                if let Ok(HvOutcome::Handle(h)) = hv.dispatch(
-                    caller,
-                    HvCall::GrantMap {
-                        grantor,
-                        gref,
-                        writable: rng.below(2) == 0,
-                    },
-                ) {
-                    handles.push((caller, h));
+                // Map a grant we actually created, as its named grantee. A read-write
+                // grant is mapped writably (pinning the frame's type through the seam);
+                // a read-only grant is mapped read-only (existence reference only).
+                if !grants.is_empty() {
+                    let idx = rng.below(grants.len() as u32) as usize;
+                    let (grantor, ggref, grantee, readonly) = grants[idx];
+                    let writable = !readonly;
+                    if let Ok(HvOutcome::Handle(h)) = hv.dispatch(
+                        grantee,
+                        HvCall::GrantMap {
+                            grantor,
+                            gref: ggref,
+                            writable,
+                        },
+                    ) {
+                        handles.push((grantee, h));
+                    }
                 }
             }
             13 => {
@@ -1202,7 +1221,12 @@ mod tests {
             summaries.iter().any(|s| s.allocated_frames > 0),
             "no seed allocated a machine frame"
         );
-        // Typed frames arise only from writable grant maps through the seam, which
-        // lands in a later commit; until then no dispatch path pins a frame's type.
+        // A typed frame can only arise from a *writable grant map* taking a writable
+        // type reference through the seam — so this reaching non-zero proves the
+        // coupled grant↔page-type path is genuinely exercised, not just each alone.
+        assert!(
+            summaries.iter().any(|s| s.typed_frames > 0),
+            "no seed pinned a frame's type via a writable grant map"
+        );
     }
 }
