@@ -122,6 +122,8 @@ impl Pl011 {
         self.write(UARTCR, 0);
         // Let any byte already in the shift register finish before we touch the config.
         while self.read(UARTFR) & FR_BUSY != 0 {}
+        // The TRM's optional "clear FEN to flush the TX FIFO" step is omitted deliberately: `init`
+        // runs once from reset, so there is nothing queued to flush.
 
         // Baud (inert under QEMU; see the divisor constants). LCR_H must be written after the
         // divisors — the LCR_H write latches the new baud.

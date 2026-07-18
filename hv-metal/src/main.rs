@@ -26,12 +26,22 @@ use core::panic::PanicInfo;
 use pl011::Pl011;
 
 // The entry point. QEMU (`-kernel`, `virt`, `virtualization=on`) starts us at EL2 with the MMU
-// off. Set the stack, zero `.bss`, and hand off to Rust; if `rust_main` ever returns, park.
+// off. Park every CPU but the primary, then set the stack, zero `.bss`, and hand off to Rust; if
+// `rust_main` ever returns, park.
 global_asm!(
     r#"
     .section .text.boot
     .global _start
 _start:
+    // Only the primary CPU proceeds. The boot CPU has all-zero affinity; any secondary that
+    // reaches here must not claim the single boot stack. On QEMU `virt` secondaries stay
+    // PSCI-parked so today only the primary runs this, but the gate keeps the single-stack boot
+    // sound before we bring APs online (or meet a non-PSCI / real-hardware reset). Mask
+    // Aff2:Aff1:Aff0 (not just Aff0) so a secondary whose index lands in a higher affinity level
+    // is still caught.
+    mrs     x0, mpidr_el1
+    and     x0, x0, #0xffffff
+    cbnz    x0, 2f
     // Stack.
     ldr     x0, =__stack_top
     mov     sp, x0
@@ -43,7 +53,7 @@ _start:
     stp     xzr, xzr, [x0], #16
     b       0b
 1:  bl      rust_main
-    // Fallthrough / return: park.
+    // Secondary-park target, and the fallthrough if `rust_main` (`-> !`) ever returns.
 2:  wfe
     b       2b
 "#
