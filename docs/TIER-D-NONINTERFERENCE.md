@@ -211,6 +211,33 @@ That makes it the **simplest** of the three (3 lemmas, zero iterations) — a da
 per-channel local respect is not uniformly hard, and that the shape depends on whether the
 channel is guarded by a state invariant or a transition precondition.
 
+## 5b. The creation channel, ∀-N (green) — the four direct channels, two-and-two
+
+The fourth direct channel: **creation**. `hv-verify/verus/unwinding_create.rs` (2 verified, 0
+errors, **first try**) proves, over **arbitrary domain count**, that `DomainCreate` by a `b` with
+no creation channel to `a` (`¬(may_create[b] ∧ ¬live[a])`) leaves `obs(a)` unchanged. The whole
+content is `life[a]`: creation *adds no resources* (a `Dead` slot is a clean shell —
+`DeadDomainNotClean`), writing only `life[target]`, `may_create[target]`, and the creator's
+`Root` edge, of which only `life[target]` is in `obs`. And `life[a]` is guard-protected — the
+`DomainCreate` guards (`may_create[b] ∧ target Dead`) force any slot `b` may lift to be `≠ a`
+(else the guard's `may_create[b]` and the channel's `live[a]` would contradict the guard's
+`¬live[target]`). Non-vacuity: dropping the channel hypothesis makes Verus reject it.
+
+**Creation is the *second* guard-channel** — so the four direct channels split cleanly
+**two-and-two**:
+
+| direct channel | proof | locality borrows from | effort |
+|---|---|---|---|
+| memory | `frame_lemma.rs` | `MisownedGrantMap` (state invariant) | ~5 lemmas |
+| signal | `unwinding_signal.rs` | event-channel reciprocity (state invariant) | ~2 lemmas / 2 iters |
+| authority | `unwinding_control.rs` | the `SchedSetAffinity` **guard** (#9) | ~3 lemmas / 0 iters |
+| creation | `unwinding_create.rs` | the `DomainCreate` **guards** (#9) | ~2 lemmas / 0 iters |
+
+The shape of a channel's local-respect proof is *predicted by how the channel is authorized*:
+state-invariant-guarded channels (memory, signal) need a two-sides bridge lifted from that
+invariant; transition-guarded channels (authority, creation) get their write-restriction straight
+from the guard and are strictly simpler. **All four direct channels are now discharged ∀-N.**
+
 ## 6. Honest scope, cost read, and the fork
 
 **What the spike establishes.** The property definition (`obs`, `⇝`, local respect, the
@@ -221,22 +248,21 @@ the enumerator bridge (real code, small size, all transitions) and one Verus unw
 
 **What remains for full Tier D.** Whole-system non-interference is *one local-respect lemma per
 transition class over the whole `obs(a)` projection*, assembled compositionally (plus the step- and
-output-consistency conditions, both light given `~_a` = `obs`-equality). Progress on the direct
-channels: the memory channel (`frame_lemma.rs`, done), the signal channel (`unwinding_signal.rs`,
-done), and the control/affinity channel (`unwinding_control.rs`, done) — **three of the direct
-channels**. Remaining: the creation channel (`DomainCreate`, a `may_create`-gated `Dead → Live`
-lift — expected simple, guard-shaped like the control channel), and the intransitive
-`DomainDestroy` cascade (the one genuinely multi-domain obligation, and the likely hardest, since
-its write-set spans a target's whole partner set — the honest unknown), then the compositional
-assembly.
+output-consistency conditions, both light given `~_a` = `obs`-equality). **All four direct channels
+are done** — memory (`frame_lemma.rs`), signal (`unwinding_signal.rs`), authority
+(`unwinding_control.rs`), creation (`unwinding_create.rs`). The only obligations left are the
+intransitive **`DomainDestroy` cascade** (the one genuinely multi-domain transition, whose write-set
+spans a target's whole partner set — the honest unknown, and now the *sole* remaining lemma) and the
+**compositional assembly** (glue the per-channel lemmas + the light step/output-consistency
+conditions into whole-system non-interference).
 
 **The cost read, plainly.** Tier D is **not** the person-months cliff it might have been. The
-definition was the hard part and it is *done and validated*; the three per-channel unwinding
-lemmas so far (~5, ~2, ~3 lemmas; zero-to-two iterations each) are *easier* than Tier C's, not
-harder — and the shape varies (two borrow from a relational invariant, one comes straight from a
-transition guard), all tractable. Completing Tier D is a **finite, tractable program** of a couple
-more unwinding lemmas plus assembly — real work (especially the destroy cascade), but not
-research-grade risk.
+definition was the hard part and it is *done and validated*; **all four** per-channel unwinding
+lemmas (~5, ~2, ~3, ~2 lemmas; zero-to-two iterations each) came in *easier* than Tier C's, and
+their shape is now understood (state-invariant-guarded channels take a two-sides bridge;
+transition-guarded channels are simpler). What is left is the `DomainDestroy` cascade — the genuine
+unknown — plus assembly. Completing Tier D is a **finite, tractable program**: one hard-ish lemma
+and the glue, not research-grade risk.
 
 **The fork (the user's call).** Tiers A–C already make the safety **core** deductively proven ∀-N;
 this spike shows Tier D's *"are we checking the right things"* capstone is reachable and its
