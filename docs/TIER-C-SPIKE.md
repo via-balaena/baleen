@@ -3,8 +3,9 @@
 
 # Tier C — the deductive spike (Kani bridge → Verus)
 
-*Status: tooling decided, repo/CI shape landed, first preservation obligation proven green.
-This is the START of Tier C — a validated approach, not the finished ∀-N program. Read
+*Status: tooling decided, repo/CI shape landed, Kani bridge green, and the **Verus ∀-N phase's
+first obligation** (`RefcountMismatch` preserved over arbitrary table size) proven green (§4).
+This is Tier C in progress — a validated end-to-end approach, not the finished ∀-N program. Read
 alongside `hv-verify/src/lib.rs` (the harnesses), `hv-core/src/grant.rs` (the code they prove
 over), and `docs/TIER-B-CUTOFF.md` §3 (the three residuals Tier C inherits).*
 
@@ -108,13 +109,42 @@ cannot prove the scalar inequality preserved in isolation — the relational inv
 it. This is exactly the precision Tier C adds over Tier B's prose, and it pins the next
 obligation.
 
-## 4. What's next (the Verus phase)
+## 4. The Verus phase — `RefcountMismatch`, ∀ table size (LANDED)
 
 `RefcountMismatch` (`maps == |live mappings|`, `writable_maps == |writable live mappings|`)
 couples a scalar to a `Vec` length — proving *it* preserved is the arbitrary-size step Kani
-would have to `unwind`, and is the natural first **Verus** obligation. With `RefcountMismatch`
-in hand, the unmap coupling above closes for arbitrary size, not just as an assumed
-precondition. The other two residuals — the projection frame-lemma and the control-forest
-acyclicity — follow. Kani has done its bridge job: proven the counter dimension on real code,
-validated that deductive verification pays off here at low cost, and sharpened the next
-obligation.
+would have to `unwind`, and was the natural first **Verus** obligation. It is now proven:
+`hv-verify/verus/refcount_mismatch.rs` verifies (Verus `0.2026.07.12`, green) that
+`RefcountMismatch` is preserved by grant `map` **and** `unmap` over an **arbitrary entry table
+× arbitrary-length mapping sequence** — the genuine ∀-N result, not a bounded one. With it in
+hand the unmap coupling of §3 closes for arbitrary size, not merely as an assumed precondition:
+the two facts the Kani harness had to `assume` (`maps ≥ 1`; read-only ⇒ `writable_maps ≤
+maps−1`) are exactly the consequences of `RefcountMismatch` the Verus `count_positive` /
+`count_update` lemmas now supply.
+
+**Fidelity — a mirror, managed.** Verus is a dialect (`spec fn`/`requires`/`ensures` do not
+parse under stable `rustc`, and Verus front-ends the whole crate it verifies), so unlike the
+Kani harnesses — ordinary Rust, `#[cfg(kani)]`-hidden, pointing at real code — the Verus proof
+cannot verify `hv-core` in place without breaking the shipping build. So it is a **mirror**,
+kept in `hv-verify/verus/` (outside `src/`, so cargo never compiles it), with fidelity to the
+shipped transition managed three ways (documented in `hv-verify/verus/README.md`): the mirror's
+`counts_after_map`/`counts_after_unmap` transcribe the production functions expression-for-
+expression (#14c); its `matches`/`count` mirror `first_violation`'s filter; and the enumerator
+already pins fidelity on the *real* code at small size (Kani on the magnitude axis) — Verus adds
+the length axis. **Non-vacuity** is validated the enumerator's way: perturbing the arithmetic
+(drop the `+1`, drop the writable bump, drop the decrement) makes Verus reject the proof.
+
+**Effort finding (honest, for the "person-months, research-grade" caveat).** This keystone
+obligation was *not* a heavy lift: the proof is ~7 lemmas/theorems and went green in three
+scratch iterations with only textbook `Seq` induction + extensional-equality hints — the
+quantifier reasoning over arbitrary `Vec` length that a model checker cannot do was handled
+cleanly by Verus's `Seq`/`Map` libraries and Z3. The spike-first structure surfaced the cost
+early and cheaply, and the cost was low *for this obligation*. That is not a claim about the two
+remaining residuals — the control-forest acyclicity in particular is a structural induction over
+a graph invariant and may be materially harder.
+
+**What's next.** The other two §3 residuals — the projection frame-lemma (per-transition
+write⟂read disjointness) and the control-forest acyclicity (structural induction over the
+delegation forest, design-lesson #13b) — are the follow-on Verus obligations. Kani did its
+bridge job (counter dimension on real code, validated the payoff, sharpened this obligation);
+Verus has now taken the first ∀-N step and validated that the mirror approach works end-to-end.

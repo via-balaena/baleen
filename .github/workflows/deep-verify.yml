@@ -8,10 +8,12 @@
 #   - a bounded run of every libFuzzer target;
 #   - the Tier C Kani preservation proofs (hv-verify) — which, unlike the enumerator, prove
 #     invariant preservation over UNBOUNDED refcount magnitudes (installing Kani + its CBMC
-#     backend costs a few minutes, so it belongs here, not in the per-PR gate).
+#     backend costs a few minutes, so it belongs here, not in the per-PR gate);
+#   - the Tier C Verus preservation proofs (hv-verify/verus) — the ∀-N step: preservation over
+#     ARBITRARY table size (the scalar↔Vec length axis Kani can only `unwind`).
 # A red run here means a reachable state violated an invariant, a fuzzer found a crash, or a
-# transition can break an invariant at some refcount — each is a real defect, so this
-# workflow is allowed to fail loudly.
+# transition can break an invariant at some refcount or table size — each is a real defect, so
+# this workflow is allowed to fail loudly.
 name: Deep verification
 
 on:
@@ -91,6 +93,47 @@ jobs:
 
       - name: cargo kani -p hv-verify (preservation proofs)
         run: cargo kani -p hv-verify
+
+  # Tier C, the ∀-N step: the Verus preservation proofs in hv-verify/verus. Where Kani makes a
+  # refcount symbolic and proves over all 2^32 MAGNITUDES on the real code (bounded on Vec
+  # length), Verus proves `RefcountMismatch` preserved by grant map/unmap over an ARBITRARY
+  # entry table and ARBITRARY-length mapping sequence — the scalar↔Vec-length axis Kani would
+  # have to `unwind` (docs/TIER-B-CUTOFF.md §3(1), docs/TIER-C-SPIKE.md). The proofs are a Verus-
+  # dialect MIRROR (Verus cannot be #[cfg]-hidden from cargo like the Kani harnesses can), kept
+  # outside hv-verify/src so a normal build never sees them; fidelity to the shipped transition
+  # is documented in hv-verify/verus/README.md. Verus ships prebuilt with its own toolchain +
+  # z3, so there is nothing to `cargo install`; the release is version-pinned so a Verus release
+  # cannot silently change proof semantics (mirrors the Kani / cargo-deny pins).
+  verus:
+    name: verus preservation proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Pinned Verus release. Raise deliberately with a local re-verify, not via Dependabot
+      # (Dependabot does not track GitHub-release downloads). Keep in step with the
+      # arm64-macos asset documented in hv-verify/verus/README.md.
+      VERUS_TAG: release/0.2026.07.12.0b42f4c
+      VERUS_ZIP: verus-0.2026.07.12.0b42f4c-x86-linux.zip
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Verus is a self-contained prebuilt bundle (verifier + its pinned rustc toolchain + z3).
+      - name: Install Verus (pinned prebuilt)
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/verus.zip \
+            "https://github.com/verus-lang/verus/releases/download/${VERUS_TAG}/${VERUS_ZIP}"
+          mkdir -p "$HOME/.local/verus"
+          unzip -q /tmp/verus.zip -d "$HOME/.local/verus"
+          echo "$HOME/.local/verus/verus-x86-linux" >> "$GITHUB_PATH"
+
+      - name: verus --crate-type=lib (RefcountMismatch preservation, ∀ table size)
+        run: verus --crate-type=lib hv-verify/verus/refcount_mismatch.rs
 
   # A bounded run of every fuzz target on nightly. No persisted corpus yet, so this is a
   # continuous smoke-fuzz (regression catcher), not a deep campaign — still far better than
