@@ -20,6 +20,7 @@ cargo-deny never see it and the pure brain stays stable-buildable. It is verifie
 | `unwinding_signal.rs` **(Tier D)** | **Signal-channel local respect**: under event-channel **reciprocity** (the peer map is an involution), a domain `a` holding no port toward `b` implies `b` holds no port toward `a`, so a `send` by `b` cannot set any pending bit of `a` — `obs(a)`'s signal projection is preserved by a step from a `b` with no signal channel to `a`. Over an **arbitrary port population**. | Tier D — non-interference |
 | `unwinding_control.rs` **(Tier D)** | **Control-channel local respect**: the `SchedSetAffinity` authority **guard** (`caller == target ∨ controls[caller][target]`) forces a step by a `b` that does not control `a` (and `b ≠ a`) to write `target ≠ a`, so `a`'s vCPU-affinity projection is untouched; a caller-only scheduler op (write confined to `b`'s rows) preserves `a`'s vCPU rows for free. Over an **arbitrary vCPU population**. *Finding: this channel's locality comes from a transition **guard** (#9), not a relational state invariant.* | Tier D — non-interference |
 | `unwinding_create.rs` **(Tier D)** | **Creation-channel local respect**: the `DomainCreate` **guards** (`may_create[caller] ∧ target Dead`) force a step by a `b` with no creation channel to `a` (`¬(may_create[b] ∧ ¬live[a])`) to lift a slot `≠ a`, so `life[a]` — the only `obs`-visible effect of creation (a `Dead` slot is a clean shell, so creation adds no resources) — is unchanged. Over **arbitrary domain count**. *The **second** guard-channel: the four direct channels split two-and-two — memory/signal borrow from a state invariant, authority/creation come from a guard.* | Tier D — non-interference |
+| `unwinding_destroy.rs` **(Tier D)** | **The `DomainDestroy` cascade** — the only *multi-domain* transition (intransitive reach). Its compound teardown (`close_all`/`clear_unbound_into`, `revoke_grants_to`/`drain_maps_of`) touches a *third* domain `a`'s ports, grant rows, and frame references — but every touch is conditioned on `a`→`c` grant or `a`→`c` port (the teardown-reach term). Proven: the port + grant-row sub-ops preserve `a`'s state when it has no reach to `c` (guard-shaped); the drain preserves `a`'s frame refs via the grant `map`-identity (`Seq`-induction, borrows-from-a-relational-invariant); and the intransitive-channel heart — `¬(b ⇝ a)` + authorized destroy of `c` ⟹ `a` has no reach to `c`. Over **arbitrary domain + partner count**. *The cascade composes **both** channel kinds in one transition.* | Tier D — non-interference |
 
 `refcount_mismatch.rs` is the keystone residual (`docs/TIER-B-CUTOFF.md` §3(1),
 `docs/TIER-C-SPIKE.md` §3–4). Proving it discharges — for *all* sizes — the two `kani::assume`s
@@ -58,6 +59,7 @@ $VERUS --crate-type=lib hv-verify/verus/control_forest_acyclic.rs   # → 8 veri
 $VERUS --crate-type=lib hv-verify/verus/unwinding_signal.rs         # → 2 verified, 0 errors  (Tier D)
 $VERUS --crate-type=lib hv-verify/verus/unwinding_control.rs        # → 3 verified, 0 errors  (Tier D)
 $VERUS --crate-type=lib hv-verify/verus/unwinding_create.rs         # → 2 verified, 0 errors  (Tier D)
+$VERUS --crate-type=lib hv-verify/verus/unwinding_destroy.rs        # → 7 verified, 0 errors  (Tier D)
 ```
 
 CI runs exactly this in the `verus preservation proofs` job of
@@ -97,20 +99,23 @@ hand; each reproduces in seconds):
 | `unwinding_signal.rs` | drop the `involution(peer)` (reciprocity) hypothesis from `no_port_toward_is_symmetric` | `assertion failed` |
 | `unwinding_control.rs` | drop the `!controls.contains((b, a))` hypothesis from `set_affinity_target_not_a` | `postcondition not satisfied` |
 | `unwinding_create.rs` | drop the `!creation_channel(..)` hypothesis from `create_target_not_a` | `postcondition not satisfied` |
+| `unwinding_destroy.rs` | drop the `!granted_to_some(a, c)` hypothesis from `no_c_map_over_a_frame` | `assertion failed` |
+| `unwinding_destroy.rs` | drop the teardown-reach `forall` hypothesis from `no_channel_no_reach_to_c` | `postcondition not satisfied` |
 
 ## What's next
 
 **All three §3 residuals are now discharged** (refcount infinity, projection frame-lemma,
 control-forest acyclicity) — Tier C is complete. `unwinding_signal.rs`,
-`unwinding_control.rs`, and `unwinding_create.rs` are the **Tier D** per-channel local-respect
-lemmas on the deductive axis: non-interference *unwinding* proven end-to-end for the signal
-channel (borrows from reciprocity), the control/affinity channel, and the creation channel (both
-straight from a transition guard). Together with `frame_lemma.rs` (the memory channel, from Tier
-C), that is **all four direct channels** done — split two-and-two (memory/signal borrow from a
-state invariant; authority/creation come from a guard). The only remaining Tier D work — the
-multi-domain `DomainDestroy` cascade and the compositional assembly into whole-system
-non-interference — is scoped in `docs/TIER-D-NONINTERFERENCE.md`, alongside the enumerator
-**bridge** (`hv-sim/src/noninterference.rs`) that validates the property definition on the real
-code at small size. See `docs/TIER-C-SPIKE.md` for the honest scope of what these ∀-N model
+`unwinding_control.rs`, `unwinding_create.rs`, and `unwinding_destroy.rs` are the **Tier D**
+per-transition local-respect lemmas on the deductive axis. Together with `frame_lemma.rs` (the
+memory channel, from Tier C), **every transition class is discharged**: the four direct channels
+(memory/signal borrow from a state invariant; authority/creation come from a guard) *and* the
+multi-domain `DomainDestroy` cascade (which composes both kinds — guard-shaped port/grant-revoke
+sub-ops + an invariant-borrowing drain). The only remaining Tier D work is the **compositional
+assembly** — gluing the per-transition lemmas and the light step/output-consistency conditions
+into the top-level whole-system non-interference theorem — scoped in
+`docs/TIER-D-NONINTERFERENCE.md`, alongside the enumerator **bridge**
+(`hv-sim/src/noninterference.rs`) that validates the property definition on the real code at small
+size. See `docs/TIER-C-SPIKE.md` for the honest scope of what these ∀-N model
 proofs do and don't cover (they cover the *model* — the pure brain; whether the *metal* enforces
 it is M3+).
