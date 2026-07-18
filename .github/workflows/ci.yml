@@ -84,13 +84,17 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
         with:
-          tool: cargo-deny
+          # Pin the tool version so CI matches what is validated locally; a CLI change in a
+          # newer cargo-deny cannot silently break this job. Dependabot does not bump this
+          # (it is a tool, not a dependency) — raise it deliberately alongside a local re-check.
+          tool: cargo-deny@0.19.0
 
       - name: cargo-deny (workspace)
         run: cargo deny check
 
       - name: cargo-deny (hv-fuzz)
-        run: cargo deny --manifest-path hv-fuzz/Cargo.toml check --config deny.toml
+        working-directory: hv-fuzz
+        run: cargo deny check --config ../deny.toml
 
   # Enforce the declared MSRV (`rust-version` in the workspace manifest): the code must
   # compile on the floor, so the promise cannot silently rot as newer std APIs tempt their
@@ -110,5 +114,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      # No `--locked`: Cargo.lock is gitignored (a zero-external-dep library workspace), so
+      # there is nothing to lock against — the resolver builds a trivial graph of path crates.
       - name: cargo check on the MSRV floor
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets
