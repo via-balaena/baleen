@@ -43,14 +43,23 @@
 //!
 //! [`frequency`] reads `CNTFRQ_EL0` for the human-readable banner only. Per the Arm ARM it is a
 //! *firmware-programmed label* (boot firmware advertises the rate to lower ELs), not measured
-//! hardware — as trustworthy as whoever set it (here, QEMU: 62.5 MHz on `virt`). The **count** is
-//! the real, monotonic thing and is what backs `Ticks`; the frequency is advisory metadata, needed
-//! only to convert ticks to wall-time, which the fence deliberately does not do.
+//! hardware — as trustworthy as whoever set it. Under QEMU it is whatever the chosen CPU model
+//! reports: our `-cpu max` runner reads **1 GHz**, a plain `virt` CPU reads 62.5 MHz — the exact
+//! figure is immaterial here precisely because it is advisory. The **count** is the real, monotonic
+//! thing and is what backs `Ticks`; the frequency is metadata, needed only to convert ticks to
+//! wall-time, which the fence deliberately does not do.
 //!
 //! ## Unsafe
 //!
 //! The `unsafe` is read-only `mrs` of `CNTPCT_EL0` / `CNTFRQ_EL0` (with a leading `isb` for the
-//! count), both readable at EL2 with no enable bit. No memory effect beyond the named register.
+//! count), both readable at EL2 with no enable bit. No memory effect beyond the named register, so
+//! `options(nomem, …)` is truthful — and the `isb`'s ordering is a runtime pipeline effect that
+//! holds regardless, since the instructions within one `asm!` are not reordered and `now()` is not
+//! `pure` (so the compiler never coalesces the repeated reads). **Note for future blocks:** `nomem`
+//! is correct *here* only because nothing needs these register accesses ordered against an **MMIO**
+//! access; do not copy the `nomem` idiom into a block that must order a register read/write against
+//! a device access (e.g. timestamping an MMIO write) — there it would be wrong and needs a memory
+//! clobber. The QEMU-vs-metal line, drawn per mechanism (design-lesson #23).
 
 use core::arch::asm;
 
@@ -109,9 +118,10 @@ pub(crate) struct Advance {
 /// and strictly advances. Returns as soon as it advances (or when the budget is spent).
 ///
 /// The count is non-decreasing by the architecture; this *observes* it, turning the `TimeSource`
-/// contract into a checked boot-time fact rather than an assumed one. Under QEMU `virt`'s 62.5 MHz
-/// counter a single `isb; mrs` plus loop overhead spans several ticks, so it advances almost
-/// immediately; the budget is generous so a slow/cold emulator still witnesses the advance.
+/// contract into a checked boot-time fact rather than an assumed one. Under QEMU (the counter runs
+/// at tens-of-MHz to GHz — see the `CNTFRQ_EL0` note above) a single `isb; mrs` plus loop overhead
+/// spans several ticks, so it advances almost immediately; the budget is generous so a slow/cold
+/// emulator still witnesses the advance.
 pub(crate) fn witness_advance(timer: &GenericTimer, budget: u32) -> Advance {
     let start = timer.now();
     let mut prev = start;

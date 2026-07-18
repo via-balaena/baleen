@@ -107,24 +107,47 @@ pub(crate) fn current_el() -> u64 {
     (raw >> 2) & 0b11
 }
 
-/// Point `VBAR_EL2` at the vector table and synchronize, so any subsequent exception is caught.
+/// Point `VBAR_EL2` at the vector table and synchronize, returning `(intended, readback)` — the
+/// table address written and the value read straight back — so the caller can confirm the write
+/// actually took.
 ///
 /// `VBAR_EL2` is UNKNOWN out of reset; until this runs, a fault at EL2 vectors to garbage and the
 /// CPU triple-faults into a reset loop. The `isb` ensures the new `VBAR_EL2` is in effect before
 /// control returns (and thus before any exception can be taken against the old value).
-pub(crate) fn install_vectors() {
-    // SAFETY: writing VBAR_EL2 is EL2-legal; `adrp`+`:lo12:` forms the PC-relative address of the
-    // in-image (2 KiB-aligned) vector table. No memory is accessed; only the system register moves.
+///
+/// The read-back turns the install into a **witnessed** step: without it the "vectors are live"
+/// marker would be an unconditional print that stays green even if the write regressed to a no-op —
+/// and the default (no-`selftest`) boot never fires a fault to catch a wrong table. Returning the
+/// read-back lets the caller gate the marker on `readback == intended` (design-lesson #24(f): assert
+/// a witness produced *by* the mechanism). The `mrs` is legal at EL2 and, like the `msr`, touches no
+/// memory.
+pub(crate) fn install_vectors() -> (u64, u64) {
+    let intended: u64;
+    let readback: u64;
+    // SAFETY: writing/reading VBAR_EL2 is EL2-legal; `adrp`+`:lo12:` forms the PC-relative address
+    // of the in-image (2 KiB-aligned) vector table. No memory is accessed; only system registers.
     unsafe {
         asm!(
-            "adrp {t}, __exception_vectors",
-            "add  {t}, {t}, :lo12:__exception_vectors",
-            "msr  vbar_el2, {t}",
+            "adrp {i}, __exception_vectors",
+            "add  {i}, {i}, :lo12:__exception_vectors",
+            "msr  vbar_el2, {i}",
             "isb",
-            t = out(reg) _,
+            "mrs  {r}, vbar_el2",
+            i = out(reg) intended,
+            r = out(reg) readback,
             options(nomem, nostack, preserves_flags),
         );
     }
+    (intended, readback)
+}
+
+/// Whether `VBAR_EL2` reads back as the intended table address — the post-condition
+/// [`install_vectors`] establishes. Compares only the meaningful address bits: `VBAR_EL2[10:0]` are
+/// RES0 (the table is 2 KiB-aligned), so they are masked off rather than trusted to read back a
+/// particular value.
+pub(crate) fn vbar_installed(intended: u64, readback: u64) -> bool {
+    const VBAR_ADDR_MASK: u64 = !0x7ff; // clear the RES0 low 11 bits
+    intended & VBAR_ADDR_MASK == readback & VBAR_ADDR_MASK
 }
 
 /// The default exception handler, called from every vector slot with `vector` = the slot index.

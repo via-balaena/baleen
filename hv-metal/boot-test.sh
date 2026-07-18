@@ -88,7 +88,9 @@ boot_and_check() {
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
 # a regression in any one is caught even without the self-test:
-#   - VBAR_EL2 installed          -> install_vectors did not silently no-op (Arc 2);
+#   - VBAR_EL2 installed          -> VBAR_EL2 read back == the vector-table address (Arc 2); the
+#                                    marker is printed ONLY when the read-back confirms the write took
+#                                    (the selftest BRK below is the complementary end-to-end check);
 #   - HCR_EL2.RW=1                 -> HCR_EL2 was configured and read back correct;
 #   - generic timer live          -> the TimeSource read a monotonic, advancing count;
 #   - HvCall CreditGrant ... =100  -> the linked hv-core brain serviced a real hypercall on the metal
