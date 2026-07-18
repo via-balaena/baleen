@@ -238,6 +238,40 @@ state-invariant-guarded channels (memory, signal) need a two-sides bridge lifted
 invariant; transition-guarded channels (authority, creation) get their write-restriction straight
 from the guard and are strictly simpler. **All four direct channels are now discharged ∀-N.**
 
+## 5c. The `DomainDestroy` cascade, ∀-N (green) — the multi-domain obligation
+
+The last and hardest transition class: the only *genuinely multi-domain* one.
+`hv-verify/verus/unwinding_destroy.rs` (7 verified, 0 errors) proves it over **arbitrary domain
+and partner count** — the §2.4 axis with no size cutoff. `DomainDestroy(c)` tears `c` down and its
+cleanup **cascades to `c`'s partners**, so a step by `b` (with `controls[b][c]`) can move a *third*
+domain `a`'s observation — the intransitive flow the bridge found (§4). Its compound teardown
+touches **three** components of `obs(a)`, and every touch is conditioned on `a`'s reach to `c`:
+
+| sub-op | touches `obs(a)` iff | shape |
+|---|---|---|
+| `close_all` / `clear_unbound_into` | `a` holds a port toward `c` (`Interdomain{c}` / `Unbound{c}`) | guard-shaped (`remote == c`) |
+| `revoke_grants_to` / `drain_maps_of` (row) | `a`'s grant row has grantee `c` | guard-shaped (`grantee == c`) |
+| `drain_maps_of` (frame refs) | `c` held a map over `a`'s frame | **borrows from the grant `map`-identity** |
+
+The proof discharges all three (`port_preserved`, `grant_row_preserved`,
+`drain_preserves_frame_refs` + `no_c_map_over_a_frame`) and the **intransitive-channel heart**
+(`no_channel_no_reach_to_c`): `¬(b ⇝ a)` plus an authorized destroy of `c` (`b == c ∨
+controls[b][c]`) implies `a` has no reach to `c` — the peer case excluded by the teardown-reach
+term, the self case (`c == b`) by the direct grant/port channels. The *reverse* direction (`a`
+referencing `c`'s frames) cannot arise past a proceeding destroy: `DomainBusy` refuses teardown
+while any foreign domain holds a live map of, or a page-table link into, `c`'s frames
+(`hypervisor.rs:1178`).
+
+**The finding — the cascade composes *both* channel kinds in one transition.** Its port and
+grant-revoke sub-ops are guard-shaped (a filtered clear on a directly-readable key); its
+drain→frame-reference sub-op borrows from a relational invariant (the grant `map`-identity: a map
+by `c` over `a`'s frame ⟹ `a` granted to `c`) via a `Seq`-induction filtered-count-equality,
+frame-lemma-shaped. So the two-and-two taxonomy of §5b reappears *within* the single hardest
+transition. Effort: ~7 lemmas — more than any single direct channel (the compound write-set + the
+`Seq` induction), but it went green without the multi-week grind the caveat warned of.
+Non-vacuity validated: dropping the `map`-identity hypothesis, or the teardown-reach hypothesis,
+makes Verus reject. **With this, every transition class of Tier D is discharged.**
+
 ## 6. Honest scope, cost read, and the fork
 
 **What the spike establishes.** The property definition (`obs`, `⇝`, local respect, the
@@ -248,21 +282,23 @@ the enumerator bridge (real code, small size, all transitions) and one Verus unw
 
 **What remains for full Tier D.** Whole-system non-interference is *one local-respect lemma per
 transition class over the whole `obs(a)` projection*, assembled compositionally (plus the step- and
-output-consistency conditions, both light given `~_a` = `obs`-equality). **All four direct channels
-are done** — memory (`frame_lemma.rs`), signal (`unwinding_signal.rs`), authority
-(`unwinding_control.rs`), creation (`unwinding_create.rs`). The only obligations left are the
-intransitive **`DomainDestroy` cascade** (the one genuinely multi-domain transition, whose write-set
-spans a target's whole partner set — the honest unknown, and now the *sole* remaining lemma) and the
-**compositional assembly** (glue the per-channel lemmas + the light step/output-consistency
-conditions into whole-system non-interference).
+output-consistency conditions, both light given `~_a` = `obs`-equality). **Every transition class
+is now discharged** — memory (`frame_lemma.rs`), signal (`unwinding_signal.rs`), authority
+(`unwinding_control.rs`), creation (`unwinding_create.rs`), and the multi-domain `DomainDestroy`
+cascade (`unwinding_destroy.rs`). The **only** remaining Tier D work is the **compositional
+assembly**: glue the per-transition lemmas + the light step/output-consistency conditions into the
+top-level whole-system non-interference statement. That is bookkeeping over parts that are all
+proven — no new unknown obligation remains.
 
-**The cost read, plainly.** Tier D is **not** the person-months cliff it might have been. The
-definition was the hard part and it is *done and validated*; **all four** per-channel unwinding
-lemmas (~5, ~2, ~3, ~2 lemmas; zero-to-two iterations each) came in *easier* than Tier C's, and
-their shape is now understood (state-invariant-guarded channels take a two-sides bridge;
-transition-guarded channels are simpler). What is left is the `DomainDestroy` cascade — the genuine
-unknown — plus assembly. Completing Tier D is a **finite, tractable program**: one hard-ish lemma
-and the glue, not research-grade risk.
+**The cost read, plainly.** Tier D was **not** the person-months cliff it might have been. The
+definition was the hard part and it is *done and validated*; all five per-transition unwinding
+lemmas (~5, ~2, ~3, ~2, ~7 lemmas) came in *easier* than feared, and their shape is now understood
+(state-invariant-guarded channels take a two-sides bridge; transition-guarded channels are simpler;
+the cascade composes both). The honest-unknown obligation — the `DomainDestroy` cascade — is
+**done**. What is left is the assembly, which is glue, not discovery. The model-level
+non-interference program is essentially proven part-by-part; whether to spend the assembly arc to
+state the single top-level theorem, or to move to the metal (M3+) with the parts in hand, is the
+standing fork — the *substance* is complete.
 
 **The fork (the user's call).** Tiers A–C already make the safety **core** deductively proven ∀-N;
 this spike shows Tier D's *"are we checking the right things"* capstone is reachable and its
