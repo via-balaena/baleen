@@ -3,9 +3,11 @@
 
 # Tier C — the deductive spike (Kani bridge → Verus)
 
-*Status: tooling decided, repo/CI shape landed, Kani bridge green, and the **Verus ∀-N phase's
-first obligation** (`RefcountMismatch` preserved over arbitrary table size) proven green (§4).
-This is Tier C in progress — a validated end-to-end approach, not the finished ∀-N program. Read
+*Status: tooling decided, repo/CI shape landed, Kani bridge green, and **all three §3 residuals
+discharged in Verus** — `RefcountMismatch` over arbitrary table size (§4), the projection
+frame-lemma / grant-summation owner-locality (§5), and the control-forest acyclicity / cycle case
+(§6). The Verus phase's stated obligation list is complete; what remains of true-diamond is Tier
+D (non-interference). These are ∀-N proofs of the *model* (the pure brain); the metal is M3+. Read
 alongside `hv-verify/src/lib.rs` (the harnesses), `hv-core/src/grant.rs` (the code they prove
 over), and `docs/TIER-B-CUTOFF.md` §3 (the three residuals Tier C inherits).*
 
@@ -178,3 +180,40 @@ summation was the only one where disjointness was non-trivial.
 **Remaining: §3 residual (3)** — the control-forest acyclicity, a structural induction over the
 delegation forest (design-lesson #13b). That is the last of the three, and likely the hardest
 (a graph invariant, not a filtered sum).
+
+## 6. Control-forest acyclicity — the cycle case, ∀ domain count (LANDED)
+
+The third and last §3 residual (`docs/TIER-B-CUTOFF.md` §2.4, §3(3)), and the one with **no size
+cutoff**: `ControlEdgeOrphaned` splits into an *orphan* case (local, witness 3 domains — the
+cutoff covers it) and a *cycle* case (a cycle of length L needs L distinct domains, so its witness
+is unbounded in domain count). §2.4 hands the cycle case to Tier C as "a structural induction
+proving the delegation graph is always a forest" (design-lesson #13b).
+
+`hv-verify/verus/control_forest_acyclic.rs` proves it green (8 verified, 0 errors) at **arbitrary
+domain count**. The mechanism: `control_grant` (`hypervisor.rs`) is the only edge-*adding*
+transition, and it adds an edge only in its **fresh-leaf** case (`to` did not already control the
+target); if `to` already controls it, it is a no-op that preserves provenance — it never
+*re-parents*, the one move that could close a cycle. A graph that only grows fresh leaves is a
+forest. The proof carries a **rank certificate** (a ghost, not stored state): a `rank` strictly
+decreasing along every `Via` edge (`valid_rank`) whose existence *is* acyclicity, plus `rank[h] <
+node count` (`bounded`). `control_grant_preserves` / `root_stamp_preserves` show the fresh-leaf
+delegation and the `DomainCreate` `Root` stamp both extend the certificate (acyclicity is
+inductive), and `certificate_discharges_orphaned` shows a valid+bounded rank makes the real
+provenance walk reach a `Root` within `n = domain_count` steps — exactly `ControlEdgeOrphaned`
+not firing.
+
+**The honest hard part, and how it was threaded.** As flagged when the residual was picked, any
+faithful proof of the code's exact `steps ≤ n` bound needs a *pigeonhole* — a terminating walk
+visits distinct nodes, so its length is bounded by the node count. This is a graph invariant, not
+a filtered sum, so it was genuinely harder than §4/§5. It was threaded by folding the pigeonhole
+into the invariant: `bounded` (`rank[h] < node count`) is preserved by the fresh-leaf step
+*without* an explicit distinct-nodes argument, because `rank[caller] < count` by the IH and the
+count grows by one. Effort landed at ~8 lemmas — more than the summation proofs (~5–7) but still
+tractable; the person-months caveat did not bite even for the hardest of the three. Non-vacuity
+validated: weakening the strict rank decrease or dropping the fresh-leaf precondition makes Verus
+reject the proof. Same *"one property borrows from a relational one"* shape as #20/#21 —
+`ControlEdgeOrphaned`'s no-cycle content is carried by the rank certificate.
+
+**All three §3 residuals are now discharged.** What remains of the true-diamond program is Tier D
+(non-interference) — and the standing caveat these proofs cover the *model* (the pure brain), not
+whether the *metal* enforces it (M3+).
