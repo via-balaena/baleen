@@ -513,10 +513,17 @@ violations.
   new standing invariant is **"a `Running` vCPU is always on a pCPU in its affinity set"**
   (`RunningOffAffinity`); only two transitions can violate it (dispatch, and narrowing affinity),
   and both are guarded, so it holds by construction. Three design calls define the shape: **(1)
-  self-service** — a domain sets its *own* vCPU's mask, consistent with every other scheduler op in
-  this model (layering the control axis onto it, the faithful Xen `XEN_DOMCTL_setvcpuaffinity`, is
-  a deferred refinement); it is sound because affinity only *restricts* a domain's own vCPUs and
-  reserves nothing, so it cannot deny a pCPU to others. **(2) Refuse, don't force-migrate** —
+  a per-target control operation** — affinity is a resource-management decision (which pCPUs a
+  domain may use), so setting it is Xen's `XEN_DOMCTL_setvcpuaffinity` domctl: a domain may affine
+  its *own* vCPUs, but a *peer's* requires the caller **control** that peer
+  (`controls[caller][target]`), the same per-target authority gate `DomainDestroy` uses — the third
+  isolation axis (after ownership and consent) applied to scheduling. (It shipped self-service
+  first, the sound core, then had the control axis layered on; the authority check lives at the
+  seam, so the scheduler subsystem stays authority-agnostic.) This is a transition *guard*, not a
+  new state invariant, and the exhaustive sweep confirms it: adding the gate left the
+  reachable-state count **exactly unchanged** (a controller reaches only affinity states the domain
+  could set itself; a denied peer op is a no-op) — the same signature the `DomainDestroy` gate
+  showed. **(2) Refuse, don't force-migrate** —
   setting an affinity that excludes the pCPU a vCPU is *currently* running on is refused (a no-op),
   not resolved by a forced migration; the brain's gating-precondition style over side-effects (as
   teardown refuses-if-busy), which keeps the invariant true by construction and `set_affinity` a
