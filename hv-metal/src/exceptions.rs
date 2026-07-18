@@ -81,6 +81,10 @@ __exception_common:
     // Diagnostic-only handler: NO general-purpose-register save-frame, because we report the fault
     // and halt — we never `eret` back to the faulting context, so there is nothing to preserve.
     // (M4 Arc 4's trap-and-service will add a full save/restore frame when it must resume a guest.)
+    // Deferred with it: a fault taken INSIDE this handler re-enters on the SAME stack (SPSel=1, no
+    // stack switch, no re-entry guard) — on `virt` it loops rather than triple-faults, and the first
+    // report drains out the UART first, so report-and-halt holds in practice; a dedicated exception
+    // stack + re-entry flag lands with Arc 4's frame.
     // w0 already holds the vector slot index — the first C argument to `handle_exception`.
     bl      handle_exception
     // `handle_exception` is `-> !` and never returns; this is belt-and-suspenders if it ever does.
