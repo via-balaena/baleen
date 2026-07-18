@@ -20,11 +20,14 @@ cargo build --release --target "$target" --manifest-path "$here/Cargo.toml"
 bin="$here/target/$target/release/hv-metal"
 
 echo "boot-test: booting under qemu-system-aarch64…"
+# `-net none`: the default virt NIC pulls a PXE romfile (efi-virtio.rom) some QEMU packages don't
+# ship (fatal on such builds); Arc 0 needs no networking, so disable it for a deterministic boot.
 out="$(mktemp)"
 qemu-system-aarch64 \
     -M virt,virtualization=on \
     -cpu max \
     -nographic \
+    -net none \
     -kernel "$bin" \
     >"$out" 2>&1 &
 qemu_pid=$!

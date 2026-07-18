@@ -28,6 +28,11 @@ fn main() {
                         "-cpu",
                         "max",
                         "-nographic",
+                        // No NIC: the default virt network device pulls a PXE romfile
+                        // (`efi-virtio.rom`) some QEMU packages don't ship, and Arc 0 needs no
+                        // networking. Keeps the boot deterministic across QEMU builds.
+                        "-net",
+                        "none",
                         "-kernel",
                         METAL_BIN,
                     ],
