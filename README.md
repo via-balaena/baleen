@@ -31,7 +31,7 @@ test on a multi-year solo project.
 | `hv-hal`        | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`)       | ✅ M1  |
 | `hv-core`       | all logic as a `no_std` library, zero `unsafe`: dispatch and state machines           | ✅ M1  |
 | `hv-sim`        | host harness — fake memory, hand-cranked clock, seeded deterministic simulation       | ✅ M1  |
-| `hv-metal`      | bare-metal binary: boot, enter EL2/VMX, the thin fenced `unsafe` core                  | ⏳ M3  |
+| `hv-metal`      | bare-metal binary: boot, enter EL2/VMX, the thin fenced `unsafe` core                  | 🚧 M3  |
 | `hv-fuzz`       | `cargo-fuzz` targets against the hypercall dispatcher                                  | ⏳ M2  |
 | `xtask`         | build/test automation (`cargo xtask <task>`)                                          | ✅ M1  |
 

@@ -14,6 +14,26 @@ fn main() {
         "test" => run("cargo", &["test", "--workspace"]),
         "check" => run("cargo", &["check", "--workspace"]),
         "doc" => doc(),
+        // Metal (M3): build `hv-metal` for the bare-metal target and boot it under QEMU.
+        // `qemu` runs it interactively (dev); `qemu-test` runs the headless boot smoke-test the
+        // CI loop asserts on. `hv-metal` is a standalone crate excluded from the workspace, so it
+        // is built via `--manifest-path` with the bare-metal `--target`.
+        "qemu" => {
+            metal_build()
+                && run(
+                    "qemu-system-aarch64",
+                    &[
+                        "-M",
+                        "virt,virtualization=on",
+                        "-cpu",
+                        "max",
+                        "-nographic",
+                        "-kernel",
+                        METAL_BIN,
+                    ],
+                )
+        }
+        "qemu-test" => run("bash", &["hv-metal/boot-test.sh"]),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run(
@@ -39,7 +59,9 @@ fn main() {
                  test   run the workspace test suite\n  \
                  check  type-check the workspace\n  \
                  doc    build docs, denying broken links\n  \
-                 ci     fmt --check, clippy -D warnings, test, then doc"
+                 ci     fmt --check, clippy -D warnings, test, then doc\n  \
+                 qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
+                 qemu-test  headless QEMU boot smoke-test (the metal CI check)"
             );
             exit(2);
         }
@@ -47,6 +69,25 @@ fn main() {
     if !ok {
         exit(1);
     }
+}
+
+/// The bare-metal target `hv-metal` builds for, and the resulting binary path.
+const METAL_TARGET: &str = "aarch64-unknown-none-softfloat";
+const METAL_BIN: &str = "hv-metal/target/aarch64-unknown-none-softfloat/release/hv-metal";
+
+/// Build `hv-metal` (a standalone, workspace-excluded crate) for the bare-metal target.
+fn metal_build() -> bool {
+    run(
+        "cargo",
+        &[
+            "build",
+            "--release",
+            "--target",
+            METAL_TARGET,
+            "--manifest-path",
+            "hv-metal/Cargo.toml",
+        ],
+    )
 }
 
 /// Build the docs with broken intra-doc links (and every other rustdoc lint)

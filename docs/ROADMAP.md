@@ -155,6 +155,54 @@ The assembled system: GPU-accelerated near-bare-metal **disposables**, an offlin
 proven `hv-core`. The parts of Qubes you actually use, on a provable core, with the GPU story Qubes
 lacks.
 
+## Near-term execution — the first arcs (M3 → M4)
+
+The phases above are the shape; this is the concrete arc-by-arc sequence to *start*, each an arc in
+the same commit → diamond → audit → CI-green rhythm the model was built with. Each arc is one PR.
+
+### Arc 0 — the metal dev + test loop *(the enabling move — do this first)*
+Stand up the loop before any hypervisor logic, so every later metal arc lands with the same
+discipline: a `hv-metal` crate (a standalone crate, excluded from the workspace like `hv-fuzz`, and
+the **only** crate that overrides the `unsafe_code = "forbid"` fence — in its own manifest), an
+`aarch64-unknown-none-softfloat` bare-metal target with a minimal linker script and an assembly
+entry, a `cargo xtask qemu` launcher (`qemu-system-aarch64 -M virt,virtualization=on -cpu max
+-nographic`), and a **headless QEMU boot-test in CI** (boot, assert a serial marker, kill on
+timeout) so "diamond → CI-green → merge" stays alive on the metal side.
+*See-it: the binary boots on the emulated CPU and prints a marker, testable in CI.*
+*Why first: without the green-CI ratchet, metal work loses the rhythm that made the model work.*
+
+### M3 — metal bring-up
+- **Arc 1 — "hello" over PL011.** MMIO to the UART (`0x0900_0000` on `virt`), a tiny `write_str`; CI
+  asserts the banner. *First observable life.*
+- **Arc 2 — EL2 + exception vectors.** Confirm `CurrentEL == EL2`; set `VBAR_EL2`; a default handler
+  that decodes `ESR_EL2` and prints instead of hanging. *A fault becomes diagnosable.*
+- **Arc 3 — claim the virt extensions + run the brain on metal.** Configure `HCR_EL2`; `TimeSource`
+  over `CNTPCT_EL0`; link `hv-core`, construct a `Hypervisor`, dispatch a synthetic `HvCall` on the
+  bare CPU and print the result.
+  **🔍 Architecture Audit #1 — the fence:** enumerate what `hv-core` *trusts the HAL to guarantee*,
+  confirm the metal HAL honors each (or name the assumption), and fill in M3's ledger rows.
+  *See-it: the diamonded brain is alive at EL2 and serviced a hypercall on (emulated) hardware.*
+
+### M4 — first guest + the bridge *(the proof touches reality)*
+- **Arc 4 — trap-and-service.** A trivial EL1 guest (`HVC`), its EL1 context, Stage-2 tables from a
+  minimal `p2m`, `eret` in, handle the trap → decode to `HvCall` → `hv-core` → return.
+- **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test.** Translate the model's `p2m` into
+  real AArch64 Stage-2 descriptors; a guest touching unauthorized memory faults to EL2.
+  **🔍 Architecture Audit #2 — model→page-table refinement:** does the emitted table deny *exactly*
+  what the model says, across read/write/execute/foreign/superpage?
+  *See-it: **the proof touches reality** — the guest is faulted by the real tables generated from the
+  proven `p2m`.*
+
+After Arc 5, **M5** (control domain + virtio-blk/console + disposable-from-template + a no-net vault)
+is where it stops being a demo and becomes a *system* — and it mostly cashes in the lifecycle and
+non-interference proofs, so it should move fast.
+
+**Two honest notes on the phase change:** (1) iteration slows — QEMU boot cycles are seconds, not
+the instant enumerator; the Arc-0 CI boot-test is what keeps that from eroding discipline. (2) This
+is the first `unsafe` (MMIO, page-table writes, system-register pokes); the fence audit (#1) exists
+precisely to keep that surface minimal and justified — the same "name exactly what's trusted" move
+as the proofs.
+
 ## The two hard pillars (called out, because they carry the risk)
 
 - **GPU acceleration (M8)** — first-class, and the main way to *beat* Qubes. The realistic path is

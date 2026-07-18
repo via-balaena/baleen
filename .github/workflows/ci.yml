@@ -85,6 +85,42 @@ jobs:
         working-directory: hv-fuzz
         run: cargo check --all-targets
 
+  # Metal boot smoke-test (M3, Arc 0): build the standalone bare-metal `hv-metal` binary for
+  # `aarch64-unknown-none-softfloat` and boot it on the QEMU `virt` machine at EL2, asserting the
+  # serial marker `rust_main` prints. This is the metal side of the "diamond -> CI-green -> merge"
+  # loop — every later metal arc rides this check. `hv-metal` is excluded from the workspace (it
+  # cannot link for the host), so it is built + booted out-of-band via `cargo xtask qemu-test`.
+  # Functional refinement only — see docs/QEMU-AND-METAL.md for what an emulated run does and does
+  # not attest.
+  metal-boot:
+    name: metal boot (QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install stable toolchain + bare-metal target
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-none-softfloat
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: hv-metal
+
+      # `qemu-system-arm` provides `qemu-system-aarch64` on Ubuntu.
+      - name: Install QEMU (AArch64 system emulation)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-arm
+
+      - name: hv-metal boots to the serial marker under QEMU
+        run: cargo xtask qemu-test
+
   # Supply-chain gate: refuse a dependency carrying a security advisory, a disallowed
   # license, an untrusted source, or a wildcard version. The shipping workspace has zero
   # external deps today, so this stays green now and blocks the first bad dep from landing
