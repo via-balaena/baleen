@@ -72,14 +72,19 @@ jobs:
         with:
           workspaces: hv-fuzz
 
-      # hv-fuzz is a *flattened* cargo-fuzz project (it IS the fuzz crate, not the
-      # conventional `<crate>/fuzz/` nested layout), so point cargo-fuzz at it with
-      # `--fuzz-dir hv-fuzz` from the repo root rather than relying on the `./fuzz` default.
+      # Two layout/toolchain notes baked into this invocation:
+      #  - hv-fuzz is a *flattened* cargo-fuzz project (it IS the fuzz crate, not the
+      #    conventional `<crate>/fuzz/` nested layout), so point cargo-fuzz at it with
+      #    `--fuzz-dir hv-fuzz` from the repo root rather than the `./fuzz` default; and
+      #  - cargo-fuzz defaults to the musl (statically-linked libc) target on Linux, which
+      #    AddressSanitizer cannot instrument ("sanitizer is incompatible with statically
+      #    linked libc"), so force the gnu target (dynamic libc, the runner's host std).
       - name: fuzz each target for 60s
         run: |
           set -euo pipefail
           for target in decode evtchn grant sched policy hypervisor p2m; do
             echo "::group::fuzz $target"
-            cargo fuzz run --fuzz-dir hv-fuzz "$target" -- -max_total_time=60 -rss_limit_mb=4096
+            cargo fuzz run --fuzz-dir hv-fuzz --target x86_64-unknown-linux-gnu \
+              "$target" -- -max_total_time=60 -rss_limit_mb=4096
             echo "::endgroup::"
           done
