@@ -115,10 +115,18 @@ unsafe impl GlobalAlloc for BumpAlloc {
             }
             // Publish the advance. On success the range `[aligned, end)` is ours exclusively. Only
             // the boot CPU allocates today, so this never spins; the loop keeps it correct if an AP
-            // is ever brought online.
+            // is ever brought online. `Relaxed` on both arms is sufficient — the allocator publishes
+            // *no* data through `next` (each caller writes its own bytes into a disjoint range), so
+            // the only requirement is that two successful reservations never overlap, which the
+            // atomic RMW on a strictly-increasing offset guarantees. Any acquire/release needed to
+            // hand an allocation between CPUs belongs to that handoff (an `Arc`, a channel), not
+            // here. (If an AP is ever onlined, note separately that the boot CPU's `.bss` zeroing —
+            // including this arena and `next` — must be made visible to it by the AP bring-up, the
+            // usual PSCI/cache-maintenance obligation; the allocator does not depend on the zeroing,
+            // since `alloc` returns uninitialized memory by contract.)
             if self
                 .next
-                .compare_exchange_weak(cur, new_off, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange_weak(cur, new_off, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 // Provenance-preserving: derive from `base_ptr`, do not cast the integer address.

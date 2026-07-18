@@ -131,9 +131,22 @@ pub extern "C" fn rust_main() -> ! {
     }
 
     // (2) Install the exception vectors. Until VBAR_EL2 points at a real table, any fault at EL2
-    //     vectors to garbage and triple-faults into a silent reset loop.
-    exceptions::install_vectors();
-    let _ = writeln!(uart, "baleen: VBAR_EL2 installed — exception vectors live");
+    //     vectors to garbage and triple-faults into a silent reset loop. Read VBAR_EL2 back and gate
+    //     the marker on it — so the *default* boot (which fires no fault) still witnesses the install
+    //     took, not merely that the call returned.
+    let (vbar_intended, vbar_readback) = exceptions::install_vectors();
+    if exceptions::vbar_installed(vbar_intended, vbar_readback) {
+        let _ = writeln!(
+            uart,
+            "baleen: VBAR_EL2 installed — exception vectors live (VBAR=0x{vbar_readback:016x})"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: VBAR_EL2 install FAILED (intended=0x{vbar_intended:016x} readback=0x{vbar_readback:016x}); halting"
+        );
+        park();
+    }
 
     // (3) Configure HCR_EL2 for AArch64 EL2 operation (RW=1, everything else 0 — no guest-trap
     //     bits, that is M4). Read it back and confirm the field took; a silent no-op write is a bug.
