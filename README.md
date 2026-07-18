@@ -31,7 +31,7 @@ test on a multi-year solo project.
 | `hv-hal`        | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`)       | ✅ M1  |
 | `hv-core`       | all logic as a `no_std` library, zero `unsafe`: dispatch and state machines           | ✅ M1  |
 | `hv-sim`        | host harness — fake memory, hand-cranked clock, seeded deterministic simulation       | ✅ M1  |
-| `hv-metal`      | bare-metal binary: boot, VMX, the thin fenced `unsafe` core                           | ⏳ M3  |
+| `hv-metal`      | bare-metal binary: boot, enter EL2/VMX, the thin fenced `unsafe` core                  | ⏳ M3  |
 | `hv-fuzz`       | `cargo-fuzz` targets against the hypercall dispatcher                                  | ⏳ M2  |
 | `baleen-xenabi` | a *northbound* **personality**: translates Xen's wire ABI into neutral `hv-core` ops  | ⏳ M5  |
 | `xtask`         | build/test automation (`cargo xtask <task>`)                                          | ✅ M1  |
@@ -56,18 +56,20 @@ core:
 - **Automotive / static-partitioning wedge** has zero Xen legacy — it gets a thin
   native personality or virtio-only guest interfaces, and never links Xen at all.
 
-### x86 and ARM are co-equal targets
+### ARM and x86 are co-equal targets
 
 Just as the *personality* keeps the core ABI-agnostic northbound, the `hv-hal` fence keeps
 it **architecture-agnostic southbound**. `hv-core` names no CPU architecture: its page
-tables are a generic 4-level hierarchy (what x86-64 *and* AArch64 both use), and it reaches
-hardware only through arch-neutral traits. The first `hv-metal` backend is **x86-64** (Intel
-VMX / EPT, the LAPIC) — so the M3–M5 milestones below describe it — but an **AArch64**
-backend (the ARM virtualization extensions at EL2, Stage-2 translation, the GIC) is an
-**equally first-class goal**, not an afterthought: it is a second implementation of the same
-`hv-hal` traits, and the diamonded brain above it does not change. This is a load-bearing
-design constraint — the fence's trait surface stays free of any architecture-specific
-concept, so the port is a new metal layer, never a rewrite.
+tables are a generic 4-level hierarchy (what AArch64 *and* x86-64 both use), and it reaches
+hardware only through arch-neutral traits. The **first `hv-metal` backend is AArch64** (the
+ARM virtualization extensions at EL2, Stage-2 translation, the GIC) — chosen to lead because
+the development machine is Apple Silicon, so an EL2 backend runs *same-architecture* under
+QEMU with no cross-emulation; the M3–M5 milestones below are described in those terms. An
+**x86-64** backend (Intel VMX / EPT, the LAPIC) is an **equally first-class goal**, not an
+afterthought: it is a second implementation of the same `hv-hal` traits, and the diamonded
+brain above it does not change. This is a load-bearing design constraint — the fence's trait
+surface stays free of any architecture-specific concept, so each port is a new metal layer,
+never a rewrite.
 
 ## The architecture in one picture
 
@@ -599,12 +601,20 @@ violations.
   (event-vCPU steering, richer scheduling), (b) *breadth* the fence defers to M3+ (wider cpumasks,
   512-entry tables, the real ABIs), and (c) ever-deeper sweeps with diminishing marginal
   confidence. The safety core is essentially complete; what remains is hardware.
-- **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
-  mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
-  AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
-  same `hv-hal` fence, per *x86 and ARM are co-equal targets* above.)
-- **M4**: one hardware-backed vCPU running a trivial guest; VMEXITs translated into
-  `hv-core` calls. The fence becomes real and load-bearing.
+- **M3**: `hv-metal` boots — under **QEMU** first (`qemu-system-aarch64 -machine
+  virt,virtualization=on`, an EL2-capable *same-architecture* VM on the Apple-Silicon dev
+  machine) — to a serial "hello" over the PL011 UART and runs at **EL2** with the ARM
+  virtualization extensions enabled: the hypervisor is alive and has claimed the virtualization
+  hardware, though no guest runs yet (that is M4). The first `unsafe`, weeks in rather than day
+  one. **AArch64/EL2 is the first backend**, chosen to lead because the dev machine is ARM, so it
+  runs native-architecture under QEMU with no cross-emulation; an **x86-64** backend (Intel VMX /
+  EPT, the LAPIC) is co-equal and follows, behind the same `hv-hal` fence, per *ARM and x86 are
+  co-equal targets* above. Real ARM silicon (a dev board or an ARM server) is deferred until a
+  guest needs validating on hardware (M4+) — Apple Silicon gates EL2, so the Mac hosts QEMU, not
+  a bare-metal hypervisor.
+- **M4**: one backend-driven vCPU (QEMU first, real silicon when it arrives) running a trivial
+  guest at EL1; guest traps to EL2 translated into `hv-core` calls. The fence becomes real and
+  load-bearing.
 - **M5**: PVH Linux boot — the vertical slice. The Xen **personality**
   (`baleen-xenabi`) enters here: PVH boot forces speaking Xen's ABI for real, so
   this is where clean-room, ABI-as-spec, XTF-conformance discipline goes into full
