@@ -22,6 +22,7 @@ cargo-deny never see it and the pure brain stays stable-buildable. It is verifie
 | `unwinding_create.rs` **(Tier D)** | **Creation-channel local respect**: the `DomainCreate` **guards** (`may_create[caller] ∧ target Dead`) force a step by a `b` with no creation channel to `a` (`¬(may_create[b] ∧ ¬live[a])`) to lift a slot `≠ a`, so `life[a]` — the only `obs`-visible effect of creation (a `Dead` slot is a clean shell, so creation adds no resources) — is unchanged. Over **arbitrary domain count**. *The **second** guard-channel: the four direct channels split two-and-two — memory/signal borrow from a state invariant, authority/creation come from a guard.* | Tier D — non-interference |
 | `unwinding_destroy.rs` **(Tier D)** | **The `DomainDestroy` cascade** — the only *multi-domain* transition (intransitive reach). Its compound teardown (`close_all`/`clear_unbound_into`, `revoke_grants_to`/`drain_maps_of`) touches a *third* domain `a`'s ports, grant rows, and frame references — but every touch is conditioned on `a`→`c` grant or `a`→`c` port (the teardown-reach term). Proven: the port + grant-row sub-ops preserve `a`'s state when it has no reach to `c` (guard-shaped); the drain preserves `a`'s frame refs via the grant `map`-identity (`Seq`-induction, borrows-from-a-relational-invariant); and the intransitive-channel heart — `¬(b ⇝ a)` + authorized destroy of `c` ⟹ `a` has no reach to `c`. Over **arbitrary domain + partner count**. *The cascade composes **both** channel kinds in one transition.* | Tier D — non-interference |
 | `noninterference_theorem.rs` **(Tier D capstone)** | **The whole-system non-interference theorem** — the Rushby **unwinding theorem** assembling the per-transition lemmas over arbitrary executions. **Theorem A** (from **local respect**, which the five lemmas above discharge): a domain `a` sees a *constant* observation across any execution of actions by principals that do not interfere with it — unrelated activity is invisible. **Theorem B** (from local respect + **step consistency**): two executions that start `obs(a)`-equivalent and agree on each actor's observation stay `obs(a)`-equivalent — `a`'s view is determined *entirely* by the inputs authorized to flow to it. Proven generically over `obs`/`step`/`actor`/`interferes`. | Tier D — non-interference |
+| `step_consistency.rs` **(Tier D)** | **Closing the last mile** — discharges what is derivable of Theorem B's *step-consistency* premise and pins the residual. `step_consistency_off_channel`: from local respect alone, step consistency holds for every non-interfering actor (the premise reduces to the *interfering* case). `factored_step_is_consistent`: it holds for every **write** channel (a principal's authorized effect on `a` factors through `obs(a)` + the actor's observation). *Finding: the irreducible residual is the confidentiality **read** direction — `a` reading a partner's state it is authorized to see — the dual of local respect, needing an `obs` **read-closure**; the integrity property (Theorem A) stands complete without it.* | Tier D — non-interference |
 
 `refcount_mismatch.rs` is the keystone residual (`docs/TIER-B-CUTOFF.md` §3(1),
 `docs/TIER-C-SPIKE.md` §3–4). Proving it discharges — for *all* sizes — the two `kani::assume`s
@@ -62,6 +63,7 @@ $VERUS --crate-type=lib hv-verify/verus/unwinding_control.rs        # → 3 veri
 $VERUS --crate-type=lib hv-verify/verus/unwinding_create.rs         # → 2 verified, 0 errors  (Tier D)
 $VERUS --crate-type=lib hv-verify/verus/unwinding_destroy.rs        # → 7 verified, 0 errors  (Tier D)
 $VERUS --crate-type=lib hv-verify/verus/noninterference_theorem.rs  # → 5 verified, 0 errors  (Tier D capstone)
+$VERUS --crate-type=lib hv-verify/verus/step_consistency.rs        # → 3 verified, 0 errors  (Tier D)
 ```
 
 CI runs exactly this in the `verus preservation proofs` job of
@@ -105,6 +107,8 @@ hand; each reproduces in seconds):
 | `unwinding_destroy.rs` | drop the teardown-reach `forall` hypothesis from `no_channel_no_reach_to_c` | `postcondition not satisfied` |
 | `noninterference_theorem.rs` | drop the `local_respect()` premise from Theorem A | `assertion failed` |
 | `noninterference_theorem.rs` | drop the `step_consistent()` premise from Theorem B | `assertion failed` |
+| `step_consistency.rs` | drop `local_respect()` from `step_consistency_off_channel` | `assertion failed` |
+| `step_consistency.rs` | drop the `writes_factor` hypothesis from `factored_step_is_consistent` | `postcondition not satisfied` |
 
 ## What's next
 
