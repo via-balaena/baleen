@@ -654,21 +654,40 @@ The decision, repo/CI shape, what is proven, and that finding live in
   (event-vCPU steering, richer scheduling), (b) *breadth* the fence defers to M3+ (wider cpumasks,
   512-entry tables, the real ABIs), and (c) ever-deeper sweeps with diminishing marginal
   confidence. The safety core is essentially complete; what remains is hardware.
-- **M3**: `hv-metal` boots — under **QEMU** first (`qemu-system-aarch64 -machine
-  virt,virtualization=on`, an EL2-capable *same-architecture* VM on the Apple-Silicon dev
-  machine) — to a serial "hello" over the PL011 UART and runs at **EL2** with the ARM
-  virtualization extensions enabled: the hypervisor is alive and has claimed the virtualization
-  hardware, though no guest runs yet (that is M4). The first `unsafe`, weeks in rather than day
-  one. **AArch64/EL2 is the first backend**, chosen to lead because the dev machine is ARM, so it
-  runs native-architecture under QEMU with no cross-emulation; an **x86-64** backend (Intel VMX /
-  EPT, the LAPIC) is co-equal and follows, behind the same `hv-hal` fence, per *ARM and x86 are
-  co-equal targets* above. Real ARM silicon (a dev board or an ARM server) is deferred until a
-  guest needs validating on hardware (M4+) — Apple Silicon gates EL2, so the Mac hosts QEMU, not
-  a bare-metal hypervisor. **Before reading anything into an emulated run, see
-  [`docs/QEMU-AND-METAL.md`](docs/QEMU-AND-METAL.md)** — the fidelity contract for QEMU testing:
-  what a green run does (functional refinement of the proven model — CPU-access isolation) and does
-  *not* (timing, memory-ordering, DMA/SMMU, errata) tell you, and why on Apple Silicon Baleen-at-EL2
-  runs under pure-emulation TCG where that gap is maximal.
+- **M3 — metal bring-up: "it's alive"** *(landed through Arc 3)*: `hv-metal` boots under **QEMU**
+  (`qemu-system-aarch64 -machine virt,virtualization=on`, an EL2-capable *same-architecture* VM on
+  the Apple-Silicon dev machine) at **EL2**, and the proven brain now services a hypercall on the
+  (emulated) bare CPU. The first `unsafe`, weeks in rather than day one. Landed arc by arc, each one
+  diamonded + audited in the A→D rhythm:
+  - **Arc 0** — the metal dev + CI boot-test loop: a standalone, workspace-excluded `hv-metal` crate
+    (the one crate that overrides `unsafe_code = "forbid"`), an `aarch64-unknown-none-softfloat`
+    target, `cargo xtask qemu`/`qemu-test`, and a **required** `metal boot (QEMU)` CI check.
+  - **Arc 1** — a proper **PL011 UART console** (`src/pl011.rs`): `init` (8N1 + FIFO + TX-enable),
+    every write gated on `TXFF` so output can't drop, and `core::fmt::Write` — the diagnostic
+    substrate everything downstream reports through.
+  - **Arc 2** — **EL2 + exception vectors** (`src/exceptions.rs`): confirm `CurrentEL == EL2`, install
+    `VBAR_EL2` + a 2 KiB-aligned 16-entry vector table, and decode any synchronous fault
+    (`EC`/`ELR`/`FAR`/`ESR`) instead of triple-faulting — *a fault becomes diagnosable*. A
+    feature-gated `BRK` self-test asserts the vectors fire (`EC=0x3c`, `vector=4`).
+  - **Arc 3 — the proven brain runs on the metal**: configure `HCR_EL2.RW=1` (`src/el2.rs`); realize
+    `hv_hal::TimeSource` on the ARM generic timer (`CNTPCT_EL0`, `isb`-ordered, monotonicity witnessed
+    each boot; `src/time.rs`); supply a `#[global_allocator]` (a bump allocator over a `.bss` arena,
+    `src/heap.rs`) so `hv-core`'s `alloc` links; then link `hv-core`, construct a real `Hypervisor`,
+    and **dispatch a synthetic `HvCall` (`dom0 CreditGrant`) through the actual `Hypervisor::dispatch`
+    path → `balance=100`**. **🔍 Architecture Audit #1 — the fence**
+    ([`docs/AUDIT-1-HAL-FENCE.md`](docs/AUDIT-1-HAL-FENCE.md)): the `hv-hal` surface is
+    architecture-neutral; `TimeSource` is realized + honored on ARM; `GuestMemory`/`VcpuOps` are
+    deferred to M4 with assumptions named; no soundness defect. Still **pre-guest** — a guest is M4.
+
+  **AArch64/EL2 is the first backend**, chosen to lead because the dev machine is ARM, so it runs
+  native-architecture under QEMU with no cross-emulation; an **x86-64** backend (Intel VMX / EPT, the
+  LAPIC) is co-equal and follows, behind the same `hv-hal` fence, per *ARM and x86 are co-equal
+  targets* above. Real ARM silicon is deferred until a guest needs validating on hardware (M4+) —
+  Apple Silicon gates EL2, so the Mac hosts QEMU, not a bare-metal hypervisor. **Before reading
+  anything into an emulated run, see [`docs/QEMU-AND-METAL.md`](docs/QEMU-AND-METAL.md)** — the
+  fidelity contract for QEMU testing: what a green run does (functional refinement of the proven model
+  — CPU-access isolation) and does *not* (timing, memory-ordering, DMA/SMMU, errata) tell you, and why
+  on Apple Silicon Baleen-at-EL2 runs under pure-emulation TCG where that gap is maximal.
 - **M4**: one backend-driven vCPU (QEMU first, real silicon when it arrives) running a trivial
   guest at EL1; guest traps to EL2 translated into `hv-core` calls. The fence becomes real and
   load-bearing.
