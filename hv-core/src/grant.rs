@@ -243,17 +243,17 @@ impl System {
             return Err(GrantError::PermissionDenied);
         }
 
-        // Bump the counts (overflow-checked before any slot is consumed).
+        // Bump the counts via the shared count-transition (overflow-checked before any
+        // slot is consumed, so a rejected map stays a true no-op).
         if let GrantEntry::Access {
             maps,
             writable_maps,
             ..
         } = self.entry_mut(grantor, gref).unwrap()
         {
-            *maps = maps.checked_add(1).ok_or(GrantError::Overflow)?;
-            if writable {
-                *writable_maps += 1;
-            }
+            let (m, w) = Self::counts_after_map(*maps, *writable_maps, writable)?;
+            *maps = m;
+            *writable_maps = w;
         }
         let handle = self.alloc_handle(Mapping {
             active: true,
@@ -291,10 +291,9 @@ impl System {
         }) = self.entry_mut(mapping.grantor, mapping.gref)
         {
             frame = *f;
-            *maps = maps.saturating_sub(1);
-            if mapping.writable {
-                *writable_maps = writable_maps.saturating_sub(1);
-            }
+            let (m, w) = Self::counts_after_unmap(*maps, *writable_maps, mapping.writable);
+            *maps = m;
+            *writable_maps = w;
         }
         self.maps[handle as usize].active = false;
         self.check_invariants();
@@ -302,6 +301,48 @@ impl System {
             frame,
             writable: mapping.writable,
         })
+    }
+
+    /// The `(maps, writable_maps)` counts of a grant entry after one more mapping is
+    /// taken over it — the pure arithmetic core of [`Self::map`], factored out so the
+    /// production transition and the Tier C preservation proof (`hv-verify`) exercise
+    /// **one** definition and can never drift (design-lesson #14c). `writable` is whether
+    /// the new mapping is writable.
+    ///
+    /// Overflow: `maps` is `checked_add`ed and returns [`GrantError::Overflow`] on wrap,
+    /// exactly as the guest-visible map does, before any slot is consumed. `writable_maps`
+    /// needs no separate check — the `WritableExceedsMaps` invariant (`writable_maps <=
+    /// maps`) together with the successful `maps` bump keeps it `<=` the new, non-wrapped
+    /// `maps`. That safety of the unchecked increment is one of the facts the Tier C Kani
+    /// proof discharges over *all* refcount magnitudes.
+    pub fn counts_after_map(
+        maps: u32,
+        writable_maps: u32,
+        writable: bool,
+    ) -> Result<(u32, u32), GrantError> {
+        let maps = maps.checked_add(1).ok_or(GrantError::Overflow)?;
+        let writable_maps = if writable {
+            writable_maps + 1
+        } else {
+            writable_maps
+        };
+        Ok((maps, writable_maps))
+    }
+
+    /// The `(maps, writable_maps)` counts of a grant entry after one live mapping over it
+    /// is released — the pure arithmetic core of [`Self::unmap`], factored out to share one
+    /// definition with the Tier C preservation proof (design-lesson #14c). `writable` is
+    /// whether the released mapping was writable. Saturating, matching [`Self::unmap`]: the
+    /// counts never underflow in practice because an active mapping always backs a live
+    /// grant (the `RefcountMismatch` invariant), so `maps > 0` whenever this is called.
+    pub fn counts_after_unmap(maps: u32, writable_maps: u32, writable: bool) -> (u32, u32) {
+        let maps = maps.saturating_sub(1);
+        let writable_maps = if writable {
+            writable_maps.saturating_sub(1)
+        } else {
+            writable_maps
+        };
+        (maps, writable_maps)
     }
 
     /// A transient grant-checked access (Xen's `GNTTABOP_copy`): validates the same

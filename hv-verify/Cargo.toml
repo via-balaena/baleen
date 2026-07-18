@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[package]
+name = "hv-verify"
+description = "Tier C deductive-verification harnesses over hv-core: Kani preservation proofs (bridge), Verus ∀-N to follow."
+# Internal workspace crate — not for crates.io. Guards against an accidental publish.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# NOTE: `kani` is intentionally NOT a dependency. Every harness below is `#[cfg(kani)]`-
+# gated, so under a normal `cargo build`/`cargo test --workspace` this crate compiles to a
+# trivially-empty library with only the internal `hv-core` path dep — MSRV, clippy, and
+# cargo-deny stay green and no external crate enters the shipping graph. The `kani` crate is
+# injected by the `cargo kani` driver, which is the only thing that compiles the harnesses.
+[dependencies]
+hv-core = { path = "../hv-core" }
+
+[lints]
+workspace = true
