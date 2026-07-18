@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[package]
+name = "hv-metal"
+description = "Bare-metal binary: boot, enter EL2, the thin fenced `unsafe` core. The southbound metal layer beneath the proven `hv-core` brain."
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+authors = ["Via Balaena"]
+publish = false
+
+# Standalone: its own workspace so the parent's stable `cargo test --workspace` never tries to
+# build this bare-metal binary (it targets `aarch64-unknown-none-softfloat` and would fail on the
+# host). The parent `Cargo.toml` also lists this dir under `exclude`. Mirrors how `hv-fuzz` is kept
+# out of the stable build.
+[workspace]
+
+# This is the ONE crate that overrides the workspace-wide `unsafe_code = "forbid"` fence. The metal
+# layer IS the thin fenced `unsafe` core — MMIO, system registers, page tables. Everything above it
+# (`hv-core`) stays `unsafe`-free and proven; every `unsafe` block here is justified against the
+# `hv-hal` fence the proofs assume (see Architecture Audit #1 in `docs/ROADMAP.md`).
+[lints.rust]
+unsafe_code = "allow"
+
+# Bare-metal: no unwinding.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

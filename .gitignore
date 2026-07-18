@@ -9,3 +9,7 @@ Cargo.lock
 /hv-fuzz/artifacts
 /hv-fuzz/coverage
 /hv-fuzz/Cargo.lock
+
+# hv-metal bare-metal build artifacts (standalone crate, its own workspace)
+/hv-metal/target
+/hv-metal/Cargo.lock

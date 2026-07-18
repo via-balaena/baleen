@@ -10,12 +10,12 @@ members = ["hv-hal", "hv-core", "hv-sim", "hv-verify", "xtask"]
 # `cargo kani -p hv-verify` (the `cargo kani` driver injects the `kani` crate); nothing about
 # the shipping build touches Kani or CBMC. Contrast hv-fuzz, which needs its toolchain at
 # build time and so must be excluded:
-# hv-fuzz is a standalone crate (its own workspace) excluded here so stable
-# `cargo test --workspace` never builds the nightly/libFuzzer machinery.
-exclude = ["hv-fuzz"]
-# hv-metal (bare-metal binary, M3) joins the workspace when it arrives; it needs a
-# custom target and would break `cargo test --workspace`, so it stays out until
-# there is a tested brain to plug in.
+# hv-fuzz and hv-metal are standalone crates (each its own workspace) excluded here so stable
+# `cargo test --workspace` never builds their special toolchains: hv-fuzz's nightly/libFuzzer
+# machinery, and hv-metal's bare-metal `aarch64-unknown-none-softfloat` binary (which cannot link
+# for the host target). hv-metal is built + boot-tested out-of-band via `cargo xtask qemu` /
+# `hv-metal/boot-test.sh` (the metal side of the CI loop — see `.github/workflows/ci.yml`).
+exclude = ["hv-fuzz", "hv-metal"]
 
 [workspace.package]
 version = "0.0.0"

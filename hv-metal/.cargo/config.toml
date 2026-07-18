@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+# Default this crate to the bare-metal target when built from within `hv-metal/`. (`cargo xtask
+# qemu`, which builds from the repo root via `--manifest-path`, passes `--target` explicitly, and
+# the linker script is wired in `build.rs` so it applies regardless of the working directory.)
+[build]
+target = "aarch64-unknown-none-softfloat"
