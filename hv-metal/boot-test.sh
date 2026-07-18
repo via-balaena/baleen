@@ -7,7 +7,8 @@
 # the "diamond -> CI-green -> merge" loop; CI runs it (see .github/workflows/ci.yml) and so can you.
 #
 # Portable timeout: qemu parks in a wfe loop (it never exits on its own), so we run it in the
-# background, wait a few seconds for the banner, then kill it — no dependency on `timeout`/`gtimeout`.
+# background, poll the serial log for the banner, and kill it as soon as the banner appears (or
+# once we hit the wait cap) — no dependency on `timeout`/`gtimeout`.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -31,11 +32,24 @@ qemu-system-aarch64 \
     -kernel "$bin" \
     >"$out" 2>&1 &
 qemu_pid=$!
-sleep "$wait_secs"
+
+# Poll for the marker instead of a fixed sleep: exit as soon as it appears (the banner prints in
+# the first moments of boot, so a green run finishes fast) while still tolerating a slow/cold
+# runner up to $wait_secs before giving up.
+deadline=$((SECONDS + wait_secs))
+found=0
+while [ "$SECONDS" -lt "$deadline" ]; do
+    if grep -q "$marker" "$out"; then
+        found=1
+        break
+    fi
+    sleep 0.25
+done
 kill "$qemu_pid" 2>/dev/null || true
 wait "$qemu_pid" 2>/dev/null || true
 
-if grep -q "$marker" "$out"; then
+# Re-check once after the kill in case the marker landed between the last poll and now.
+if [ "$found" -eq 1 ] || grep -q "$marker" "$out"; then
     echo "boot-test: OK — found '$marker'"
     exit 0
 else

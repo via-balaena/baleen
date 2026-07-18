@@ -34,6 +34,11 @@ SECTIONS {
         __bss_end = .;
     }
 
+    /*
+     * The boot stack grows down from __stack_top toward .bss. There is no guard page: a deep
+     * enough overflow would silently corrupt .bss/.rodata/.text. 64 KiB is ample for this no_std
+     * bring-up (no recursion, no large stack buffers); revisit if that changes or on real hardware.
+     */
     . = ALIGN(16);
     . += STACK_SIZE;
     __stack_top = .;
