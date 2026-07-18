@@ -3,10 +3,12 @@
 
 # Tier D — non-interference (the property definition + the bridge spike)
 
-*Status: **COMPLETE at the model level.** Property definition decided and validated on real code
-(the enumerator bridge); every transition class proven ∀-N (five per-transition local-respect
-lemmas); and the **unwinding theorem** (`noninterference_theorem.rs`) assembles them into
-whole-system non-interference. This is the deepest and last tier of the true-diamond program — the
+*Status: **integrity non-interference COMPLETE at the model level; confidentiality dual
+characterized.** Property definition decided and validated on real code (the enumerator bridge);
+every transition class proven ∀-N (five per-transition local-respect lemmas); the **unwinding
+theorem** (`noninterference_theorem.rs`) assembles them into whole-system non-interference; and the
+last mile (`step_consistency.rs`) discharges the derivable part of the confidentiality premise,
+leaving a bounded, characterized read-closure residual (§5e). This is the deepest and last tier of the true-diamond program — the
 "are we checking the **right** things" capstone. Tiers A–C prove the invariants hold in every
 reachable state, ∀-N; Tier D proves those invariants **collectively imply real isolation**. Read
 alongside `hv-sim/src/noninterference.rs` (the enumerator bridge), the five `hv-verify/verus/
@@ -299,7 +301,37 @@ system (`obs`, `step`, `actor`, `interferes`, `run`) and proves two theorems:
 The two conditions are proven to *imply* the global property by trace induction; the five
 per-transition lemmas discharge local respect for the concrete system, and step consistency is the
 projection-determinism premise. Non-vacuity: dropping either premise makes Verus reject the
-corresponding theorem. **With the assembly, Tier D is complete at the model level.**
+corresponding theorem.
+
+## 5e. The last mile — step/output consistency, and the integrity/confidentiality split
+
+`hv-verify/verus/step_consistency.rs` (3 verified, 0 errors) discharges what is cleanly derivable
+of Theorem B's step-consistency premise and pins down the irreducible residual — the honest content
+of "the last mile."
+
+* **The reduction** (`step_consistency_off_channel`): from local respect *alone*, step consistency
+  holds for every step whose actor does not interfere with `a`. So the premise is never needed
+  off-channel — it reduces to the **interfering-actor** case (the confidentiality obligation is
+  only ever about authorized flows). The output-side analogue (`output_consistency_off_channel`)
+  holds the same way.
+* **The write direction** (`factored_step_is_consistent`): step consistency holds for every
+  **write** channel — a principal `b`'s *authorized effect on `a`* (mapping a grant `a` offered →
+  `a`'s frame refs `+1`; signalling a channel `a` is party to → `a`'s pending bit) is computed from
+  `a`'s state and `b`'s, both observed, so it factors through `obs(a) + obs(actor)`.
+
+**The finding — the residual is the confidentiality dual.** What does *not* factor through
+`obs(a) + obs(actor)` is a domain reading a **partner's** state it is authorized to see — `a`
+itself mapping/copying a grant a partner `c` offered it, whose success reads `c`'s frame ownership
+(the `StaleGrant` check), state in neither `obs(a)` nor `obs(actor == a)`. This is the exact **dual
+of local respect**: local respect is *integrity* — no unauthorized principal **writes** `obs(a)` —
+and it is **proven ∀-N**; the residual is *confidentiality* — no unauthorized state is **read** into
+`a`'s view. Discharging it fully requires refining the observation to its **read-closure** (`obs(a)`
+extended with the partner state `a` holds a read-capability for — the frames behind grants `a` has
+mapped), after which the read factors and step consistency closes. That refinement, and
+re-validating the channel relation against it, is a **bounded, well-characterized next arc** — the
+confidentiality direction of the property. **The integrity property the tier set out to prove
+(Theorem A — "`a` can't be *affected* except through authorized channels") stands complete without
+it.**
 
 ## 6. Honest scope, cost read, and the fork
 
@@ -309,25 +341,30 @@ checks, no violation), the tooling call is made (Verus, bridge-first), and **bot
 the enumerator bridge (real code, small size, all transitions) and one Verus unwinding lemma
 (∀-N, second seam). Non-interference on this model is **tractable, not a research dead-end.**
 
-**Tier D is complete at the model level.** Whole-system non-interference is *one local-respect
-lemma per transition class over `obs(a)`*, assembled by the unwinding theorem (§5d). Every part is
+**Tier D's integrity non-interference is complete at the model level; the confidentiality dual is
+characterized.** Whole-system non-interference is *one local-respect lemma per transition class over
+`obs(a)`*, assembled by the unwinding theorem (§5d). Every part of the **integrity** property is
 done: the property definition (validated on real code by the bridge, §4); the five per-transition
 local-respect lemmas — memory (`frame_lemma.rs`), signal (`unwinding_signal.rs`), authority
 (`unwinding_control.rs`), creation (`unwinding_create.rs`), the `DomainDestroy` cascade
-(`unwinding_destroy.rs`); and the compositional assembly (`noninterference_theorem.rs`) proving the
-per-step conditions imply the global property. No obligation remains open. The one *stated premise*
-that is not separately mechanized is **step consistency** (projection-determinism) — light given
-`~_a` = `obs`-equality, and pinned on the real code by the enumerator bridge (which checks
-`obs(a)`-preservation exhaustively at small size).
+(`unwinding_destroy.rs`); and the compositional assembly (`noninterference_theorem.rs`), whose
+Theorem A ("`a` can't be *affected* except through authorized channels") rests on local respect
+alone. The **confidentiality** dual (Theorem B, "`a` can't *learn* anything unauthorized") reduces
+(§5e) to step consistency on interfering actors, which is proven for the *write* direction and
+whose sole residual is the *read* direction — a bounded, well-characterized arc needing an `obs`
+read-closure.
 
 **The cost read, plainly.** Tier D was **not** the person-months cliff it might have been. The
 definition was the hard part and it is *done and validated*; all five per-transition unwinding
 lemmas (~5, ~2, ~3, ~2, ~7 lemmas) came in *easier* than feared, their shape is understood
 (state-invariant-guarded channels take a two-sides bridge; transition-guarded channels are simpler;
-the cascade composes both); and the assembly went green in one arc. **The true-diamond program
-A→D is complete at the model level** — Tiers A–C prove every invariant holds ∀-N, Tier D proves
-they collectively imply isolation. The natural next horizon is the **metal** (M3+, ARM-first QEMU):
-carrying these model guarantees onto hardware — an inherently new program, outside true-diamond.
+the cascade composes both); the assembly went green in one arc; and the last mile resolved cleanly
+into "integrity: done; confidentiality: characterized, read-closure residual." **The true-diamond
+program A→D is complete at the model level for integrity non-interference** — Tiers A–C prove every
+invariant holds ∀-N, Tier D proves they collectively imply *isolation* (nothing unauthorized affects
+a domain). Two honest horizons remain: the **confidentiality read-closure** (finishing Theorem B —
+a bounded model-level arc), and the **metal** (M3+, ARM-first QEMU — carrying the model guarantees
+onto hardware, an inherently new program outside true-diamond).
 
 **The fork (the user's call).** Tiers A–C already make the safety **core** deductively proven ∀-N;
 this spike shows Tier D's *"are we checking the right things"* capstone is reachable and its
