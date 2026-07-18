@@ -858,16 +858,21 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
                 },
             )),
             24 => drop_ok(hv.dispatch(caller, HvCall::P2mUnpin { mfn })),
-            // A seed-derived hard-affinity mask over the pCPU set — so dispatches face pins
-            // that can exclude a pCPU, exercising the scheduler's affinity invariant through
-            // the integrated seam (and the offline reset when a pinned vCPU is taken down).
-            _ => drop_ok(hv.dispatch(
-                caller,
-                HvCall::SchedSetAffinity {
-                    vcpu,
-                    affinity: u64::from(rng.below(1 << PCPUS)),
-                },
-            )),
+            // A seed-derived hard-affinity mask over the pCPU set, on a seed-chosen target —
+            // so dispatches face pins that can exclude a pCPU (exercising the affinity
+            // invariant and the offline reset), and the per-target authority gate sees self,
+            // controller, and Denied paths through the seam.
+            _ => {
+                let target = rng.below(u32::from(DOMAINS)) as u16;
+                drop_ok(hv.dispatch(
+                    caller,
+                    HvCall::SchedSetAffinity {
+                        target,
+                        vcpu,
+                        affinity: u64::from(rng.below(1 << PCPUS)),
+                    },
+                ))
+            }
         }
     }
 

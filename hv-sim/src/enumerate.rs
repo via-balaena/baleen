@@ -206,15 +206,24 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                         },
                     ));
                 }
-                // Every affinity mask over the pCPU set — so the model-checker drives the
-                // full spectrum from empty (unschedulable) through single-pCPU pins to the
-                // all-pCPUs default, exercising the run guard (dispatch onto a non-affine
-                // pCPU) and the set-affinity guard (narrowing below a running pCPU) at every
-                // reachable placement. With `SchedSetAffinity` now an explicit op, this loop
-                // is what keeps the scheduler's affinity coverage from being silently empty
-                // (design-lesson #14f — a generator must drive a value the runtime once fixed).
-                for affinity in 0..(1u64 << cfg.pcpus) {
-                    v.push((caller, HvCall::SchedSetAffinity { vcpu, affinity }));
+                // Every affinity mask over the pCPU set, for every `target` — so the
+                // model-checker drives the full spectrum from empty (unschedulable) through
+                // single-pCPU pins to the all-pCPUs default (exercising the run guard and the
+                // set-affinity guard at every placement), *and* every authority path: a
+                // self-affinity op (`caller == target`), an authorized peer op (a controller
+                // over `target`), and a `Denied` peer op (no control). Driving `target` is
+                // mandatory now that it is an explicit field (design-lesson #14f).
+                for target in 0..doms {
+                    for affinity in 0..(1u64 << cfg.pcpus) {
+                        v.push((
+                            caller,
+                            HvCall::SchedSetAffinity {
+                                target,
+                                vcpu,
+                                affinity,
+                            },
+                        ));
+                    }
                 }
             }
         }

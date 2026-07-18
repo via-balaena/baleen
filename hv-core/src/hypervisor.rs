@@ -104,16 +104,28 @@ pub enum HvCall {
     SchedWake { vcpu: Vcpu },
     /// Take one of the caller's vCPUs offline, closing any on-CPU interval at `now`.
     SchedOffline { vcpu: Vcpu, now: Ticks },
-    /// Set the **hard-affinity mask** of one of the caller's vCPUs — the set of physical
-    /// CPUs it may be dispatched onto (bit `p` = pCPU `p` permitted). The settable analogue
-    /// of a fixed vCPU↔pCPU binding (Xen's `XEN_DOMCTL_setvcpuaffinity`). Refused
-    /// ([`HvError::Sched`]`(`[`sched::SchedError::NotAffine`]`)`) if the vCPU is currently
-    /// `Running` on a pCPU the new mask excludes — the scheduler refuses rather than
-    /// force-migrate, so a rejected set mutates nothing. The mask is canonicalized to the
-    /// system's pCPU range. Like the other scheduler ops this acts on the *caller's own*
-    /// vCPU; layering the control axis onto it (a controller setting a target's affinity,
-    /// the faithful domctl) is a deferred refinement.
-    SchedSetAffinity { vcpu: Vcpu, affinity: u64 },
+    /// Set the **hard-affinity mask** of a vCPU of domain `target` — the set of physical CPUs
+    /// it may be dispatched onto (bit `p` = pCPU `p` permitted). Affinity is a resource-
+    /// management decision (which pCPUs a domain may use), so this is a **whole-domain control
+    /// operation** — Xen's `XEN_DOMCTL_setvcpuaffinity`, a domctl the control domain issues
+    /// about a target.
+    ///
+    /// **Authority:** a domain may set its *own* vCPUs' affinity (`caller == target`), but
+    /// setting a *peer's* requires the caller *control* that peer (`controls[caller][target]`),
+    /// exactly the per-target authority gate [`HvCall::DomainDestroy`] uses — the third
+    /// isolation axis (after ownership and consent) applied to scheduling. Otherwise
+    /// [`HvError::Denied`], mutating nothing. Past the gate `target` is always `Live` (self is
+    /// `Live` by the caller gate; a controlled target is `Live` by the control-edge invariant).
+    ///
+    /// Refused instead with [`HvError::Sched`]`(`[`sched::SchedError::NotAffine`]`)` if the
+    /// vCPU is currently `Running` on a pCPU the new mask excludes — the scheduler refuses
+    /// rather than force-migrate, so a rejected set mutates nothing. The mask is canonicalized
+    /// to the system's pCPU range.
+    SchedSetAffinity {
+        target: DomId,
+        vcpu: Vcpu,
+        affinity: u64,
+    },
 
     /// Allocate a free machine frame to the caller.
     ///
@@ -665,11 +677,11 @@ impl Hypervisor {
                 .offline(caller, vcpu, now)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Sched),
-            HvCall::SchedSetAffinity { vcpu, affinity } => self
-                .sched
-                .set_affinity(caller, vcpu, affinity)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::Sched),
+            HvCall::SchedSetAffinity {
+                target,
+                vcpu,
+                affinity,
+            } => self.sched_set_affinity(caller, target, vcpu, affinity),
 
             HvCall::P2mAllocate { mfn } => self
                 .p2m
@@ -893,6 +905,36 @@ impl Hypervisor {
             return Err(HvError::NotAlive);
         }
         Ok(())
+    }
+
+    /// Set a vCPU's hard affinity, gated by the per-target authority axis — the scheduler's
+    /// whole-domain control operation (Xen's `setvcpuaffinity` domctl). A domain may set its
+    /// *own* vCPUs' affinity, but a *peer's* requires control of that peer, the same gate
+    /// [`Self::domain_destroy`] applies. The authority check lives here at the seam (the
+    /// scheduler subsystem stays authority-agnostic, like every subsystem — it enforces only
+    /// the affinity *mechanics*, `NotAffine` and the mask), and it is checked before touching
+    /// the scheduler, so a `Denied` mutates nothing. Past the gate `target` is provably `Live`
+    /// (a self-caller is `Live`; a controlled target is `Live` by
+    /// [`CrossViolation::ControlEdgeDeadEndpoint`]), so the scheduler op never faces a `Dead`
+    /// domain here.
+    fn sched_set_affinity(
+        &mut self,
+        caller: DomId,
+        target: DomId,
+        vcpu: Vcpu,
+        affinity: u64,
+    ) -> Result<HvOutcome, HvError> {
+        if target as usize >= self.domain_count() {
+            return Err(HvError::BadDomain);
+        }
+        // A domain may affine its own vCPUs; affining a peer's needs control of that peer.
+        if caller != target && self.controls[caller as usize][target as usize] == Control::Absent {
+            return Err(HvError::Denied);
+        }
+        self.sched
+            .set_affinity(target, vcpu, affinity)
+            .map(|()| HvOutcome::Done)
+            .map_err(HvError::Sched)
     }
 
     fn check_bind_vcpu(&self, caller: DomId, vcpu: Vcpu) -> Result<(), HvError> {
@@ -4309,10 +4351,11 @@ mod tests {
     fn sched_set_affinity_through_dispatch_gates_run() {
         let mut h = hv(); // 2 pCPUs → full mask 0b11
         h.dispatch(1, HvCall::SchedAdmit { vcpu: 0 }).unwrap();
-        // Pin domain 1's vCPU 0 to pCPU 1 only.
+        // Domain 1 pins its own vCPU 0 to pCPU 1 only (a self-affinity op).
         h.dispatch(
             1,
             HvCall::SchedSetAffinity {
+                target: 1,
                 vcpu: 0,
                 affinity: 0b10,
             },
@@ -4344,6 +4387,70 @@ mod tests {
         assert!(h.invariants_hold());
     }
 
+    /// Affinity is a whole-domain control operation: a domain may set its *own* vCPUs'
+    /// affinity, and a *controller* may set a controlled peer's, but a domain with no control
+    /// of the target is `Denied` — the same per-target authority gate as `DomainDestroy`.
+    #[test]
+    fn setting_a_peers_affinity_requires_control_of_it() {
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        // dom0 creates domains 1 and 2, so dom0 controls both; neither controls the other.
+        for target in 1..=2 {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+
+        // Authorized: dom0 controls domain 1, so it may set domain 1's affinity.
+        assert!(h
+            .dispatch(
+                0,
+                HvCall::SchedSetAffinity {
+                    target: 1,
+                    vcpu: 0,
+                    affinity: 0b10,
+                },
+            )
+            .is_ok());
+        assert_eq!(h.sched().affinity_of(1, 0), Some(0b10));
+
+        // Denied: domain 2 does not control domain 1, so it cannot — a true no-op.
+        assert_eq!(
+            h.dispatch(
+                2,
+                HvCall::SchedSetAffinity {
+                    target: 1,
+                    vcpu: 0,
+                    affinity: 0b01,
+                },
+            ),
+            Err(HvError::Denied)
+        );
+        assert_eq!(
+            h.sched().affinity_of(1, 0),
+            Some(0b10),
+            "a denied set mutates nothing"
+        );
+
+        // Self: domain 1 may always set its own affinity, controlled by no one.
+        assert!(h
+            .dispatch(
+                1,
+                HvCall::SchedSetAffinity {
+                    target: 1,
+                    vcpu: 0,
+                    affinity: 0b01,
+                },
+            )
+            .is_ok());
+        assert_eq!(h.sched().affinity_of(1, 0), Some(0b01));
+        assert!(h.invariants_hold());
+    }
+
     /// Affinity is behaviourally live, so the reuse guarantee extends to it: a domain
     /// narrows a vCPU's affinity, is torn down, and the slot is reborn — the reborn tenant's
     /// vCPU inherits the default (all-pCPUs) affinity, no stale scheduling constraint from
@@ -4364,6 +4471,7 @@ mod tests {
         h.dispatch(
             1,
             HvCall::SchedSetAffinity {
+                target: 1,
                 vcpu: 0,
                 affinity: 0b10,
             },

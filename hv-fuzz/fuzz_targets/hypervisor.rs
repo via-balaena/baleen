@@ -199,10 +199,13 @@ fuzz_target!(|data: &[u8]| {
             // Tear a whole domain down — all four subsystems and both seams at once.
             // Stale handles it leaves behind are already tolerated by the unmap arm.
             30 => HvCall::DomainDestroy { target: other, now },
-            // Set a vCPU's hard-affinity mask (a fuzzed pCPU set). A later SchedRun onto an
-            // excluded pCPU is refused, so no Running vCPU is ever left off-affinity — the
-            // scheduler's affinity invariant is exercised through the integrated seam too.
+            // Set a vCPU's hard-affinity mask (a fuzzed pCPU set) on a fuzzer-chosen target —
+            // `other`, so self-affinity (target == caller), an authorized controller op, and a
+            // Denied peer op are all attempted. A later SchedRun onto an excluded pCPU is
+            // refused, so no Running vCPU is left off-affinity — the scheduler's affinity
+            // invariant and its per-target authority gate are both exercised through the seam.
             _ => HvCall::SchedSetAffinity {
+                target: other,
                 vcpu,
                 affinity: u64::from(b),
             },
