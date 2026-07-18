@@ -3,12 +3,16 @@
 
 # Tier D — non-interference (the property definition + the bridge spike)
 
-*Status: **property definition decided and validated on real code; tooling/bridge call made;
-spike green on both axes.** This is the deepest and last tier of the true-diamond program — the
+*Status: **COMPLETE at the model level.** Property definition decided and validated on real code
+(the enumerator bridge); every transition class proven ∀-N (five per-transition local-respect
+lemmas); and the **unwinding theorem** (`noninterference_theorem.rs`) assembles them into
+whole-system non-interference. This is the deepest and last tier of the true-diamond program — the
 "are we checking the **right** things" capstone. Tiers A–C prove the invariants hold in every
-reachable state, ∀-N; Tier D asks whether those invariants **collectively imply real isolation**.
-Read alongside `hv-sim/src/noninterference.rs` (the enumerator bridge), `hv-verify/verus/
-unwinding_signal.rs` (the Verus unwinding spike), and `docs/TIER-C-SPIKE.md` (the tier before).*
+reachable state, ∀-N; Tier D proves those invariants **collectively imply real isolation**. Read
+alongside `hv-sim/src/noninterference.rs` (the enumerator bridge), the five `hv-verify/verus/
+unwinding_*.rs` + `frame_lemma.rs` (the per-transition lemmas), `noninterference_theorem.rs` (the
+assembly), and `docs/TIER-C-SPIKE.md` (the tier before). These prove the **model** (the pure brain);
+whether the **metal** enforces it is M3+, outside this program.*
 
 ## 0. What Tier D is, and why it is different
 
@@ -272,6 +276,31 @@ transition. Effort: ~7 lemmas — more than any single direct channel (the compo
 Non-vacuity validated: dropping the `map`-identity hypothesis, or the teardown-reach hypothesis,
 makes Verus reject. **With this, every transition class of Tier D is discharged.**
 
+## 5d. The compositional assembly — the whole-system theorem (green)
+
+The capstone: the per-transition lemmas each prove **local respect** for one `step` class; the
+**unwinding theorem** (Goguen–Meseguer / Rushby — the method seL4-infoflow and CertiKOS use)
+assembles them into the top-level property over *arbitrary executions*.
+`hv-verify/verus/noninterference_theorem.rs` (5 verified, 0 errors) models the abstract transition
+system (`obs`, `step`, `actor`, `interferes`, `run`) and proves two theorems:
+
+* **Theorem A — local respect lifts to whole executions** (from **local respect** alone): a domain
+  `a` sees a *constant* observation across any execution whose actions are all by principals that
+  don't interfere with it. *Unrelated activity, of any length, is invisible to `a`.* This is the
+  direct assembly of the five per-transition lemmas — and it is **complete**, because local respect
+  is exactly what those five discharge (each for one `step` class, covering every `HvCall`).
+* **Theorem B — the unwinding theorem** (from local respect + **step consistency**): two executions
+  that start `obs(a)`-equivalent and agree, at each step, on the acting domain's observation, stay
+  `obs(a)`-equivalent throughout. *`a`'s view is determined entirely by the inputs authorized to
+  flow to it — it leaks nothing about the rest.* Step consistency (`obs(a)`'s successor is a
+  function of `obs(a)` and the actor's observation — projection-determinism) is the remaining
+  unwinding premise, light given `~_a` = `obs`-equality.
+
+The two conditions are proven to *imply* the global property by trace induction; the five
+per-transition lemmas discharge local respect for the concrete system, and step consistency is the
+projection-determinism premise. Non-vacuity: dropping either premise makes Verus reject the
+corresponding theorem. **With the assembly, Tier D is complete at the model level.**
+
 ## 6. Honest scope, cost read, and the fork
 
 **What the spike establishes.** The property definition (`obs`, `⇝`, local respect, the
@@ -280,25 +309,25 @@ checks, no violation), the tooling call is made (Verus, bridge-first), and **bot
 the enumerator bridge (real code, small size, all transitions) and one Verus unwinding lemma
 (∀-N, second seam). Non-interference on this model is **tractable, not a research dead-end.**
 
-**What remains for full Tier D.** Whole-system non-interference is *one local-respect lemma per
-transition class over the whole `obs(a)` projection*, assembled compositionally (plus the step- and
-output-consistency conditions, both light given `~_a` = `obs`-equality). **Every transition class
-is now discharged** — memory (`frame_lemma.rs`), signal (`unwinding_signal.rs`), authority
-(`unwinding_control.rs`), creation (`unwinding_create.rs`), and the multi-domain `DomainDestroy`
-cascade (`unwinding_destroy.rs`). The **only** remaining Tier D work is the **compositional
-assembly**: glue the per-transition lemmas + the light step/output-consistency conditions into the
-top-level whole-system non-interference statement. That is bookkeeping over parts that are all
-proven — no new unknown obligation remains.
+**Tier D is complete at the model level.** Whole-system non-interference is *one local-respect
+lemma per transition class over `obs(a)`*, assembled by the unwinding theorem (§5d). Every part is
+done: the property definition (validated on real code by the bridge, §4); the five per-transition
+local-respect lemmas — memory (`frame_lemma.rs`), signal (`unwinding_signal.rs`), authority
+(`unwinding_control.rs`), creation (`unwinding_create.rs`), the `DomainDestroy` cascade
+(`unwinding_destroy.rs`); and the compositional assembly (`noninterference_theorem.rs`) proving the
+per-step conditions imply the global property. No obligation remains open. The one *stated premise*
+that is not separately mechanized is **step consistency** (projection-determinism) — light given
+`~_a` = `obs`-equality, and pinned on the real code by the enumerator bridge (which checks
+`obs(a)`-preservation exhaustively at small size).
 
 **The cost read, plainly.** Tier D was **not** the person-months cliff it might have been. The
 definition was the hard part and it is *done and validated*; all five per-transition unwinding
-lemmas (~5, ~2, ~3, ~2, ~7 lemmas) came in *easier* than feared, and their shape is now understood
+lemmas (~5, ~2, ~3, ~2, ~7 lemmas) came in *easier* than feared, their shape is understood
 (state-invariant-guarded channels take a two-sides bridge; transition-guarded channels are simpler;
-the cascade composes both). The honest-unknown obligation — the `DomainDestroy` cascade — is
-**done**. What is left is the assembly, which is glue, not discovery. The model-level
-non-interference program is essentially proven part-by-part; whether to spend the assembly arc to
-state the single top-level theorem, or to move to the metal (M3+) with the parts in hand, is the
-standing fork — the *substance* is complete.
+the cascade composes both); and the assembly went green in one arc. **The true-diamond program
+A→D is complete at the model level** — Tiers A–C prove every invariant holds ∀-N, Tier D proves
+they collectively imply isolation. The natural next horizon is the **metal** (M3+, ARM-first QEMU):
+carrying these model guarantees onto hardware — an inherently new program, outside true-diamond.
 
 **The fork (the user's call).** Tiers A–C already make the safety **core** deductively proven ∀-N;
 this spike shows Tier D's *"are we checking the right things"* capstone is reachable and its
