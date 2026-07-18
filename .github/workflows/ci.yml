@@ -119,7 +119,12 @@ jobs:
       - name: Install QEMU (AArch64 system emulation)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-arm
 
-      - name: hv-metal boots to the serial marker under QEMU
+      # hv-metal is excluded from the workspace, so the `fmt · clippy · test` job never lints it —
+      # yet it is the one crate carrying `unsafe`. Gate it here under the same `-D warnings` bar.
+      - name: Lint hv-metal (fmt --check + clippy -D warnings, both feature configs)
+        run: cargo xtask metal-lint
+
+      - name: hv-metal boots to the serial markers under QEMU
         run: cargo xtask qemu-test
 
   # Supply-chain gate: refuse a dependency carrying a security advisory, a disallowed
