@@ -434,6 +434,15 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
     // so liveness, `may_create`, and the whole control matrix are behaviourally live and
     // must be part of the fingerprint — else two states differing only in who is alive, may
     // create, or controls whom would wrongly merge, dropping coverage.
+    //
+    // Note what is deliberately *absent*: no per-slot incarnation/generation. A slot taken
+    // Live→Dead→Live with identical contents fingerprints identically to one never destroyed
+    // — the two states are behaviourally the same, because domain-ID reuse soundness rests on
+    // clearing stale references, not on distinguishing incarnations (there is no generation
+    // counter to distinguish). That is what keeps the reachable set finite under
+    // create/destroy/recreate cycling: an unbounded incarnation would split every rebirth into
+    // a fresh state and the BFS would never close. The `DeadDomainReferenced` invariant is what
+    // makes this sound — a reborn slot provably inherits nothing, so it *is* the same state.
     for dom in 0..hv.domain_count() as u16 {
         k.push(hv.is_live(dom) as u64);
         k.push(hv.may_create(dom) as u64);
@@ -636,6 +645,29 @@ mod tests {
         }
     }
 
+    /// Domain-ID reuse in focus: create + destroy + *both* cross-domain reference kinds
+    /// (grants and interdomain event channels), so a slot can be granted to / opened a
+    /// channel to, torn down, and reborn — the config that can even *represent* the reuse
+    /// vectors. The lifecycle sweep has p2m but no evtchn/grant, so it could never build an
+    /// inbound reference to a slot it then destroys (design-lesson #13f — the tiny universe
+    /// must be big enough to hold the feature's witness). Here every reachable interleaving
+    /// of birth, cross-domain referencing, death, and rebirth is proven to leave no stale
+    /// reference naming a `Dead` slot (`DeadDomainReferenced`): the mint gate refuses one to a
+    /// Dead target, and teardown sweeps away every one to a dying slot. Were either removed,
+    /// this same sweep would surface a counterexample — the destroy-with-an-inbound-grant (or
+    /// -channel) state that the pre-fix code left reachable. Two domains is the smallest world
+    /// that forms a cross-domain reference and reuses a slot (dom0 creates and reuses slot 1).
+    fn reuse_cfg(depth: u32) -> Config {
+        Config {
+            evtchn: true,
+            grant: true,
+            create: true,
+            destroy: true,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
     fn all_cfg(depth: u32) -> Config {
         Config {
             evtchn: true,
@@ -706,6 +738,27 @@ mod tests {
     fn the_delegation_forest_is_exhaustively_sound() {
         let states = expect_clean(&delegation_cfg(4));
         assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
+    /// Domain-ID reuse, exhaustively (shallow): every reachable interleaving of a two-domain
+    /// create/destroy world under *both* grants and interdomain event channels keeps no stale
+    /// reference naming a `Dead` slot — a proof of `DeadDomainReferenced` over every way a
+    /// slot can be referenced, torn down, and reborn. The CI depth is kept modest; the deep
+    /// twin below runs far enough to grant-and-channel a slot, destroy it, and revive it.
+    #[test]
+    fn domain_id_reuse_is_exhaustively_sound() {
+        let states = expect_clean(&reuse_cfg(4));
+        assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
+    /// The deep domain-ID-reuse sweep. Depth 8 is enough to bring up a slot, grant it a frame
+    /// (or open an interdomain channel to it), destroy it, and recreate it — so it
+    /// exhaustively proves the mint gate and teardown sweep leave no reachable state in which a
+    /// grant or a half-open port names a Dead slot, across every create/destroy interleaving.
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn domain_id_reuse_deep() {
+        expect_no_violation(&reuse_cfg(8));
     }
 
     /// The deep grant↔page-type / page-table↔grant sweep. Depth 7 is enough to reach a
