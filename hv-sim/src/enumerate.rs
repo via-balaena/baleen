@@ -753,6 +753,109 @@ mod tests {
         }
     }
 
+    /// Tier A larger-scope: the grant / page-type seams over **three** domains and **three**
+    /// frames, not two. The small-scope hypothesis is the load-bearing assumption behind every
+    /// bounded sweep — this probes it directly by adding a third party, so a bug that only
+    /// manifests with three domains sharing (A grants to B while C owns/maps something) would
+    /// surface where the two-domain `grant_p2m_cfg` cannot even represent it.
+    fn grant_p2m_3dom_cfg(depth: u32) -> Config {
+        Config {
+            grant: true,
+            p2m: true,
+            create: true,
+            destroy: true,
+            domains: 3,
+            frames: 3,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
+    /// Tier A cross: **delegated** control (`Via` edges) together with grant + interdomain
+    /// event channels over three domains. The audit *argued* a `Via` edge drives the identical
+    /// grant/evtchn teardown a creation `Root` edge does (the cascade touches only the control
+    /// matrix), so delegate × grant × evtchn is decomposable — but it was never checked together:
+    /// `reuse_cfg` has grant+evtchn but no delegate, `delegation_cfg` has delegate but no
+    /// grant/evtchn. Three domains is the smallest world that forms a `Via` edge *and* a
+    /// cross-domain reference, so this turns that argument into a check.
+    fn authority_seams_cfg(depth: u32) -> Config {
+        Config {
+            evtchn: true,
+            grant: true,
+            create: true,
+            destroy: true,
+            delegate: true,
+            domains: 3,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
+    /// Tier A completeness: the page-table hierarchy over **all four** levels (`L1..L4`) with
+    /// enough frames to stack a deep tree, not just the `L1`/`L2` the other configs use. The
+    /// level logic is level-generic (`interior_child_type`, the `get_type` level-conflict), so
+    /// `L3`/`L4` are isomorphic to `L1`/`L2` by inspection — this closes the gap empirically
+    /// anyway, proving the higher levels' typing and interior-child discipline over a real sweep.
+    fn deep_hierarchy_cfg(depth: u32) -> Config {
+        Config {
+            p2m: true,
+            create: true,
+            destroy: true,
+            levels: vec![PtLevel::L1, PtLevel::L2, PtLevel::L3, PtLevel::L4],
+            frames: 4,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
+    // ─── Tier A: larger-scope + cross-invariant + full-hierarchy sweeps ──────────────
+    // Each has a CI-shallow test (closes fast in debug) and a deep `#[ignore]`d twin that
+    // closes to a theorem in release. Together they close the bounded gaps the audit left:
+    // three-domain scope (the small-scope hypothesis at K+1), the delegate × grant × evtchn
+    // cross (argued decomposable, now checked), and the L3/L4 levels (isomorphic to L1/L2).
+
+    #[test]
+    fn grant_p2m_over_three_domains_is_sound() {
+        let states = expect_clean(&grant_p2m_3dom_cfg(3));
+        assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn grant_p2m_over_three_domains_deep() {
+        let mut cfg = grant_p2m_3dom_cfg(5);
+        cfg.max_states = 4_000_000;
+        expect_no_violation(&cfg); // closes ≈1.82M states
+    }
+
+    #[test]
+    fn delegation_crossed_with_grant_and_evtchn_is_sound() {
+        let states = expect_clean(&authority_seams_cfg(3));
+        assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn delegation_crossed_with_grant_and_evtchn_deep() {
+        let mut cfg = authority_seams_cfg(5);
+        cfg.max_states = 4_000_000;
+        expect_no_violation(&cfg); // closes ≈1.27M states
+    }
+
+    #[test]
+    fn the_four_level_hierarchy_is_sound() {
+        let states = expect_clean(&deep_hierarchy_cfg(5));
+        assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn the_four_level_hierarchy_deep() {
+        let mut cfg = deep_hierarchy_cfg(8);
+        cfg.max_states = 4_000_000;
+        expect_no_violation(&cfg);
+    }
+
     // The CI-sized enumerations run at a shallow depth so the whole suite stays a few
     // seconds; the `#[ignore]`d twins below crank the same configs far deeper for an
     // on-demand exhaustive sweep (`cargo test --release -- --ignored`).
