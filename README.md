@@ -656,7 +656,11 @@ The decision, repo/CI shape, what is proven, and that finding live in
   EPT, the LAPIC) is co-equal and follows, behind the same `hv-hal` fence, per *ARM and x86 are
   co-equal targets* above. Real ARM silicon (a dev board or an ARM server) is deferred until a
   guest needs validating on hardware (M4+) — Apple Silicon gates EL2, so the Mac hosts QEMU, not
-  a bare-metal hypervisor.
+  a bare-metal hypervisor. **Before reading anything into an emulated run, see
+  [`docs/QEMU-AND-METAL.md`](docs/QEMU-AND-METAL.md)** — the fidelity contract for QEMU testing:
+  what a green run does (functional refinement of the proven model — CPU-access isolation) and does
+  *not* (timing, memory-ordering, DMA/SMMU, errata) tell you, and why on Apple Silicon Baleen-at-EL2
+  runs under pure-emulation TCG where that gap is maximal.
 - **M4**: one backend-driven vCPU (QEMU first, real silicon when it arrives) running a trivial
   guest at EL1; guest traps to EL2 translated into `hv-core` calls. The fence becomes real and
   load-bearing.
