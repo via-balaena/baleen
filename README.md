@@ -503,6 +503,38 @@ violations.
   channel) and the `run_destroy` seed sweep — which cycles `Dead→Live→Dead→Live` with inbound
   references live and asserts the invariant every step — and fuzzed through the integrated target.
   No soundness bug found.
+- **vCPU affinity** *(landed)*: the scheduler had exactly **one** invariant — pCPU exclusivity —
+  and no notion of *where* a vCPU is allowed to run: a `Runnable` vCPU could be dispatched onto
+  **any** idle pCPU. This gives the previously invariant-light scheduler its **second safety
+  invariant**. Each vCPU carries a **hard-affinity mask** (real hardware's cpumask, Xen's
+  `cpu_hard_affinity`) — the set of pCPUs it may run on — defaulting to *all* pCPUs so existing
+  "run anywhere" behaviour is unchanged until narrowed. A new `SchedSetAffinity` op sets it, and
+  `SchedRun` is **guarded**: a dispatch onto a pCPU outside the mask is refused (`NotAffine`). The
+  new standing invariant is **"a `Running` vCPU is always on a pCPU in its affinity set"**
+  (`RunningOffAffinity`); only two transitions can violate it (dispatch, and narrowing affinity),
+  and both are guarded, so it holds by construction. Three design calls define the shape: **(1)
+  self-service** — a domain sets its *own* vCPU's mask, consistent with every other scheduler op in
+  this model (layering the control axis onto it, the faithful Xen `XEN_DOMCTL_setvcpuaffinity`, is
+  a deferred refinement); it is sound because affinity only *restricts* a domain's own vCPUs and
+  reserves nothing, so it cannot deny a pCPU to others. **(2) Refuse, don't force-migrate** —
+  setting an affinity that excludes the pCPU a vCPU is *currently* running on is refused (a no-op),
+  not resolved by a forced migration; the brain's gating-precondition style over side-effects (as
+  teardown refuses-if-busy), which keeps the invariant true by construction and `set_affinity` a
+  pure mask write. **(3) Reset on offline** — because affinity is *behaviourally live* (it gates
+  `run`, unlike `runtime`, which gates nothing and is dropped from the state fingerprint), `offline`
+  resets it to the all-pCPUs default, so a re-admitted vCPU — or one **reborn in a reused domain
+  slot** — inherits no stale scheduling constraint. That is a deliberate departure from Xen (which
+  preserves affinity across offline), made for exactly the reason the domain-ID-reuse arc chose
+  eager cleanup over a generation counter: a reborn domain must behave identically to a fresh one,
+  and a behaviourally-live field must not leak across the lifecycle. An **empty** mask (run nowhere)
+  is deliberately allowed — an unschedulable vCPU is a *liveness*/policy concern, not a safety one,
+  the same dividing line that keeps fairness out of this module. Model-checked exhaustively by a new
+  `affinity_cfg` over **two** pCPUs (so a mask can genuinely exclude one), driving every mask across
+  every placement: closed clean shallow, and coverage proven non-vacuous — with the run-guard
+  removed the sweep surfaces `RunningOffAffinity` immediately. `state_key` fingerprints the mask
+  (behaviourally live — design-lesson #7). Witnessed by six `hv-core` cases and the seeded
+  `run_sched`/`run_hypervisor` mirrors, and fuzzed through the scheduler and integrated targets with
+  a fuzzed mask so off-affinity dispatches are attempted directly. No soundness bug found.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
   AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
