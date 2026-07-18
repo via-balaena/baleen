@@ -12,14 +12,22 @@ cargo-deny never see it and the pure brain stays stable-buildable. It is verifie
 
 ## What is proven
 
-| file | obligation |
-|---|---|
-| `refcount_mismatch.rs` | `RefcountMismatch` (`maps == \|live mappings\|`, `writable_maps == \|writable live mappings\|`) is preserved by grant `map` **and** `unmap`, for an **arbitrary entry table × arbitrary-length mapping sequence** — the ∀-N / scalar↔`Vec` step Kani could only `unwind`. |
+| file | obligation | §3 residual |
+|---|---|---|
+| `refcount_mismatch.rs` | `RefcountMismatch` (`maps == \|live mappings\|`, `writable_maps == \|writable live mappings\|`) is preserved by grant `map` **and** `unmap`, for an **arbitrary entry table × arbitrary-length mapping sequence** — the ∀-N / scalar↔`Vec` step Kani could only `unwind`. | (1) refcount infinity |
+| `frame_lemma.rs` | The **projection frame-lemma**: the grant summation `maps_over_frame(f)` is **owner-local** — under `MisownedGrantMap`, only `owner(f)`'s grants contribute, so a transition disjoint from `{f, owner(f)}` cannot perturb `UnbackedGrantMap`'s read-value at `f`. Over an **arbitrary-length** grant population. | (2) projection frame-lemma |
 
-This is the keystone Tier C residual (`docs/TIER-B-CUTOFF.md` §3(1), `docs/TIER-C-SPIKE.md`
-§3–4). Proving it discharges — for *all* sizes — the two `kani::assume`s the spike's unmap
-harness could only assert (`maps ≥ 1`; read-only ⇒ `writable_maps ≤ maps − 1`), closing the
-coupling the Kani finding (design-lesson #20) surfaced.
+`refcount_mismatch.rs` is the keystone residual (`docs/TIER-B-CUTOFF.md` §3(1),
+`docs/TIER-C-SPIKE.md` §3–4). Proving it discharges — for *all* sizes — the two `kani::assume`s
+the spike's unmap harness could only assert (`maps ≥ 1`; read-only ⇒ `writable_maps ≤ maps − 1`),
+closing the coupling the Kani finding (design-lesson #20) surfaced.
+
+`frame_lemma.rs` discharges the substantive case of residual (2) (`docs/TIER-B-CUTOFF.md` §2.3):
+the frame property the size cutoff imports. Of §2.3's three bullets (slot-reuse
+index-independence, the grant-summation owner-locality, and the single-referrer scans), the
+summation is the only cross-domain one, so it is the only non-trivial case — and its locality
+*borrows* from `MisownedGrantMap`, the same "one invariant borrows from a relational one" shape
+the Kani spike found (#20). Only residual (3), control-forest acyclicity, remains.
 
 ## Running it
 
@@ -29,10 +37,11 @@ VTAG=release/0.2026.07.12.0b42f4c
 curl -sL -o verus.zip \
   "https://github.com/verus-lang/verus/releases/download/$VTAG/verus-0.2026.07.12.0b42f4c-arm64-macos.zip"
 unzip -q verus.zip -d ~/.local/verus
+VERUS=~/.local/verus/verus-arm64-macos/verus
 
-# Verify (exit 0 = every proof discharged):
-~/.local/verus/verus-arm64-macos/verus --crate-type=lib hv-verify/verus/refcount_mismatch.rs
-# → verification results:: 8 verified, 0 errors
+# Verify each proof (exit 0 = every proof discharged):
+$VERUS --crate-type=lib hv-verify/verus/refcount_mismatch.rs   # → 8 verified, 0 errors
+$VERUS --crate-type=lib hv-verify/verus/frame_lemma.rs         # → 5 verified, 0 errors
 ```
 
 CI runs exactly this in the `verus preservation proofs` job of
@@ -57,17 +66,18 @@ Three anchors, all documented inline in `refcount_mismatch.rs`:
 
 ## Non-vacuity (the "remove the fix → counterexample" check)
 
-The proof has teeth — perturbing the arithmetic makes Verus reject it (verified by hand; each
-reproduces in seconds):
+The proofs have teeth — dropping a load-bearing hypothesis makes Verus reject them (verified by
+hand; each reproduces in seconds):
 
-| perturbation | result |
-|---|---|
-| `map` target scalar `counts_after_map(..)` → `(maps, wmaps)` (drop the `+1`) | `postcondition not satisfied` |
-| `counts_after_map` writable half `wmaps + b2n(w)` → `wmaps` (drop the writable bump) | `postcondition not satisfied` |
-| `counts_after_unmap(..)` → `(maps, wmaps)` (no decrement) | `postcondition not satisfied` |
+| file | perturbation | result |
+|---|---|---|
+| `refcount_mismatch.rs` | `map` target scalar `counts_after_map(..)` → `(maps, wmaps)` (drop the `+1`) | `postcondition not satisfied` |
+| `refcount_mismatch.rs` | `counts_after_map` writable half `wmaps + b2n(w)` → `wmaps` (drop the writable bump) | `postcondition not satisfied` |
+| `refcount_mismatch.rs` | `counts_after_unmap(..)` → `(maps, wmaps)` (no decrement) | `postcondition not satisfied` |
+| `frame_lemma.rs` | drop `misowned_ok` from `owner_local`'s `requires` | `postcondition not satisfied` |
+| `frame_lemma.rs` | drop the `g.frame != f \|\| g.count == 0` guard on the disjoint step | `postcondition not satisfied` |
 
 ## What's next
 
-The remaining §3 residuals — the projection frame-lemma (per-transition write⟂read
-disjointness) and the control-forest acyclicity (structural induction over the delegation
-forest, design-lesson #13b) — are the follow-on Verus obligations. See `docs/TIER-C-SPIKE.md`.
+Only §3 residual (3) remains — the control-forest acyclicity (structural induction over the
+delegation forest, design-lesson #13b). See `docs/TIER-C-SPIKE.md`.

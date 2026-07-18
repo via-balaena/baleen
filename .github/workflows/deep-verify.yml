@@ -96,9 +96,12 @@ jobs:
 
   # Tier C, the ∀-N step: the Verus preservation proofs in hv-verify/verus. Where Kani makes a
   # refcount symbolic and proves over all 2^32 MAGNITUDES on the real code (bounded on Vec
-  # length), Verus proves `RefcountMismatch` preserved by grant map/unmap over an ARBITRARY
-  # entry table and ARBITRARY-length mapping sequence — the scalar↔Vec-length axis Kani would
-  # have to `unwind` (docs/TIER-B-CUTOFF.md §3(1), docs/TIER-C-SPIKE.md). The proofs are a Verus-
+  # length), Verus proves the §3 residuals over ARBITRARY size: RefcountMismatch preserved by
+  # grant map/unmap over an arbitrary entry table + mapping sequence (refcount_mismatch.rs), and
+  # the projection frame-lemma — the grant summation maps_over_frame(f) is owner-local, so a
+  # disjoint transition can't perturb UnbackedGrantMap (frame_lemma.rs) — the scalar↔Vec-length
+  # axis Kani would have to `unwind` (docs/TIER-B-CUTOFF.md §2.3/§3, docs/TIER-C-SPIKE.md §4-5).
+  # The proofs are a Verus-
   # dialect MIRROR (Verus cannot be #[cfg]-hidden from cargo like the Kani harnesses can), kept
   # outside hv-verify/src so a normal build never sees them; fidelity to the shipped transition
   # is documented in hv-verify/verus/README.md. Verus ships prebuilt (verifier + z3) but drives
@@ -144,8 +147,17 @@ jobs:
           unzip -q /tmp/verus.zip -d "$HOME/.local/verus"
           echo "$HOME/.local/verus/verus-x86-linux" >> "$GITHUB_PATH"
 
-      - name: verus --crate-type=lib (RefcountMismatch preservation, ∀ table size)
-        run: verus --crate-type=lib hv-verify/verus/refcount_mismatch.rs
+      # Verify every proof file in hv-verify/verus/ (RefcountMismatch preservation over
+      # arbitrary table size; the projection frame-lemma / grant-summation owner-locality; …).
+      # `set -e` fails the job if any single proof does not discharge.
+      - name: verus --crate-type=lib (Tier C ∀-N preservation proofs)
+        run: |
+          set -euo pipefail
+          for proof in hv-verify/verus/*.rs; do
+            echo "::group::verus $proof"
+            verus --crate-type=lib "$proof"
+            echo "::endgroup::"
+          done
 
   # A bounded run of every fuzz target on nightly. No persisted corpus yet, so this is a
   # continuous smoke-fuzz (regression catcher), not a deep campaign — still far better than
