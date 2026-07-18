@@ -31,7 +31,7 @@ test on a multi-year solo project.
 | `hv-hal`        | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`)       | ✅ M1  |
 | `hv-core`       | all logic as a `no_std` library, zero `unsafe`: dispatch and state machines           | ✅ M1  |
 | `hv-sim`        | host harness — fake memory, hand-cranked clock, seeded deterministic simulation       | ✅ M1  |
-| `hv-metal`      | bare-metal binary: boot, enter EL2/VMX, the thin fenced `unsafe` core                  | 🚧 M3  |
+| `hv-metal`      | bare-metal binary: boot, enter EL2/VMX, the thin fenced `unsafe` core                  | 🚧 M4  |
 | `hv-fuzz`       | `cargo-fuzz` targets against the hypercall dispatcher                                  | ⏳ M2  |
 | `xtask`         | build/test automation (`cargo xtask <task>`)                                          | ✅ M1  |
 
@@ -688,9 +688,22 @@ The decision, repo/CI shape, what is proven, and that finding live in
   fidelity contract for QEMU testing: what a green run does (functional refinement of the proven model
   — CPU-access isolation) and does *not* (timing, memory-ordering, DMA/SMMU, errata) tell you, and why
   on Apple Silicon Baleen-at-EL2 runs under pure-emulation TCG where that gap is maximal.
-- **M4**: one backend-driven vCPU (QEMU first, real silicon when it arrives) running a trivial
-  guest at EL1; guest traps to EL2 translated into `hv-core` calls. The fence becomes real and
-  load-bearing.
+- **M4 — first guest: the proof touches reality** *(Arc 4 landed)*: a trivial guest at EL1 whose
+  traps to EL2 become `hv-core` calls — the fence becomes real and load-bearing.
+  - **Arc 4 — trap-and-service. ✅ DONE**
+    ([`docs/ARC-4-TRAP-AND-SERVICE.md`](docs/ARC-4-TRAP-AND-SERVICE.md)): a trivial EL1 guest boots
+    behind a minimal Stage-2 (`HCR_EL2.VM=1` + one 2 MiB identity block, `src/guest.rs`), issues
+    `HVC`, and traps to EL2 (vector slot 8, `EC=0x16`); a GPR save/restore frame on a dedicated
+    exception stack (+ a re-entry guard) resumes it. The saved registers are decoded through
+    `hv-core`'s `RawHypercall`/`Hypercall::decode` seam and routed through the **actual
+    `Hypervisor::dispatch`**; the result is handed back and the guest observes it — echoing the
+    serviced balance in a final `HVC` (`grant 100`, `spend 30` → **70**; 70 is no call's input, so
+    the echo proves the guest saw the *serviced* result, across two resume cycles). `VcpuOps::
+    set_entry` realized on ARM (`ELR_EL2`); `inject_interrupt`/`GuestMemory` honestly deferred.
+    Three-way converged (spec-derived code + blind Arm-ARM auditor + QEMU). **No isolation content.**
+  - **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test** (next): translate the proven
+    `p2m` into faithful AArch64 Stage-2 descriptors; a guest touching unauthorized memory faults to
+    EL2. **🔍 Architecture Audit #2** — does the emitted table deny *exactly* what the model says?
 - **M5+**: the **greenfield "slim Qubes"** capstone — unmodified Linux guests under
   hardware-virt + **virtio**; isolated **disposables** from a template; an offline **vault**;
   a trusted **input/GUI domain**; **direct device attach** (data USB); and **GPU

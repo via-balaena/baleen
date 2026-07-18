@@ -13,6 +13,7 @@ ENTRY(_start)
 
 RAM_START = 0x40080000;
 STACK_SIZE = 0x10000; /* 64 KiB */
+EXC_STACK_SIZE = 0x4000; /* 16 KiB — the EL2 exception stack (Arc 4) */
 
 SECTIONS {
     . = RAM_START;
@@ -53,6 +54,31 @@ SECTIONS {
     . = ALIGN(16);
     . += STACK_SIZE;
     __stack_top = .;
+
+    /*
+     * The dedicated EL2 exception stack (M4 Arc 4). Guest trap-and-service runs the vector
+     * handler on SP_EL2 switched to this region — separate from the boot stack, which rust_main
+     * abandons the moment it `eret`s into the guest (that path is terminal). One frame deep per
+     * trap (saved + restored around each service), so 16 KiB is generous. Arc 2's diagnostic
+     * handler had no save-frame and needed no such stack; resuming a guest does.
+     */
+    . = ALIGN(16);
+    . += EXC_STACK_SIZE;
+    __exc_stack_top = .;
+
+    /*
+     * Guest RAM (M4 Arc 4). A dedicated, 2 MiB-aligned NOLOAD region the hypervisor loads the
+     * guest image into (a copy of the in-image guest template) and identity-maps with a single
+     * Stage-2 2 MiB block. 2 MiB-aligned + exactly 2 MiB so the block maps ONLY guest RAM — the
+     * hypervisor's own memory is deliberately outside the guest's IPA space (no isolation content
+     * yet; that honesty is what Arc 5's negative-isolation test builds on). NOLOAD: it reserves
+     * DRAM (the `virt` machine has ample) without bloating the image, and _start's `.bss` zeroing
+     * does not reach here — the guest bytes are written by the boot-time copy, not relied on zero.
+     */
+    . = ALIGN(0x200000);
+    __guest_ram_start = .;
+    . += 0x200000;
+    __guest_ram_end = .;
 
     /DISCARD/ : { *(.comment) *(.note .note.*) *(.eh_frame*) }
 }

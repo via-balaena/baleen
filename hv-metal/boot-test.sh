@@ -6,15 +6,17 @@
 # `virt` machine at EL2, and assert the expected serial markers appear. This is the metal side of
 # the "diamond -> CI-green -> merge" loop; CI runs it (see .github/workflows/ci.yml) and so can you.
 #
-# Arc 3 runs it TWICE:
-#   - the DEFAULT build: the full Arc-3 sequence — at EL2, vectors installed, HCR_EL2.RW=1, the
-#     generic-timer TimeSource live and monotonic, and a synthetic HvCall dispatched into the linked
-#     hv-core brain returning the right balance (asserts every one of those markers);
-#   - the `--features selftest` build: additionally asserts the HvCall *accounting* witness
-#     (grant 100 / spend 30 -> balance 70), then deliberately executes `BRK #0` so the installed
-#     exception vectors must CATCH and DECODE the fault (asserts the class `EC=0x3c` and the slot
-#     `vector=4`). Each self-test asserts a witness produced BY the mechanism under test — the
-#     non-vacuity proofs that the dispatch and the vectors fire (design-lessons #23, #24(f)).
+# The boot runs TWICE (through M4 Arc 4):
+#   - the DEFAULT build: at EL2, vectors installed, HCR_EL2.RW=1, the generic-timer TimeSource live
+#     and monotonic, a synthetic HvCall dispatched directly into the linked hv-core brain (Arc 3),
+#     and then the Arc-4 headline — a real EL1 guest issues HVC, traps to EL2, and has both
+#     hypercalls serviced through the ACTUAL Hypervisor::dispatch (nr=0 arg=100 -> 100, nr=1 arg=30
+#     -> 70), with the guest observing the serviced balance on a round-trip HVC (asserts each);
+#   - the `--features selftest` build: additionally asserts the Arc-3 accounting witness
+#     (grant 100 / spend 30 -> balance 70), hard-asserts the guest round-trip equality, then — chained
+#     at the end of the guest report — deliberately executes `BRK #0` so the installed exception
+#     vectors must CATCH and DECODE the fault (asserts the class `EC=0x3c` and the slot `vector=4`).
+#     Each marker is a witness produced BY the mechanism under test (design-lessons #23, #24(f)).
 #
 # Portable timeout: qemu parks in a wfe loop (it never exits on its own), so we run it in the
 # background, poll the serial log for the markers, and kill it as soon as they all appear (or once
@@ -101,7 +103,11 @@ boot_and_check "default" "" \
     "VBAR_EL2 installed" \
     "HCR_EL2.RW=1" \
     "generic timer live" \
-    "HvCall CreditGrant(100) -> balance=100"
+    "HvCall CreditGrant(100) -> balance=100" \
+    "entering EL1 guest" \
+    "guest HVC serviced: nr=0 arg=100 -> result=100" \
+    "guest HVC serviced: nr=1 arg=30 -> result=70" \
+    "guest observed HvCall result=70 via HVC round-trip"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -117,6 +123,10 @@ boot_and_check "selftest" "--features selftest" \
     "generic timer live" \
     "HvCall CreditGrant(100) -> balance=100" \
     "selftest: HvCall accounting OK" \
+    "guest HVC serviced: nr=0 arg=100 -> result=100" \
+    "guest HVC serviced: nr=1 arg=30 -> result=70" \
+    "guest observed HvCall result=70 via HVC round-trip" \
+    "selftest: guest round-trip OK" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
