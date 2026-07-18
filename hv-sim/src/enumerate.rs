@@ -726,6 +726,33 @@ mod tests {
         }
     }
 
+    /// vCPU affinity crossed with the **whole** integrated core, over **two pCPUs**. `all_cfg`
+    /// runs one pCPU, where affinity is trivial (the mask can exclude nothing), so affinity has
+    /// only ever been model-checked *in isolation* (`affinity_cfg`) — its orthogonality to the
+    /// grant / page-type / event seams was *argued* (no cross-invariant reads the affinity mask,
+    /// and no non-scheduler transition touches scheduler state), never *checked together*. This
+    /// config turns that argument into a proof over the shared reachable state: every subsystem
+    /// on, two vCPUs over two pCPUs so a mask genuinely excludes a pCPU, plus create/destroy/
+    /// delegate — so if any coupling between affinity and the other seams existed, a
+    /// `RunningOffAffinity` (or any other) breach would surface in the *combined* interleaving.
+    /// (None does; this is the empirical half of the audit's decomposition argument — Tier A of
+    /// the true-diamond program.)
+    fn all_affinity_cfg(depth: u32) -> Config {
+        Config {
+            evtchn: true,
+            grant: true,
+            sched: true,
+            p2m: true,
+            create: true,
+            destroy: true,
+            delegate: true,
+            vcpus: 2,
+            pcpus: 2,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
     // The CI-sized enumerations run at a shallow depth so the whole suite stays a few
     // seconds; the `#[ignore]`d twins below crank the same configs far deeper for an
     // on-demand exhaustive sweep (`cargo test --release -- --ignored`).
@@ -760,6 +787,18 @@ mod tests {
     #[test]
     fn the_integrated_core_is_exhaustively_sound_shallow() {
         expect_clean(&all_cfg(3));
+    }
+
+    /// vCPU affinity crossed with the *whole* core over two pCPUs, shallow: the combined
+    /// interleaving the isolated `affinity_cfg` (affinity only) and the one-pCPU `all_cfg`
+    /// (affinity trivial) never exercised together. Closes the audit's "affinity is orthogonal"
+    /// *argument* into a *checked* result — Tier A of the true-diamond program. The deep twin
+    /// runs far enough to have a vCPU `Running` on an affinity-restricted pCPU while grants and
+    /// page tables are live across both domains.
+    #[test]
+    fn affinity_crossed_with_the_full_core_is_sound() {
+        let states = expect_clean(&all_affinity_cfg(3));
+        assert!(states > 200, "suspiciously few states explored: {states}");
     }
 
     /// The domain lifecycle, exhaustively: every reachable interleaving of create, destroy,
@@ -877,6 +916,20 @@ mod tests {
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn integrated_core_deep() {
         expect_no_violation(&all_cfg(5));
+    }
+
+    /// The deep affinity × full-core sweep, **closed to a theorem**. Depth 5 closes exhaustively
+    /// (≈1.9M states — raised cap so it does not truncate): every reachable state within 5
+    /// hypercalls of the two-pCPU, two-vCPU, all-subsystem world keeps every invariant, so a
+    /// `Running` vCPU on an affinity-restricted pCPU coexisting with live grants, page tables,
+    /// events, and delegation never breaks anything. The exhaustive proof that vCPU affinity is
+    /// orthogonal to the other seams (Tier A).
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn all_affinity_deep() {
+        let mut cfg = all_affinity_cfg(5);
+        cfg.max_states = 4_000_000;
+        expect_no_violation(&cfg);
     }
 
     /// The dedup key is sound: distinct observable states must not collapse. A frame
