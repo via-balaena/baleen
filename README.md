@@ -427,6 +427,43 @@ violations.
   subtree). A delegatee that can no longer strip its delegator, while an ancestor still can and
   it cascades, is the disaggregated-toolstack authority Xen's XSM does coarsely — here a checked
   invariant.
+- **Superpages** *(landed)*: a page-table entry may now be a **leaf at any level**, not
+  only under an `L1`. A leaf terminates the walk and maps an ordinary `Writable` page; above
+  `L1` it is a **superpage** — a 2 MiB page mapped directly by an `L2` entry, a 1 GiB page by
+  an `L3` — with its size carried by the parent entry's level, no leaf type of its own (real
+  hardware's large pages, and how EPT/Stage-2 map guest RAM). This lands *between* the two
+  prior page-table arcs, and naming which is the point. Unlike the *nodes* arc it is **not** a
+  one-line relaxation: leaf-vs-interior was inferred from the parent level (`level == L1`),
+  and a superpage makes an `L2` entry ambiguous — a **read-only** superpage in particular
+  leaves its child untyped, so an `L2`→untyped-child edge is a legitimate 2 MiB leaf *or* a
+  corrupt interior edge, and only stored state tells them apart. So the entry records a
+  `leaf` bit — real hardware's page-size / `PS` bit — **new stored structure** (design-lesson
+  #5), modeled with the existing bool idiom like `writable`, not a new `PageType`
+  (design-lesson #8). But unlike the *revocation* arc it earns **no new named invariant**: the
+  existing `MislevelledLink` hierarchy invariant *generalizes* to read the bit (a leaf's child
+  is a valid leaf target — `Writable`-typed if writable, merely allocated if read-only; an
+  interior entry's child is the level below), so the honest result is *new structure, an
+  existing invariant generalized, zero new seams*. `ChildRef`/`entry_child_ref` make `link`
+  (which reference to take), `unlink` (which to give back), and the invariant (which type the
+  child must be) all derive from one place, so they cannot drift. Three guarantees hold **for
+  free**, confirming design-lesson #12 a third time: **write-xor-pagetable** binds at superpage
+  size unchanged (a writable 2 MiB leaf pins its child `Writable`, so it can never also be a
+  page table); the **foreign-link seam** — `UnauthorizedForeignLink`, already a scan over
+  *every* edge — authorizes a shared 2 MiB leaf off the one grant a shared 4 KiB leaf needs,
+  and teardown/revoke-block key on the boundary edge, level- and shape-agnostic; and
+  **acyclicity** is untouched because a leaf is *terminal* (no page-table child to descend).
+  Frame contiguity/alignment of the 512 sub-frames a real superpage spans is deliberately
+  **abstracted out** — a leaf pins one `Mfn`, and the accounting is identical whether it
+  stands for 4 KiB or 2 MiB; contiguity is an MMU/allocator concern for `hv-metal`, not a
+  brain invariant. Model-checked exhaustively: the enumerator now drives both entry shapes
+  (required to keep its interior coverage once `leaf` is explicit) and `state_key` fingerprints
+  `leaf` so a superpage and a small-page mapping of the same frame never merge (design-lesson
+  #7); the grant<->p2m depth-7 sweep — now building 2 MiB superpage leaves as well as small
+  pages and node shares — re-measured at **852,085** states (up from 741,777), closed complete,
+  zero violations (lifecycle depth-12 likewise grew 18,422 → 45,920). Witnessed by the seeded
+  `run_ptab` (a `superpages` reachability witness) and `run_foreign` (a foreign 2 MiB leaf
+  shared and authorized by one grant, `superpage_links`) across the seed space, and fuzzed
+  through the integrated target. No soundness bug found.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
   AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
