@@ -26,6 +26,7 @@ fn base() -> Config {
         delegate: false,
         depth: 5,
         max_states: 6_000_000,
+        symmetry: false,
     }
 }
 

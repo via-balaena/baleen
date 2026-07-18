@@ -3,10 +3,11 @@
 
 # Tier B — the cutoff / small-scope-completeness argument
 
-*Status: analysis + instrumentation landed. This is a reasoning artifact, not a machine
-proof — it says exactly what the bounded model checking already proves at all sizes and all
-depths, and exactly what it does not (which is Tier C's job). Read alongside
-`hv-sim/src/enumerate.rs` (the checker this argument is about) and the `first_violation` /
+*Status: analysis + instrumentation + symmetry-reduction optimization landed (§2.5). This is a
+reasoning artifact, not a machine proof — it says exactly what the bounded model checking already
+proves at all sizes and all depths, and exactly what it does not (which is Tier C's job). Read
+alongside `hv-sim/src/enumerate.rs` (the checker this argument is about, now with the
+symmetry-reduced dedup and its soundness-validation tests) and the `first_violation` /
 `first_cross_violation` methods in `hv-core` (the 28 invariants it reasons over).*
 
 ## 0. What Tier B is, and is not
@@ -113,21 +114,24 @@ Running each seam config with the new instrumentation (see
 | delegation forest (4 dom) | create+destroy+delegate | 12 | 58,280 | **SATURATES** (asserted by `delegation_forest_deep`) |
 | domain-ID reuse | evtchn+grant (no p2m) | >8 | >22.9M | **finite → saturates**, but the reachable set is huge — 5.66M at d7, **22.9M at d8 and still not saturated**; d9 OOMs an 8 GB laptop (§1.2: no owned frame ⇒ no unbounded refcount) |
 | authority × seams (3 dom) | evtchn+grant+delegate | large | large | **finite → saturates** (§1.2: no p2m; the 3-domain evtchn+grant space is very large — did not finish here) |
-| four-level hierarchy | p2m (L1–L4, 4 frames) | large | large | **finite → saturates** (§1.2: pins idempotent, links capped ⇒ refs bounded; the 4-frame × 4-level space did not finish here) |
-| event ↔ scheduler | evtchn+sched | large | large | **finite → saturates** (§1.2: both subsystems bounded; >6M states by d8) |
+| four-level hierarchy (4 frames) | p2m (L1–L4) | large | large | **finite → saturates** (§1.2: pins idempotent, links capped ⇒ refs bounded; the 4-frame × 4-level space did not finish here, even ~20× reduced — its saturation depth is too deep at \|G\|=24) |
+| **four-level hierarchy (3 frames)** | p2m (L1–L4) | **16 (reduced)** | **1,030,856 (reduced)** | **SATURATES — measured, via symmetry reduction** (§2.5): unreduced it truncates at the cap; frame-symmetry reduction (\|G\|=3!=6) collapses it to 1.03M orbit reps and the frontier empties (asserted in-tree by `hierarchy_saturates_only_under_symmetry_reduction`) |
+| event ↔ scheduler | evtchn+sched | large | large | **finite → saturates** (§1.2: both subsystems bounded; >6M states by d8; only ~2× reduced — port symmetry is weak here) |
 | **grant ↔ p2m** | **grant+p2m** | **never** | ∞ | **UNBOUNDED** — `maps`/`refs` climb per map |
 
-The five top rows are run **to an empty frontier** — a measured all-depths theorem; the three
-affinity/lifecycle/delegation ones are now asserted in-tree by the `*_deep` tests
-(`expect_saturated`, which fails unless the frontier empties). The four middle rows are proven
-*finite* by §1.2 (they contain no refcount that can grow without bound) and therefore *must*
-saturate at some depth — but the demonstration was attempted and their reachable sets turn out
-to be **too large to empty the frontier on a single 8 GB laptop**: domain-ID reuse, the most
-telling, reaches 22.9M distinct states by depth 8 with the frontier *still* non-empty, and
-depth 9 exhausts memory. So for these four the all-depths claim rests on the finiteness
-*argument*, not (yet) on a measured empty frontier — an honest distinction: a bigger box, or a
-counter/structural abstraction that shrinks the state space, would close them. Only the last row
-is genuinely infinite, and no box closes it.
+The small top rows are run **to an empty frontier** — a measured all-depths theorem; the
+affinity/lifecycle/delegation ones are asserted in-tree by the `*_deep` tests
+(`expect_saturated`, which fails unless the frontier empties), and the **3-frame four-level
+hierarchy** joins them via symmetry reduction (§2.5). The remaining middle rows are proven
+*finite* by §1.2 (no refcount can grow without bound) and therefore *must* saturate at some
+depth — but their reachable sets are **too large to empty the frontier on a single 8 GB laptop**,
+even after symmetry reduction: domain-ID reuse reaches 22.9M distinct states by depth 8 with the
+frontier *still* non-empty (≈8× reduced ≈ still millions), and the 4-frame hierarchy's saturation
+depth is deeper than the ~20× frame reduction can reach in tolerable time at `|G|=24`. So for
+those the all-depths claim rests on the finiteness *argument* plus the depth-robust
+*coverage-completeness* validation of §2.5, not (yet) on a measured empty frontier — an honest
+distinction: a bigger box, a faster canonicalization, or Tier C would close them. Only the last
+row is genuinely infinite, and no box closes it.
 
 The grant↔p2m growth is monotone and explosive — 1.3k (d3) → 9.9k (d4) → 51k (d5) → 211k
 (d6) → 828k (d7) → truncates — and the direct witness is unambiguous: allocate a frame, grant
@@ -187,22 +191,32 @@ small — a *cutoff* size k0), and projection (a violation at any N implies one 
 frame, port, vCPU, or pCPU id; ids are compared only by equality and by stored relationship
 (grantor==owner, a port's `remote`, a link's `parent`/`child`, a control cell's `Via(d)`).
 
-**Evidence.** A sweep of `hv-core` for literal id constants finds exactly **one** asymmetry,
-both occurrences in `Hypervisor::new`: domain 0 boots `Live` with `may_create`, every other
-slot boots `Dead` without it (`hypervisor.rs:514,520`). Nothing else in the core — no
-transition, no `first_violation`, no `first_cross_violation` — contains a `dom == k` literal.
-The 28 invariants read ids only structurally (indices into vectors, equality tests, reciprocity
-lookups).
+**Evidence.** A sweep of `hv-core` for literal id constants finds **two** distinguished ids,
+both benign for the reduction because a permutation only has to *fix* them:
 
-**Consequence.** The initial state is invariant under any permutation of ids that fixes the
-sole distinguished element, domain 0. Formally the symmetry group is
-`S_frames × S_ports × S_vcpus × S_pcpus × S_grants × Stab₀(S_domains)` (the stabilizer of dom0
-over domains, full symmetry over everything else), and the transition relation and invariant
-set are equivariant under it. Therefore a reachable violating state at *any* id-assignment has
-an isomorphic reachable violating state at the **canonical** assignment `{0, 1, …, k−1}`. **The
-identities are irrelevant; only the multiplicities (sizes) matter.** This is the standard
-data-independence reduction, and here it is exact because the code is, by construction,
-id-agnostic except at boot.
+- **Domain 0** boots `Live` with `may_create`; every other slot boots `Dead` without it
+  (`hypervisor.rs:514,520`). No transition, `first_violation`, or `first_cross_violation`
+  contains a `dom == k` literal — the sole domain asymmetry is at boot.
+- **vCPU 0** is the default notify target: `evtchn::notify_target` returns `Some(0)` for an
+  `Interdomain` or `Unbound` port (`evtchn.rs`, Xen's default `notify_vcpu_id`), so when event
+  channels are in play vCPU 0 is distinguished from its peers. (The original version of this
+  section, grepping only for *domain* literals, missed this; it is corrected here. It changes
+  nothing downstream — the vCPU cutoff is 2 regardless, §2.2 — but the symmetry group over
+  vCPUs is the *stabilizer* of vCPU 0, not the full `S_vcpus`.)
+
+The 28 invariants otherwise read ids only structurally (indices into vectors, equality tests,
+reciprocity lookups).
+
+**Consequence.** The initial state is invariant under any permutation of ids that fixes the two
+distinguished elements. Formally the symmetry group is
+`S_frames × S_ports × Stab₀(S_vcpus) × S_pcpus × S_grants × Stab₀(S_domains)` (the stabilizers
+of dom0 and vCPU 0, full symmetry over everything else), and the transition relation and
+invariant set are equivariant under it. Therefore a reachable violating state at *any*
+id-assignment has an isomorphic reachable violating state at the **canonical** assignment
+`{0, 1, …, k−1}`. **The identities are irrelevant; only the multiplicities (sizes) matter.**
+This is the standard data-independence reduction, and here it is exact because the code is, by
+construction, id-agnostic except at boot and at the one notify default. §2.5 turns this proof
+into an enumerator *optimization*.
 
 ### 2.2 Per-invariant locality → a size cutoff k0
 
@@ -318,6 +332,76 @@ a forest has no cycles, at any size. That is a structural induction over the del
 **not** a size cutoff — again squarely in Tier C's territory (an inductive invariant on the
 transition relation, proven for arbitrary N).
 
+### 2.5 Symmetry reduction — the §2.1 proof as an enumerator optimization
+
+§2.1 proves the data-independence *fact*; this turns it into a *tool*. The enumerator dedups
+reachable states by `state_key`, which is **not** canonical under id-permutation, so every one
+of the (up to) `|G|` symmetric variants of a state is explored and stored separately. Symmetry
+reduction canonicalizes each state to its orbit representative before dedup — the
+lexicographically minimal `state_key` over the group `G` — so an entire orbit collapses to one
+state. The reachable set shrinks by up to `|G|`, and a config that was too large to empty its
+frontier can become one that saturates. Enabled by `Config::symmetry`; off by default so every
+existing sweep still runs unreduced as the ground truth.
+
+**What is permuted (Phase 1).** The three id kinds the code compares purely structurally and
+that carry the payoff: **frames** (global `S_frames`), and **ports** and **grants** (each domain
+independently). Domains, vCPUs, and pCPUs are held fixed: domain 0 and vCPU 0 are the
+distinguished ids of §2.1, and with ≤ 2 vCPUs / ≤ 2 pCPUs in every config their stabilizers are
+trivial anyway, so nothing is lost. (Domain permutation — the coupled case, since the per-domain
+port/grant/vCPU arrays move with their domain — is deferred; it would help only the 3–4-domain
+configs.) The permutation is applied to a plain-data `Snapshot` read out of the `Hypervisor`,
+remapping every id-bearing field *and every cross-reference*: a port's `remote_port` indexes the
+remote domain's port table, a mapping's `gref` indexes the grantor's grant table, an edge's
+parent/child are frame ids. Getting those remaps complete and consistent is the entire soundness
+burden.
+
+**Soundness — validated, not asserted.** Merging two states that are *not* symmetric would hide
+states — and any violation reachable only through them — which is the worst failure a
+verification tool can have. So the reduction is validated ruthlessly, in the enumerator's test
+module, before any theorem leans on it:
+
+1. **Group-is-an-automorphism (closure).** On a *saturated* config — whose reachable set is
+   complete, hence closed under any automorphism of the transition system — every group element
+   maps every reachable state back *into* the reachable set. Checked exhaustively over the whole
+   group and every reachable state, for frames (real p2m), ports (self-interdomain, exercising
+   `remote_port`), and grants (exercising the mapping `gref` remap). A permutation that carried a
+   reachable state *off* the set would be no symmetry at all; this catches exactly that. (The
+   check must use a *saturated* set: a merely depth-bounded slice is not closed, because a
+   permutation need not preserve hypercall distance — the allocator makes low indices cheaper to
+   reach, so a 2-hypercall state can have a 4-hypercall symmetric image, present in the full set
+   but absent from a depth-3 slice. That subtlety is why the first cut of this validation
+   false-flagged ports before being corrected to require saturation.)
+2. **Coverage-completeness (hides-no-orbit), depth-robust.** The reduced BFS's visited canonical
+   keys equal the canonical projection of the *entire* unreduced reachable set. This is the
+   operational inject-a-bug check and it catches a *harmful* over-merge directly: if the
+   canonical key wrongly merged two non-symmetric states with different successors, the reduced
+   run — expanding only one representative — would never generate the other's unique successor
+   orbits, so its visited set would be strictly missing keys the full set contains.
+3. **Orbit-invariance + separation, and count sanity.** The canonical key is constant on each
+   orbit and distinct across orbits; and `|R|/|G| ≤ reduced ≤ |R|`, with the reduced count equal
+   to the orbit count computed *independently* of the min (by each state's full orbit key-set).
+
+**Measured payoff.** The reduction factor grows with depth and with how much symmetric structure
+a config uses. Frame symmetry is by far the strongest (frames are named explicitly, so p2m
+states use all of them): the four-level hierarchy over 4 frames reduces ≈ **20×** (1.73M → 83.5k
+at depth 8). Grant+port+frame on `reuse` reduces 4.7× (d4) → 7.9× (d6), still climbing. Port
+symmetry alone is weak (≈ 2× on `evtchn+sched` at d7) because most of those states bind few
+ports. The reduction trades **time for memory**: canonicalization costs `|G|` key-builds per
+state, so the reduced run is often *slower* in wall-clock even as it stores far fewer states —
+which is exactly the right trade against a memory wall.
+
+The concrete win: the **full four-level page-table hierarchy over three frames**, which
+*truncates* at the state cap unreduced (argued-finite, unmeasured), **saturates** under
+frame-symmetry reduction (`|G| = 6`) at **1,030,856 orbit representatives, depth 16** — a
+*measured* all-depths theorem where before there was only §1.2's argument
+(`hierarchy_saturates_only_under_symmetry_reduction`). The very largest configs (`reuse` at ≈8×,
+the 4-frame hierarchy at ≈20× but `|G|=24`) still do not empty their frontier in tolerable
+laptop wall-clock even reduced — an honest limit: symmetry reduction moves the memory wall
+substantially and delivers new measured theorems, but it is a constant-factor tool, not a
+substitute for the deductive step where a config is genuinely infinite (grant↔p2m) or its
+saturation depth is simply out of reach. A faster (factored, non-brute-force) canonicalization is
+the natural next optimization.
+
 ---
 
 ## 3. Honest ledger — what Tier B closes, what it hands to Tier C
@@ -327,15 +411,20 @@ transition relation, proven for arbitrary N).
 - **The depth axis for every bounded-state config** — a *theorem*, via saturation, now
   machine-checkable by running to an empty frontier (the `saturated` flag, itself checked by
   `saturation_flag_is_sound`). Two grades of evidence, honestly separated: **(measured)** the
-  small configs — evtchn, sched/affinity, lifecycle, delegation, grant-without-p2m — are run to
-  an empty frontier and proven safe at *all* depths (three asserted in-tree); **(argued)** the
-  large bounded configs — reuse, the 4-level hierarchy, evtchn+sched — are *proven finite* by
-  §1.2 (no unbounded refcount) but their state sets run to tens of millions (reuse: 22.9M by
-  depth 8, still not empty), too large to actually empty the frontier on this hardware. Either
-  way the depth bound is not fundamental for these — only the last, refcount-unbounded config is
-  genuinely infinite. This was latent in the existing sweeps and is now made explicit.
+  small configs — evtchn, sched/affinity, lifecycle, delegation, grant-without-p2m, **and now the
+  full four-level hierarchy over three frames (via symmetry reduction, §2.5)** — are run to an
+  empty frontier and proven safe at *all* depths (asserted in-tree); **(argued)** the largest
+  bounded configs — reuse, the 4-frame hierarchy, evtchn+sched — are *proven finite* by §1.2 (no
+  unbounded refcount) but their state sets run to tens of millions (reuse: 22.9M by depth 8, still
+  not empty), too large to empty the frontier on this hardware *even after* symmetry reduction
+  (≈8×/≈20×). Either way the depth bound is not fundamental for these — only the last,
+  refcount-unbounded config is genuinely infinite.
 - **Symmetry** — the reduction from "all id-assignments" to "canonical `0..k−1`" is exact,
-  because the code is id-agnostic except for dom0 at boot.
+  because the code is id-agnostic except for dom0 at boot and vCPU 0 at notify (§2.1). This is
+  now not only an argument but an **operational, validated enumerator optimization** (§2.5): the
+  canonicalize-before-dedup that turned the 3-frame four-level hierarchy from argued-finite into a
+  measured all-depths theorem, with its soundness pinned by group-closure, coverage-completeness,
+  and orbit-invariance tests.
 - **The per-invariant locality analysis and the cutoff k0** — 27 of 28 invariants have a
   bounded witness; k0 = (4,3,2,2,2,2); Tier A's 3-domain grant/p2m + 4-domain delegation
   sweeps are its combined base case.
