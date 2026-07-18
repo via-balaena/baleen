@@ -12,12 +12,18 @@ It is a **standalone crate** (its own `[workspace]`), **excluded** from the pare
 targets `aarch64-unknown-none-softfloat` and cannot link for the host, so stable `cargo test
 --workspace` never touches it. It is built and booted out-of-band.
 
-## Status: M3, Arc 0 — the metal dev + test loop
+## Status: M3, Arc 1 — a proper PL011 console
 
-Per [`docs/ROADMAP.md`](../docs/ROADMAP.md), Arc 0 is the *enabling* step: a bare-metal binary that
-boots on the QEMU `virt` machine, prints a marker over the PL011 UART, and parks — establishing the
-dev + CI boot-test loop every later arc rides. **No hypervisor logic yet**: EL2 configuration is
-Arc 2, the first guest is M4.
+Per [`docs/ROADMAP.md`](../docs/ROADMAP.md), Arc 0 stood up the dev + CI boot-test loop with a raw
+one-byte UART poke. **Arc 1** turns that into a *proper* PL011 console (`src/pl011.rs`): it
+initializes the UART into a known state (8N1, FIFOs on, TX enabled), gates every write on the
+TX-FIFO-not-full flag so output cannot be silently dropped, and exposes `core::fmt::Write` so later
+arcs can `write!`/`writeln!` formatted diagnostics. This is the substrate everything downstream
+reports through — exception decode, the `CurrentEL` readout, `hv-core` dispatch results.
+
+It is **plumbing** — a diagnostic substrate with no isolation content — and **still no hypervisor
+logic**: EL2 configuration is Arc 2, the first guest is M4. A green boot attests the console works,
+nothing about the hypervisor.
 
 ## Build & run
 
@@ -36,7 +42,8 @@ job).
 
 | file | what |
 |---|---|
-| `src/main.rs` | `_start` (assembly: stack, `.bss` zero, hand to Rust), `rust_main` (PL011 marker), panic handler |
+| `src/main.rs` | `_start` (assembly: stack, `.bss` zero, hand to Rust), `rust_main` (console up + banner), panic handler (reports `PanicInfo`) |
+| `src/pl011.rs` | the PL011 UART driver — init, TX-FIFO-gated writes, `core::fmt::Write` |
 | `linker.ld` | minimal linker script for the `virt` machine (load at `0x4008_0000`, a 64 KiB stack) |
 | `build.rs` | wires the linker script in (works regardless of build CWD) |
 | `boot-test.sh` | the headless QEMU boot smoke-test |
