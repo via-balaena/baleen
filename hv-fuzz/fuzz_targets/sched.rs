@@ -4,9 +4,11 @@
 //! Fuzz the scheduler state machine.
 //!
 //! The input byte stream is decoded into a sequence of admit/run/preempt/block/wake/
-//! offline operations over a small fixed system, with a monotonically advancing clock
-//! so time accounting is exercised too. After *every* transition the whole-system
-//! invariant is checked — pCPU exclusivity and run-state/occupancy reciprocity. The
+//! offline/set-affinity operations over a small fixed system, with a monotonically
+//! advancing clock so time accounting is exercised too. After *every* transition the
+//! whole-system invariant is checked — pCPU exclusivity, run-state/occupancy
+//! reciprocity, *and* that no `Running` vCPU sits on a pCPU outside its affinity mask
+//! (`set_affinity` picks a fuzzed mask, so off-affinity dispatches are attempted). The
 //! transition surface is pure (no VM, no hardware), so libFuzzer explores
 //! interleavings of two vCPUs contending for one physical CPU at millions of
 //! exec/sec. The seeded mirror in `hv-sim` (`run_sched`) makes the same property a
@@ -43,7 +45,7 @@ fuzz_target!(|data: &[u8]| {
         let pcpu = u32::from(b) % PCPUS as u32;
         now = now.wrapping_add(1 + u64::from(a));
 
-        match op % 6 {
+        match op % 7 {
             0 => {
                 let _ = sys.admit(dom, vcpu);
             }
@@ -59,8 +61,14 @@ fuzz_target!(|data: &[u8]| {
             4 => {
                 let _ = sys.wake(dom, vcpu);
             }
-            _ => {
+            5 => {
                 let _ = sys.offline(dom, vcpu, now);
+            }
+            // A fuzzed affinity mask — `b` selects which pCPUs the vCPU may run on (the
+            // subsystem canonicalizes it to the pCPU range). A later `run` onto an excluded
+            // pCPU must then be refused, and no `Running` vCPU may end up off-affinity.
+            _ => {
+                let _ = sys.set_affinity(dom, vcpu, u64::from(b));
             }
         }
 

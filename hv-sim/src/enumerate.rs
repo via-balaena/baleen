@@ -206,6 +206,16 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                         },
                     ));
                 }
+                // Every affinity mask over the pCPU set — so the model-checker drives the
+                // full spectrum from empty (unschedulable) through single-pCPU pins to the
+                // all-pCPUs default, exercising the run guard (dispatch onto a non-affine
+                // pCPU) and the set-affinity guard (narrowing below a running pCPU) at every
+                // reachable placement. With `SchedSetAffinity` now an explicit op, this loop
+                // is what keeps the scheduler's affinity coverage from being silently empty
+                // (design-lesson #14f — a generator must drive a value the runtime once fixed).
+                for affinity in 0..(1u64 << cfg.pcpus) {
+                    v.push((caller, HvCall::SchedSetAffinity { vcpu, affinity }));
+                }
             }
         }
         if cfg.p2m {
@@ -378,7 +388,12 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
                 Some(RunState::Running { pcpu }) => (2, u64::from(pcpu)),
                 Some(RunState::Blocked) => (3, 0),
             };
-            k.extend([tag, p]);
+            // The affinity mask IS behaviourally live — it gates which pCPU `run` may target
+            // — so two states differing only in a vCPU's affinity are distinct and must not
+            // merge (design-lesson #7). Contrast `runtime`/`dispatched_at`, dropped above
+            // because no transition reads them. (An Offline vCPU always carries the default
+            // mask, so this adds no spurious states for offline vCPUs.)
+            k.extend([tag, p, s.affinity_of(dom, vcpu).unwrap_or(0)]);
         }
     }
     for pcpu in 0..s.pcpu_count() as u32 {
@@ -657,6 +672,26 @@ mod tests {
     /// this same sweep would surface a counterexample — the destroy-with-an-inbound-grant (or
     /// -channel) state that the pre-fix code left reachable. Two domains is the smallest world
     /// that forms a cross-domain reference and reuses a slot (dom0 creates and reuses slot 1).
+    /// vCPU affinity in focus: the scheduler over **two pCPUs** (so a mask can genuinely
+    /// exclude a pCPU — with one pCPU affinity is trivial), driving `SchedSetAffinity` across
+    /// every mask alongside admit/run/preempt/block/wake/offline and create/destroy. Every
+    /// reachable interleaving is proven to keep a `Running` vCPU on a pCPU its mask permits
+    /// (`RunningOffAffinity`) *and* pCPU exclusivity — the scheduler's two safety invariants
+    /// together, over the full space of pins (empty, single-pCPU, all-pCPUs) and placements.
+    /// Create/destroy so the offline affinity-reset (a reborn vCPU starts at the default) is
+    /// covered too.
+    fn affinity_cfg(depth: u32) -> Config {
+        Config {
+            sched: true,
+            create: true,
+            destroy: true,
+            vcpus: 2,
+            pcpus: 2,
+            depth,
+            ..Config::tiny()
+        }
+    }
+
     fn reuse_cfg(depth: u32) -> Config {
         Config {
             evtchn: true,
@@ -738,6 +773,23 @@ mod tests {
     fn the_delegation_forest_is_exhaustively_sound() {
         let states = expect_clean(&delegation_cfg(4));
         assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
+    /// vCPU affinity, exhaustively (shallow): every reachable interleaving of set-affinity,
+    /// dispatch, and the run-state transitions over two pCPUs keeps every `Running` vCPU on a
+    /// pCPU its hard-affinity mask permits — a proof of `RunningOffAffinity` (and pCPU
+    /// exclusivity) across the full mask space. The deep twin runs far enough to pin, dispatch,
+    /// contend, and reset affinity through offline/rebirth.
+    #[test]
+    fn vcpu_affinity_is_exhaustively_sound() {
+        let states = expect_clean(&affinity_cfg(4));
+        assert!(states > 200, "suspiciously few states explored: {states}");
+    }
+
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn vcpu_affinity_deep() {
+        expect_no_violation(&affinity_cfg(8));
     }
 
     /// Domain-ID reuse, exhaustively (shallow): every reachable interleaving of a two-domain

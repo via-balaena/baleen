@@ -303,7 +303,7 @@ pub fn run_sched(seed: u64, steps: u32) -> SchedOutcome {
         let dom = rng.below(u32::from(DOMAINS)) as u16;
         let vcpu = rng.below(VCPUS);
         let pcpu = rng.below(PCPUS);
-        match rng.below(6) {
+        match rng.below(7) {
             0 => {
                 let _ = sys.admit(dom, vcpu);
             }
@@ -319,8 +319,15 @@ pub fn run_sched(seed: u64, steps: u32) -> SchedOutcome {
             4 => {
                 let _ = sys.wake(dom, vcpu);
             }
-            _ => {
+            5 => {
                 let _ = sys.offline(dom, vcpu, now);
+            }
+            // A seed-derived affinity mask over the pCPU set (0..2^PCPUS): empty, either
+            // single pCPU, or all. So subsequent runs face pins that exclude a pCPU, and the
+            // affinity invariant is driven, not just present.
+            _ => {
+                let affinity = u64::from(rng.below(1 << PCPUS));
+                let _ = sys.set_affinity(dom, vcpu, affinity);
             }
         }
     }
@@ -724,7 +731,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         let pcpu = rng.below(PCPUS);
         let mfn = rng.below(FRAMES);
 
-        match rng.below(25) {
+        match rng.below(26) {
             0 => drop_ok(hv.dispatch(
                 caller,
                 HvCall::CreditGrant {
@@ -850,7 +857,17 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
                     level: pt_level(mfn),
                 },
             )),
-            _ => drop_ok(hv.dispatch(caller, HvCall::P2mUnpin { mfn })),
+            24 => drop_ok(hv.dispatch(caller, HvCall::P2mUnpin { mfn })),
+            // A seed-derived hard-affinity mask over the pCPU set — so dispatches face pins
+            // that can exclude a pCPU, exercising the scheduler's affinity invariant through
+            // the integrated seam (and the offline reset when a pinned vCPU is taken down).
+            _ => drop_ok(hv.dispatch(
+                caller,
+                HvCall::SchedSetAffinity {
+                    vcpu,
+                    affinity: u64::from(rng.below(1 << PCPUS)),
+                },
+            )),
         }
     }
 

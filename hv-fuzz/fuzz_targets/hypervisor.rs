@@ -93,7 +93,7 @@ fuzz_target!(|data: &[u8]| {
         let slot = u32::from(a) % TABLE_SLOTS;
         now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 31 {
+        let call = match op % 32 {
             0 => HvCall::CreditGrant {
                 amount: u32::from(a),
             },
@@ -198,7 +198,14 @@ fuzz_target!(|data: &[u8]| {
             },
             // Tear a whole domain down — all four subsystems and both seams at once.
             // Stale handles it leaves behind are already tolerated by the unmap arm.
-            _ => HvCall::DomainDestroy { target: other, now },
+            30 => HvCall::DomainDestroy { target: other, now },
+            // Set a vCPU's hard-affinity mask (a fuzzed pCPU set). A later SchedRun onto an
+            // excluded pCPU is refused, so no Running vCPU is ever left off-affinity — the
+            // scheduler's affinity invariant is exercised through the integrated seam too.
+            _ => HvCall::SchedSetAffinity {
+                vcpu,
+                affinity: u64::from(b),
+            },
         };
 
         let _ = hv.dispatch(caller, call);
