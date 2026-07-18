@@ -4,6 +4,7 @@
 # Baleen
 
 [![CI](https://github.com/via-balaena/baleen/actions/workflows/ci.yml/badge.svg)](https://github.com/via-balaena/baleen/actions/workflows/ci.yml)
+[![Deep verification](https://github.com/via-balaena/baleen/actions/workflows/deep-verify.yml/badge.svg)](https://github.com/via-balaena/baleen/actions/workflows/deep-verify.yml)
 
 A type-1 hypervisor written in Rust, built brain-first.
 
