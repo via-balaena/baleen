@@ -145,7 +145,12 @@ const NOW: u64 = 1;
 
 /// Build the fixed `(caller, HvCall)` universe for a config — every operation the
 /// enabled groups can express over the tiny sizes.
-fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
+///
+/// `pub(crate)` so the Tier-D non-interference bridge ([`crate::noninterference`])
+/// drives the *same* transition universe the reachability sweep does — the check must
+/// quantify over exactly the transitions the enumerator proves the invariants over, or
+/// it would be testing a different machine.
+pub(crate) fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
     let mut v = Vec::new();
     let doms = cfg.domains as u16;
     let bools = [false, true];
