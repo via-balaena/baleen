@@ -56,6 +56,13 @@ carries a `saturated: bool`, set true only when the frontier empties **without**
 truncation (a capped run cannot prove a frontier empty). The distinction is one branch in
 the BFS loop — but it changes the *kind* of guarantee a closed run yields.
 
+Because every all-depths theorem below rests on that one flag, the flag itself is checked, not
+trusted: `saturation_flag_is_sound` (a fast, non-ignored test) pins both directions — a tiny
+bounded world reports `saturated` *and* a deeper run of it finds **zero** new states (the
+completeness the flag claims is real), while the unbounded grant+p2m world **never** reports
+`saturated` and strictly grows depth over depth (the flag distinguishes finite from infinite,
+not merely "the loop ended"). The instrument is diamonded before its theorems are leaned on.
+
 ### 1.2 Why saturation is reachable at all — finiteness
 
 Saturation can only happen if the config's reachable state set is **finite**. It is finite
@@ -104,19 +111,23 @@ Running each seam config with the new instrumentation (see
 | vCPU affinity | sched | 16 | 237,312 | **SATURATES** (asserted by `vcpu_affinity_deep`) |
 | domain lifecycle | p2m+create+destroy+delegate | 16 | 47,496 | **SATURATES** (asserted by `domain_lifecycle_deep`) |
 | delegation forest (4 dom) | create+destroy+delegate | 12 | 58,280 | **SATURATES** (asserted by `delegation_forest_deep`) |
-| domain-ID reuse | evtchn+grant (no p2m) | — | — | **finite → saturates** (§1.2: no owned frame ⇒ no unbounded refcount; deep, not run to an empty frontier here) |
-| authority × seams (3 dom) | evtchn+grant+delegate | — | — | **finite → saturates** (§1.2: no p2m; large 3-domain space) |
-| four-level hierarchy | p2m (L1–L4, 4 frames) | — | — | **finite → saturates** (§1.2: pins idempotent, links capped ⇒ refs bounded; large) |
-| event ↔ scheduler | evtchn+sched | — | — | **finite → saturates** (§1.2: both subsystems bounded; large — >6M states) |
+| domain-ID reuse | evtchn+grant (no p2m) | >8 | >22.9M | **finite → saturates**, but the reachable set is huge — 5.66M at d7, **22.9M at d8 and still not saturated**; d9 OOMs an 8 GB laptop (§1.2: no owned frame ⇒ no unbounded refcount) |
+| authority × seams (3 dom) | evtchn+grant+delegate | large | large | **finite → saturates** (§1.2: no p2m; the 3-domain evtchn+grant space is very large — did not finish here) |
+| four-level hierarchy | p2m (L1–L4, 4 frames) | large | large | **finite → saturates** (§1.2: pins idempotent, links capped ⇒ refs bounded; the 4-frame × 4-level space did not finish here) |
+| event ↔ scheduler | evtchn+sched | large | large | **finite → saturates** (§1.2: both subsystems bounded; >6M states by d8) |
 | **grant ↔ p2m** | **grant+p2m** | **never** | ∞ | **UNBOUNDED** — `maps`/`refs` climb per map |
 
 The five top rows are run **to an empty frontier** — a measured all-depths theorem; the three
 affinity/lifecycle/delegation ones are now asserted in-tree by the `*_deep` tests
 (`expect_saturated`, which fails unless the frontier empties). The four middle rows are proven
 *finite* by §1.2 (they contain no refcount that can grow without bound) and therefore *must*
-saturate at some depth — but their reachable sets are large enough that emptying the frontier
-is expensive, so they are marked as reasoned, not yet run to saturation on this machine. Only
-the last row is genuinely infinite.
+saturate at some depth — but the demonstration was attempted and their reachable sets turn out
+to be **too large to empty the frontier on a single 8 GB laptop**: domain-ID reuse, the most
+telling, reaches 22.9M distinct states by depth 8 with the frontier *still* non-empty, and
+depth 9 exhausts memory. So for these four the all-depths claim rests on the finiteness
+*argument*, not (yet) on a measured empty frontier — an honest distinction: a bigger box, or a
+counter/structural abstraction that shrinks the state space, would close them. Only the last row
+is genuinely infinite, and no box closes it.
 
 The grant↔p2m growth is monotone and explosive — 1.3k (d3) → 9.9k (d4) → 51k (d5) → 211k
 (d6) → 828k (d7) → truncates — and the direct witness is unambiguous: allocate a frame, grant
@@ -314,10 +325,15 @@ transition relation, proven for arbitrary N).
 **Closed by Tier B, outright:**
 
 - **The depth axis for every bounded-state config** — a *theorem*, via saturation, now
-  machine-checkable by running to an empty frontier (the `saturated` flag). Most of the
-  verification surface (evtchn, sched/affinity, lifecycle, delegation, and the grant/authority
-  configs that lack an owned frame to map) is proven safe **at all depths**, not merely up to a
-  bound. This was latent in the existing sweeps and is now made explicit.
+  machine-checkable by running to an empty frontier (the `saturated` flag, itself checked by
+  `saturation_flag_is_sound`). Two grades of evidence, honestly separated: **(measured)** the
+  small configs — evtchn, sched/affinity, lifecycle, delegation, grant-without-p2m — are run to
+  an empty frontier and proven safe at *all* depths (three asserted in-tree); **(argued)** the
+  large bounded configs — reuse, the 4-level hierarchy, evtchn+sched — are *proven finite* by
+  §1.2 (no unbounded refcount) but their state sets run to tens of millions (reuse: 22.9M by
+  depth 8, still not empty), too large to actually empty the frontier on this hardware. Either
+  way the depth bound is not fundamental for these — only the last, refcount-unbounded config is
+  genuinely infinite. This was latent in the existing sweeps and is now made explicit.
 - **Symmetry** — the reduction from "all id-assignments" to "canonical `0..k−1`" is exact,
   because the code is id-agnostic except for dom0 at boot.
 - **The per-invariant locality analysis and the cutoff k0** — 27 of 28 invariants have a

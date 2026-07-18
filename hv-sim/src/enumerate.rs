@@ -1155,4 +1155,69 @@ mod tests {
         c.dispatch(0, HvCall::P2mFree { mfn: 0 }).unwrap();
         assert_eq!(state_key(&c), state_key(&Hypervisor::new(2, 1, 1, 1, 1, 2)));
     }
+
+    /// The `saturated` flag is *sound* — the property the Tier-B all-depths theorems rest on.
+    /// A saturated run is only meaningful if the flag means what it claims: the frontier truly
+    /// emptied, so no state exists at any greater depth. This pins the mechanism itself (cheap
+    /// enough for CI) so the deep `expect_saturated` sweeps stand on a checked instrument, not a
+    /// trusted one.
+    #[test]
+    fn saturation_flag_is_sound() {
+        // A tiny bounded world: create/destroy over two domains, nothing else. Its reachable
+        // set is a handful of states, so it saturates almost immediately.
+        let sat = |depth| {
+            enumerate(&Config {
+                create: true,
+                destroy: true,
+                depth,
+                ..Config::tiny()
+            })
+        };
+
+        // (a) It reports saturation, and the flag's meaning is real: once saturated at depth d,
+        //     going deeper finds ZERO new states (an empty frontier has no successors to add).
+        //     If `saturated` were set spuriously, a deeper run would grow the count.
+        let shallow = sat(6);
+        assert!(
+            shallow.saturated,
+            "tiny create/destroy world should saturate by depth 6"
+        );
+        assert!(!shallow.truncated);
+        let deeper = sat(20);
+        assert_eq!(
+            shallow.states, deeper.states,
+            "saturation claims completeness at all depths, yet a deeper run found more states — \
+             the flag is unsound"
+        );
+        assert!(deeper.saturated);
+
+        // (b) It is not set gratuitously: a genuinely UNBOUNDED config (grant+p2m, whose
+        //     refcounts climb without bound) must NEVER report saturation — its frontier is
+        //     non-empty at every depth, and a deeper run strictly grows. This is the negative
+        //     half: the flag distinguishes finite from infinite, not just "did the loop end".
+        let unbounded = |depth| {
+            enumerate(&Config {
+                grant: true,
+                p2m: true,
+                create: true,
+                destroy: true,
+                depth,
+                ..Config::tiny()
+            })
+        };
+        let g3 = unbounded(3);
+        let g4 = unbounded(4);
+        assert!(
+            !g3.saturated,
+            "grant+p2m is unbounded and must not report saturation"
+        );
+        assert!(!g4.saturated);
+        assert!(
+            g4.states > g3.states,
+            "grant+p2m must keep growing depth over depth (unbounded reachable set): \
+             {} at d3 vs {} at d4",
+            g3.states,
+            g4.states
+        );
+    }
 }
