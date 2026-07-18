@@ -26,11 +26,15 @@
 //! [`map`]/[`unmap`] transitions call (design-lesson #14c — one derivation, no drift), not a
 //! re-modelled copy. Proving these is proving a property of the shipped code.
 //!
-//! **What this bridge does NOT yet cover, stated honestly:** the counter is unbounded here,
-//! but the *table size* (number of grant entries / live mappings) is not — the relational
-//! invariant `RefcountMismatch` (`maps == |live mappings|`) couples a scalar to a `Vec`
-//! length, which Kani would have to `unwind`. Arbitrary table size at once is the ∀-N job of
-//! the **Verus** phase that follows this spike. The one companion harness that drives the
+//! **What this bridge does NOT cover — and where the ∀-N step now lives:** the counter is
+//! unbounded here, but the *table size* (number of grant entries / live mappings) is not — the
+//! relational invariant `RefcountMismatch` (`maps == |live mappings|`) couples a scalar to a
+//! `Vec` length, which Kani would have to `unwind`. Arbitrary table size at once is the ∀-N job
+//! of the **Verus** phase, which now discharges it: `RefcountMismatch` is proven preserved by
+//! grant `map` and `unmap` over an arbitrary entry table × arbitrary-length mapping sequence in
+//! `hv-verify/verus/refcount_mismatch.rs` (a Verus-dialect mirror, verified out-of-band — see
+//! `hv-verify/verus/README.md`). That closes, for all sizes, the two `kani::assume`s the unmap
+//! harness below could only assert. The one companion harness that drives the
 //! real [`System`] state machine end-to-end
 //! (`grant_state_machine::real_map_preserves_first_violation_bounded`) is therefore
 //! explicitly *bounded* on table size — it demonstrates the bridge reaches the full code, not
