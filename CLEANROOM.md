@@ -3,7 +3,16 @@
 
 # Clean-room provenance policy
 
-Baleen aims to run real Xen guests by implementing **Xen's ABI as a specification**,
+> **Scope update (2026-07-18):** the Xen personality (`baleen-xenabi`) is **dropped** — the
+> build target is a **greenfield "slim Qubes"** on **native + virtio** guest interfaces, not a
+> Xen-ABI-compatibility layer (see [`docs/ROADMAP.md`](docs/ROADMAP.md)). virtio and the ARM/x86
+> virtualization architectures are **public standards** implemented from their own specs, so the
+> acute legal risk this policy was written for — reimplementing Xen's ABI without touching Xen's
+> GPL source — is **largely moot**. The rule below still holds as good hygiene for *any* standard
+> we implement (work from the spec, never from a specific GPL implementation's source), and would
+> snap back to full force only if a Xen-compatibility personality were ever revived.
+
+Baleen originally aimed to run real Xen guests by implementing **Xen's ABI as a specification**,
 without deriving from Xen's GPL source. Baleen is dual-licensed Apache-2.0 / MIT;
 that is only defensible if no GPL code — and no design copied from reading GPL code
 — makes its way in. This file is the standing rule that keeps that true.
