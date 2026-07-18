@@ -464,6 +464,45 @@ violations.
   `run_ptab` (a `superpages` reachability witness) and `run_foreign` (a foreign 2 MiB leaf
   shared and authorized by one grant, `superpage_links`) across the seed space, and fuzzed
   through the integrated target. No soundness bug found.
+- **Domain-ID reuse** *(landed)*: a `DomId` is an index into a fixed slot table, and
+  `DomainCreate` reuses a `Dead` slot — so the same id names different domains over time. The
+  lifecycle arc proved a `Dead` slot is a clean shell *outbound* (owns and offers nothing); this
+  arc closes the *inbound* direction. Two references survived teardown naming a slot by bare id,
+  so a reborn tenant silently inherited them — a **different security principal served by a
+  reference made for its predecessor**: a grant `{grantor:A, grantee:D}` outlived `D`, so a
+  reborn `D'` could map it and reach `A`'s frame (a confused deputy across the reuse boundary);
+  and `close_all(D)` returned each interdomain peer to `Unbound { remote: D }`, so a reborn `D'`
+  could bind it, inheriting a channel the peer opened for `D`. A bare id is a stable identity
+  only if no reference to a past incarnation survives into the next. **Rather than a per-slot
+  generation counter** (Xen's approach): an unbounded incarnation would break the enumerator's
+  finite-state BFS — create/destroy/recreate would split every rebirth into a fresh state and the
+  search would never close — and it leaves inert dangling references around, against this brain's
+  clean-by-construction grain. Instead the lifecycle loop is closed on the *inbound* direction,
+  over **existing state, no new stored structure**: a **mint gate** (`reject_dead_target`) refuses
+  `EvtchnAllocUnbound`/`GrantAccess` naming a non-`Live` target (`NotAlive`), so no inbound
+  reference to a `Dead` slot is ever created; and a **teardown sweep** clears every *other*
+  domain's `Unbound { remote: target }` port (`clear_unbound_into`) and every inbound grant
+  `{grantee: target}` (`revoke_grants_to`), so none survives the domain it named. The new standing
+  invariant `DeadDomainReferenced` is the **inbound complement of `DeadDomainNotClean`**: together
+  they say a `Dead` slot holds nothing *and* nothing points at it — a truly isolated shell, so a
+  reborn domain inherits nothing. (A live `Interdomain` port naming a `Dead` slot needs no check:
+  it would already break event-channel reciprocity, since a `Dead` domain's ports are all `Free`.)
+  Naming which design-lesson shape this is *is* the point: unlike the prior three page-table arcs
+  it is a **new checked invariant with no new stored structure** — the fourth corner of the
+  structure×invariant matrix (nodes = neither, revocation = both, superpages = structure only),
+  and a lifecycle-closure in the spirit of the create/destroy arc, carried to the inbound
+  direction. Model-checked exhaustively by a new `reuse_cfg` (grants + interdomain channels +
+  create + destroy — the smallest world that references a slot and reuses it, which the lifecycle
+  sweep could not represent): closed clean shallow, no violation at the deep 1.5M-state cap. The
+  coverage is not vacuous — with the mint gate and sweep removed, `reuse_cfg` surfaces a
+  counterexample at depth 1 (`EvtchnAllocUnbound { remote: 1 }` naming the boot-`Dead` slot 1).
+  `state_key` fingerprints liveness and both reference kinds but deliberately carries **no
+  incarnation**, so a slot cycled `Live→Dead→Live` merges with one never destroyed — which keeps
+  the reachable set finite, and `DeadDomainReferenced` is what makes that merge sound. Witnessed
+  by two seeded `hv-core` cases (a reborn domain inheriting neither a stale grant nor a stale
+  channel) and the `run_destroy` seed sweep — which cycles `Dead→Live→Dead→Live` with inbound
+  references live and asserts the invariant every step — and fuzzed through the integrated target.
+  No soundness bug found.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
   AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
