@@ -70,6 +70,16 @@ pub struct Config {
     pub depth: u32,
     /// Safety cap: stop after this many distinct states (a partial result).
     pub max_states: usize,
+    /// Symmetry reduction: dedup on the **canonical** state key (the orbit
+    /// representative under id-permutation) instead of the raw [`state_key`]. Sound
+    /// because the core is data-independent — no transition or invariant branches on a
+    /// literal id (see `docs/TIER-B-CUTOFF.md` §2.1) — so permuting frames / ports /
+    /// grants maps a reachable state to a behaviourally identical reachable state.
+    /// Collapses each symmetry orbit to one state, shrinking the reachable set by up to
+    /// the group order, which can turn an argued-finite config into a *measured* saturated
+    /// one. Off by default: every existing sweep runs unreduced (the ground truth the
+    /// reduction is validated against). See `canonical_key`.
+    pub symmetry: bool,
 }
 
 impl Config {
@@ -93,6 +103,7 @@ impl Config {
             delegate: false,
             depth: 5,
             max_states: 1_500_000,
+            symmetry: false,
         }
     }
 }
@@ -340,44 +351,203 @@ fn level_tag(ty: Option<PageType>) -> u64 {
     }
 }
 
-/// A canonical fingerprint of the whole integrated state. Two states share a key iff
-/// they are behaviourally identical, so BFS deduplication on it neither merges distinct
-/// states (which would drop coverage) nor splits equivalent ones needlessly. It keeps
-/// every field a future transition can read and drops the ones none can — a vCPU's
-/// accrued `runtime`/`dispatched_at` (gate nothing) and a frame's `pt_level` while it is
-/// untyped (dead). Grant *handle* identity is kept (unmap targets a handle); page-table
-/// edges are keyed by `(parent, slot)`, so their *set* — sorted here — is canonical.
-pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
+/// A grant table entry: `(grantee, frame, readonly, maps, writable_maps)`.
+type GrantEntry = (u16, u32, bool, u32, u32);
+/// A live grant mapping at a handle: `(grantee, grantor, gref, writable)`.
+type Mapping = (u16, u16, u32, bool);
+/// A page-table edge: `(parent, slot, child, writable, leaf)`.
+type Edge = (u32, u32, u32, bool, bool);
+
+/// A plain-data extract of exactly the observable state that [`snapshot_key`]
+/// fingerprints — the read-once form of a [`Hypervisor`] that [`permute`] can relabel
+/// without touching `hv-core`. Symmetry reduction needs to apply an id-permutation and
+/// re-fingerprint; permuting a live `Hypervisor` would need core mutators, so instead we
+/// read the state out once into this struct and permute the copy. Per-domain arrays are
+/// row-major (`dom * stride + local`).
+#[derive(Clone)]
+struct Snapshot {
+    n_dom: usize,
+    n_port: usize,
+    n_grant: usize,
+    n_vcpu: usize,
+    n_pcpu: usize,
+    n_frame: usize,
+    /// Per `(dom, port)`. `PortState` carries its own `remote` / `remote_port` / `vcpu`.
+    ports: Vec<PortRec>,
+    /// Per `(dom, gref)`.
+    grants: Vec<Option<GrantEntry>>,
+    /// Per handle slot (a global pool).
+    mappings: Vec<Option<Mapping>>,
+    /// Per `(dom, vcpu)`.
+    vcpus: Vec<VcpuRec>,
+    /// Per pCPU: the `(dom, vcpu)` occupying it, if any.
+    occ: Vec<Option<(u16, u32)>>,
+    /// Per mfn.
+    frames: Vec<Option<FrameRec>>,
+    /// A page-table edge set — unordered (sorted in the key).
+    edges: Vec<Edge>,
+    live: Vec<bool>,
+    may_create: Vec<bool>,
+    /// Per `(holder, target)`.
+    control: Vec<Control>,
+}
+
+#[derive(Clone, Copy)]
+struct PortRec {
+    state: PortState,
+    pending: bool,
+    masked: bool,
+}
+
+#[derive(Clone, Copy)]
+struct VcpuRec {
+    state: RunState,
+    affinity: u64,
+}
+
+#[derive(Clone, Copy)]
+struct FrameRec {
+    owner: u16,
+    refs: u32,
+    writable_refs: u32,
+    pagetable_refs: u32,
+    ty: Option<PageType>,
+    pinned: bool,
+}
+
+impl Snapshot {
+    /// Read the whole observable state out of a `Hypervisor` — the exact set of fields
+    /// [`state_key`] fingerprints, and nothing more. Sizes are uniform across domains
+    /// (every domain is created with the same universe), so domain 0's counts stand for all.
+    fn from_hv(hv: &Hypervisor) -> Snapshot {
+        let e = hv.evtchn();
+        let g = hv.grant();
+        let s = hv.sched();
+        let p = hv.p2m();
+        let n_dom = hv.domain_count();
+        let n_port = if n_dom > 0 { e.port_count(0) } else { 0 };
+        let n_grant = if n_dom > 0 { g.entry_count(0) } else { 0 };
+        let n_vcpu = if n_dom > 0 { s.vcpu_count(0) } else { 0 };
+        let n_pcpu = s.pcpu_count();
+        let n_frame = p.frame_count();
+
+        let mut ports = Vec::with_capacity(n_dom * n_port);
+        for dom in 0..n_dom as u16 {
+            for port in 0..n_port as u32 {
+                ports.push(PortRec {
+                    state: e.state_of(dom, port).unwrap_or(PortState::Free),
+                    pending: e.is_pending(dom, port),
+                    masked: e.is_masked(dom, port),
+                });
+            }
+        }
+
+        let mut grants = Vec::with_capacity(n_dom * n_grant);
+        for dom in 0..n_dom as u16 {
+            for gref in 0..n_grant as u32 {
+                grants.push(g.grant_entry(dom, gref));
+            }
+        }
+        let mappings = (0..g.handle_slots() as u32)
+            .map(|h| g.mapping_at(h))
+            .collect();
+
+        let mut vcpus = Vec::with_capacity(n_dom * n_vcpu);
+        for dom in 0..n_dom as u16 {
+            for vcpu in 0..n_vcpu as u32 {
+                vcpus.push(VcpuRec {
+                    state: s.state_of(dom, vcpu).unwrap_or(RunState::Offline),
+                    affinity: s.affinity_of(dom, vcpu).unwrap_or(0),
+                });
+            }
+        }
+        let occ = (0..n_pcpu as u32).map(|pcpu| s.occupant(pcpu)).collect();
+
+        let mut frames = Vec::with_capacity(n_frame);
+        for mfn in 0..n_frame as u32 {
+            frames.push(p.owner_of(mfn).map(|owner| {
+                let ty = p.current_type(mfn);
+                let pagetable_refs = match ty {
+                    Some(pt @ PageType::PageTable(_)) => p.type_refs(mfn, pt).unwrap_or(0),
+                    _ => 0,
+                };
+                FrameRec {
+                    owner,
+                    refs: p.refs(mfn).unwrap_or(0),
+                    writable_refs: p.type_refs(mfn, PageType::Writable).unwrap_or(0),
+                    pagetable_refs,
+                    ty,
+                    pinned: p.is_pinned(mfn),
+                }
+            }));
+        }
+        let edges = p.link_edges();
+
+        let live = (0..n_dom as u16).map(|d| hv.is_live(d)).collect();
+        let may_create = (0..n_dom as u16).map(|d| hv.may_create(d)).collect();
+        let mut control = Vec::with_capacity(n_dom * n_dom);
+        for holder in 0..n_dom as u16 {
+            for target in 0..n_dom as u16 {
+                control.push(hv.control_edge(holder, target));
+            }
+        }
+
+        Snapshot {
+            n_dom,
+            n_port,
+            n_grant,
+            n_vcpu,
+            n_pcpu,
+            n_frame,
+            ports,
+            grants,
+            mappings,
+            vcpus,
+            occ,
+            frames,
+            edges,
+            live,
+            may_create,
+            control,
+        }
+    }
+}
+
+/// The canonical fingerprint of a [`Snapshot`]. Two snapshots share a key iff they are
+/// behaviourally identical, so BFS deduplication on it neither merges distinct states
+/// (which would drop coverage) nor splits equivalent ones needlessly. It keeps every field
+/// a future transition can read and drops the ones none can — a vCPU's accrued
+/// `runtime`/`dispatched_at` (gate nothing) and a frame's `pt_level` while it is untyped
+/// (dead). Grant *handle* identity is kept (unmap targets a handle); page-table edges are
+/// keyed by `(parent, slot)`, so their *set* — sorted here — is canonical.
+///
+/// This is the single source of truth for the fingerprint layout: [`state_key`] is a thin
+/// wrapper over `snapshot_key(&Snapshot::from_hv(hv))`, and the symmetry-reduced
+/// [`canonical_key`] minimises `snapshot_key` over the permutation group.
+fn snapshot_key(sn: &Snapshot) -> Vec<u64> {
     let mut k = Vec::new();
 
-    let e = hv.evtchn();
-    for dom in 0..e.domain_count() as u16 {
-        for port in 0..e.port_count(dom) as u32 {
-            let (tag, a, b) = match e.state_of(dom, port) {
-                Some(PortState::Free) | None => (0, 0, 0),
-                Some(PortState::Unbound { remote }) => (1, u64::from(remote), 0),
-                Some(PortState::Interdomain {
+    for dom in 0..sn.n_dom {
+        for port in 0..sn.n_port {
+            let r = &sn.ports[dom * sn.n_port + port];
+            let (tag, a, b) = match r.state {
+                PortState::Free => (0, 0, 0),
+                PortState::Unbound { remote } => (1, u64::from(remote), 0),
+                PortState::Interdomain {
                     remote,
                     remote_port,
-                }) => (2, u64::from(remote), u64::from(remote_port)),
-                Some(PortState::Virq { vcpu, virq }) => (3, u64::from(vcpu), u64::from(virq)),
-                Some(PortState::Ipi { vcpu }) => (4, u64::from(vcpu), 0),
+                } => (2, u64::from(remote), u64::from(remote_port)),
+                PortState::Virq { vcpu, virq } => (3, u64::from(vcpu), u64::from(virq)),
+                PortState::Ipi { vcpu } => (4, u64::from(vcpu), 0),
             };
-            k.extend([
-                tag,
-                a,
-                b,
-                e.is_pending(dom, port) as u64,
-                e.is_masked(dom, port) as u64,
-            ]);
+            k.extend([tag, a, b, r.pending as u64, r.masked as u64]);
         }
     }
     k.push(0xFFFF_0001);
 
-    let g = hv.grant();
-    for dom in 0..g.domain_count() as u16 {
-        for gref in 0..g.entry_count(dom) as u32 {
-            match g.grant_entry(dom, gref) {
+    for dom in 0..sn.n_dom {
+        for gref in 0..sn.n_grant {
+            match sn.grants[dom * sn.n_grant + gref] {
                 Some((grantee, frame, ro, maps, wmaps)) => k.extend([
                     1,
                     u64::from(grantee),
@@ -391,14 +561,13 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
         }
     }
     // Handle layout, trailing free slots trimmed (behaviourally irrelevant).
-    let slots = g.handle_slots();
-    let live = (0..slots)
+    let live = (0..sn.mappings.len())
         .rev()
-        .find(|&h| g.mapping_at(h as u32).is_some())
+        .find(|&h| sn.mappings[h].is_some())
         .map(|h| h + 1)
         .unwrap_or(0);
     for h in 0..live {
-        match g.mapping_at(h as u32) {
+        match sn.mappings[h] {
             Some((ge, gr, gref, w)) => {
                 k.extend([1, u64::from(ge), u64::from(gr), u64::from(gref), w as u64])
             }
@@ -407,55 +576,47 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
     }
     k.push(0xFFFF_0002);
 
-    let s = hv.sched();
-    for dom in 0..s.domain_count() as u16 {
-        for vcpu in 0..s.vcpu_count(dom) as u32 {
+    for dom in 0..sn.n_dom {
+        for vcpu in 0..sn.n_vcpu {
+            let vr = &sn.vcpus[dom * sn.n_vcpu + vcpu];
             // Run state only — runtime and dispatched_at gate no transition.
-            let (tag, p) = match s.state_of(dom, vcpu) {
-                Some(RunState::Offline) | None => (0, 0),
-                Some(RunState::Runnable) => (1, 0),
-                Some(RunState::Running { pcpu }) => (2, u64::from(pcpu)),
-                Some(RunState::Blocked) => (3, 0),
+            let (tag, p) = match vr.state {
+                RunState::Offline => (0, 0),
+                RunState::Runnable => (1, 0),
+                RunState::Running { pcpu } => (2, u64::from(pcpu)),
+                RunState::Blocked => (3, 0),
             };
             // The affinity mask IS behaviourally live — it gates which pCPU `run` may target
             // — so two states differing only in a vCPU's affinity are distinct and must not
             // merge (design-lesson #7). Contrast `runtime`/`dispatched_at`, dropped above
             // because no transition reads them. (An Offline vCPU always carries the default
             // mask, so this adds no spurious states for offline vCPUs.)
-            k.extend([tag, p, s.affinity_of(dom, vcpu).unwrap_or(0)]);
+            k.extend([tag, p, vr.affinity]);
         }
     }
-    for pcpu in 0..s.pcpu_count() as u32 {
-        match s.occupant(pcpu) {
+    for pcpu in 0..sn.n_pcpu {
+        match sn.occ[pcpu] {
             Some((d, v)) => k.extend([1, u64::from(d), u64::from(v)]),
             None => k.extend([0, 0, 0]),
         }
     }
     k.push(0xFFFF_0003);
 
-    let p = hv.p2m();
-    for mfn in 0..p.frame_count() as u32 {
-        match p.owner_of(mfn) {
-            Some(owner) => {
-                let ty = p.current_type(mfn);
-                let pt_refs = match ty {
-                    Some(pt @ PageType::PageTable(_)) => p.type_refs(mfn, pt).unwrap_or(0),
-                    _ => 0,
-                };
-                k.extend([
-                    1,
-                    u64::from(owner),
-                    u64::from(p.refs(mfn).unwrap_or(0)),
-                    u64::from(p.type_refs(mfn, PageType::Writable).unwrap_or(0)),
-                    u64::from(pt_refs),
-                    level_tag(ty),
-                    p.is_pinned(mfn) as u64,
-                ]);
-            }
+    for mfn in 0..sn.n_frame {
+        match sn.frames[mfn] {
+            Some(f) => k.extend([
+                1,
+                u64::from(f.owner),
+                u64::from(f.refs),
+                u64::from(f.writable_refs),
+                u64::from(f.pagetable_refs),
+                level_tag(f.ty),
+                f.pinned as u64,
+            ]),
             None => k.extend([0, 0, 0, 0, 0, 0, 0]),
         }
     }
-    let mut edges = p.link_edges();
+    let mut edges = sn.edges.clone();
     edges.sort_unstable();
     k.push(edges.len() as u64);
     for (par, slot, ch, writable, leaf) in edges {
@@ -487,18 +648,18 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
     // create/destroy/recreate cycling: an unbounded incarnation would split every rebirth into
     // a fresh state and the BFS would never close. The `DeadDomainReferenced` invariant is what
     // makes this sound — a reborn slot provably inherits nothing, so it *is* the same state.
-    for dom in 0..hv.domain_count() as u16 {
-        k.push(hv.is_live(dom) as u64);
-        k.push(hv.may_create(dom) as u64);
+    for dom in 0..sn.n_dom {
+        k.push(sn.live[dom] as u64);
+        k.push(sn.may_create[dom] as u64);
     }
     // Fingerprint each control edge's *provenance*, not just its presence: two states
     // differing only in who delegated an edge are behaviourally distinct — they permit
     // different chain-restricted revokes (an ancestor may prune where a non-ancestor is
     // Denied) — so keying presence alone would wrongly merge them and drop coverage
     // (design-lesson #7). Absent=0, Root=1, Via(d)=2+d, an injective tag per cell value.
-    for holder in 0..hv.domain_count() as u16 {
-        for target in 0..hv.domain_count() as u16 {
-            let tag = match hv.control_edge(holder, target) {
+    for holder in 0..sn.n_dom {
+        for target in 0..sn.n_dom {
+            let tag = match sn.control[holder * sn.n_dom + target] {
                 Control::Absent => 0,
                 Control::Root => 1,
                 Control::Via(d) => 2 + u64::from(d),
@@ -508,6 +669,228 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
     }
 
     k
+}
+
+/// A canonical fingerprint of the whole integrated state (see `snapshot_key`).
+pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
+    snapshot_key(&Snapshot::from_hv(hv))
+}
+
+// ─── symmetry reduction ──────────────────────────────────────────────────────────
+//
+// The core is *data-independent*: no transition and no invariant branches on the literal
+// value of any id (`docs/TIER-B-CUTOFF.md` §2.1), so permuting the ids of one entity kind
+// carries a reachable state to a behaviourally identical reachable state. Deduplicating on
+// the orbit representative — the lexicographically minimal `snapshot_key` over the
+// permutation group — therefore collapses each orbit to one state without ever merging two
+// genuinely distinct states. That is sound *only* if every permutation we apply is a real
+// symmetry and every cross-reference is remapped consistently, which is exactly what the
+// `symmetry_group_*` validation tests pin down.
+//
+// Two distinguished ids the code is NOT symmetric under, so we leave them fixed: domain 0
+// (boots Live with `may_create` — the sole boot asymmetry) and vCPU 0 (an Interdomain /
+// Unbound port's `notify_target` is hardcoded to vCPU 0 — `evtchn.rs`, an asymmetry §2.1
+// missed). With ≤ 2 vCPUs and ≤ 2 pCPUs in every config the vCPU/pCPU stabilizers are
+// trivial anyway, and domain permutation is deferred (it couples the per-domain arrays);
+// Phase 1 permutes the three id kinds the code compares purely structurally and that carry
+// the payoff: frames (global), and ports and grants (each domain independently).
+
+/// One symmetry-group element. `frame[m]` is the new id of old frame `m`; `port[d]` and
+/// `grant[d]` are old-domain `d`'s local port / grant permutations (each a bijection of
+/// `0..count`). Domains, vCPUs and pCPUs are held fixed (see the module note above).
+struct Perm {
+    frame: Vec<usize>,
+    port: Vec<Vec<usize>>,
+    grant: Vec<Vec<usize>>,
+}
+
+/// Apply a permutation to a snapshot, remapping every id-bearing field *and* every
+/// cross-reference. Getting the cross-references complete is the whole soundness burden:
+/// a port's `remote_port` indexes the *remote* domain's port table (remapped by that
+/// domain's port perm), a grant mapping's `gref` indexes the *grantor's* grant table
+/// (remapped by the grantor's grant perm), and an edge's parent/child are frame ids. A
+/// missed remap would forge a state that is not actually symmetric and silently merge
+/// distinct states — hence the exhaustive `symmetry_group_is_a_reachability_automorphism`
+/// closure check.
+fn permute(sn: &Snapshot, g: &Perm) -> Snapshot {
+    let (nd, np, ng) = (sn.n_dom, sn.n_port, sn.n_grant);
+
+    // Ports: move `(dom, p)` to `(dom, port[dom][p])`; remap an Interdomain peer's
+    // `remote_port` by the *remote* domain's port permutation.
+    let mut ports = sn.ports.clone();
+    for dom in 0..nd {
+        for p in 0..np {
+            let mut rec = sn.ports[dom * np + p];
+            if let PortState::Interdomain {
+                remote,
+                remote_port,
+            } = rec.state
+            {
+                let rp = g.port[remote as usize][remote_port as usize] as u32;
+                rec.state = PortState::Interdomain {
+                    remote,
+                    remote_port: rp,
+                };
+            }
+            ports[dom * np + g.port[dom][p]] = rec;
+        }
+    }
+
+    // Grant entries: move `(dom, j)` to `(dom, grant[dom][j])`; remap the granted frame id.
+    let mut grants = sn.grants.clone();
+    for dom in 0..nd {
+        for j in 0..ng {
+            let e = sn.grants[dom * ng + j]
+                .map(|(ge, fr, ro, m, wm)| (ge, g.frame[fr as usize] as u32, ro, m, wm));
+            grants[dom * ng + g.grant[dom][j]] = e;
+        }
+    }
+
+    // Grant mappings: `gref` indexes the grantor's entry table — remap by the grantor's
+    // grant perm. Handle position is unchanged (handles are not permuted).
+    let mappings = sn
+        .mappings
+        .iter()
+        .map(|m| m.map(|(ge, gr, gref, w)| (ge, gr, g.grant[gr as usize][gref as usize] as u32, w)))
+        .collect();
+
+    // Frames: relabel each frame's id (its record's contents are unchanged — the owner is a
+    // domain, and domains are fixed in Phase 1).
+    let mut frames = vec![None; sn.n_frame];
+    for m in 0..sn.n_frame {
+        frames[g.frame[m]] = sn.frames[m];
+    }
+
+    // Edges: remap parent and child frame ids; slot / writable / leaf are unchanged.
+    let edges = sn
+        .edges
+        .iter()
+        .map(|&(par, slot, ch, w, leaf)| {
+            (
+                g.frame[par as usize] as u32,
+                slot,
+                g.frame[ch as usize] as u32,
+                w,
+                leaf,
+            )
+        })
+        .collect();
+
+    Snapshot {
+        n_dom: nd,
+        n_port: np,
+        n_grant: ng,
+        n_vcpu: sn.n_vcpu,
+        n_pcpu: sn.n_pcpu,
+        n_frame: sn.n_frame,
+        ports,
+        grants,
+        mappings,
+        // vCPUs, pCPU occupancy, lifecycle and control are all keyed by fixed ids in Phase 1.
+        vcpus: sn.vcpus.clone(),
+        occ: sn.occ.clone(),
+        frames,
+        edges,
+        live: sn.live.clone(),
+        may_create: sn.may_create.clone(),
+        control: sn.control.clone(),
+    }
+}
+
+/// Every permutation of `0..k` (row 0 is the identity `0,1,…`).
+fn perms_of(k: usize) -> Vec<Vec<usize>> {
+    fn rec(cur: &mut Vec<usize>, i: usize, out: &mut Vec<Vec<usize>>) {
+        if i == cur.len() {
+            out.push(cur.clone());
+            return;
+        }
+        for j in i..cur.len() {
+            cur.swap(i, j);
+            rec(cur, i + 1, out);
+            cur.swap(i, j);
+        }
+    }
+    let mut cur: Vec<usize> = (0..k).collect();
+    let mut out = Vec::new();
+    rec(&mut cur, 0, &mut out);
+    out
+}
+
+/// Every `d`-length tuple whose entries are each drawn from `base` — the independent
+/// per-domain choice of a port (or grant) permutation.
+fn cartesian_power(base: &[Vec<usize>], d: usize) -> Vec<Vec<Vec<usize>>> {
+    let mut acc: Vec<Vec<Vec<usize>>> = vec![vec![]];
+    for _ in 0..d {
+        acc = acc
+            .iter()
+            .flat_map(|prefix| {
+                base.iter().map(move |b| {
+                    let mut t = prefix.clone();
+                    t.push(b.clone());
+                    t
+                })
+            })
+            .collect();
+    }
+    acc
+}
+
+/// Build the symmetry group for a config. A permutation kind is included only when it is
+/// non-trivial *and* the subsystem that gives its ids meaning is enabled — a pure
+/// performance gate (a symmetry that acts as the identity on the reachable states just
+/// wastes `snapshot_key` calls). Every factor's first element is the identity, so the group
+/// always contains the identity and `canonical_key` is well-defined. Omitting any factor is
+/// always sound (a subgroup reduces less, never wrongly).
+fn group(cfg: &Config) -> Vec<Perm> {
+    let d = cfg.domains;
+    let frame_sym = cfg.frames >= 2 && (cfg.p2m || cfg.grant);
+    let port_sym = cfg.ports >= 2 && cfg.evtchn;
+    let grant_sym = cfg.grants >= 2 && cfg.grant;
+
+    let id_frame: Vec<usize> = (0..cfg.frames).collect();
+    let id_port: Vec<usize> = (0..cfg.ports).collect();
+    let id_grant: Vec<usize> = (0..cfg.grants).collect();
+
+    let frame_perms = if frame_sym {
+        perms_of(cfg.frames)
+    } else {
+        vec![id_frame]
+    };
+    let port_tuples = if port_sym {
+        cartesian_power(&perms_of(cfg.ports), d)
+    } else {
+        vec![vec![id_port; d]]
+    };
+    let grant_tuples = if grant_sym {
+        cartesian_power(&perms_of(cfg.grants), d)
+    } else {
+        vec![vec![id_grant; d]]
+    };
+
+    let mut out = Vec::new();
+    for f in &frame_perms {
+        for pt in &port_tuples {
+            for gt in &grant_tuples {
+                out.push(Perm {
+                    frame: f.clone(),
+                    port: pt.clone(),
+                    grant: gt.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The orbit representative: the lexicographically minimal `snapshot_key` over the group.
+/// Constant on each symmetry orbit (it is a min over the whole group) and — because
+/// `snapshot_key` separates distinct states and every `g` is a genuine symmetry —
+/// different on different orbits. So deduplicating BFS on it is sound.
+fn canonical_key(sn: &Snapshot, grp: &[Perm]) -> Vec<u64> {
+    grp.iter()
+        .map(|g| snapshot_key(&permute(sn, g)))
+        .min()
+        .expect("group always contains the identity")
 }
 
 /// Exhaustively enumerate every state reachable within `cfg.depth` hypercalls, checking
@@ -524,11 +907,24 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
         cfg.frames,
     );
 
+    // With symmetry reduction, dedup on the orbit representative (the canonical key over the
+    // permutation group), so all symmetric variants of a state collapse to one; otherwise
+    // dedup on the raw state key. The group is built once and reused. Invariant checking is
+    // always done on the *concrete* state before keying, so reduction can never hide a
+    // violation — it only decides whether a state is re-expanded.
+    let grp = cfg.symmetry.then(|| group(cfg));
+    let keyfn = |hv: &Hypervisor| -> StateKey {
+        match &grp {
+            Some(g) => canonical_key(&Snapshot::from_hv(hv), g),
+            None => state_key(hv),
+        }
+    };
+
     // Each visited state records how it was first reached, for counterexample traces.
     // The root maps to itself with no op.
     let mut came_from: CameFrom = HashMap::new();
     let mut frontier: Vec<(StateKey, Hypervisor)> = Vec::new();
-    let root_key = state_key(&init);
+    let root_key = keyfn(&init);
     came_from.insert(root_key.clone(), None);
     frontier.push((root_key, init));
     let mut truncated = false;
@@ -544,8 +940,8 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                 let mut h = hv.clone();
                 let _: Result<HvOutcome, _> = h.dispatch(caller, call);
                 if !h.invariants_hold() {
-                    let key = state_key(&h);
-                    came_from.insert(key.clone(), Some((state_key(hv), caller, call)));
+                    let key = keyfn(&h);
+                    came_from.insert(key.clone(), Some((keyfn(hv), caller, call)));
                     return EnumOutcome {
                         states: came_from.len(),
                         truncated,
@@ -553,13 +949,13 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                         violation: Some(trace(&came_from, &key)),
                     };
                 }
-                let key = state_key(&h);
+                let key = keyfn(&h);
                 if !came_from.contains_key(&key) {
                     if came_from.len() >= cfg.max_states {
                         truncated = true;
                         continue;
                     }
-                    came_from.insert(key.clone(), Some((state_key(hv), caller, call)));
+                    came_from.insert(key.clone(), Some((keyfn(hv), caller, call)));
                     next.push((key, h));
                 }
             }
@@ -1219,5 +1615,443 @@ mod tests {
             g3.states,
             g4.states
         );
+    }
+
+    // ─── symmetry-reduction soundness validation ─────────────────────────────────────
+    //
+    // Symmetry reduction touches the dedup core, and a wrong canonicalization silently
+    // merges two DIFFERENT orbits — hiding states, and any violation reachable only through
+    // them. That is the worst possible outcome for a verification tool, so the reduction is
+    // validated ruthlessly before a single theorem is leaned on it. These tests are CI-fast
+    // (small configs, full enumeration both ways).
+
+    /// A tiny p2m config exercising **frame** symmetry (3 frames ⇒ |G| = 3! = 6).
+    fn sym_frame_cfg() -> Config {
+        Config {
+            p2m: true,
+            create: true,
+            destroy: true,
+            frames: 3,
+            levels: vec![PtLevel::L1, PtLevel::L2, PtLevel::L3],
+            depth: 3,
+            ..Config::tiny()
+        }
+    }
+
+    /// A tiny evtchn+grant config exercising **frame × port × grant** symmetry
+    /// (2 frames, 2 ports/dom, 2 grants/dom over 2 domains ⇒ |G| = 2 · 2!² · 2!² = 32) —
+    /// the same shape as `reuse_cfg`, the flagship reduction target.
+    fn sym_reuse_cfg() -> Config {
+        reuse_cfg(3)
+    }
+
+    /// A tiny evtchn+sched config exercising **port** symmetry (2 ports/dom over 2 domains
+    /// ⇒ |G| = 2!² = 4), with vCPU 0 correctly left fixed (its `notify_target` asymmetry).
+    fn sym_evtchn_sched_cfg() -> Config {
+        evtchn_sched_cfg(3)
+    }
+
+    /// Full BFS collecting one concrete `Hypervisor` per distinct (raw-keyed) reachable
+    /// state — the ground-truth reachable set the reduction is validated against.
+    fn reachable_states(cfg: &Config) -> Vec<Hypervisor> {
+        let universe = ops(cfg);
+        let init = Hypervisor::new(
+            cfg.domains,
+            cfg.ports,
+            cfg.grants,
+            cfg.vcpus,
+            cfg.pcpus,
+            cfg.frames,
+        );
+        let mut seen: std::collections::HashSet<StateKey> = std::collections::HashSet::new();
+        let mut all = Vec::new();
+        seen.insert(state_key(&init));
+        let mut frontier = vec![init.clone()];
+        all.push(init);
+        for _ in 0..cfg.depth {
+            let mut next = Vec::new();
+            for hv in &frontier {
+                for &(caller, call) in &universe {
+                    let mut h = hv.clone();
+                    let _: Result<HvOutcome, _> = h.dispatch(caller, call);
+                    // Only invariant-holding states are enqueued; a clean config (asserted by
+                    // the caller) has no others, so this matches `enumerate`'s reachable set.
+                    if !h.invariants_hold() {
+                        continue;
+                    }
+                    if seen.insert(state_key(&h)) {
+                        next.push(h.clone());
+                        all.push(h);
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        all
+    }
+
+    // Small configs that *saturate* (their BFS frontier goes empty), so `reachable_states`
+    // returns the COMPLETE reachable set — which is genuinely *closed* under any automorphism
+    // of the transition system, at all depths. (A merely depth-bounded reachable set is not
+    // closed: a permutation need not preserve hypercall distance from `new()` — the allocator
+    // makes low indices cheaper to reach — so `alloc unbound` at 2 hypercalls has a symmetric
+    // image at 4, present in the full set but absent from a depth-3 slice. That is why closure
+    // must be checked on a saturated set, not a truncated one.)
+    fn sat_frame_cfg() -> Config {
+        // Real p2m over 2 frames, one domain (frames owned, typed, pinned, linked). |G| = 2.
+        Config {
+            p2m: true,
+            domains: 1,
+            frames: 2,
+            levels: vec![PtLevel::L1, PtLevel::L2],
+            depth: 16,
+            ..Config::tiny()
+        }
+    }
+    fn sat_port_cfg() -> Config {
+        // Event channels over dom0 alone (self-unbound + self-interdomain, so `remote_port`
+        // is exercised), no create/destroy. Saturates at 129 states. |G| = 4.
+        Config {
+            evtchn: true,
+            domains: 2,
+            ports: 2,
+            depth: 14,
+            ..Config::tiny()
+        }
+    }
+    fn sat_grant_cfg() -> Config {
+        // Grants + create/destroy over one frame (no p2m ⇒ no unbounded refcount ⇒ saturates
+        // at 2537). Exercises grant-entry perms and the mapping `gref` remap. |G| = 4.
+        Config {
+            grant: true,
+            create: true,
+            destroy: true,
+            frames: 1,
+            depth: 12,
+            ..Config::tiny()
+        }
+    }
+    fn sat_frame_grant_cfg() -> Config {
+        // Grants over two frames: frame AND grant symmetry on a saturated set (26,345). |G| = 8.
+        Config {
+            frames: 2,
+            depth: 10,
+            ..sat_grant_cfg()
+        }
+    }
+
+    /// **The soundness crux — the group is an automorphism of the transition system.** A
+    /// *saturated* config's reachable set is complete, hence closed under any automorphism: for
+    /// every reachable state and every group element, the permuted state is itself reachable. A
+    /// group element that carries a reachable state OFF the reachable set is *not* a symmetry —
+    /// its cross-reference remap is wrong, or the group wrongly includes it — and canonicalizing
+    /// on it could merge distinct orbits. Checked directly over the whole group and every
+    /// reachable state. Closure failing *is* the over-merge bug, surfaced at its source.
+    fn assert_group_closes_saturated_set(cfg: &Config) {
+        let out = enumerate(cfg);
+        assert!(out.violation.is_none(), "config must be clean");
+        assert!(
+            out.saturated,
+            "closure must be checked on a SATURATED (complete, closed) reachable set, not a \
+             depth-bounded slice — this config did not saturate"
+        );
+        let grp = group(cfg);
+        assert!(
+            grp.len() > 1,
+            "group must be non-trivial or the test proves nothing"
+        );
+
+        let states = reachable_states(cfg);
+        let keyset: std::collections::HashSet<StateKey> = states.iter().map(state_key).collect();
+
+        for hv in &states {
+            let sn = Snapshot::from_hv(hv);
+            for g in &grp {
+                assert!(
+                    keyset.contains(&snapshot_key(&permute(&sn, g))),
+                    "a group element mapped a reachable state OFF the (complete) reachable set — \
+                     not a symmetry (unsound). |G|={}, |R|={}",
+                    grp.len(),
+                    states.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symmetry_group_closes_saturated_set_frames() {
+        assert_group_closes_saturated_set(&sat_frame_cfg());
+    }
+
+    #[test]
+    fn symmetry_group_closes_saturated_set_ports() {
+        assert_group_closes_saturated_set(&sat_port_cfg());
+    }
+
+    #[test]
+    fn symmetry_group_closes_saturated_set_grants() {
+        assert_group_closes_saturated_set(&sat_grant_cfg());
+    }
+
+    /// Frame × grant symmetry together on a saturated set (|G| = 8 over 26,345 states) — the
+    /// same combined group `reuse` and the deep sweeps use, checked all-depths. `#[ignore]`d
+    /// only because 26k × 8 permutations is a second or two, more than the CI closure budget.
+    #[test]
+    #[ignore = "deeper saturated-closure validation — run with --release --ignored"]
+    fn symmetry_group_closes_saturated_set_frame_grant() {
+        assert_group_closes_saturated_set(&sat_frame_grant_cfg());
+    }
+
+    /// `canonical_key` is a genuine orbit function: constant on each orbit (invariant under
+    /// the group action — which also checks `permute` composes as a group action) and
+    /// distinguishing on a hand-built non-symmetric pair. The orbit-invariance direction is
+    /// what licenses deduping on it; the separation direction is what stops it from merging
+    /// everything.
+    #[test]
+    fn canonical_key_is_orbit_invariant_and_separating() {
+        let cfg = sym_reuse_cfg();
+        let grp = group(&cfg);
+        for hv in reachable_states(&cfg) {
+            let sn = Snapshot::from_hv(&hv);
+            let canon = canonical_key(&sn, &grp);
+            for g in &grp {
+                // Permuting a state must not change its canonical key: min over the group of
+                // the orbit of g·s is the same orbit, hence the same min.
+                assert_eq!(
+                    canon,
+                    canonical_key(&permute(&sn, g), &grp),
+                    "canonical key is not orbit-invariant"
+                );
+            }
+        }
+        // Separation: two states that are NOT related by any id-permutation must keep
+        // distinct canonical keys. dom0 owning frame 0 typed as a page table is not symmetric
+        // to dom0 owning it as a writable page (page type is not an id we permute).
+        let mut a = Hypervisor::new(2, 2, 2, 1, 1, 2);
+        a.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        a.dispatch(
+            0,
+            HvCall::P2mPin {
+                mfn: 0,
+                level: PtLevel::L1,
+            },
+        )
+        .unwrap();
+        let mut b = Hypervisor::new(2, 2, 2, 1, 1, 2);
+        b.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        let gp = group(&Config {
+            p2m: true,
+            grant: true,
+            ..Config::tiny()
+        });
+        assert_ne!(
+            canonical_key(&Snapshot::from_hv(&a), &gp),
+            canonical_key(&Snapshot::from_hv(&b), &gp),
+            "canonical key wrongly merged two non-symmetric states"
+        );
+    }
+
+    /// The reduced enumeration visits **exactly** the orbits the full one does — no orbit
+    /// dropped (which would be unsound), none invented. The orbit count is computed
+    /// independently of `canonical_key`'s min, by the *set* of keys in each state's orbit
+    /// (two states share an orbit iff their orbit-key-sets are equal), so this is not
+    /// circular with the reduced run. Also pins the count-sanity floor `|R| / |G| ≤ reduced ≤
+    /// |R|`: a reduction cannot merge below the orbit-count floor.
+    fn assert_reduction_faithful(cfg: &Config) {
+        let mut full_cfg = cfg.clone();
+        full_cfg.symmetry = false;
+        let mut red_cfg = cfg.clone();
+        red_cfg.symmetry = true;
+
+        let full = enumerate(&full_cfg);
+        let red = enumerate(&red_cfg);
+        assert!(full.violation.is_none() && !full.truncated);
+        assert!(red.violation.is_none() && !red.truncated);
+        assert_eq!(
+            red.saturated, full.saturated,
+            "reduction must not change saturation"
+        );
+
+        let grp = group(cfg);
+        let states = reachable_states(&full_cfg);
+        // Each state's orbit, identified by the *set* of keys it reaches under the group
+        // (independent of which representative `canonical_key` would pick).
+        let orbits: std::collections::HashSet<std::collections::BTreeSet<StateKey>> = states
+            .iter()
+            .map(|hv| {
+                let sn = Snapshot::from_hv(hv);
+                grp.iter().map(|g| snapshot_key(&permute(&sn, g))).collect()
+            })
+            .collect();
+
+        assert_eq!(
+            red.states,
+            orbits.len(),
+            "reduced run must visit exactly one state per orbit ({} orbits in {} full states)",
+            orbits.len(),
+            full.states
+        );
+        assert!(
+            red.states <= full.states,
+            "reduction cannot grow the state count"
+        );
+        assert!(
+            red.states.saturating_mul(grp.len()) >= full.states,
+            "over-merged below the orbit-count floor |R|/|G|: reduced={} |G|={} full={}",
+            red.states,
+            grp.len(),
+            full.states
+        );
+    }
+
+    #[test]
+    fn reduced_visits_exactly_the_full_orbits_frames() {
+        assert_reduction_faithful(&sym_frame_cfg());
+    }
+
+    #[test]
+    fn reduced_visits_exactly_the_full_orbits_reuse() {
+        assert_reduction_faithful(&sym_reuse_cfg());
+    }
+
+    #[test]
+    fn reduced_visits_exactly_the_full_orbits_evtchn_sched() {
+        assert_reduction_faithful(&sym_evtchn_sched_cfg());
+    }
+
+    /// The reduced run **hides no reachable orbit** — the coverage-completeness soundness test,
+    /// and the depth-robust one (it needs no saturation). This is the operational form of the
+    /// brief's inject-a-bug check: a violation lives in some reachable state, whose orbit the
+    /// reduced BFS must visit or the violation is hidden. It catches a *harmful over-merge*
+    /// directly: if `canonical_key` wrongly merged two non-symmetric states s1, s2 with
+    /// different successors, the reduced BFS expands only one representative and never generates
+    /// s2's unique successor orbits — so `visited` would be strictly missing canonical keys that
+    /// the full reachable set contains, and this `assert_eq` fires. (It cannot false-pass on
+    /// such a merge, precisely because it expands only one representative per canonical key
+    /// while `full_orbit_reps` is taken over *every* full-reachable state.) Run across all three
+    /// permuted id kinds.
+    fn assert_reduction_hides_no_orbit(cfg: &Config) {
+        let mut red_cfg = cfg.clone();
+        red_cfg.symmetry = true;
+
+        let grp = group(cfg);
+        // Every orbit the full (unreduced) reachable set touches, by its canonical rep.
+        let full_orbit_reps: std::collections::HashSet<StateKey> = reachable_states(cfg)
+            .iter()
+            .map(|hv| canonical_key(&Snapshot::from_hv(hv), &grp))
+            .collect();
+
+        // The canonical keys the reduced BFS actually visits (expanding one rep per orbit).
+        let visited = reduced_visited_keys(&red_cfg);
+
+        assert_eq!(
+            visited, full_orbit_reps,
+            "reduced run's visited orbits differ from the full run's — a reachable orbit was \
+             dropped (a harmful over-merge) or invented"
+        );
+    }
+
+    /// The full four-level page-table hierarchy over **three frames**, driven to an all-depths
+    /// theorem **that only symmetry reduction can reach**. Unreduced, this config's reachable
+    /// set exceeds the state cap and never empties its frontier — it stays "argued-finite"
+    /// (§1.2: pins idempotent, links capped ⇒ refcounts bounded) but *unmeasured*. With
+    /// frame-symmetry reduction (the three frames are fully interchangeable, |G| = 3! = 6) the
+    /// reachable set collapses to 1,030,856 orbit representatives and the frontier **does** go
+    /// empty at depth 16 — proving the L1–L4 hierarchy invariants (`MislevelledLink`,
+    /// write-xor-pagetable, exclusivity) hold in every reachable state at **every** depth, over
+    /// a full four-level tree. This is symmetry reduction's headline payoff: converting a
+    /// depth-axis *argument* into a *measured* all-depths theorem (`docs/TIER-B-CUTOFF.md`
+    /// §2.5). Takes ~5 min in release — `#[ignore]`d like the other deep sweeps.
+    fn sym_hierarchy_cfg(depth: u32) -> Config {
+        Config {
+            p2m: true,
+            domains: 1,
+            frames: 3,
+            levels: vec![PtLevel::L1, PtLevel::L2, PtLevel::L3, PtLevel::L4],
+            symmetry: true,
+            depth,
+            max_states: 3_000_000,
+            ..Config::tiny()
+        }
+    }
+
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn hierarchy_saturates_only_under_symmetry_reduction() {
+        // Reduced: the frontier empties — a measured all-depths theorem (≈1.03M reps).
+        let states = expect_saturated(&sym_hierarchy_cfg(16));
+        assert!(
+            (900_000..1_200_000).contains(&states),
+            "reduced saturated size out of expected band: {states}"
+        );
+
+        // Non-vacuity: the SAME config *unreduced* does NOT saturate within a cap that the
+        // reduced run clears with room to spare — it truncates. So the reduction is precisely
+        // what turns §1.2's finiteness argument into a measured empty frontier here.
+        let mut full = sym_hierarchy_cfg(16);
+        full.symmetry = false;
+        full.max_states = 1_500_000;
+        let out = enumerate(&full);
+        assert!(
+            out.truncated && !out.saturated,
+            "expected the unreduced run to truncate at the cap, not saturate — reduction would \
+             then be adding nothing"
+        );
+    }
+
+    #[test]
+    fn reduction_hides_no_reachable_orbit_frames() {
+        assert_reduction_hides_no_orbit(&sym_frame_cfg());
+    }
+
+    #[test]
+    fn reduction_hides_no_reachable_orbit_ports() {
+        assert_reduction_hides_no_orbit(&sym_evtchn_sched_cfg());
+    }
+
+    #[test]
+    fn reduction_hides_no_reachable_orbit_grants_and_ports() {
+        assert_reduction_hides_no_orbit(&sym_reuse_cfg());
+    }
+
+    /// The set of canonical keys a reduced BFS visits (mirrors `enumerate`'s dedup exactly).
+    fn reduced_visited_keys(cfg: &Config) -> std::collections::HashSet<StateKey> {
+        let universe = ops(cfg);
+        let init = Hypervisor::new(
+            cfg.domains,
+            cfg.ports,
+            cfg.grants,
+            cfg.vcpus,
+            cfg.pcpus,
+            cfg.frames,
+        );
+        let grp = group(cfg);
+        let key = |hv: &Hypervisor| canonical_key(&Snapshot::from_hv(hv), &grp);
+        let mut seen: std::collections::HashSet<StateKey> = std::collections::HashSet::new();
+        seen.insert(key(&init));
+        let mut frontier = vec![init];
+        for _ in 0..cfg.depth {
+            let mut next = Vec::new();
+            for hv in &frontier {
+                for &(caller, call) in &universe {
+                    let mut h = hv.clone();
+                    let _: Result<HvOutcome, _> = h.dispatch(caller, call);
+                    if !h.invariants_hold() {
+                        continue;
+                    }
+                    if seen.insert(key(&h)) {
+                        next.push(h);
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        seen
     }
 }

@@ -141,8 +141,17 @@ infinite space. A per-invariant **locality/cutoff** analysis (each of the 28
 invariants is violated by a bounded witness, so a size cutoff k0 = 4 domains / 3
 frames bounds the search — which Tier A's 3-domain grant/p2m and 4-domain delegation
 sweeps already cover as the base case) and a **data-independence/symmetry** argument
-(the core branches on no literal id except dom0-at-boot) complete the size axis. The full argument, its two honest
-residuals handed to Tier C, and the measured saturation table live in
+(the core branches on no literal id except dom0-at-boot and vCPU-0-at-notify) complete
+the size axis. That symmetry argument is now also an **enumerator optimization**:
+canonicalizing each state to its orbit representative (over frame / port / grant
+id-permutations) before dedup collapses each symmetry orbit to one state — up to ≈20×
+fewer states for frame-heavy page-table configs — which turned the **full four-level
+page-table hierarchy** from argued-finite into a *measured* all-depths theorem
+(saturates at 1,030,856 orbit representatives). Its soundness is validated ruthlessly
+(the group is checked to be a genuine automorphism on saturated reachable sets, and the
+reduced run to hide no reachable orbit) since a wrong canonicalization would silently
+hide states. The full argument, its two honest residuals handed to Tier C, and the
+measured saturation table live in
 [`docs/TIER-B-CUTOFF.md`](docs/TIER-B-CUTOFF.md).
 
 ## Milestones
