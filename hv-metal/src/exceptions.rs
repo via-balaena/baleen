@@ -67,7 +67,12 @@ __exception_vectors:
     ventry 5    // 0x280  Current EL with SPx — IRQ/vIRQ
     ventry 6    // 0x300  Current EL with SPx — FIQ/vFIQ
     ventry 7    // 0x380  Current EL with SPx — SError/vSError
-    ventry 8    // 0x400  Lower EL, AArch64   — Synchronous
+    // 0x400  Lower EL, AArch64 — Synchronous: where a guest's `HVC` lands (M4 Arc 4). Unlike the
+    // diagnostic slots, this one does NOT `mov w0,#index` — that would clobber the guest's `x0`
+    // (its hypercall number) before the trap-and-service handler can save it. It branches straight
+    // to the trampoline (`guest.rs`), which saves x0..x30 first, services, and `eret`s to resume.
+    .balign 0x80
+    b       __guest_sync_entry
     ventry 9    // 0x480  Lower EL, AArch64   — IRQ/vIRQ
     ventry 10   // 0x500  Lower EL, AArch64   — FIQ/vFIQ
     ventry 11   // 0x580  Lower EL, AArch64   — SError/vSError
@@ -78,13 +83,13 @@ __exception_vectors:
 
     .balign 0x80
 __exception_common:
-    // Diagnostic-only handler: NO general-purpose-register save-frame, because we report the fault
-    // and halt — we never `eret` back to the faulting context, so there is nothing to preserve.
-    // (M4 Arc 4's trap-and-service will add a full save/restore frame when it must resume a guest.)
-    // Deferred with it: a fault taken INSIDE this handler re-enters on the SAME stack (SPSel=1, no
-    // stack switch, no re-entry guard) — on `virt` it loops rather than triple-faults, and the first
-    // report drains out the UART first, so report-and-halt holds in practice; a dedicated exception
-    // stack + re-entry flag lands with Arc 4's frame.
+    // Diagnostic-only handler (slots 0–7, 9–15): NO general-purpose-register save-frame, because we
+    // report the fault and halt — we never `eret` back to the faulting context, so there is nothing
+    // to preserve. This stays correct even now that Arc 4 exists: a diagnostic handler genuinely
+    // needs no frame; the save/restore frame + dedicated exception stack Arc 4 added belong to the
+    // one path that RESUMES a guest (slot 8 → `__guest_sync_entry` in `guest.rs`), not here. A fault
+    // taken INSIDE this handler re-enters on the same stack (SPSel=1) — on `virt` it loops rather
+    // than triple-faults, and the first report drains out the UART first, so report-and-halt holds.
     // w0 already holds the vector slot index — the first C argument to `handle_exception`.
     bl      handle_exception
     // `handle_exception` is `-> !` and never returns; this is belt-and-suspenders if it ever does.

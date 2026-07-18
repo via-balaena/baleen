@@ -190,8 +190,18 @@ timeout) so "diamond → CI-green → merge" stays alive on the metal side.
   *See-it: the diamonded brain is alive at EL2 and serviced a hypercall on (emulated) hardware.*
 
 ### M4 — first guest + the bridge *(the proof touches reality)*
-- **Arc 4 — trap-and-service.** A trivial EL1 guest (`HVC`), its EL1 context, Stage-2 tables from a
-  minimal `p2m`, `eret` in, handle the trap → decode to `HvCall` → `hv-core` → return.
+- **Arc 4 — trap-and-service. ✅ DONE** (`docs/ARC-4-TRAP-AND-SERVICE.md`). A trivial EL1 guest
+  boots behind a minimal Stage-2 (`HCR_EL2.VM=1` + a single 2 MiB identity block mapping just the
+  guest's RAM), issues `HVC`, traps to EL2 (vector slot 8, `EC=0x16`); a GPR save/restore frame on a
+  dedicated exception stack (+ a re-entry guard) resumes the guest. The saved registers are decoded
+  through `hv-core`'s `RawHypercall`/`Hypercall::decode` seam, mapped to an `HvCall`, and routed
+  through the **actual `Hypervisor::dispatch`**; the result is written back to the guest's `x0` and
+  `eret`ed. The guest observes it and echoes the serviced balance in a final `HVC` — a witness
+  produced by the guest (`grant 100`, `spend 30` → **70**; 70 is no call's input, and two resume
+  cycles reach it). `VcpuOps::set_entry` realized on ARM (`ELR_EL2`); `inject_interrupt`/`GuestMemory`
+  honestly deferred. Three-way converged (spec-derived code + blind Arm-ARM auditor + QEMU). No
+  isolation content — that is Arc 5.
+  *See-it: the proven brain services a real guest's hypercall and the guest observes the result.*
 - **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test.** Translate the model's `p2m` into
   real AArch64 Stage-2 descriptors; a guest touching unauthorized memory faults to EL2.
   **🔍 Architecture Audit #2 — model→page-table refinement:** does the emitted table deny *exactly*

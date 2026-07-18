@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # `hv-metal` — the bare-metal layer (Arc 3)
+//! # `hv-metal` — the bare-metal layer (M4 Arc 4)
 //!
 //! The southbound metal layer beneath the proven `hv-core` brain. Arc 0 stood up the dev + CI
 //! boot-test loop; Arc 1 turned the raw UART poke into a *proper* [`pl011`] console; Arc 2 confirmed
-//! EL2 and installed the [`exceptions`] vector table so a fault becomes diagnosable; **Arc 3** (see
-//! `docs/ROADMAP.md`) is where the proven brain first runs on the bare CPU. It:
+//! EL2 and installed the [`exceptions`] vector table so a fault becomes diagnosable; Arc 3 ran the
+//! proven brain on the bare CPU (still pre-guest); **Arc 4** (see `docs/ROADMAP.md`) is where the
+//! proof first touches a **guest**. The boot:
 //!
 //! 1. configures `HCR_EL2` for AArch64 EL2 operation ([`el2`]);
 //! 2. realizes [`hv_hal::TimeSource`] on the ARM generic timer ([`time`]) — the first piece of the
 //!    `hv-hal` fence to gain a real hardware backing (Architecture Audit #1);
 //! 3. supplies a `#[global_allocator]` ([`heap`]) and links [`hv_core`], constructs a real
-//!    `Hypervisor`, and **dispatches a synthetic `HvCall` on the metal**, printing the result — the
-//!    diamonded ∀-N brain, alive at EL2, servicing a hypercall.
+//!    `Hypervisor`, and dispatches a synthetic `HvCall` *directly* on the metal (Arc 3, kept as a
+//!    regression);
+//! 4. enters a trivial **EL1 guest** ([`guest`]) behind a minimal Stage-2: the guest issues `HVC`,
+//!    the CPU traps to EL2, the saved registers are decoded through `hv-core`'s ABI seam and routed
+//!    through the **actual `Hypervisor::dispatch`**, the result is handed back, and the guest
+//!    observes it — trap-and-service, the first time the ∀-N brain serves a real guest.
 //!
-//! Still **pre-guest**: no EL1 guest, no Stage-2, no isolation content — that is M4. Arc 3 *refines*
-//! the proof (the HAL realizes the model's southbound assumptions) and is QEMU-sound for the
-//! functional dispatch (`docs/QEMU-AND-METAL.md`).
+//! Arc 4 *refines* the proof (the model's dispatch, driven for a real guest on emulated hardware)
+//! and is QEMU-sound for the functional round trip. It carries **no isolation content** — the
+//! Stage-2 map is just enough to run the guest; the faithful `p2m`→Stage-2 refinement and the
+//! negative-isolation test are Arc 5 (`docs/ROADMAP.md`, `docs/QEMU-AND-METAL.md`).
 //!
 //! This is the one crate that carries `unsafe` (the workspace forbids it everywhere else); `hv-core`
 //! and `hv-hal`, linked here, keep building under their own `unsafe_code = "forbid"` manifests, so
@@ -30,6 +36,7 @@
 
 mod el2;
 mod exceptions;
+mod guest;
 mod heap;
 mod pl011;
 mod time;
@@ -185,27 +192,24 @@ pub extern "C" fn rust_main() -> ! {
     }
 
     // (5) The Arc-3 headline: link the proven brain, construct a real Hypervisor, and dispatch a
-    //     synthetic HvCall on the bare CPU. Constructing the Hypervisor also exercises the
-    //     #[global_allocator] — a free witness that allocation works on the metal.
+    //     synthetic HvCall *directly* on the bare CPU (no guest). Kept as the Arc-3 regression:
+    //     constructing the Hypervisor also exercises the #[global_allocator], a free witness that
+    //     allocation works on the metal.
     dispatch_synthetic_hvcall(&mut uart);
 
-    // (6) The self-tests: witnesses produced *by* the mechanisms under test (design-lesson #24(f)).
-    //     Both are gated behind `selftest` (off by default) so the normal boot path stays clean,
-    //     while CI exercises them on every arc. Order matters — the Arc-3 accounting check runs
-    //     first because the Arc-2 BRK check halts in the handler and never returns.
+    // (6) The Arc-3 accounting self-test (direct dispatch path), gated behind `selftest` and run
+    //     *before* the guest because it returns cleanly; a witness produced by the dispatch itself
+    //     (design-lesson #24(f)). The Arc-2 BRK fault-catch that used to follow it now runs at the
+    //     end of the guest round-trip (chained inside `guest`'s terminal report handler under
+    //     `selftest`), so every prior witness still fires in the same boot.
     #[cfg(feature = "selftest")]
-    {
-        selftest_hvcall_accounting(&mut uart);
+    selftest_hvcall_accounting(&mut uart);
 
-        let _ = writeln!(uart, "baleen: exception self-test — executing BRK #0");
-        // SAFETY: `BRK` is a software breakpoint; it deterministically raises a synchronous
-        // exception taken to the current EL (EL2), which the installed handler catches + reports.
-        unsafe { core::arch::asm!("brk #0") };
-        // The handler halts and never returns here; reaching this line would be a real bug.
-        let _ = writeln!(uart, "baleen: BUG — returned from the BRK self-test");
-    }
-
-    park();
+    // (7) The Arc-4 headline: enter a real EL1 guest that issues `HVC`, trap it to EL2, decode +
+    //     route through the ACTUAL Hypervisor::dispatch, hand the result back, and let the guest
+    //     observe it — the first time the proof touches a guest. Terminal: the guest-report handler
+    //     parks (and, under `selftest`, chains the Arc-2 fault-catch first), so this never returns.
+    guest::run(&mut uart);
 }
 
 /// Parameters of the bring-up `Hypervisor`. Deliberately tiny — dom0 (slot 0) boots `Live` with a
@@ -222,8 +226,9 @@ const NUM_FRAMES: usize = 8;
 /// domain for the synthetic call.
 const DOM0: hv_core::hypervisor::DomId = 0;
 
-/// Build a real `Hypervisor` sized by the constants above.
-fn build_hypervisor() -> Hypervisor {
+/// Build a real `Hypervisor` sized by the constants above. `pub(crate)` so the Arc-4 guest module
+/// ([`guest`]) can construct the brain the trap-and-service loop services.
+pub(crate) fn build_hypervisor() -> Hypervisor {
     Hypervisor::new(
         NUM_DOMAINS,
         PORTS_PER_DOMAIN,
