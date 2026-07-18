@@ -39,6 +39,7 @@ fn main() {
                 )
         }
         "qemu-test" => run("bash", &["hv-metal/boot-test.sh"]),
+        "metal-lint" => metal_lint(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run(
@@ -66,7 +67,8 @@ fn main() {
                  doc    build docs, denying broken links\n  \
                  ci     fmt --check, clippy -D warnings, test, then doc\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
-                 qemu-test  headless QEMU boot smoke-test (the metal CI check)"
+                 qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
+                 metal-lint fmt --check + clippy -D warnings for hv-metal (both feature configs)"
             );
             exit(2);
         }
@@ -79,6 +81,42 @@ fn main() {
 /// The bare-metal target `hv-metal` builds for, and the resulting binary path.
 const METAL_TARGET: &str = "aarch64-unknown-none-softfloat";
 const METAL_BIN: &str = "hv-metal/target/aarch64-unknown-none-softfloat/release/hv-metal";
+
+/// Lint `hv-metal` — fmt `--check` + clippy `-D warnings` on the bare-metal target, for BOTH
+/// feature configs (default and `selftest`). `hv-metal` is excluded from the workspace, so
+/// `cargo xtask ci`'s workspace-scoped fmt/clippy never touch it — yet it is the ONE crate that
+/// carries `unsafe`, so it must stay under the same `-D warnings` bar. The `metal boot (QEMU)` CI
+/// job runs this so the gate is enforced (single source of truth: CI calls this task).
+///
+/// Note: no `--all-targets` — a `#![no_std] #![no_main]` bare-metal bin has no buildable `test`
+/// target (the test harness needs `std`), so `--all-targets` would fail to compile it.
+fn metal_lint() -> bool {
+    run(
+        "cargo",
+        &[
+            "fmt",
+            "--manifest-path",
+            "hv-metal/Cargo.toml",
+            "--",
+            "--check",
+        ],
+    ) && metal_clippy(&[])
+        && metal_clippy(&["--features", "selftest"])
+}
+
+/// Run clippy over `hv-metal` for the bare-metal target with `extra` cargo args, denying warnings.
+fn metal_clippy(extra: &[&str]) -> bool {
+    let mut args = vec![
+        "clippy",
+        "--manifest-path",
+        "hv-metal/Cargo.toml",
+        "--target",
+        METAL_TARGET,
+    ];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["--", "-D", "warnings"]);
+    run("cargo", &args)
+}
 
 /// Build `hv-metal` (a standalone, workspace-excluded crate) for the bare-metal target.
 fn metal_build() -> bool {

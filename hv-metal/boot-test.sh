@@ -51,11 +51,13 @@ boot_and_check() {
 
     # Poll until every marker is present or we hit the deadline (a green run finishes fast — the
     # markers print in the first moments of boot — while still tolerating a slow/cold runner).
+    # Markers are matched as FIXED strings (`grep -F`), not regexes — several contain characters
+    # that are regex metacharacters (e.g. the parens in "vector=4 (cur_el_spx_sync)").
     local deadline=$((SECONDS + wait_secs))
     while [ "$SECONDS" -lt "$deadline" ]; do
         local all=1
         for m in "$@"; do
-            grep -q "$m" "$out" || all=0
+            grep -qF "$m" "$out" || all=0
         done
         [ "$all" -eq 1 ] && break
         sleep 0.25
@@ -65,7 +67,7 @@ boot_and_check() {
 
     local failed=0
     for m in "$@"; do
-        if grep -q "$m" "$out"; then
+        if grep -qF "$m" "$out"; then
             echo "boot-test: OK ($label) — found '$m'"
         else
             echo "boot-test: FAIL ($label) — marker '$m' not found"
@@ -78,17 +80,25 @@ boot_and_check() {
         echo "----------------------------------------"
         exit 1
     fi
+    rm -f "$out"
 }
 
-# Default path: the vectors are installed and we boot to park, at EL2.
+# Default path: at EL2, and the vectors get installed (assert the post-install banner, so a
+# regression turning install_vectors into a silent no-op is caught even without firing a fault).
 boot_and_check "default" "" \
     "hv-metal alive" \
-    "CurrentEL = EL2"
+    "CurrentEL = EL2" \
+    "VBAR_EL2 installed"
 
-# Self-test path: the deliberate BRK must be caught and decoded to the BRK exception class (0x3c).
+# Self-test path: the deliberate BRK must be caught and decoded. We assert BOTH the decoded class
+# (EC=0x3c, from ESR_EL2) AND the vector slot that fired (vector=4 (cur_el_spx_sync), from the
+# table stub's `mov w0,#N`) — the latter binds the runtime check to the 16-entry slot-index
+# plumbing, which the ESR-derived EC alone does not exercise.
 boot_and_check "selftest" "--features selftest" \
     "hv-metal alive" \
     "CurrentEL = EL2" \
+    "VBAR_EL2 installed" \
+    "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
 echo "boot-test: OK — all checks passed"
