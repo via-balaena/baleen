@@ -143,8 +143,38 @@ early and cheaply, and the cost was low *for this obligation*. That is not a cla
 remaining residuals — the control-forest acyclicity in particular is a structural induction over
 a graph invariant and may be materially harder.
 
-**What's next.** The other two §3 residuals — the projection frame-lemma (per-transition
-write⟂read disjointness) and the control-forest acyclicity (structural induction over the
-delegation forest, design-lesson #13b) — are the follow-on Verus obligations. Kani did its
-bridge job (counter dimension on real code, validated the payoff, sharpened this obligation);
-Verus has now taken the first ∀-N step and validated that the mirror approach works end-to-end.
+**What's next.** The other two §3 residuals — the projection frame-lemma and the control-forest
+acyclicity — are the follow-on Verus obligations. Kani did its bridge job (counter dimension on
+real code, validated the payoff, sharpened this obligation); Verus has now taken the first ∀-N
+step and validated that the mirror approach works end-to-end.
+
+## 5. The projection frame-lemma — grant-summation owner-locality (LANDED)
+
+The second §3 residual (`docs/TIER-B-CUTOFF.md` §2.3, §3(2)). The size cutoff imports a **frame
+property**: a transition on entities disjoint from a violation's witness W does not perturb W's
+invariant-observable state. Its substantive case is the `UnbackedGrantMap` summation
+`maps_over_frame(f)` (`hypervisor.rs`), which sums `map_count` across **every** grantor's grants
+naming `f` — so *a priori* any domain's transition could change it. It cannot, and the reason is
+a **cross-invariant coupling**: `UnbackedGrantMap` is checked only after `MisownedGrantMap`,
+which forces every grant with *live maps* over `f` to be granted by `owner(f)`. So a grant of `f`
+by any `D ≠ owner(f)` carries no live maps and contributes 0 — the summation is **owner-local**,
+a function of `{f, owner(f)}` (exactly the §2.2 witness), and any transition disjoint from that
+witness leaves it unchanged.
+
+`hv-verify/verus/frame_lemma.rs` proves this green (5 verified, 0 errors) over an **arbitrary-
+length** grant population: `owner_local` (whole-population sum == owner-only sum, under the
+misowned hypothesis); `frame_property` (the total is a function only of the owner-projection —
+the form §2.3's projection construction imports); and `disjoint_append_preserves` (a concrete
+non-owner `grant_access` preserves the total, the projection, and the hypothesis). This is the
+same *"one invariant borrows from a relational one"* shape as the Kani finding (#20):
+`UnbackedGrantMap`'s locality borrows from `MisownedGrantMap`. Fidelity managed as in §4 (the
+mirror's `sum_frame` transcribes `maps_over_frame`; `misowned_ok` mirrors the `MisownedGrantMap`
+check; the enumerator pins the pair on real code at small size via Tier A's `grant_p2m_3dom_cfg`).
+Non-vacuity validated: dropping the misowned hypothesis or the disjoint-step guard makes Verus
+reject the proof. Effort was again low (~5 lemmas). §2.3's other two bullets — slot-reuse
+index-independence and the single-referrer scans — are non-cross-domain and simpler; the
+summation was the only one where disjointness was non-trivial.
+
+**Remaining: §3 residual (3)** — the control-forest acyclicity, a structural induction over the
+delegation forest (design-lesson #13b). That is the last of the three, and likely the hardest
+(a graph invariant, not a filtered sum).
