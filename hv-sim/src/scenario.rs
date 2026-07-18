@@ -1501,6 +1501,10 @@ pub struct PtabOutcome {
     /// PTEs while the CPU still walks it. A witness that the read-only-onto-page-table
     /// path (writable-xor-pagetable coexistence) is actually reached under interleaving.
     pub ro_onto_pagetable: u32,
+    /// **Superpages** installed — leaves mapped directly by a parent *above* `L1` (an `L2`
+    /// 2 MiB or `L3` 1 GiB page). A witness that the driver genuinely builds superpages, so
+    /// the generalized hierarchy invariant is proven over trees that actually contain them.
+    pub superpages: u32,
     /// Whether the whole-system page invariant — including hierarchical
     /// level-correctness — held after every step.
     pub invariants_hold: bool,
@@ -1527,39 +1531,59 @@ impl PtabOutcome {
     }
 }
 
+/// What one [`try_link`] attempt observed, so the driver can prove it reaches the shapes
+/// that matter — not just that no invariant broke.
+#[derive(Debug, Default, Clone, Copy)]
+struct Linked {
+    /// A *read-only leaf onto a frame that was already a page table* — the linear-map case.
+    ro_onto_pagetable: bool,
+    /// A **superpage** — a leaf installed under a parent *above* `L1` (an `L2` 2 MiB or `L3`
+    /// 1 GiB page mapped directly), the shape this arc adds.
+    superpage: bool,
+}
+
 /// Try to install one valid page-table entry: pick a table `parent`, a free `slot`, a
-/// `child` the same domain owns, and link them. Returns `true` iff it installed a
-/// *read-only leaf onto a frame that was already a page table* — the linear-map case.
+/// `child` the same domain owns, and link them — as either an interior entry or a leaf.
 ///
-/// A seed bit chooses read-only or writable. A **writable** entry (or any interior one)
-/// needs an *untyped* child, so the link establishes it one level down and the driver
-/// grows L4→…→leaf trees rather than bouncing off type conflicts. A **read-only leaf**
-/// (under an `L1`) imposes no type, so it may point at *any* frame the owner holds —
-/// including one already typed as a page table, exercising the read-only-view-of-a-table
-/// coexistence. On success the `(parent, slot)` edge is recorded for a later unlink.
-fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) -> bool {
+/// Seed bits choose the entry's shape. **Leaf vs interior**: an entry under an `L1` is
+/// always a leaf; above `L1` a coin picks a leaf (a *superpage* — a 2 MiB/1 GiB page mapped
+/// directly) or an interior entry descending one level. **Writable vs read-only**: a
+/// *writable* leaf, or any interior entry, needs an *untyped* child, so the link establishes
+/// it (a leaf as `Writable`, an interior child as the table below) and the driver grows real
+/// trees rather than bouncing off type conflicts. A *read-only* leaf imposes no type, so it
+/// may point at *any* frame the owner holds — including one already typed as a page table,
+/// exercising the read-only-view-of-a-table coexistence at leaf *or* superpage granularity.
+/// On success the `(parent, slot)` edge is recorded for a later unlink.
+fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) -> Linked {
     // Candidate parents: any frame currently typed as a page table.
     let parents: Vec<u32> = (0..sys.frame_count() as u32)
         .filter(|&m| matches!(sys.current_type(m), Some(PageType::PageTable(_))))
         .collect();
     if parents.is_empty() {
-        return false;
+        return Linked::default();
     }
     let parent = parents[rng.below(parents.len() as u32) as usize];
     let slot = rng.below(p2m::TABLE_SLOTS);
     if sys.child_at(parent, slot).is_some() {
-        return false; // slot occupied — leave it for another step
+        return Linked::default(); // slot occupied — leave it for another step
     }
     let owner = match sys.owner_of(parent) {
         Some(o) => o,
-        None => return false,
+        None => return Linked::default(),
     };
-    // A read-only *leaf* (only meaningful under an L1 parent here) may point at any allocated
-    // frame; every other entry needs an untyped child to establish the level below. This
-    // driver builds leaves only under `L1` (superpage leaves at `L2`/`L3` are witnessed by a
-    // dedicated driver); an entry under an `L1` is a leaf, everything else interior.
-    let parent_is_l1 = sys.current_type(parent) == Some(PageType::PageTable(PtLevel::L1));
-    let ro_leaf = rng.below(2) == 0 && parent_is_l1;
+    let level = match sys.current_type(parent) {
+        Some(PageType::PageTable(l)) => l,
+        _ => return Linked::default(),
+    };
+    // An interior entry is only possible above `L1` (there is a level below to descend to);
+    // under an `L1` the entry must be a leaf. Above `L1`, a coin picks a leaf (a superpage)
+    // or an interior entry. A read-only leaf may point at any allocated frame; every other
+    // shape needs an untyped child to establish its type one level down (or as a writable
+    // leaf).
+    let interior_possible = level != PtLevel::L1;
+    let leaf = !interior_possible || rng.below(2) == 0;
+    let writable = !leaf || rng.below(2) != 0;
+    let ro_leaf = leaf && !writable;
     let children: Vec<u32> = (0..sys.frame_count() as u32)
         .filter(|&m| {
             m != parent
@@ -1572,28 +1596,30 @@ fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) 
         })
         .collect();
     if children.is_empty() {
-        return false;
+        return Linked::default();
     }
     let child = children[rng.below(children.len() as u32) as usize];
     let onto_pagetable = ro_leaf && matches!(sys.current_type(child), Some(PageType::PageTable(_)));
-    if sys
-        .link(owner, parent, slot, child, !ro_leaf, parent_is_l1)
-        .is_ok()
-    {
+    if sys.link(owner, parent, slot, child, writable, leaf).is_ok() {
         links.push((parent, slot));
-        onto_pagetable
+        Linked {
+            ro_onto_pagetable: onto_pagetable,
+            superpage: leaf && level != PtLevel::L1,
+        }
     } else {
-        false
+        Linked::default()
     }
 }
 
 /// Drive the page-type [`p2m::System`] through a seed-derived stream that *builds
 /// page-table trees*: allocate frames, pin some as roots at each of the four levels, and
-/// link untyped children one level down to grow L4→L3→L2→L1→leaf chains, unlinking and
-/// freeing as it goes. This is where the hierarchical type invariant — every entry points
-/// exactly one level down — is stress-tested under interleaving: the core's `debug_assert!`
-/// fires on every transition, so a mislevelled edge surfaces here with the seed as the
-/// whole reproducer. This is the multi-level cousin of the write-xor stress in [`run_p2m`].
+/// link children — interior entries one level down, or leaves (including **superpages**, a
+/// leaf mapped directly by an `L2`/`L3` entry) — to grow real trees, unlinking and freeing
+/// as it goes. This is where the hierarchical type invariant — every entry descends exactly
+/// one level *or* terminates in a leaf — is stress-tested under interleaving: the core's
+/// `debug_assert!` fires on every transition, so a mislevelled edge surfaces here with the
+/// seed as the whole reproducer. This is the multi-level cousin of the write-xor stress in
+/// [`run_p2m`].
 pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
     const DOMAINS: u16 = 2;
     const FRAMES: u32 = 8;
@@ -1604,6 +1630,7 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
 
     let mut invariants_hold = true;
     let mut ro_onto_pagetable = 0u32;
+    let mut superpages = 0u32;
     for _ in 0..steps {
         let mfn = rng.below(FRAMES);
         match rng.below(8) {
@@ -1618,7 +1645,9 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
                 }
             }
             2..=4 => {
-                ro_onto_pagetable += try_link(&mut sys, &mut rng, &mut links) as u32;
+                let observed = try_link(&mut sys, &mut rng, &mut links);
+                ro_onto_pagetable += observed.ro_onto_pagetable as u32;
+                superpages += observed.superpage as u32;
             }
             5 => {
                 if !links.is_empty() {
@@ -1645,6 +1674,7 @@ pub fn run_ptab(seed: u64, steps: u32) -> PtabOutcome {
 
     PtabOutcome {
         ro_onto_pagetable,
+        superpages,
         ..PtabOutcome::of(&sys, invariants_hold)
     }
 }
@@ -1661,6 +1691,11 @@ pub struct ForeignOutcome {
     /// rather than a single leaf. A witness that the subtree-sharing path is reached, not
     /// just leaf mapping.
     pub node_links: u32,
+    /// Of those, the foreign **superpage** leaves — a peer's data frame mapped directly by
+    /// an `L2` entry (a shared 2 MiB page), authorized by the one grant of that frame exactly
+    /// as a 4 KiB foreign leaf is. A witness that a foreign superpage share is reached, so the
+    /// authorization invariant is proven over superpage leaves as well as small pages.
+    pub superpage_links: u32,
     /// Of those, the *read-only* ones — a foreign entry authorized by any grant (contrast
     /// a writable entry, which needs a read-write grant). A witness that the read-only
     /// cross-domain path is reached, not just the writable one.
@@ -1682,8 +1717,10 @@ pub struct ForeignOutcome {
 /// the node is a real subtree), and spare data frames. The loop grants a data frame *or an
 /// `L1` node* across the domain boundary — read-only or read-write by a seed bit — and maps
 /// the granted foreign frame into the peer's table at a seed-chosen access: a data frame
-/// goes under the peer's `L1` (a foreign *leaf*), a node under the peer's `L2` (a foreign
-/// *interior* entry, sharing the subtree). It unlinks entries, revokes grants, and attempts
+/// goes under the peer's `L1` (a 4 KiB foreign *leaf*) or directly under its `L2` (a 2 MiB
+/// foreign *superpage* leaf), a node under the peer's `L2` (a foreign *interior* entry,
+/// sharing the subtree) — every one authorized by the same single grant of the child frame,
+/// whatever the size. It unlinks entries, revokes grants, and attempts
 /// *unauthorized* links (no grant, or a writable entry over a read-only grant) to witness
 /// the isolation guard firing. The authorization invariant — every cross-domain entry
 /// backed by a grant of matching permission, at every level — is checked after every step,
@@ -1819,11 +1856,17 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                 if !grants.is_empty() {
                     let idx = rng.below(grants.len() as u32) as usize;
                     let (_grantor, _gref, grantee, frame, is_node) = grants[idx];
-                    let parent = if is_node {
+                    // Choose where the granted foreign frame lands. A node share is always an
+                    // interior entry under the peer's L2. A data frame is a leaf — either a
+                    // 4 KiB leaf under the peer's L1, or a 2 MiB *superpage* mapped directly by
+                    // the peer's L2 (a seed coin) — both authorized by the same one grant.
+                    let superpage = !is_node && rng.below(2) == 0;
+                    let parent = if is_node || superpage {
                         l2_of(grantee)
                     } else {
                         l1_of(grantee)
                     };
+                    let leaf = !is_node;
                     // Slot 0 of the L1 node is taken by its own leaf; leave it be, and share
                     // the L2's slots freely.
                     let slot = 1 + rng.below(7);
@@ -1835,15 +1878,16 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                             slot,
                             child: frame,
                             writable,
-                            // A data frame under an L1 is a leaf; the peer's L1 node under an
-                            // L2 is an interior entry sharing its subtree.
-                            leaf: !is_node,
+                            leaf,
                         },
                     ) {
                         Ok(_) => {
                             out.links += 1;
                             if is_node {
                                 out.node_links += 1;
+                            }
+                            if superpage {
+                                out.superpage_links += 1;
                             }
                             if !writable {
                                 out.ro_links += 1;
@@ -2477,6 +2521,10 @@ mod tests {
                 "ro-onto-pagetable",
                 outcomes.iter().any(|o| o.ro_onto_pagetable > 0),
             ),
+            // A superpage — a leaf mapped directly by an L2/L3 entry. Without this the
+            // generalized hierarchy invariant would be proving itself only over the small-page
+            // trees the old driver built, never a superpage the new leaf shape allows.
+            ("superpage", outcomes.iter().any(|o| o.superpages > 0)),
         ] {
             assert!(reached, "no seed ever produced a {name} — driver too weak");
         }
@@ -2522,6 +2570,11 @@ mod tests {
             outcomes.iter().any(|o| o.node_links > 0),
             "no seed ever shared a page-table node (interior foreign entry) — the \
              subtree-sharing path is uncovered"
+        );
+        assert!(
+            outcomes.iter().any(|o| o.superpage_links > 0),
+            "no seed ever shared a foreign superpage (a 2 MiB leaf under the peer's L2) — the \
+             cross-domain superpage path is uncovered"
         );
         assert!(
             outcomes.iter().any(|o| o.ro_links > 0),
