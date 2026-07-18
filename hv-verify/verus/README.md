@@ -23,6 +23,7 @@ cargo-deny never see it and the pure brain stays stable-buildable. It is verifie
 | `unwinding_destroy.rs` **(Tier D)** | **The `DomainDestroy` cascade** — the only *multi-domain* transition (intransitive reach). Its compound teardown (`close_all`/`clear_unbound_into`, `revoke_grants_to`/`drain_maps_of`) touches a *third* domain `a`'s ports, grant rows, and frame references — but every touch is conditioned on `a`→`c` grant or `a`→`c` port (the teardown-reach term). Proven: the port + grant-row sub-ops preserve `a`'s state when it has no reach to `c` (guard-shaped); the drain preserves `a`'s frame refs via the grant `map`-identity (`Seq`-induction, borrows-from-a-relational-invariant); and the intransitive-channel heart — `¬(b ⇝ a)` + authorized destroy of `c` ⟹ `a` has no reach to `c`. Over **arbitrary domain + partner count**. *The cascade composes **both** channel kinds in one transition.* | Tier D — non-interference |
 | `noninterference_theorem.rs` **(Tier D capstone)** | **The whole-system non-interference theorem** — the Rushby **unwinding theorem** assembling the per-transition lemmas over arbitrary executions. **Theorem A** (from **local respect**, which the five lemmas above discharge): a domain `a` sees a *constant* observation across any execution of actions by principals that do not interfere with it — unrelated activity is invisible. **Theorem B** (from local respect + **step consistency**): two executions that start `obs(a)`-equivalent and agree on each actor's observation stay `obs(a)`-equivalent — `a`'s view is determined *entirely* by the inputs authorized to flow to it. Proven generically over `obs`/`step`/`actor`/`interferes`. | Tier D — non-interference |
 | `step_consistency.rs` **(Tier D)** | **Closing the last mile** — discharges what is derivable of Theorem B's *step-consistency* premise and pins the residual. `step_consistency_off_channel`: from local respect alone, step consistency holds for every non-interfering actor (the premise reduces to the *interfering* case). `factored_step_is_consistent`: it holds for every **write** channel (a principal's authorized effect on `a` factors through `obs(a)` + the actor's observation). *Finding: the irreducible residual is the confidentiality **read** direction — `a` reading a partner's state it is authorized to see — the dual of local respect, needing an `obs` **read-closure**; the integrity property (Theorem A) stands complete without it.* | Tier D — non-interference |
+| `read_closure.rs` **(Tier D)** | **The confidentiality read-closure — finishing Theorem B.** Refines the observation to `obs⁺(a)` (= `obs(a)` + the read-capability tuple `(grantor, frame, active, owner)` for every grant naming `a` as grantee — exactly what `GrantMap`/`GrantCopy` reads). `read_outcome_factors`: `a`'s cross-domain read outcome is a function of `obs⁺(a)`, so step consistency's residual case **factors** once the observation is read-closed. `read_cap_stable`: `obs⁺(a)` is preserved by any principal that is neither the capability's grantor nor an owner-changer of its frame — the **extended channel relation** `⇝⁺` (the confidentiality dual of the write channels). With `obs := obs⁺`, `interferes := ⇝ ∪ ⇝⁺`, both unwinding conditions hold, so the generic assembly theorem yields **full non-interference — integrity *and* confidentiality**. | Tier D — non-interference |
 
 `refcount_mismatch.rs` is the keystone residual (`docs/TIER-B-CUTOFF.md` §3(1),
 `docs/TIER-C-SPIKE.md` §3–4). Proving it discharges — for *all* sizes — the two `kani::assume`s
@@ -64,6 +65,7 @@ $VERUS --crate-type=lib hv-verify/verus/unwinding_create.rs         # → 2 veri
 $VERUS --crate-type=lib hv-verify/verus/unwinding_destroy.rs        # → 7 verified, 0 errors  (Tier D)
 $VERUS --crate-type=lib hv-verify/verus/noninterference_theorem.rs  # → 5 verified, 0 errors  (Tier D capstone)
 $VERUS --crate-type=lib hv-verify/verus/step_consistency.rs        # → 3 verified, 0 errors  (Tier D)
+$VERUS --crate-type=lib hv-verify/verus/read_closure.rs            # → 2 verified, 0 errors  (Tier D)
 ```
 
 CI runs exactly this in the `verus preservation proofs` job of
@@ -109,6 +111,8 @@ hand; each reproduces in seconds):
 | `noninterference_theorem.rs` | drop the `step_consistent()` premise from Theorem B | `assertion failed` |
 | `step_consistency.rs` | drop `local_respect()` from `step_consistency_off_channel` | `assertion failed` |
 | `step_consistency.rs` | drop the `writes_factor` hypothesis from `factored_step_is_consistent` | `postcondition not satisfied` |
+| `read_closure.rs` | drop the `owner` component from the read-closure (`read_view`) | `postcondition not satisfied` |
+| `read_closure.rs` | weaken `d != cap.grantor` in `read_cap_stable` | `postcondition not satisfied` |
 
 ## What's next
 
@@ -121,10 +125,13 @@ memory channel, from Tier C), **every transition class is discharged**: the four
 multi-domain `DomainDestroy` cascade (which composes both kinds — guard-shaped port/grant-revoke
 sub-ops + an invariant-borrowing drain). `noninterference_theorem.rs` is the **capstone**: the
 Rushby **unwinding theorem** assembling those per-transition local-respect lemmas into whole-system
-non-interference over arbitrary executions. **With it, Tier D — and the true-diamond program A→D — is
-complete at the model level:** Tiers A–C prove every invariant holds ∀-N, and Tier D proves those
-invariants *collectively imply* isolation (that we are checking the *right* things) — validated on
-the real code by the enumerator **bridge** (`hv-sim/src/noninterference.rs`) and proven ∀-N here. See
-`docs/TIER-D-NONINTERFERENCE.md`, and `docs/TIER-C-SPIKE.md` for the honest scope of what these ∀-N
-model proofs do and don't cover (they cover the *model* — the pure brain; whether the *metal*
-enforces it is M3+).
+non-interference over arbitrary executions. `step_consistency.rs` and `read_closure.rs` close its
+second premise — the confidentiality direction: `step_consistency.rs` reduces it to the read
+direction, and `read_closure.rs` discharges that via the observation read-closure `obs⁺` and the
+extended channel relation `⇝⁺`. **With them, Tier D — and the true-diamond program A→D — is complete
+at the model level, both directions (integrity *and* confidentiality):** Tiers A–C prove every
+invariant holds ∀-N, and Tier D proves those invariants *collectively imply* isolation (that we are
+checking the *right* things) — validated on the real code by the enumerator **bridge**
+(`hv-sim/src/noninterference.rs`) and proven ∀-N here. See `docs/TIER-D-NONINTERFERENCE.md`, and
+`docs/TIER-C-SPIKE.md` for the honest scope of what these ∀-N model proofs do and don't cover (they
+cover the *model* — the pure brain; whether the *metal* enforces it is M3+).

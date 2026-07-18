@@ -3,12 +3,13 @@
 
 # Tier D — non-interference (the property definition + the bridge spike)
 
-*Status: **integrity non-interference COMPLETE at the model level; confidentiality dual
-characterized.** Property definition decided and validated on real code (the enumerator bridge);
-every transition class proven ∀-N (five per-transition local-respect lemmas); the **unwinding
-theorem** (`noninterference_theorem.rs`) assembles them into whole-system non-interference; and the
-last mile (`step_consistency.rs`) discharges the derivable part of the confidentiality premise,
-leaving a bounded, characterized read-closure residual (§5e). This is the deepest and last tier of the true-diamond program — the
+*Status: **COMPLETE at the model level — both directions (integrity and confidentiality).** Property
+definition decided and validated on real code (the enumerator bridge); every transition class proven
+∀-N (five per-transition local-respect lemmas); the **unwinding theorem**
+(`noninterference_theorem.rs`) assembles them into whole-system non-interference; the last mile
+(`step_consistency.rs`) reduces the confidentiality premise to the read direction; and the
+**read-closure** (`read_closure.rs`) discharges that via `obs⁺` and the extended relation `⇝⁺` —
+closing both directions (§5e–§5f). This is the deepest and last tier of the true-diamond program — the
 "are we checking the **right** things" capstone. Tiers A–C prove the invariants hold in every
 reachable state, ∀-N; Tier D proves those invariants **collectively imply real isolation**. Read
 alongside `hv-sim/src/noninterference.rs` (the enumerator bridge), the five `hv-verify/verus/
@@ -333,6 +334,32 @@ confidentiality direction of the property. **The integrity property the tier set
 (Theorem A — "`a` can't be *affected* except through authorized channels") stands complete without
 it.**
 
+## 5f. The read-closure — finishing the confidentiality direction (green)
+
+`hv-verify/verus/read_closure.rs` (2 verified, 0 errors) discharges the residual §5e identified.
+Refine the observation to **`obs⁺(a)`** = `obs(a)` plus, for every grant naming `a` as grantee, the
+read-capability tuple `(grantor, frame, active, owner(frame))` — exactly what `a`'s
+`GrantMap`/`GrantCopy` reads (the grant's activeness and grantee, and the `StaleGrant` ownership
+check). Two lemmas close it:
+
+* `read_outcome_factors` — **step consistency closes.** `a`'s cross-domain read succeeds iff the
+  capability is active and the frame is still owned by the grantor — a function of the read-closure
+  tuple *alone*. So two states agreeing on `obs⁺(a)` compute the same read outcome and successor:
+  the residual case factors once the observation is read-closed.
+* `read_cap_stable` — **local respect extends.** `obs⁺(a)` is preserved by any step whose principal
+  is neither the capability's **grantor** (only the grantor can end/alter the grant) nor an
+  **owner-changer** of its frame. Those two are exactly the **extended channel relation `⇝⁺`** — the
+  confidentiality dual of the write channels (`c ⇝⁺ a` iff `c` controls what `a` reads: `c` offered
+  `a` the grant, or `c` can re-own its frame).
+
+With `obs := obs⁺` and `interferes := ⇝ ∪ ⇝⁺`, **both** unwinding conditions hold — local respect
+(the five write-lemmas for `obs(a)` + `read_cap_stable` for the closure) and step consistency (the
+write channels factor, §5e, + `read_outcome_factors` for the reads) — so the generic assembly
+theorem (`noninterference_theorem.rs`) yields **full non-interference: integrity *and*
+confidentiality**. Non-vacuity: dropping the ownership component of the read-closure, or the
+grantor guard, makes Verus reject. **The confidentiality direction is closed; Tier D is complete at
+the model level in both directions.**
+
 ## 6. Honest scope, cost read, and the fork
 
 **What the spike establishes.** The property definition (`obs`, `⇝`, local respect, the
@@ -358,13 +385,14 @@ read-closure.
 definition was the hard part and it is *done and validated*; all five per-transition unwinding
 lemmas (~5, ~2, ~3, ~2, ~7 lemmas) came in *easier* than feared, their shape is understood
 (state-invariant-guarded channels take a two-sides bridge; transition-guarded channels are simpler;
-the cascade composes both); the assembly went green in one arc; and the last mile resolved cleanly
-into "integrity: done; confidentiality: characterized, read-closure residual." **The true-diamond
-program A→D is complete at the model level for integrity non-interference** — Tiers A–C prove every
-invariant holds ∀-N, Tier D proves they collectively imply *isolation* (nothing unauthorized affects
-a domain). Two honest horizons remain: the **confidentiality read-closure** (finishing Theorem B —
-a bounded model-level arc), and the **metal** (M3+, ARM-first QEMU — carrying the model guarantees
-onto hardware, an inherently new program outside true-diamond).
+the cascade composes both); the assembly went green in one arc; the last mile resolved cleanly
+into "integrity: done; confidentiality: read-closure residual"; and the read-closure (§5f) then
+discharged that residual in one more arc. **The true-diamond program A→D is complete at the model
+level, in both directions** — Tiers A–C prove every invariant holds ∀-N; Tier D proves they
+collectively imply *isolation*, integrity (nothing unauthorized *affects* a domain) *and*
+confidentiality (a domain *learns* nothing unauthorized). The one remaining horizon is the **metal**
+(M3+, ARM-first QEMU) — carrying these model guarantees onto hardware, an inherently new program
+outside true-diamond, and the user's to open and time.
 
 **The fork (the user's call).** Tiers A–C already make the safety **core** deductively proven ∀-N;
 this spike shows Tier D's *"are we checking the right things"* capstone is reachable and its
