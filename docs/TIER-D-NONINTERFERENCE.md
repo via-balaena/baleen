@@ -192,6 +192,25 @@ obligation. Combined with `frame_lemma.rs` (the memory channel, ~5 lemmas), the 
 shape recurs, and Verus/Z3 handle the ∀-N quantifiers cleanly. The person-months caveat did **not**
 bite for these two channels.
 
+## 5a. The control/affinity channel, ∀-N (green) — and a channel that *doesn't* borrow
+
+The next incremental arc (chosen over committing to the whole remaining program): the third
+direct channel, **authority/control**. `hv-verify/verus/unwinding_control.rs` (3 verified, 0
+errors, **first try**) proves, over an **arbitrary vCPU population**, that a scheduler step by a
+`b` with no authority over `a` (and `b ≠ a`) leaves `a`'s vCPU projection unchanged:
+`SchedSetAffinity` is the one scheduler op with a `target`, gated by
+`caller == target ∨ controls[caller][target]` — so the guard forces any target `b` may write to
+be `≠ a`; the caller-only ops write only `b`'s own rows.
+
+**The finding — not every channel borrows from a relational invariant.** The memory channel's
+locality borrows from `MisownedGrantMap`, the signal channel's from reciprocity — both *state*
+invariants bridging two sides. The authority channel's locality comes **directly from the
+transition guard** (design-lesson #9: authorization is a *guard*, not a *state invariant*): the
+`SchedSetAffinity` check *is* the write-restriction, so there is no two-sides bridge to prove.
+That makes it the **simplest** of the three (3 lemmas, zero iterations) — a datapoint that
+per-channel local respect is not uniformly hard, and that the shape depends on whether the
+channel is guarded by a state invariant or a transition precondition.
+
 ## 6. Honest scope, cost read, and the fork
 
 **What the spike establishes.** The property definition (`obs`, `⇝`, local respect, the
@@ -202,17 +221,22 @@ the enumerator bridge (real code, small size, all transitions) and one Verus unw
 
 **What remains for full Tier D.** Whole-system non-interference is *one local-respect lemma per
 transition class over the whole `obs(a)` projection*, assembled compositionally (plus the step- and
-output-consistency conditions, both light given `~_a` = `obs`-equality). Concretely: the memory
-channel (`frame_lemma.rs`, done), the signal channel (`unwinding_signal.rs`, done), and the
-remaining classes — the control/affinity channel, the creation channel, and the intransitive
+output-consistency conditions, both light given `~_a` = `obs`-equality). Progress on the direct
+channels: the memory channel (`frame_lemma.rs`, done), the signal channel (`unwinding_signal.rs`,
+done), and the control/affinity channel (`unwinding_control.rs`, done) — **three of the direct
+channels**. Remaining: the creation channel (`DomainCreate`, a `may_create`-gated `Dead → Live`
+lift — expected simple, guard-shaped like the control channel), and the intransitive
 `DomainDestroy` cascade (the one genuinely multi-domain obligation, and the likely hardest, since
-its write-set spans a target's whole partner set). Each is expected, on the two datapoints so far,
-to be a handful of lemmas; the `DomainDestroy` cascade is the honest unknown.
+its write-set spans a target's whole partner set — the honest unknown), then the compositional
+assembly.
 
 **The cost read, plainly.** Tier D is **not** the person-months cliff it might have been. The
-definition was the hard part and it is *done and validated*; the deductive obligations so far are
-*easier* than Tier C's, not harder. Completing Tier D is a **finite, tractable program** of a few
-more unwinding lemmas — real work (especially the destroy cascade), but not research-grade risk.
+definition was the hard part and it is *done and validated*; the three per-channel unwinding
+lemmas so far (~5, ~2, ~3 lemmas; zero-to-two iterations each) are *easier* than Tier C's, not
+harder — and the shape varies (two borrow from a relational invariant, one comes straight from a
+transition guard), all tractable. Completing Tier D is a **finite, tractable program** of a couple
+more unwinding lemmas plus assembly — real work (especially the destroy cascade), but not
+research-grade risk.
 
 **The fork (the user's call).** Tiers A–C already make the safety **core** deductively proven ∀-N;
 this spike shows Tier D's *"are we checking the right things"* capstone is reachable and its
