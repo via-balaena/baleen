@@ -6,12 +6,15 @@
 # `virt` machine at EL2, and assert the expected serial markers appear. This is the metal side of
 # the "diamond -> CI-green -> merge" loop; CI runs it (see .github/workflows/ci.yml) and so can you.
 #
-# Arc 2 runs it TWICE:
-#   - the DEFAULT build: vectors installed, boots to park at EL2 (asserts the alive marker + that we
-#     are actually at EL2);
-#   - the `--features selftest` build: deliberately executes `BRK #0`, so the installed exception
-#     vectors must CATCH and DECODE the fault (asserts, additionally, the decoded exception class
-#     `EC=0x3c`). This is the non-vacuity proof that the vectors fire — design-lesson #23.
+# Arc 3 runs it TWICE:
+#   - the DEFAULT build: the full Arc-3 sequence — at EL2, vectors installed, HCR_EL2.RW=1, the
+#     generic-timer TimeSource live and monotonic, and a synthetic HvCall dispatched into the linked
+#     hv-core brain returning the right balance (asserts every one of those markers);
+#   - the `--features selftest` build: additionally asserts the HvCall *accounting* witness
+#     (grant 100 / spend 30 -> balance 70), then deliberately executes `BRK #0` so the installed
+#     exception vectors must CATCH and DECODE the fault (asserts the class `EC=0x3c` and the slot
+#     `vector=4`). Each self-test asserts a witness produced BY the mechanism under test — the
+#     non-vacuity proofs that the dispatch and the vectors fire (design-lessons #23, #24(f)).
 #
 # Portable timeout: qemu parks in a wfe loop (it never exits on its own), so we run it in the
 # background, poll the serial log for the markers, and kill it as soon as they all appear (or once
@@ -83,21 +86,35 @@ boot_and_check() {
     rm -f "$out"
 }
 
-# Default path: at EL2, and the vectors get installed (assert the post-install banner, so a
-# regression turning install_vectors into a silent no-op is caught even without firing a fault).
+# Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
+# a regression in any one is caught even without the self-test:
+#   - VBAR_EL2 installed          -> install_vectors did not silently no-op (Arc 2);
+#   - HCR_EL2.RW=1                 -> HCR_EL2 was configured and read back correct;
+#   - generic timer live          -> the TimeSource read a monotonic, advancing count;
+#   - HvCall CreditGrant ... =100  -> the linked hv-core brain serviced a real hypercall on the metal
+#                                    (printed ONLY when the dispatch returned exactly Balance(100)).
 boot_and_check "default" "" \
     "hv-metal alive" \
     "CurrentEL = EL2" \
-    "VBAR_EL2 installed"
+    "VBAR_EL2 installed" \
+    "HCR_EL2.RW=1" \
+    "generic timer live" \
+    "HvCall CreditGrant(100) -> balance=100"
 
-# Self-test path: the deliberate BRK must be caught and decoded. We assert BOTH the decoded class
-# (EC=0x3c, from ESR_EL2) AND the vector slot that fired (vector=4 (cur_el_spx_sync), from the
-# table stub's `mov w0,#N`) — the latter binds the runtime check to the 16-entry slot-index
-# plumbing, which the ESR-derived EC alone does not exercise.
+# Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
+# both returned the exact expected balances — a witness produced by the dispatch itself), then the
+# deliberate BRK must be caught and decoded. We assert BOTH the decoded class (EC=0x3c, from
+# ESR_EL2) AND the vector slot that fired (vector=4 (cur_el_spx_sync), from the table stub's
+# `mov w0,#N`) — the latter binds the runtime check to the 16-entry slot-index plumbing, which the
+# ESR-derived EC alone does not exercise.
 boot_and_check "selftest" "--features selftest" \
     "hv-metal alive" \
     "CurrentEL = EL2" \
     "VBAR_EL2 installed" \
+    "HCR_EL2.RW=1" \
+    "generic timer live" \
+    "HvCall CreditGrant(100) -> balance=100" \
+    "selftest: HvCall accounting OK" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
