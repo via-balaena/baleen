@@ -305,6 +305,31 @@ impl System {
         }
     }
 
+    /// Free every *other* domain's half-open port that names `target` as its awaited
+    /// peer — the inbound-reference step of tearing `target` down. An `Unbound { remote:
+    /// target }` port is a standing invitation for `target` to bind: it *survives*
+    /// `target`'s teardown as a bare index, and if the slot were reborn, the new tenant
+    /// could silently accept it ([`Self::bind_interdomain`] only checks the awaited
+    /// `remote == binder`, and a reused `DomId` compares equal). So teardown clears these
+    /// invitations, exactly as [`Self::close_all`] clears the ports `target` itself held —
+    /// the peer loses a half-open port that named a domain which no longer exists, and can
+    /// open a fresh one against whoever is reborn there, deliberately. Frees the whole
+    /// channel (any pending/masked bit with it), so no `Free`-port-with-signal breaks; it
+    /// never touches `Interdomain` ports (a live interdomain link to `target` cannot coexist
+    /// with `target` dead — reciprocity would break, and `target`'s own ports are already
+    /// closed). This is the event-channel half of "a `Dead` slot has nothing pointing into
+    /// it" ([`crate::hypervisor::CrossViolation::DeadDomainReferenced`]).
+    pub fn clear_unbound_into(&mut self, target: DomId) {
+        for dom in 0..self.domain_count() as DomId {
+            for port in 0..self.port_count(dom) as Port {
+                if self.state_of(dom, port) == Some(PortState::Unbound { remote: target }) {
+                    *self.chan_mut(dom, port).unwrap() = EventChannel::FREE;
+                }
+            }
+        }
+        self.check_invariants();
+    }
+
     // ─── queries (the read side of the fence) ─────────────────────────────────
 
     /// Whether an event on this port would be delivered *now*: pending and not
@@ -343,6 +368,20 @@ impl System {
     pub fn has_deliverable_for(&self, dom: DomId, vcpu: Vcpu) -> bool {
         (0..self.port_count(dom) as Port)
             .any(|port| self.deliverable(dom, port) && self.notify_target(dom, port) == Some(vcpu))
+    }
+
+    /// Whether any port anywhere is a half-open [`PortState::Unbound`] awaiting `target`
+    /// as its peer — an inbound reference to `target` held by (possibly) another domain.
+    /// The read side of the event-channel half of
+    /// [`crate::hypervisor::CrossViolation::DeadDomainReferenced`]: a `Dead` `target` must have no such
+    /// invitation outstanding, since a reborn slot must never inherit a channel opened for
+    /// the tenant that preceded it. [`Self::clear_unbound_into`] is what keeps this false
+    /// for a torn-down domain.
+    pub fn any_unbound_into(&self, target: DomId) -> bool {
+        (0..self.domain_count() as DomId).any(|dom| {
+            (0..self.port_count(dom) as Port)
+                .any(|port| self.state_of(dom, port) == Some(PortState::Unbound { remote: target }))
+        })
     }
 
     /// The state of a port, if the ids are in range.
@@ -711,6 +750,26 @@ mod tests {
         assert!(s.has_deliverable_for(0, 1));
         s.consume(0, p).unwrap();
         assert!(!s.has_deliverable_for(0, 1));
+    }
+
+    #[test]
+    fn clear_unbound_into_frees_only_ports_awaiting_the_target() {
+        let mut s = sys();
+        // Domains 0 and 1 each open a half-open port awaiting domain 2; domain 1 also opens
+        // one awaiting domain 0.
+        let a = s.alloc_unbound(0, 2).unwrap();
+        let b = s.alloc_unbound(1, 2).unwrap();
+        let c = s.alloc_unbound(1, 0).unwrap();
+        assert!(s.any_unbound_into(2));
+
+        s.clear_unbound_into(2);
+        assert!(!s.any_unbound_into(2), "no port still awaits domain 2");
+        assert_eq!(s.state_of(0, a), Some(PortState::Free));
+        assert_eq!(s.state_of(1, b), Some(PortState::Free));
+        // The port awaiting a *different* domain is untouched.
+        assert_eq!(s.state_of(1, c), Some(PortState::Unbound { remote: 0 }));
+        assert!(s.any_unbound_into(0));
+        assert!(s.invariants_hold());
     }
 
     #[test]

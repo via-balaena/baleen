@@ -365,6 +365,45 @@ impl System {
         }
     }
 
+    /// Revoke every grant — offered by *any* grantor — that names `grantee` as its
+    /// grantee: the inbound-reference step of tearing `grantee` down. A grant `{grantee}`
+    /// is a standing permit naming a domain by bare index; it *survives* `grantee`'s
+    /// teardown, and if the slot were reborn the new tenant — a different principal — could
+    /// [`crate::Hypervisor`]-map it and reach the grantor's page ([`Self::map`] only checks
+    /// the named grantee, and a reused `DomId` compares equal). So teardown withdraws these
+    /// permits, the mirror of [`Self::revoke_all`] (which withdraws the grants `grantee`
+    /// *offered*). Every such grant is unmapped by the time this runs — the caller has
+    /// already drained `grantee`'s own maps, and only `grantee` could have mapped a grant
+    /// naming it — so each [`Self::end_access`] succeeds by construction. This is the grant
+    /// half of "a `Dead` slot has nothing pointing into it"
+    /// ([`crate::hypervisor::CrossViolation::DeadDomainReferenced`]).
+    pub fn revoke_grants_to(&mut self, grantee: DomId) {
+        for grantor in 0..self.domain_count() as DomId {
+            for gref in 0..self.entry_count(grantor) as GrantRef {
+                if self.grantee_of(grantor, gref) == Some(grantee) {
+                    let r = self.end_access(grantor, gref);
+                    debug_assert!(
+                        r.is_ok(),
+                        "revoke_grants_to hit a still-mapped grant: {r:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether any grant offered by any grantor names `grantee` as its grantee — an
+    /// inbound permit naming `grantee`. The read side of the grant half of
+    /// [`crate::hypervisor::CrossViolation::DeadDomainReferenced`]: a `Dead` `grantee` must have no
+    /// permit outstanding, since a reborn slot must never inherit a grant issued to the
+    /// tenant that preceded it. [`Self::revoke_grants_to`] keeps this false for a torn-down
+    /// domain.
+    pub fn any_grant_to(&self, grantee: DomId) -> bool {
+        (0..self.domain_count() as DomId).any(|grantor| {
+            (0..self.entry_count(grantor) as GrantRef)
+                .any(|gref| self.grantee_of(grantor, gref) == Some(grantee))
+        })
+    }
+
     // ─── queries ──────────────────────────────────────────────────────────────
 
     /// Whether any grant `target` offers is currently mapped by a *different* domain —
@@ -814,6 +853,25 @@ mod tests {
         assert!(!s.is_granted(0, 0), "domain 0's grants are gone");
         assert!(!s.is_granted(0, 3));
         assert!(s.is_granted(1, 0), "another domain's grant is untouched");
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn revoke_grants_to_withdraws_only_permits_naming_the_grantee() {
+        let mut s = sys();
+        // Domains 0 and 2 each grant a frame to domain 1; domain 0 also grants one to domain 2.
+        s.grant_access(0, 0, 1, 10, false).unwrap();
+        s.grant_access(2, 0, 1, 20, false).unwrap();
+        s.grant_access(0, 1, 2, 30, false).unwrap();
+        assert!(s.any_grant_to(1));
+
+        s.revoke_grants_to(1);
+        assert!(!s.any_grant_to(1), "no permit still names domain 1");
+        assert!(!s.is_granted(0, 0));
+        assert!(!s.is_granted(2, 0));
+        // The permit naming a *different* grantee is untouched.
+        assert!(s.is_granted(0, 1));
+        assert!(s.any_grant_to(2));
         assert!(s.invariants_hold());
     }
 

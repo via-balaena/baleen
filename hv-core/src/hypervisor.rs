@@ -330,6 +330,24 @@ pub enum CrossViolation {
     /// forever, across every subsystem at once. Whole-domain and cross-subsystem, so it
     /// belongs to the integrated core, not any one subsystem.
     DeadDomainNotClean { dom: DomId },
+    /// A `Dead` domain that some *other* domain still holds a live cross-reference to — a
+    /// half-open event-channel port awaiting it as a peer (`Unbound { remote: dom }`), or a
+    /// grant naming it as grantee. The **inbound** complement of
+    /// [`Self::DeadDomainNotClean`]: that one says a `Dead` slot holds nothing *outbound*
+    /// (owns no frame, offers/holds no grant, has no bound port); this says nothing
+    /// *inbound* points *at* it. Both must hold for a slot to be a truly isolated shell, so
+    /// that reviving it ([`HvCall::DomainCreate`]) yields a fresh domain no stale reference
+    /// can reach — the heart of domain-**ID reuse** soundness: a `DomId` is a stable
+    /// identity only if no reference to a past incarnation survives into the next. Maintained
+    /// by construction with no per-reference generation: minting is gated on a `Live` target
+    /// (`reject_dead_target`), and teardown eagerly clears every inbound reference to the
+    /// dying slot (`grant::revoke_grants_to` + `evtchn::clear_unbound_into`), so no reference
+    /// naming a slot can outlast the incarnation it was made against. Whole-domain and
+    /// cross-subsystem (it reads event channels and grant tables against the lifecycle), so
+    /// it belongs to the integrated core. (A live `Interdomain` port naming a `Dead` domain
+    /// needs no separate check — it would already break event-channel reciprocity, since a
+    /// `Dead` domain's ports are all `Free`.)
+    DeadDomainReferenced { dom: DomId },
     /// A `Dead` domain that still holds the `may_create` capability. It must imply `Live`:
     /// the only way a domain gains `may_create` is a `may_create` domain creating it so, and
     /// teardown strips it on death — so a `Dead` slot holding it would mean authority
@@ -534,11 +552,15 @@ impl Hypervisor {
                 .map(HvOutcome::Balance)
                 .map_err(HvError::Credit),
 
-            HvCall::EvtchnAllocUnbound { remote } => self
-                .evtchn
-                .alloc_unbound(caller, remote)
-                .map(HvOutcome::Port)
-                .map_err(HvError::Evtchn),
+            HvCall::EvtchnAllocUnbound { remote } => {
+                // The awaited peer is an inbound reference: refuse to open a half-open port
+                // for a Dead slot, so no invitation ever names a domain that is not there.
+                self.reject_dead_target(remote)?;
+                self.evtchn
+                    .alloc_unbound(caller, remote)
+                    .map(HvOutcome::Port)
+                    .map_err(HvError::Evtchn)
+            }
             HvCall::EvtchnBindInterdomain {
                 remote,
                 remote_port,
@@ -584,11 +606,16 @@ impl Hypervisor {
                 grantee,
                 frame,
                 readonly,
-            } => self
-                .grant
-                .grant_access(caller, gref, grantee, frame, readonly)
-                .map(|()| HvOutcome::Done)
-                .map_err(HvError::Grant),
+            } => {
+                // The grantee is an inbound reference: refuse to issue a permit to a Dead
+                // slot, so no grant ever names a domain that is not there (which a reborn
+                // slot could otherwise inherit).
+                self.reject_dead_target(grantee)?;
+                self.grant
+                    .grant_access(caller, gref, grantee, frame, readonly)
+                    .map(|()| HvOutcome::Done)
+                    .map_err(HvError::Grant)
+            }
             HvCall::GrantEndAccess { gref } => self.grant_end_access(caller, gref),
             HvCall::GrantMap {
                 grantor,
@@ -831,6 +858,28 @@ impl Hypervisor {
     /// port with a permanently-stuck pending bit). The scheduler owns the vCPU space, so
     /// the seam cross-checks it here — mirroring Xen's `vcpu_id` validation at bind time.
     /// A bad *caller* is left to the subsystem to report as its own `BadDomain`.
+    /// Reject minting a cross-domain reference that names a non-`Live` domain — the
+    /// inbound-reference mint gate. A half-open event-channel port
+    /// ([`HvCall::EvtchnAllocUnbound`]) and a grant ([`HvCall::GrantAccess`]) both record a
+    /// `DomId` (`remote` / `grantee`) that outlives the transition and can be *honored
+    /// later* by whoever occupies that slot then. If the slot is `Dead` — no domain lives
+    /// there — the reference names nobody, and were the slot reborn a different principal
+    /// would silently inherit it (the domain-ID reuse breach). So a reference may only ever
+    /// be minted against a `Live` target; a `Dead` one is [`HvError::NotAlive`], mutating
+    /// nothing. An *out-of-range* target is left to the subsystem to report as its own
+    /// `BadDomain` (unchanged), so only the in-range-but-`Dead` case is caught here. This is
+    /// the transition-guard half that, with the teardown sweep clearing any reference to a
+    /// dying slot, keeps [`CrossViolation::DeadDomainReferenced`] a standing invariant — the
+    /// inbound mirror of the caller-liveness gate that keeps [`CrossViolation::DeadDomainNotClean`]
+    /// standing.
+    fn reject_dead_target(&self, target: DomId) -> Result<(), HvError> {
+        if (target as usize) < self.domain_count() && self.life[target as usize] != DomainLife::Live
+        {
+            return Err(HvError::NotAlive);
+        }
+        Ok(())
+    }
+
     fn check_bind_vcpu(&self, caller: DomId, vcpu: Vcpu) -> Result<(), HvError> {
         if (caller as usize) < self.sched.domain_count()
             && (vcpu as usize) >= self.sched.vcpu_count(caller)
@@ -1101,6 +1150,19 @@ impl Hypervisor {
         self.p2m.unpin_all(target);
         self.p2m.free_all(target);
 
+        // Clear every *inbound* reference other domains hold that names `target` — the
+        // mirror of the steps above (which cleared what `target` held or offered). A grant
+        // issued *to* `target` and a half-open port awaiting `target` both survive as bare
+        // `DomId` references, so a reborn slot with the same id would silently inherit them —
+        // a grantee's page reachable by a fresh tenant, a peer's channel bound by one. So
+        // teardown withdraws them, keeping "a `Dead` slot has nothing pointing into it"
+        // (`DeadDomainReferenced`) standing. Ordered after the p2m teardown so ending a
+        // grant to `target` strands no foreign page-table link of `target`'s (those are gone
+        // now), and after `drain_maps_of` so every such grant is already unmapped — so each
+        // revoke succeeds by construction, like `revoke_all`.
+        self.grant.revoke_grants_to(target);
+        self.evtchn.clear_unbound_into(target);
+
         // The slot drops to Dead and loses all authority — a clean, unprivileged shell that
         // only a later DomainCreate can revive. Clearing `may_create` keeps "may_create ⇒
         // Live" (DeadDomainMayCreate) standing; clearing every control edge into and out of
@@ -1337,11 +1399,14 @@ impl Hypervisor {
     ///
     /// Domain lifecycle & authority: every `Dead` slot is a provably-clean, authority-free
     /// shell — it owns no frame, offers or holds no grant, has no bound port or online vCPU,
-    /// holds no `may_create`, and sits on no control edge; every control edge relates two
+    /// holds no `may_create`, sits on no control edge, *and* has nothing pointing into it (no
+    /// grant naming it as grantee, no half-open port awaiting it — so a reborn slot inherits
+    /// no stale reference, the domain-ID reuse guarantee); every control edge relates two
     /// `Live` domains; and every control edge's provenance traces acyclically back to a
     /// creation `Root` (no delegation outlives its delegator's, no cycle). The whole-domain
-    /// invariants that close the create/destroy loop and keep the per-target authority — and
-    /// its delegation forest — tied to life.
+    /// invariants that close the create/destroy loop — outbound cleanliness *and* inbound
+    /// reference-freedom — and keep the per-target authority — and its delegation forest —
+    /// tied to life.
     /// The total live grant mappings, and writable ones, standing over `frame` — summed
     /// across every grant that names it. In a consistent state all such grants share the
     /// frame's owner (the misowned check enforces that), so this is the exact count of
@@ -1429,6 +1494,14 @@ impl Hypervisor {
             if self.life[dom as usize] == DomainLife::Dead {
                 if !self.is_clean_shell(dom) {
                     return Some(CrossViolation::DeadDomainNotClean { dom });
+                }
+                // The inbound complement: no *other* domain may hold a live reference naming
+                // this Dead slot — a grant issued to it, or a half-open port awaiting it —
+                // else a reborn slot would silently inherit a channel or a page permission
+                // that was meant for the tenant that died. The mint gate + teardown sweep
+                // keep this false by construction; this is the standing check that they do.
+                if self.grant.any_grant_to(dom) || self.evtchn.any_unbound_into(dom) {
+                    return Some(CrossViolation::DeadDomainReferenced { dom });
                 }
                 if self.may_create[dom as usize] {
                     return Some(CrossViolation::DeadDomainMayCreate { dom });
@@ -2306,16 +2379,24 @@ mod tests {
         assert!(!h.p2m().is_allocated(3), "its self-granted frame is freed");
         assert!(!h.grant().holds_any_map(1), "it holds no maps");
 
-        // Everything else is spared. Domain 0 keeps frame 4 (its reference dropped when
-        // domain 1's map was drained), its grant of it survives (unmapped now), and its
-        // interdomain peer fell back to a valid, re-bindable Unbound port.
+        // Domain 0's own resources are spared: it keeps frame 4 (its reference dropped when
+        // domain 1's map was drained).
         assert_eq!(h.p2m().owner_of(4), Some(0));
         assert_eq!(h.p2m().refs(4), Some(0));
-        assert!(h.grant().is_granted(0, 0));
-        assert_eq!(h.grant().map_count(0, 0), Some(0));
+        // But its *inbound references to domain 1* are swept, not spared — a permit issued to
+        // a domain that no longer exists, and a half-open port awaiting it, must not outlive
+        // it (else a reborn slot 1 would silently inherit them). Domain 0's grant naming
+        // grantee 1 is revoked, and its interdomain peer — which teardown returned to
+        // `Unbound { remote: 1 }` — is then cleared to `Free`, not left re-bindable by a
+        // future tenant of slot 1. (The `DeadDomainReferenced` invariant.)
+        assert!(
+            !h.grant().is_granted(0, 0),
+            "a grant to the destroyed domain is withdrawn"
+        );
         assert_eq!(
             h.evtchn().state_of(0, unbound),
-            Some(evtchn::PortState::Unbound { remote: 1 })
+            Some(evtchn::PortState::Free),
+            "a half-open port awaiting the destroyed domain is cleared"
         );
         assert!(h.invariants_hold());
     }
@@ -4004,5 +4085,204 @@ mod tests {
             h.dispatch(0, HvCall::P2mFree { mfn: 0 }),
             Err(HvError::P2m(p2m::P2mError::WrongState))
         );
+    }
+
+    // ─── domain-ID reuse ───────────────────────────────────────────────────────
+    //
+    // A `DomId` is an index into a fixed slot table, and `DomainCreate` reuses a `Dead`
+    // slot. The lifecycle arc proved the slot itself is a clean shell when `Dead` (owns and
+    // offers nothing). These tests cover the *other* half: no domain may hold a live
+    // reference *naming* a `Dead` slot, so a reborn tenant can never inherit a channel or a
+    // grant meant for the one that preceded it. Two mechanisms enforce it — a mint gate
+    // (`reject_dead_target`) and a teardown sweep (`revoke_grants_to` / `clear_unbound_into`)
+    // — and one standing invariant checks it (`DeadDomainReferenced`).
+
+    /// The mint gate: a cross-domain reference may not be created naming a `Dead` slot — a
+    /// grant to it, or a half-open port awaiting it, is refused `NotAlive` and mutates
+    /// nothing. Once the slot is `Live`, the same references are allowed.
+    #[test]
+    fn a_reference_cannot_be_minted_naming_a_dead_domain() {
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        // Slots 1 and 2 boot Dead. dom0 owns a frame it would grant.
+        h.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+
+        // A grant to a Dead grantee, and a port awaiting a Dead remote, are both refused.
+        assert_eq!(
+            h.dispatch(
+                0,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 1,
+                    frame: 0,
+                    readonly: false,
+                },
+            ),
+            Err(HvError::NotAlive)
+        );
+        assert_eq!(
+            h.dispatch(0, HvCall::EvtchnAllocUnbound { remote: 1 }),
+            Err(HvError::NotAlive)
+        );
+        // Nothing was minted — the refusals are true no-ops, and no reference names slot 1.
+        assert!(!h.grant().is_granted(0, 0));
+        assert!(!h.grant().any_grant_to(1));
+        assert!(!h.evtchn().any_unbound_into(1));
+        assert!(h.invariants_hold());
+
+        // Bring slot 1 to life; now the very same references are legitimate.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        assert!(h
+            .dispatch(
+                0,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 1,
+                    frame: 0,
+                    readonly: false,
+                },
+            )
+            .is_ok());
+        assert!(h
+            .dispatch(0, HvCall::EvtchnAllocUnbound { remote: 1 })
+            .is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    /// The grant reuse vector, closed: a third party's grant issued to a domain does not
+    /// survive that domain's teardown, so a reborn slot with the same id cannot map it and
+    /// reach the grantor's page — the confused deputy across the reuse boundary is prevented.
+    #[test]
+    fn a_reborn_domain_cannot_inherit_a_grant_made_to_its_predecessor() {
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        // dom0 brings up domain 1 (the tenant to be reused) and domain 2 (a third party).
+        for target in 1..=2 {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        // Domain 2 owns frame 5 and grants it read-write to domain 1 — its consent names the
+        // *current* tenant of slot 1.
+        h.dispatch(2, HvCall::P2mAllocate { mfn: 5 }).unwrap();
+        h.dispatch(
+            2,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 5,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        assert!(h.grant().is_granted(2, 0));
+
+        // dom0 tears domain 1 down. The grant naming grantee 1 is swept, not spared.
+        h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .unwrap();
+        assert!(
+            !h.grant().is_granted(2, 0),
+            "domain 2's grant to the destroyed domain is withdrawn at teardown"
+        );
+        assert!(h.invariants_hold());
+
+        // dom0 revives slot 1 as a fresh domain — a *different* principal, same index.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        // It cannot reach domain 2's frame through the stale grant: the grant is gone, so the
+        // map is a plain WrongState — domain 2 never consented to *this* tenant.
+        assert_eq!(
+            h.dispatch(
+                1,
+                HvCall::GrantMap {
+                    grantor: 2,
+                    gref: 0,
+                    writable: false,
+                },
+            ),
+            Err(HvError::Grant(grant::GrantError::WrongState))
+        );
+        assert!(h.invariants_hold());
+    }
+
+    /// The event-channel reuse vector, closed: a live interdomain channel's peer, returned to
+    /// a half-open `Unbound` port when the far end is torn down, is *cleared* rather than left
+    /// awaiting the slot — so a reborn tenant of that slot cannot silently bind a channel the
+    /// peer opened for its predecessor.
+    #[test]
+    fn a_reborn_domain_cannot_inherit_a_channel_opened_for_its_predecessor() {
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        for target in 1..=2 {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        // Domain 2 opens a port awaiting domain 1; domain 1 binds it — a live interdomain
+        // channel between the two current tenants.
+        let peer_port = match h.dispatch(2, HvCall::EvtchnAllocUnbound { remote: 1 }) {
+            Ok(HvOutcome::Port(p)) => p,
+            other => panic!("expected a port, got {other:?}"),
+        };
+        h.dispatch(
+            1,
+            HvCall::EvtchnBindInterdomain {
+                remote: 2,
+                remote_port: peer_port,
+            },
+        )
+        .unwrap();
+
+        // dom0 tears domain 1 down. `close_all` returns domain 2's peer to
+        // `Unbound { remote: 1 }`; the teardown sweep then clears it to `Free`.
+        h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .unwrap();
+        assert_eq!(
+            h.evtchn().state_of(2, peer_port),
+            Some(evtchn::PortState::Free),
+            "the peer's port is cleared, not left awaiting a reborn slot 1"
+        );
+        assert!(h.invariants_hold());
+
+        // dom0 revives slot 1. The reborn tenant cannot bind the peer's (now Free) port.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.dispatch(
+                1,
+                HvCall::EvtchnBindInterdomain {
+                    remote: 2,
+                    remote_port: peer_port,
+                },
+            ),
+            Err(HvError::Evtchn(evtchn::EvtchnError::WrongState))
+        );
+        assert!(h.invariants_hold());
     }
 }
