@@ -52,9 +52,9 @@ jobs:
   # continuous smoke-fuzz (regression catcher), not a deep campaign — still far better than
   # the targets only ever being compile-checked.
   fuzz:
-    name: bounded fuzz run
+    name: fuzz (persisted corpus)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -72,19 +72,35 @@ jobs:
         with:
           workspaces: hv-fuzz
 
-      # Two layout/toolchain notes baked into this invocation:
+      # Persist the coverage corpus across runs — the point of a fuzzing *campaign* vs a
+      # from-scratch smoke test. The key is unique per run (so the post-job save always writes
+      # a fresh entry), and `restore-keys` pulls the most recent prior corpus, so each weekly
+      # run builds on every earlier run's coverage instead of restarting from zero. cargo-fuzz
+      # keeps the corpus at `hv-fuzz/corpus/<target>` (the `--fuzz-dir` root).
+      - name: Restore the fuzzing corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: hv-fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      # Two layout/toolchain notes baked into the invocation:
       #  - hv-fuzz is a *flattened* cargo-fuzz project (it IS the fuzz crate, not the
       #    conventional `<crate>/fuzz/` nested layout), so point cargo-fuzz at it with
       #    `--fuzz-dir hv-fuzz` from the repo root rather than the `./fuzz` default; and
       #  - cargo-fuzz defaults to the musl (statically-linked libc) target on Linux, which
       #    AddressSanitizer cannot instrument ("sanitizer is incompatible with statically
       #    linked libc"), so force the gnu target (dynamic libc, the runner's host std).
-      - name: fuzz each target for 60s
+      # Each target runs 180s, then `cmin` minimizes its corpus so coverage accumulates
+      # without unbounded growth in the cache.
+      - name: fuzz each target (build on the persisted corpus)
         run: |
           set -euo pipefail
           for target in decode evtchn grant sched policy hypervisor p2m; do
             echo "::group::fuzz $target"
             cargo fuzz run --fuzz-dir hv-fuzz --target x86_64-unknown-linux-gnu \
-              "$target" -- -max_total_time=60 -rss_limit_mb=4096
+              "$target" -- -max_total_time=180 -rss_limit_mb=4096
+            cargo fuzz cmin --fuzz-dir hv-fuzz --target x86_64-unknown-linux-gnu "$target"
             echo "::endgroup::"
           done
