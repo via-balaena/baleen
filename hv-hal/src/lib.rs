@@ -18,15 +18,17 @@
 //! laptop and on the metal, and the only thing hardware can falsify is this thin
 //! translation layer.
 //!
-//! **Architecture-neutral by design — x86 and ARM are co-equal targets.** These trait
+//! **Architecture-neutral by design — ARM and x86 are co-equal targets.** These trait
 //! signatures deliberately name no CPU architecture: `Gpa`/`Ticks` are plain integers,
 //! memory is bytes, a vCPU takes an interrupt vector and an entry point. The *first*
-//! `hv-metal` backend is x86-64 (Intel VMX / EPT, the LAPIC), but an AArch64 backend
-//! (the ARM virtualization extensions at EL2, Stage-2 translation, the GIC) is an equally
-//! first-class goal and plugs in behind exactly these traits — the portable brain above
-//! does not change. Keeping this surface free of any architecture-specific concept (a VMCS
-//! field, an `ept_*` type, a GIC redistributor) is what keeps that promise cheap, so it is
-//! a standing constraint on anything added here.
+//! `hv-metal` backend is AArch64 (the ARM virtualization extensions at EL2, Stage-2
+//! translation, the GIC, the generic timer); an x86-64 backend (Intel VMX / EPT, the LAPIC,
+//! the TSC) is an equally first-class goal and plugs in behind exactly these traits — the
+//! portable brain above does not change. Keeping this surface free of any architecture-
+//! specific concept (a VMCS field, an `ept_*` type, a GIC redistributor) is what keeps that
+//! promise cheap, so it is a standing constraint on anything added here. Confirmed by
+//! Architecture Audit #1 (`docs/AUDIT-1-HAL-FENCE.md`), which re-derived this surface against
+//! the first real (ARM) backend and found it neutral.
 
 #![no_std]
 
@@ -67,6 +69,8 @@ pub trait TimeSource {
 pub trait VcpuOps {
     /// Queue an interrupt `vector` for delivery on the next guest entry.
     fn inject_interrupt(&mut self, vector: u8);
-    /// Set the guest instruction pointer for the next entry.
-    fn set_entry(&mut self, rip: u64);
+    /// Set the guest instruction pointer (the program counter) for the next entry. `entry` is an
+    /// architecture-neutral name deliberately: on AArch64 it lands in `ELR_EL2` / the guest `PC`,
+    /// on x86 in `RIP` — the trait names neither (Architecture Audit #1).
+    fn set_entry(&mut self, entry: u64);
 }

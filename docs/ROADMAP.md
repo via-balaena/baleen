@@ -176,11 +176,17 @@ timeout) so "diamond → CI-green → merge" stays alive on the metal side.
   asserts the banner. *First observable life.*
 - **Arc 2 — EL2 + exception vectors.** Confirm `CurrentEL == EL2`; set `VBAR_EL2`; a default handler
   that decodes `ESR_EL2` and prints instead of hanging. *A fault becomes diagnosable.*
-- **Arc 3 — claim the virt extensions + run the brain on metal.** Configure `HCR_EL2`; `TimeSource`
-  over `CNTPCT_EL0`; link `hv-core`, construct a `Hypervisor`, dispatch a synthetic `HvCall` on the
-  bare CPU and print the result.
-  **🔍 Architecture Audit #1 — the fence:** enumerate what `hv-core` *trusts the HAL to guarantee*,
-  confirm the metal HAL honors each (or name the assumption), and fill in M3's ledger rows.
+- **Arc 3 — claim the virt extensions + run the brain on metal. ✅ DONE.** `HCR_EL2.RW=1` (AArch64
+  EL2, no guest-trap bits — those are M4); `TimeSource` realized over `CNTPCT_EL0` (`isb`-ordered,
+  monotonicity witnessed on every boot); a `#[global_allocator]` (bump over `.bss`) so `hv-core`'s
+  `alloc` links; `hv-core` linked, a real `Hypervisor` constructed, and a synthetic `HvCall`
+  (`dom0` `CreditGrant`) dispatched on the bare CPU returning `balance=100`. A `--features selftest`
+  build asserts the accounting witness (grant 100 / spend 30 → 70). Three-way converged (spec-derived
+  code + blind Arm-ARM auditor + QEMU).
+  **🔍 Architecture Audit #1 — the fence: ✅ DONE** (`docs/AUDIT-1-HAL-FENCE.md`). Verdict: the
+  `hv-hal` surface is architecture-neutral; `TimeSource` is realized and honored on ARM;
+  `GuestMemory` + `VcpuOps` are deferred to M4 with their assumptions named; two cosmetic neutrality
+  leaks (an x86-first doc claim; a `rip` param name) found and fixed. No soundness defect.
   *See-it: the diamonded brain is alive at EL2 and serviced a hypercall on (emulated) hardware.*
 
 ### M4 — first guest + the bridge *(the proof touches reality)*
@@ -228,7 +234,7 @@ point of the `hv-hal` fence); only the metal layer does.
 | layer | relation to the proof | needs real HW? |
 |---|---|---|
 | `hv-core` (M0) | **proven** ∀-N, both non-interference directions | — (it's the model) |
-| M3 HAL / metal | *refines* (realizes the model's southbound traits) | no (QEMU-sound) |
+| M3 HAL / metal | *refines* — `TimeSource` realized+honored (ARM); `GuestMemory`/`VcpuOps` deferred, assumptions named (Audit #1, `docs/AUDIT-1-HAL-FENCE.md`) | no (QEMU-sound) |
 | M4 Stage-2 gen | *refines* (model→page-table bridge; negative-isolation test) | no (QEMU-sound) |
 | M5 disposables + vault | *refines* (lifecycle + non-interference cashed in) | no (QEMU-sound) |
 | M6 input/GUI domain | *extends* (focus-integrity) + plumbing | no |

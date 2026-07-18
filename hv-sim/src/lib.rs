@@ -95,8 +95,8 @@ impl VcpuOps for RecordingVcpu {
         self.injected.push(vector);
     }
 
-    fn set_entry(&mut self, rip: u64) {
-        self.entry = Some(rip);
+    fn set_entry(&mut self, entry: u64) {
+        self.entry = Some(entry);
     }
 }
 

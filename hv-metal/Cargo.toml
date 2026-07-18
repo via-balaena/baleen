@@ -11,10 +11,22 @@ authors = ["Via Balaena"]
 publish = false
 
 [features]
-# `selftest` makes Arc 2's boot deliberately execute `BRK #0` so the installed exception vectors
-# catch + decode a real fault (the boot-test asserts the decode). Off by default: the normal boot
-# installs the vectors and parks, leaving a clean path for Arc 3 to build on. See `src/exceptions.rs`.
+# `selftest` turns the boot into a self-checking run: it asserts the synthetic `HvCall` dispatched
+# into `hv-core` produced the exact expected accounting witness (Arc 3), then deliberately executes
+# `BRK #0` so the installed exception vectors catch + decode a real fault (Arc 2 — the boot-test
+# asserts the decode). Off by default: the normal boot runs the Arc-3 sequence and parks. Each
+# self-test asserts a witness produced *by* the mechanism under test (design-lesson #24(f)). See
+# `src/exceptions.rs` and `rust_main`.
 selftest = []
+
+# The proven brain and the fence it speaks to, linked across the workspace boundary as path deps
+# (both are members of the parent workspace; hv-metal is its own excluded workspace). They build
+# under their own manifests — i.e. still `unsafe_code = "forbid"`, still proven — so linking them
+# here does not pierce the fence. hv-metal supplies the `#[global_allocator]` (see `src/heap.rs`)
+# that `hv-core`'s `alloc` use needs on the metal.
+[dependencies]
+hv-core = { path = "../hv-core" }
+hv-hal = { path = "../hv-hal" }
 
 # Standalone: its own workspace so the parent's stable `cargo test --workspace` never tries to
 # build this bare-metal binary (it targets `aarch64-unknown-none-softfloat` and would fail on the

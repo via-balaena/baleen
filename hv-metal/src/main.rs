@@ -1,31 +1,47 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # `hv-metal` — the bare-metal layer (Arc 2)
+//! # `hv-metal` — the bare-metal layer (Arc 3)
 //!
 //! The southbound metal layer beneath the proven `hv-core` brain. Arc 0 stood up the dev + CI
-//! boot-test loop; Arc 1 turned the raw UART poke into a *proper* [`pl011`] console; **Arc 2**
-//! (see `docs/ROADMAP.md`) confirms we are at EL2, installs the [`exceptions`] vector table
-//! (`VBAR_EL2`), and stands up a default handler that **decodes and reports** any synchronous fault
-//! through that console instead of triple-faulting into a silent reset loop — *a fault becomes
-//! diagnosable*. Still no hypervisor logic: linking `hv-core` is Arc 3, the guest is M4.
+//! boot-test loop; Arc 1 turned the raw UART poke into a *proper* [`pl011`] console; Arc 2 confirmed
+//! EL2 and installed the [`exceptions`] vector table so a fault becomes diagnosable; **Arc 3** (see
+//! `docs/ROADMAP.md`) is where the proven brain first runs on the bare CPU. It:
 //!
-//! This is the one crate that carries `unsafe` (the workspace forbids it everywhere else). Here
-//! `unsafe` is volatile MMIO to fixed device addresses and EL2 system-register/vector setup — each
-//! use is justified against the `hv-hal` fence the proofs assume (see [`pl011`] and [`exceptions`]
-//! for the per-layer contracts and their `unsafe` accounting).
+//! 1. configures `HCR_EL2` for AArch64 EL2 operation ([`el2`]);
+//! 2. realizes [`hv_hal::TimeSource`] on the ARM generic timer ([`time`]) — the first piece of the
+//!    `hv-hal` fence to gain a real hardware backing (Architecture Audit #1);
+//! 3. supplies a `#[global_allocator]` ([`heap`]) and links [`hv_core`], constructs a real
+//!    `Hypervisor`, and **dispatches a synthetic `HvCall` on the metal**, printing the result — the
+//!    diamonded ∀-N brain, alive at EL2, servicing a hypercall.
+//!
+//! Still **pre-guest**: no EL1 guest, no Stage-2, no isolation content — that is M4. Arc 3 *refines*
+//! the proof (the HAL realizes the model's southbound assumptions) and is QEMU-sound for the
+//! functional dispatch (`docs/QEMU-AND-METAL.md`).
+//!
+//! This is the one crate that carries `unsafe` (the workspace forbids it everywhere else); `hv-core`
+//! and `hv-hal`, linked here, keep building under their own `unsafe_code = "forbid"` manifests, so
+//! the fence is not pierced. Here `unsafe` is volatile MMIO to fixed device addresses, EL2
+//! system-register/vector setup, and the bump allocator — each use justified against the `hv-hal`
+//! fence the proofs assume (see each module for its per-layer contract and `unsafe` accounting).
 
 #![no_std]
 #![no_main]
 
+mod el2;
 mod exceptions;
+mod heap;
 mod pl011;
+mod time;
 
 use core::arch::global_asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
+use hv_core::{HvCall, HvOutcome, Hypervisor};
+
 use pl011::Pl011;
+use time::GenericTimer;
 
 // The entry point. QEMU (`-kernel`, `virt`, `virtualization=on`) starts us at EL2 with the MMU
 // off. Park every CPU but the primary, then set the stack, zero `.bss`, and hand off to Rust; if
@@ -83,11 +99,14 @@ pub(crate) fn park() -> ! {
 }
 
 /// The Rust entry, called from `_start`. Brings up the console, confirms EL2, installs the
-/// exception vectors, then (optionally) proves they catch a fault before parking.
+/// exception vectors, configures `HCR_EL2`, realizes the generic-timer `TimeSource`, then links the
+/// proven brain and dispatches a synthetic `HvCall` on the metal — before (optionally) self-testing
+/// and parking.
 ///
 /// The `hv-metal alive` substring and the `CurrentEL = EL2` line are the contract with
-/// `hv-metal/boot-test.sh`; the `--features selftest` build additionally emits the caught-exception
-/// decode the boot-test asserts on (`EC=0x3c`).
+/// `hv-metal/boot-test.sh`, as are the Arc-3 markers (`HCR_EL2.RW=1`, `generic timer live`, the
+/// dispatch result). The `--features selftest` build additionally asserts the `HvCall` accounting
+/// witness and then exercises the Arc-2 fault-catch (`EC=0x3c`).
 #[no_mangle]
 pub extern "C" fn rust_main() -> ! {
     let mut uart = uart();
@@ -95,7 +114,7 @@ pub extern "C" fn rust_main() -> ! {
     // `writeln!` cannot fail here — `Pl011`'s `write_str` is infallible — so the result is ignored.
     let _ = writeln!(
         uart,
-        "baleen: hv-metal alive (arc2) — EL2 + exception vectors"
+        "baleen: hv-metal alive (arc3) — the proven brain runs on the metal"
     );
 
     // (1) Confirm we are actually at EL2 before trusting any EL2 system register — a real check,
@@ -116,11 +135,55 @@ pub extern "C" fn rust_main() -> ! {
     exceptions::install_vectors();
     let _ = writeln!(uart, "baleen: VBAR_EL2 installed — exception vectors live");
 
-    // (3) The diamond move: prove the vectors actually catch + decode a fault. Gated behind the
-    //     `selftest` feature (off by default) so the default boot path stays clean for Arc 3 to
-    //     build on, while CI still exercises the fault-catch on every arc (design-lesson #23).
+    // (3) Configure HCR_EL2 for AArch64 EL2 operation (RW=1, everything else 0 — no guest-trap
+    //     bits, that is M4). Read it back and confirm the field took; a silent no-op write is a bug.
+    let hcr = el2::configure();
+    if el2::rw_is_aarch64(hcr) {
+        let _ = writeln!(
+            uart,
+            "baleen: HCR_EL2.RW=1 (EL1=AArch64) — value=0x{hcr:016x}"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: HCR_EL2 write did not take (0x{hcr:016x}); halting"
+        );
+        park();
+    }
+
+    // (4) Realize hv_hal::TimeSource on the ARM generic timer and witness that the count is
+    //     monotonic and live (advances, is not frozen at zero) — the fence honored on the metal.
+    let timer = GenericTimer;
+    let freq = time::frequency();
+    let adv = time::witness_advance(&timer, 1_000_000);
+    if adv.monotonic && adv.advanced {
+        let _ = writeln!(
+            uart,
+            "baleen: generic timer live: CNTFRQ={freq} Hz, CNTPCT {} -> {} (monotonic)",
+            adv.start, adv.end
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: generic timer FAULT: monotonic={} advanced={} ({}->{}); halting",
+            adv.monotonic, adv.advanced, adv.start, adv.end
+        );
+        park();
+    }
+
+    // (5) The Arc-3 headline: link the proven brain, construct a real Hypervisor, and dispatch a
+    //     synthetic HvCall on the bare CPU. Constructing the Hypervisor also exercises the
+    //     #[global_allocator] — a free witness that allocation works on the metal.
+    dispatch_synthetic_hvcall(&mut uart);
+
+    // (6) The self-tests: witnesses produced *by* the mechanisms under test (design-lesson #24(f)).
+    //     Both are gated behind `selftest` (off by default) so the normal boot path stays clean,
+    //     while CI exercises them on every arc. Order matters — the Arc-3 accounting check runs
+    //     first because the Arc-2 BRK check halts in the handler and never returns.
     #[cfg(feature = "selftest")]
     {
+        selftest_hvcall_accounting(&mut uart);
+
         let _ = writeln!(uart, "baleen: exception self-test — executing BRK #0");
         // SAFETY: `BRK` is a software breakpoint; it deterministically raises a synchronous
         // exception taken to the current EL (EL2), which the installed handler catches + reports.
@@ -130,6 +193,80 @@ pub extern "C" fn rust_main() -> ! {
     }
 
     park();
+}
+
+/// Parameters of the bring-up `Hypervisor`. Deliberately tiny — dom0 (slot 0) boots `Live` with a
+/// credit account, which is all the synthetic call needs; the rest are `Dead` shells. Small enough
+/// that the whole thing fits comfortably in the bump heap (see [`heap`]).
+const NUM_DOMAINS: usize = 4;
+const PORTS_PER_DOMAIN: usize = 4;
+const GRANTS_PER_DOMAIN: usize = 4;
+const VCPUS_PER_DOMAIN: usize = 2;
+const NUM_PCPUS: usize = 2;
+const NUM_FRAMES: usize = 8;
+
+/// Domain 0 — the primordial control domain, `Live` from boot with a credit account. The acting
+/// domain for the synthetic call.
+const DOM0: hv_core::hypervisor::DomId = 0;
+
+/// Build a real `Hypervisor` sized by the constants above.
+fn build_hypervisor() -> Hypervisor {
+    Hypervisor::new(
+        NUM_DOMAINS,
+        PORTS_PER_DOMAIN,
+        GRANTS_PER_DOMAIN,
+        VCPUS_PER_DOMAIN,
+        NUM_PCPUS,
+        NUM_FRAMES,
+    )
+}
+
+/// Dispatch one synthetic `HvCall` — `dom0` grants itself 100 credits — through the real
+/// `hv-core` dispatch path, and report the result. This is *the brain running on the metal*: the
+/// call traverses `Hypervisor::dispatch` → `route` → the liveness gate → the credit subsystem,
+/// exactly as it does on the host, and returns a value we check rather than merely print.
+///
+/// `CreditGrant` is the most minimal call that still runs the full path: dom0 is already `Live` with
+/// a credit account, so there is zero setup, yet the outcome is a deterministic witness
+/// (`grant 100 → Balance(100)`).
+fn dispatch_synthetic_hvcall(uart: &mut Pl011) {
+    let mut hv = build_hypervisor();
+    match hv.dispatch(DOM0, HvCall::CreditGrant { amount: 100 }) {
+        Ok(HvOutcome::Balance(100)) => {
+            let _ = writeln!(
+                uart,
+                "baleen: HvCall CreditGrant(100) -> balance=100 (hv-core serviced it on the metal)"
+            );
+        }
+        other => {
+            // Any other outcome is a real bug in the linked brain or the dispatch plumbing.
+            let _ = writeln!(uart, "baleen: HvCall UNEXPECTED outcome: {other:?}");
+        }
+    }
+}
+
+/// The Arc-3 self-test: assert the linked brain does real accounting across two calls — a witness
+/// produced *by* the dispatch mechanism, kept as a permanent CI assertion (design-lesson #24(f)).
+///
+/// `grant 100` then `spend 30` must settle at `balance = 70`; the "accounting OK" marker is printed
+/// **only** when both outcomes match exactly, so the boot-test matching it is genuine evidence the
+/// dispatch returned the right values, not merely that it ran.
+#[cfg(feature = "selftest")]
+fn selftest_hvcall_accounting(uart: &mut Pl011) {
+    let mut hv = build_hypervisor();
+    let granted = hv.dispatch(DOM0, HvCall::CreditGrant { amount: 100 });
+    let spent = hv.dispatch(DOM0, HvCall::CreditSpend { amount: 30 });
+    if granted == Ok(HvOutcome::Balance(100)) && spent == Ok(HvOutcome::Balance(70)) {
+        let _ = writeln!(
+            uart,
+            "baleen: selftest: HvCall accounting OK (grant 100, spend 30 -> balance 70)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: selftest: HvCall accounting FAIL (grant={granted:?} spend={spent:?})"
+        );
+    }
 }
 
 #[panic_handler]
