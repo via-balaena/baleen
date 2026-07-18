@@ -33,28 +33,36 @@ test on a multi-year solo project.
 | `hv-sim`        | host harness — fake memory, hand-cranked clock, seeded deterministic simulation       | ✅ M1  |
 | `hv-metal`      | bare-metal binary: boot, enter EL2/VMX, the thin fenced `unsafe` core                  | ⏳ M3  |
 | `hv-fuzz`       | `cargo-fuzz` targets against the hypercall dispatcher                                  | ⏳ M2  |
-| `baleen-xenabi` | a *northbound* **personality**: translates Xen's wire ABI into neutral `hv-core` ops  | ⏳ M5  |
 | `xtask`         | build/test automation (`cargo xtask <task>`)                                          | ✅ M1  |
 
-`hv-metal`, `hv-fuzz`, and `baleen-xenabi` are intentionally absent from the
-workspace until their milestones — the first two need a custom target / nightly,
-and the third only takes shape once M5 forces a real guest ABI.
+`hv-metal` and `hv-fuzz` are intentionally absent from the workspace until their
+milestones — both need a custom target / nightly.
+
+**Direction (2026-07-18):** with the model proven end-to-end (`docs/TIER-B/C/D`), the
+build target is a **greenfield "slim Qubes"** — GPU-accelerated near-metal disposables, an
+offline vault, direct device attach, and a trusted input/GUI domain, on the proven core,
+using **hardware-virt + virtio** so unmodified guests need no knowledge of Baleen. The
+planned Xen personality (`baleen-xenabi`) is **dropped**: matching Xen's ABI would drag its
+unproven semantics onto the clean core and leave us chasing an external surface forever. See
+[**`docs/ROADMAP.md`**](docs/ROADMAP.md) for the phased, diamond-every-layer plan.
 
 ### Identity vs. personality
 
 `hv-core` does not know what Xen is. Schedulers, event-channel state machines,
 memory accounting, and grant-style resource lifecycles are *generic* hypervisor
-logic. Xen's specific hypercall numbering, ABI structs, and PVH boot protocol live
-in a **personality** — `baleen-xenabi` — that sits northbound of the core in the
-same architectural position `hv-hal` sits southbound. Xen is a conformance target
-and a compatibility layer one of our markets needs, **not** the identity of the
-core:
+logic. Guest-facing wire formats and boot protocols live in a **personality**
+northbound of the core, in the same architectural position `hv-hal` sits southbound —
+the core stays ABI-agnostic, and the personality is chosen per target.
 
-- **Qubes wedge** needs the Xen personality faithful (libxl-ish tooling, event
-  channels, grant tables, xenstore) — this is where the clean-room, ABI-as-spec,
-  XTF-conformance discipline applies in full. See [`CLEANROOM.md`](CLEANROOM.md).
-- **Automotive / static-partitioning wedge** has zero Xen legacy — it gets a thin
-  native personality or virtio-only guest interfaces, and never links Xen at all.
+The **greenfield "slim Qubes"** capstone (see [`docs/ROADMAP.md`](docs/ROADMAP.md)) fills
+that slot with a **native + virtio** personality: guests run under hardware virtualization
+and speak **virtio** (block, console, input, gpu), which unmodified Linux already supports —
+so no guest needs to know Baleen exists, and no Xen ABI is implemented. The once-planned Xen
+personality (`baleen-xenabi`) is **dropped**: reimplementing the Qubes *architecture* (isolated
+disposables, a vault, controlled inter-VM comms) fresh on the proven core keeps the proof's
+guarantees flowing all the way up, where emulating Xen's ABI would sever them at the boundary.
+The clean-room / ABI-as-spec discipline (see [`CLEANROOM.md`](CLEANROOM.md)) still governs any
+*standard* wire format we implement (virtio), just not a Xen-compatibility layer.
 
 ### ARM and x86 are co-equal targets
 
@@ -78,11 +86,11 @@ of a sort — one faces guests, one faces hardware — and neither leaks into th
 
 ```
    NORTHBOUND — guest ABI (personality, not identity)
-         ┌──────────────────┐   ┌────────────────────────┐
-         │ baleen-xenabi    │   │ baleen-virtio / native │
-         │ Xen wire → ops   │   │ automotive wedge       │
-         │  — M5 —          │   │  — later —             │
-         └────────┬─────────┘   └───────────┬────────────┘
+         ┌────────────────────────┐   ┌──────────────────┐
+         │ native + virtio        │   │ (Xen personality │
+         │ blk·net·console·input· │   │  dropped — see    │
+         │ gpu → ops  — M5+ —     │   │  ROADMAP.md)     │
+         └───────────┬────────────┘   └──────────────────┘
                   │      neutral, ABI-agnostic ops
           ┌───────▼────────────────────────▼─────────────┐
           │  hv-core   (no_std, zero unsafe)              │
@@ -104,7 +112,7 @@ of a sort — one faces guests, one faces hardware — and neither leaks into th
 The southbound fence between core and hardware is the *same* fence as the `unsafe`
 boundary. ~85% of bugs live in `hv-core` and are found on your laptop; the two
 translation layers are each small enough to audit line by line (that's what the
-hardware — and, northbound, XTF conformance — is for).
+hardware — and, northbound, virtio conformance against real guest drivers — is for).
 
 ## Try it
 
@@ -664,11 +672,15 @@ The decision, repo/CI shape, what is proven, and that finding live in
 - **M4**: one backend-driven vCPU (QEMU first, real silicon when it arrives) running a trivial
   guest at EL1; guest traps to EL2 translated into `hv-core` calls. The fence becomes real and
   load-bearing.
-- **M5**: PVH Linux boot — the vertical slice. The Xen **personality**
-  (`baleen-xenabi`) enters here: PVH boot forces speaking Xen's ABI for real, so
-  this is where clean-room, ABI-as-spec, XTF-conformance discipline goes into full
-  force — and, conveniently, the part with legal-hygiene requirements is the part
-  built last.
+- **M5+**: the **greenfield "slim Qubes"** capstone — unmodified Linux guests under
+  hardware-virt + **virtio**; isolated **disposables** from a template; an offline **vault**;
+  a trusted **input/GUI domain**; **direct device attach** (data USB); and **GPU
+  acceleration** for near-bare-metal disposables (the main improvement over Qubes). Built
+  one diamonded, audited layer at a time — never skipping ahead — with each layer marked for
+  whether it *extends*, *refines*, or is orthogonal to the proof. The full phased plan,
+  the two hard pillars (GPU, IOMMU/DMA), the ARM-vs-x86 platform fork, and the per-layer
+  "verified"-scope ledger are in [**`docs/ROADMAP.md`**](docs/ROADMAP.md). *(This supersedes
+  the earlier "PVH Linux via a Xen personality" plan — `baleen-xenabi` is dropped.)*
 
 ## License
 
