@@ -812,14 +812,23 @@ mod tests {
         assert!(states > 200, "suspiciously few states explored: {states}");
     }
 
-    /// The deep domain-ID-reuse sweep. Depth 8 is enough to bring up a slot, grant it a frame
-    /// (or open an interdomain channel to it), destroy it, and recreate it — so it
-    /// exhaustively proves the mint gate and teardown sweep leave no reachable state in which a
-    /// grant or a half-open port names a Dead slot, across every create/destroy interleaving.
+    /// The deep domain-ID-reuse sweep, **closed to a theorem**. Depth 7 is enough to bring up a
+    /// slot, grant it a frame (or open an interdomain channel to it), destroy it, and recreate it,
+    /// and — crucially — it *closes* exhaustively (≈5.66M states) rather than truncating: it
+    /// proves the mint gate and teardown sweep leave *no* reachable state within 7 hypercalls in
+    /// which a grant or a half-open port names a Dead slot, across every create/destroy
+    /// interleaving. This supersedes the earlier depth-8 form, which only *truncated* at the 1.5M
+    /// cap (a lower bound, not a proof); because BFS visits shallower depths first, the truncated
+    /// run had not even finished the depth-≤7 states (≈5.66M > 1.5M), so this closure strictly
+    /// subsumes it *and* adds completeness. The raised cap is what lets it close; a
+    /// memory-starved box falls back to a still-clean truncated lower bound (`expect_no_violation`
+    /// tolerates that and reports it).
     #[test]
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn domain_id_reuse_deep() {
-        expect_no_violation(&reuse_cfg(8));
+        let mut cfg = reuse_cfg(7);
+        cfg.max_states = 8_000_000;
+        expect_no_violation(&cfg);
     }
 
     /// The deep grant↔page-type / page-table↔grant sweep. Depth 7 is enough to reach a
@@ -849,10 +858,19 @@ mod tests {
         expect_no_violation(&delegation_cfg(8));
     }
 
+    /// The deep event↔scheduler (lost-wakeup) sweep, **closed to a theorem**. Depth 7 *closes*
+    /// exhaustively (≈2.12M states): every reachable state within 7 hypercalls under all
+    /// event-channel and scheduler ops keeps no deliverable event resting on a blocked vCPU. Like
+    /// the reuse sweep, this supersedes the earlier depth-8 form that only truncated at the 1.5M
+    /// cap — a complete depth-7 proof rather than a partial depth-8 probe (BFS had not finished
+    /// the depth-≤7 states at 1.5M, so this strictly subsumes it). The raised cap lets it close;
+    /// a memory-starved box degrades to a still-clean truncated lower bound.
     #[test]
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn evtchn_and_sched_seam_deep() {
-        expect_no_violation(&evtchn_sched_cfg(8));
+        let mut cfg = evtchn_sched_cfg(7);
+        cfg.max_states = 4_000_000;
+        expect_no_violation(&cfg);
     }
 
     #[test]

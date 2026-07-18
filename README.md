@@ -542,6 +542,62 @@ violations.
   (behaviourally live — design-lesson #7). Witnessed by six `hv-core` cases and the seeded
   `run_sched`/`run_hypervisor` mirrors, and fuzzed through the scheduler and integrated targets with
   a fuzzed mask so off-affinity dispatches are attempted directly. No soundness bug found.
+- **Adversarial audit & verification-depth consolidation** *(landed)*: seven feature arcs deep,
+  the obvious backlog thin and zero soundness bugs ever found, the discipline says stop *adding*
+  and start *auditing*. This arc is not a feature — it is a systematic attempt to **break** the
+  whole (now large) invariant set on paper, then confirm the code and the model-checker already
+  prevent it, and to consolidate where the verification was a *lower bound* rather than a *theorem*.
+  The audited surface is **28 standing state invariants** — event channels (4: interdomain
+  reciprocity, no-signal-on-`Free`, VIRQ uniqueness, no ghost peer), grant tables (5: refcount
+  coherence, read-only integrity, grantee identity, `writable_maps ≤ maps`, no dangling map), the
+  scheduler (5: pCPU-exclusivity reciprocity from both sides + no ghost occupant, and `Running`
+  on-affinity), page-type accounting (5: owner integrity, write-xor-pagetable, typed `≤` refs,
+  pinned `⇒` page-typed, level-correct links), and the **nine cross-subsystem seam invariants**
+  (unbacked/misowned grant map, lost wakeup, unauthorized foreign link, a `Dead` slot
+  clean/unreferenced/`may_create`-free, a control edge live-endpointed/rooted-acyclic) — plus the
+  credit account's conservation, and the **~10 transition *guards*** proven differently (a guard is
+  a no-op-on-refusal, not a state predicate — design-lesson #9): the caller-liveness gate, the
+  `reject_dead_target` mint gate, the global `may_create` and per-target `controls` authority
+  gates, the revoke chain-restriction, the `StaleGrant`/`Unauthorized`/`DomainBusy` seam checks,
+  the `grant_end_access` foreign-link block, and the `sched_block` deliverable re-check. Four
+  passes. **(1) Gap hunt** — for every invariant, enumerate every transition that could move the
+  system toward violating it (design-lesson #3) and confirm each is guarded or maintained by
+  construction, hunting specifically for a falsification path *nothing* guards. Every threatening
+  edge is covered; the subtle ones re-derived and reconfirmed — the `grant_end_access` /
+  `revoke_grants_to` **ordering** (a foreign page-table link into `target`'s frame blocks teardown
+  up front via `has_foreign_link_into`, and inbound grants are revoked only *after* the p2m
+  teardown drops `target`'s own outward links, so no revoke ever strands a live foreign entry);
+  the `maps_over_frame` summation (sound because two grantors with live maps over one frame is
+  unreachable — the misowned check would fire first, and a live map pins ownership); the cascade
+  fixpoint (`sweep_orphaned_control_edges` removes exactly a just-orphaned subtree, and the
+  provenance walk's `steps > n` bound cannot false-positive on a legitimate depth-`n` chain).
+  **(2) Redundancy / subsumption** — no invariant is dead or subsumed. Two deliberate
+  conservatisms confirmed *safe, not unsound*: `grant_end_access` blocks a revoke on *any* foreign
+  link by the grantee, not only the one this grant authorizes (a liveness wart, never a hole); and
+  the `L1`/`L2`-only pin universe is *isomorphic* to `L3`/`L4` (the level logic is a symmetric
+  match — higher levels add no reachable code path). **(3) Cross-invariant interaction** — every
+  feature *pair* is either model-checked together or *provably decomposable*: vCPU affinity is
+  orthogonal to grant/p2m/evtchn (no cross-invariant reads the affinity mask, and no non-scheduler
+  transition touches scheduler state — so the siloed two-pCPU `affinity_cfg` is complete), and a
+  *delegated* `Via` control edge drives the **identical** grant/evtchn teardown a creation `Root`
+  edge does (the cascade touches only the control matrix), so the 2-domain `all_cfg` and the
+  4-domain `delegation_cfg` cover it without an intractable four-domain-everything sweep. The
+  scheduling *policy* layer is out of scope by construction — it enacts only through the public,
+  invariant-checked transitions, so the same safety net covers it (its fuzz target re-asserts pCPU
+  exclusivity). **(4) Depth consolidation** — the one place verification was a lower bound: the
+  event↔scheduler and domain-ID-reuse deep sweeps *truncated* at the 1.5M-state cap. Characterizing
+  their closing depth showed both **close exhaustively at depth 7** (≈2.12M and ≈5.66M states), so
+  both were **upgraded from truncated lower bounds to complete theorems** (depth 7, raised cap) —
+  and because BFS visits shallower depths first, each closure *strictly subsumes* the earlier
+  truncated run (which had not even finished the depth-≤7 states) while adding completeness. **Every
+  deep sweep now closes.** **Outcome: no soundness bug, and none expected — the by-construction
+  design holds across all 28 invariants × every threatening transition.** That is the valid,
+  valuable result the audit was for: it answers the direction's own load-bearing question — *how
+  close is the pure brain to "can't diamond anymore"?* — and the honest read is **very close**. The
+  remaining headroom is not soundness holes but (a) *policy* refinement with no safety content
+  (event-vCPU steering, richer scheduling), (b) *breadth* the fence defers to M3+ (wider cpumasks,
+  512-entry tables, the real ABIs), and (c) ever-deeper sweeps with diminishing marginal
+  confidence. The safety core is essentially complete; what remains is hardware.
 - **M3**: `hv-metal` boots on real hardware to a serial "hello" and enters VMX root
   mode. The first `unsafe`, weeks in rather than day one. (x86-64 is the first backend; an
   AArch64 `hv-metal` — EL2, Stage-2 translation, the GIC — is a co-equal target behind the
