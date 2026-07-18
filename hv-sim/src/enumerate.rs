@@ -21,6 +21,14 @@
 //! the reachable set is finite: the search terminates and the result is a *theorem* —
 //! every state reachable in `<= depth` hypercalls from `new()` is invariant-safe.
 //!
+//! **Saturation (Tier B).** For a config whose state carries no *unbounded* field, the
+//! reachable set is finite even without a depth bound, so the BFS frontier eventually goes
+//! *empty* — [`EnumOutcome::saturated`] — and the theorem strengthens to *all* depths, not
+//! just `<= depth`. The one unbounded field is a refcount (`grant::maps`, a frame's `refs`),
+//! which grows only when a grant maps an *owned* frame — i.e. `grant` and `p2m` enabled
+//! together. Every other config saturates; grant+p2m alone is infinite and finite only per
+//! depth. See `docs/TIER-B-CUTOFF.md` for the full cutoff / small-scope-completeness argument.
+//!
 //! **Focus by seam.** Enabling every op group at once explodes the branching factor, so
 //! [`Config`] selects which subsystems' hypercalls to enumerate. Running grant+p2m
 //! together exhaustively covers the grant↔page-type and page-table↔grant seams;
@@ -96,6 +104,18 @@ pub struct EnumOutcome {
     pub states: usize,
     /// True if the `max_states` cap was hit before the search closed (partial result).
     pub truncated: bool,
+    /// True iff the search closed by **saturation** — a BFS frontier that went *empty*
+    /// before the depth budget ran out, meaning every state reachable in the config was
+    /// visited *at every depth*, not merely up to `cfg.depth`. This is the Tier-B
+    /// distinction: a saturated run is an **all-depths theorem** for that fixed config (the
+    /// entire reachable state space is finite and fully explored — see [`enumerate`]),
+    /// whereas a merely non-truncated run that exhausted its depth budget is complete only
+    /// *up to* `cfg.depth`. Never true when `truncated` is (a capped run cannot prove the
+    /// frontier empty). The finiteness that makes saturation reachable at all rests on
+    /// [`state_key`] carrying no unbounded field: every fingerprint component ranges over a
+    /// set bounded by the config's fixed sizes, so the distinct-state set is finite and BFS
+    /// must eventually empty its frontier at *some* depth.
+    pub saturated: bool,
     /// A shortest counterexample: the hypercall path from `new()` to a state that
     /// violates the integrated invariant, or `None` if none exists within `depth`.
     pub violation: Option<Vec<(u16, HvCall)>>,
@@ -512,6 +532,10 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
     came_from.insert(root_key.clone(), None);
     frontier.push((root_key, init));
     let mut truncated = false;
+    // Set once the frontier goes empty *without* truncation — the config's whole reachable
+    // set is exhausted at every depth (an all-depths theorem). A run that instead exhausts
+    // its depth budget leaves this false: it is complete only up to `cfg.depth`.
+    let mut saturated = false;
 
     for _ in 0..cfg.depth {
         let mut next: Vec<(StateKey, Hypervisor)> = Vec::new();
@@ -525,6 +549,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                     return EnumOutcome {
                         states: came_from.len(),
                         truncated,
+                        saturated: false,
                         violation: Some(trace(&came_from, &key)),
                     };
                 }
@@ -540,6 +565,10 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
             }
         }
         if next.is_empty() {
+            // The frontier emptied. If no state was ever dropped to the cap, this is genuine
+            // saturation — no unvisited state remains at *any* depth. If we did truncate, the
+            // empty frontier is an artefact of the cap, not a proof, so we must not claim it.
+            saturated = !truncated;
             break;
         }
         frontier = next;
@@ -548,6 +577,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
     EnumOutcome {
         states: came_from.len(),
         truncated,
+        saturated,
         violation: None,
     }
 }
@@ -587,8 +617,10 @@ mod tests {
 
     // For the deep on-demand sweeps: assert only that no reachable state violates an
     // invariant. Hitting the state cap is fine — millions of states proven clean is the
-    // point — so truncation is tolerated (and reported).
-    fn expect_no_violation(cfg: &Config) {
+    // point — so truncation is tolerated (and reported). Reports whether the run merely
+    // completed to depth, or *saturated* (frontier went empty → an all-depths theorem for
+    // the config, the Tier-B distinction).
+    fn expect_no_violation(cfg: &Config) -> EnumOutcome {
         let out = enumerate(cfg);
         assert!(
             out.violation.is_none(),
@@ -599,11 +631,43 @@ mod tests {
             "deep sweep: {} states explored{}",
             out.states,
             if out.truncated {
-                " (hit the state cap — a lower bound)"
+                " (hit the state cap — a lower bound)".to_string()
+            } else if out.saturated {
+                format!(
+                    " (SATURATED at depth <= {} — the config's ENTIRE reachable set, all depths)",
+                    cfg.depth
+                )
             } else {
-                " (closed — complete for this depth)"
+                " (closed for this depth — complete up to cfg.depth, frontier still non-empty)"
+                    .to_string()
             }
         );
+        out
+    }
+
+    // For a config small enough to fully saturate: assert the search closed by an *empty
+    // frontier*, not by exhausting its depth budget. This upgrades the result from "safe up
+    // to depth D" to "safe at every depth — the config's whole finite reachable set is
+    // proven clean" (Tier B: the depth bound dissolves for this fixed size).
+    fn expect_saturated(cfg: &Config) -> usize {
+        let out = enumerate(cfg);
+        assert!(
+            out.violation.is_none(),
+            "invariant violated after: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(
+            !out.truncated,
+            "hit the {}-state cap before saturating — raise max_states or shrink the config",
+            cfg.max_states
+        );
+        assert!(
+            out.saturated,
+            "did not saturate at depth {}: {} states explored with a non-empty frontier — \
+             raise depth until the frontier empties",
+            cfg.depth, out.states
+        );
+        out.states
     }
 
     fn grant_p2m_cfg(depth: u32) -> Config {
@@ -937,10 +1001,22 @@ mod tests {
         assert!(states > 200, "suspiciously few states explored: {states}");
     }
 
+    /// vCPU affinity, **saturated to an all-depths theorem**. The scheduler carries no
+    /// unbounded refcount (run states, masks, and occupancy are all bounded by the config
+    /// sizes — `runtime` is excluded from `state_key`), so its reachable set is finite and
+    /// BFS empties the frontier: at depth 16 the sweep does not merely finish its budget, it
+    /// *saturates* (237,312 states), proving `RunningOffAffinity` + pCPU exclusivity hold in
+    /// **every** reachable state of this config at **every** depth — the depth bound has
+    /// dissolved. See `docs/TIER-B-CUTOFF.md` §1. (`affinity_cfg` uses `Config::tiny`'s
+    /// 1.5M cap, far above 237k, so it closes by an empty frontier, not the cap.)
     #[test]
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn vcpu_affinity_deep() {
-        expect_no_violation(&affinity_cfg(8));
+        let states = expect_saturated(&affinity_cfg(16));
+        assert!(
+            states > 200_000,
+            "affinity reachable set unexpectedly small: {states}"
+        );
     }
 
     /// Domain-ID reuse, exhaustively (shallow): every reachable interleaving of a two-domain
@@ -983,21 +1059,38 @@ mod tests {
         expect_no_violation(&grant_p2m_cfg(7));
     }
 
+    /// The domain lifecycle, **saturated to an all-depths theorem**. With p2m but no grant,
+    /// no map can back onto an owned frame, so no refcount ever grows without bound (pins are
+    /// idempotent, links are capped at one per `(parent,slot)`) — the reachable set is finite.
+    /// At depth 16 the frontier empties: 47,496 states, every reachable interleaving of birth,
+    /// resource acquisition, delegation, and death proven to leave every `Dead` slot a clean,
+    /// unprivileged shell — at all depths, not merely up to a bound. See `docs/TIER-B-CUTOFF.md`.
     #[test]
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn domain_lifecycle_deep() {
-        expect_no_violation(&lifecycle_cfg(12));
+        let states = expect_saturated(&lifecycle_cfg(16));
+        assert!(
+            states > 40_000,
+            "lifecycle reachable set unexpectedly small: {states}"
+        );
     }
 
-    /// The deep delegation-forest sweep. Depth 8 over four domains is enough to build a
-    /// depth-2 delegation chain (create the target, create two intermediaries, delegate
-    /// creator → A → B) and then exercise every revoke and destroy against it — so it
-    /// exhaustively proves chain-restricted revocation, subtree cascades, and delegator-death
-    /// cascades never leave an orphaned or cyclic edge.
+    /// The deep delegation-forest sweep, **saturated to an all-depths theorem**. The control
+    /// matrix over four domains is a bounded structure (each cell is `Absent`/`Root`/`Via(d)`,
+    /// D+2 values, D² cells) with no refcount, so its reachable set is finite: at depth 12 the
+    /// frontier empties (58,280 states). This is enough to build a depth-2 delegation chain
+    /// (create the target, two intermediaries, delegate creator → A → B) and exercise every
+    /// revoke and destroy against it — proving chain-restricted revocation, subtree cascades,
+    /// and delegator-death cascades never leave an orphaned or cyclic edge, at **all** depths.
+    /// The cycle-freedom itself is not a size-cutoff result — see `docs/TIER-B-CUTOFF.md` §2.4.
     #[test]
     #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
     fn delegation_forest_deep() {
-        expect_no_violation(&delegation_cfg(8));
+        let states = expect_saturated(&delegation_cfg(12));
+        assert!(
+            states > 50_000,
+            "delegation reachable set unexpectedly small: {states}"
+        );
     }
 
     /// The deep event↔scheduler (lost-wakeup) sweep, **closed to a theorem**. Depth 7 *closes*

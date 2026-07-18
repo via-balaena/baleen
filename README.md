@@ -122,10 +122,28 @@ configuration it breadth-first visits *every* reachable state and checks the
 integrated invariant at each — a proof, not a sample, that no reachable state can
 break it. CI runs shallow per-seam sweeps in seconds; the deep on-demand sweeps
 (`cargo test --release -- --ignored`) have exhaustively cleared **millions** of
-distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 742k states —
+distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 828k states —
 including cross-domain foreign *node* shares, not just leaves; the whole integrated
-core to depth 5 ≈ 415k; event↔scheduler to depth 8 past the 1.5M cap) with zero
-violations.
+core to depth 5 ≈ 415k; event↔scheduler to depth 7 ≈ 2.1M) with zero violations.
+
+**Bounded → unbounded (the true-diamond program, Tier B).** Those sweeps are bounded
+in two ways: hypercall *depth* and config *size*. The enumerator now distinguishes a
+run that merely exhausts its depth budget from one that **saturates** — whose BFS
+frontier goes *empty*, meaning the config's entire reachable set has been visited at
+**every** depth, an all-depths theorem. Most configs saturate (nothing in them grows
+a refcount without bound): the domain lifecycle (47k states), vCPU affinity (237k),
+the delegation forest (58k), event channels and the scheduler each on their own — all
+proven safe at *all* depths, not merely up to a bound. The lone exception is
+grant↔p2m *together*: a frame can be mapped an unbounded number of times, so that
+state space is genuinely infinite and finite only per depth — precisely the boundary
+where deductive proof (Tier C) becomes unavoidable, since one cannot enumerate an
+infinite space. A per-invariant **locality/cutoff** analysis (each of the 28
+invariants is violated by a bounded witness, so a size cutoff k0 = 3 domains / 3
+frames bounds the search — which Tier A's 3-domain sweeps already cover as the base
+case) and a **data-independence/symmetry** argument (the core branches on no literal
+id except dom0-at-boot) complete the size axis. The full argument, its two honest
+residuals handed to Tier C, and the measured saturation table live in
+[`docs/TIER-B-CUTOFF.md`](docs/TIER-B-CUTOFF.md).
 
 ## Milestones
 
