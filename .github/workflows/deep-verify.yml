@@ -2,12 +2,16 @@
 # Copyright (c) 2026 Via Balaena
 
 # The heavy verification the per-push CI deliberately skips, run on a schedule (and on
-# demand). Two things the fast lane cannot afford every push:
+# demand). Three things the fast lane cannot afford every push:
 #   - the exhaustive enumerator's deep sweeps (`#[ignore]`d, millions of reachable states,
 #     GBs of RAM) — the bounded-model-checking theorems that are the project's whole point;
-#   - a bounded run of every libFuzzer target.
-# A red run here means a reachable state violated an invariant, or a fuzzer found a crash —
-# either is a real defect, so this workflow is allowed to fail loudly.
+#   - a bounded run of every libFuzzer target;
+#   - the Tier C Kani preservation proofs (hv-verify) — which, unlike the enumerator, prove
+#     invariant preservation over UNBOUNDED refcount magnitudes (installing Kani + its CBMC
+#     backend costs a few minutes, so it belongs here, not in the per-PR gate).
+# A red run here means a reachable state violated an invariant, a fuzzer found a crash, or a
+# transition can break an invariant at some refcount — each is a real defect, so this
+# workflow is allowed to fail loudly.
 name: Deep verification
 
 on:
@@ -52,6 +56,41 @@ jobs:
 
       - name: cargo test --release --ignored (deep sweeps)
         run: cargo test --release -p hv-sim -- --ignored --nocapture --test-threads=1
+
+  # Tier C: the Kani preservation proofs in hv-verify. Each proof makes a grant refcount
+  # fully symbolic and proves an invariant (`WritableExceedsMaps`) survives a transition for
+  # EVERY 2^32 magnitude — the residual Tier B (docs/TIER-B-CUTOFF.md §1.4) could only argue,
+  # since an infinite state space cannot be enumerated. The harnesses are `#[cfg(kani)]`-gated,
+  # so they exist only under `cargo kani`; a normal build never sees them.
+  kani:
+    name: kani preservation proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # Kani is a cargo subcommand plus its own downloaded backend (CBMC). The version is
+      # pinned so a Kani release cannot silently change proof semantics — raise it deliberately
+      # (mirrors the cargo-deny @0.19.0 pin). `cargo kani setup` fetches the backend once.
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier@0.67.0
+          cargo kani setup
+
+      - name: cargo kani -p hv-verify (preservation proofs)
+        run: cargo kani -p hv-verify
 
   # A bounded run of every fuzz target on nightly. No persisted corpus yet, so this is a
   # continuous smoke-fuzz (regression catcher), not a deep campaign — still far better than

@@ -154,6 +154,24 @@ hide states. The full argument, its two honest residuals handed to Tier C, and t
 measured saturation table live in
 [`docs/TIER-B-CUTOFF.md`](docs/TIER-B-CUTOFF.md).
 
+**Deductive proof (Tier C) — the ∀-N jump, begun.** Bounded model checking, however
+exhaustive, enumerates small states; Tier C *proves every transition preserves every
+invariant for arbitrary size*, reasoning over all states at once. The tooling is a
+**bridge**: [Kani](https://github.com/model-checking/kani) symbolically executes the
+**real** hv-core code (a scalar made symbolic is checked over all 2³² values by its SMT
+backend, no bound), then **Verus** for the full arbitrary-size proofs. The first spike
+(`hv-verify`) discharges the cleanest Tier B residual — the grant refcount *infinity* — as a
+machine-checked theorem: `WritableExceedsMaps` (`writable_maps ≤ maps`) is preserved by the
+map and unmap count-transitions for **every** refcount magnitude, and the unchecked
+increment provably cannot overflow. The proofs call the *same* count arithmetic production
+does (one derivation, no drift). The spike already earned its keep by surfacing a precise
+finding: `WritableExceedsMaps` is **not** self-inductive under unmap — its preservation
+*borrows* from `RefcountMismatch`, so the "±1 lockstep" is a genuine coupling, and
+`RefcountMismatch`'s own (scalar-to-`Vec`) preservation is the next, Verus-shaped obligation.
+The decision, repo/CI shape, what is proven, and that finding live in
+[`docs/TIER-C-SPIKE.md`](docs/TIER-C-SPIKE.md). The proofs run in the scheduled
+`Deep verification` workflow (`cargo kani -p hv-verify`), not the per-PR gate.
+
 ## Milestones
 
 - **M1 — architecture proof** *(this commit)*: `hv-core` dispatches two toy

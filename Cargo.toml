@@ -3,7 +3,13 @@
 
 [workspace]
 resolver = "2"
-members = ["hv-hal", "hv-core", "hv-sim", "xtask"]
+members = ["hv-hal", "hv-core", "hv-sim", "hv-verify", "xtask"]
+# hv-verify (Tier C) IS a member: its Kani preservation proofs are `#[cfg(kani)]`-gated, so
+# under a normal build it is a trivially-empty crate with only an internal path dep — stable
+# `cargo test --workspace`, MSRV, and cargo-deny stay green. The proofs run out-of-band with
+# `cargo kani -p hv-verify` (the `cargo kani` driver injects the `kani` crate); nothing about
+# the shipping build touches Kani or CBMC. Contrast hv-fuzz, which needs its toolchain at
+# build time and so must be excluded:
 # hv-fuzz is a standalone crate (its own workspace) excluded here so stable
 # `cargo test --workspace` never builds the nightly/libFuzzer machinery.
 exclude = ["hv-fuzz"]
@@ -17,7 +23,15 @@ edition = "2021"
 license = "Apache-2.0 OR MIT"
 authors = ["Via Balaena"]
 repository = "https://github.com/via-balaena/baleen"
-rust-version = "1.96"
+# MSRV is 1.96, enforced by the `MSRV (1.96)` CI job (a `cargo check` on the 1.96 floor —
+# see .github/workflows/ci.yml). It is deliberately NOT also set as a `rust-version` manifest
+# gate: that gate makes cargo REFUSE any toolchain below 1.96, which blocks Kani — the Tier C
+# proof toolchain in hv-verify. Kani ships its own pinned nightly (currently 1.93) that
+# legitimately builds these same libraries to model-check them, and it forwards no
+# `--ignore-rust-version` escape. The CI job is the real, single-source MSRV enforcement; a
+# hard manifest gate would only duplicate it while breaking the deductive-proof build. Restore
+# `rust-version = "1.96"` here (and the `.workspace = true` lines in the members) if Kani's
+# bundled toolchain ever reaches the floor.
 
 [workspace.lints.rust]
 # The fence, enforced by the compiler: no crate in this workspace may write unsafe.

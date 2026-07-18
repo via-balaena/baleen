@@ -118,10 +118,12 @@ jobs:
         working-directory: hv-fuzz
         run: cargo deny check --config ../deny.toml
 
-  # Enforce the declared MSRV (`rust-version` in the workspace manifest): the code must
-  # compile on the floor, so the promise cannot silently rot as newer std APIs tempt their
-  # way in. A `check` (not a full test run) is the MSRV contract — the stable `ci` job above
-  # already runs the tests.
+  # Enforce the MSRV: the code must compile on the 1.96 floor, so the promise cannot silently
+  # rot as newer std APIs tempt their way in. This job is the *single source* of MSRV
+  # enforcement — the workspace manifest deliberately omits the `rust-version` gate so Kani's
+  # pinned (older) toolchain can build the libraries for the Tier C proofs (see the note in
+  # Cargo.toml). The `1.96` here is therefore the MSRV definition; raise both together. A
+  # `check` (not a full test run) is the contract — the stable `ci` job above runs the tests.
   msrv:
     name: MSRV (1.96)
     runs-on: ubuntu-latest
