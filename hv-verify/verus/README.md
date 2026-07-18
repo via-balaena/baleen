@@ -17,7 +17,8 @@ cargo-deny never see it and the pure brain stays stable-buildable. It is verifie
 | `refcount_mismatch.rs` | `RefcountMismatch` (`maps == \|live mappings\|`, `writable_maps == \|writable live mappings\|`) is preserved by grant `map` **and** `unmap`, for an **arbitrary entry table × arbitrary-length mapping sequence** — the ∀-N / scalar↔`Vec` step Kani could only `unwind`. | (1) refcount infinity |
 | `frame_lemma.rs` | The **projection frame-lemma**: the grant summation `maps_over_frame(f)` is **owner-local** — under `MisownedGrantMap`, only `owner(f)`'s grants contribute, so a transition disjoint from `{f, owner(f)}` cannot perturb `UnbackedGrantMap`'s read-value at `f`. Over an **arbitrary-length** grant population. | (2) projection frame-lemma |
 | `control_forest_acyclic.rs` | **Control-forest acyclicity**: `ControlEdgeOrphaned`'s cycle case, which has **no size cutoff**. A rank certificate (strictly decreasing along `Via` edges, bounded by node count) is preserved by `control_grant`'s fresh-leaf delegation and the `DomainCreate` `Root` stamp, and discharges the real provenance-walk-reaches-`Root`-within-`n` check — at **arbitrary domain count**. | (3) control-cycle acyclicity |
-| `unwinding_signal.rs` **(Tier D spike)** | **Signal-channel local respect**: under event-channel **reciprocity** (the peer map is an involution), a domain `a` holding no port toward `b` implies `b` holds no port toward `a`, so a `send` by `b` cannot set any pending bit of `a` — `obs(a)`'s signal projection is preserved by a step from a `b` with no signal channel to `a`. Over an **arbitrary port population**. | Tier D — non-interference |
+| `unwinding_signal.rs` **(Tier D)** | **Signal-channel local respect**: under event-channel **reciprocity** (the peer map is an involution), a domain `a` holding no port toward `b` implies `b` holds no port toward `a`, so a `send` by `b` cannot set any pending bit of `a` — `obs(a)`'s signal projection is preserved by a step from a `b` with no signal channel to `a`. Over an **arbitrary port population**. | Tier D — non-interference |
+| `unwinding_control.rs` **(Tier D)** | **Control-channel local respect**: the `SchedSetAffinity` authority **guard** (`caller == target ∨ controls[caller][target]`) forces a step by a `b` that does not control `a` (and `b ≠ a`) to write `target ≠ a`, so `a`'s vCPU-affinity projection is untouched; a caller-only scheduler op (write confined to `b`'s rows) preserves `a`'s vCPU rows for free. Over an **arbitrary vCPU population**. *Finding: this channel's locality comes from a transition **guard** (#9), not a relational state invariant — the simplest of the three.* | Tier D — non-interference |
 
 `refcount_mismatch.rs` is the keystone residual (`docs/TIER-B-CUTOFF.md` §3(1),
 `docs/TIER-C-SPIKE.md` §3–4). Proving it discharges — for *all* sizes — the two `kani::assume`s
@@ -54,6 +55,7 @@ $VERUS --crate-type=lib hv-verify/verus/refcount_mismatch.rs        # → 8 veri
 $VERUS --crate-type=lib hv-verify/verus/frame_lemma.rs              # → 5 verified, 0 errors
 $VERUS --crate-type=lib hv-verify/verus/control_forest_acyclic.rs   # → 8 verified, 0 errors
 $VERUS --crate-type=lib hv-verify/verus/unwinding_signal.rs         # → 2 verified, 0 errors  (Tier D)
+$VERUS --crate-type=lib hv-verify/verus/unwinding_control.rs        # → 3 verified, 0 errors  (Tier D)
 ```
 
 CI runs exactly this in the `verus preservation proofs` job of
@@ -91,16 +93,20 @@ hand; each reproduces in seconds):
 | `control_forest_acyclic.rs` | weaken the strict rank decrease `rank[d] < rank[h]` → `≤` | `postcondition not satisfied` |
 | `control_forest_acyclic.rs` | drop the `is_absent(col[to])` fresh-leaf precondition (allow re-parenting) | `postcondition not satisfied` |
 | `unwinding_signal.rs` | drop the `involution(peer)` (reciprocity) hypothesis from `no_port_toward_is_symmetric` | `assertion failed` |
+| `unwinding_control.rs` | drop the `!controls.contains((b, a))` hypothesis from `set_affinity_target_not_a` | `postcondition not satisfied` |
 
 ## What's next
 
 **All three §3 residuals are now discharged** (refcount infinity, projection frame-lemma,
-control-forest acyclicity) — Tier C is complete. `unwinding_signal.rs` is the **Tier D spike**
-on the deductive axis: one non-interference *unwinding* lemma, proven end-to-end, showing that
-local respect has the same tractable *"borrows-from-a-relational-invariant"* shape (here from
-event-channel reciprocity) on a second seam. The full Tier D program — a local-respect lemma
-per transition class over the whole `obs(a)` projection, assembled into whole-system
-non-interference — is scoped in `docs/TIER-D-NONINTERFERENCE.md`, alongside the enumerator
+control-forest acyclicity) — Tier C is complete. `unwinding_signal.rs` and
+`unwinding_control.rs` are the **Tier D** per-channel local-respect lemmas on the deductive
+axis: non-interference *unwinding* proven end-to-end for the signal channel (borrows from
+event-channel reciprocity) and the control/affinity channel (locality straight from the
+`SchedSetAffinity` authority guard — the simplest of the three). Together with `frame_lemma.rs`
+(the memory channel, from Tier C), that is **three of the direct channels** done. The remaining
+Tier D work — the creation channel and the multi-domain `DomainDestroy` cascade, assembled into
+whole-system non-interference — is scoped in `docs/TIER-D-NONINTERFERENCE.md`, alongside the
+enumerator
 **bridge** (`hv-sim/src/noninterference.rs`) that validates the property definition on the real
 code at small size. See `docs/TIER-C-SPIKE.md` for the honest scope of what these ∀-N model
 proofs do and don't cover (they cover the *model* — the pure brain; whether the *metal* enforces
