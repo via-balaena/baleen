@@ -1554,10 +1554,12 @@ fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) 
         Some(o) => o,
         None => return false,
     };
-    // A read-only *leaf* (only meaningful under an L1 parent) may point at any allocated
-    // frame; every other entry needs an untyped child to establish the level below.
-    let ro_leaf =
-        rng.below(2) == 0 && sys.current_type(parent) == Some(PageType::PageTable(PtLevel::L1));
+    // A read-only *leaf* (only meaningful under an L1 parent here) may point at any allocated
+    // frame; every other entry needs an untyped child to establish the level below. This
+    // driver builds leaves only under `L1` (superpage leaves at `L2`/`L3` are witnessed by a
+    // dedicated driver); an entry under an `L1` is a leaf, everything else interior.
+    let parent_is_l1 = sys.current_type(parent) == Some(PageType::PageTable(PtLevel::L1));
+    let ro_leaf = rng.below(2) == 0 && parent_is_l1;
     let children: Vec<u32> = (0..sys.frame_count() as u32)
         .filter(|&m| {
             m != parent
@@ -1574,7 +1576,10 @@ fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) 
     }
     let child = children[rng.below(children.len() as u32) as usize];
     let onto_pagetable = ro_leaf && matches!(sys.current_type(child), Some(PageType::PageTable(_)));
-    if sys.link(owner, parent, slot, child, !ro_leaf).is_ok() {
+    if sys
+        .link(owner, parent, slot, child, !ro_leaf, parent_is_l1)
+        .is_ok()
+    {
         links.push((parent, slot));
         onto_pagetable
     } else {
@@ -1733,6 +1738,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                 slot: 0,
                 child: node_leaf,
                 writable: true,
+                leaf: true, // the node's own 4 KiB leaf under its L1
             },
         )
         .unwrap();
@@ -1829,6 +1835,9 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                             slot,
                             child: frame,
                             writable,
+                            // A data frame under an L1 is a leaf; the peer's L1 node under an
+                            // L2 is an interior entry sharing its subtree.
+                            leaf: !is_node,
                         },
                     ) {
                         Ok(_) => {
@@ -1878,6 +1887,9 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                         slot,
                         child,
                         writable: true,
+                        // A node share (peer's L1 under our L2) is interior; a data-frame
+                        // leaf goes under our L1.
+                        leaf: !as_node,
                     },
                 ) {
                     out.unauthorized += 1;

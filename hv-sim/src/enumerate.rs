@@ -219,18 +219,26 @@ fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                 for slot in 0..2u32 {
                     v.push((caller, HvCall::P2mUnlink { parent: mfn, slot }));
                     for child in 0..cfg.frames as u32 {
-                        // Both a writable and a read-only leaf — the read-only one is the
-                        // linear-map case, a leaf that may point at a live page table.
+                        // Every (writable, leaf) shape. `writable`: a writable vs a read-only
+                        // entry — the read-only leaf is the linear-map case, one that may point
+                        // at a live page table. `leaf`: an interior entry (descends one level)
+                        // vs a leaf (maps a page and terminates — a *superpage* when its parent
+                        // is above `L1`). Driving both is what makes the model-checker build,
+                        // and prove sound, an `L2`→leaf 2 MiB superpage as well as the interior
+                        // `L2`→`L1` edge, over the same reachable-state sweep.
                         for &writable in &bools {
-                            v.push((
-                                caller,
-                                HvCall::P2mLink {
-                                    parent: mfn,
-                                    slot,
-                                    child,
-                                    writable,
-                                },
-                            ));
+                            for &leaf in &bools {
+                                v.push((
+                                    caller,
+                                    HvCall::P2mLink {
+                                        parent: mfn,
+                                        slot,
+                                        child,
+                                        writable,
+                                        leaf,
+                                    },
+                                ));
+                            }
                         }
                     }
                 }
@@ -406,12 +414,17 @@ pub fn state_key(hv: &Hypervisor) -> Vec<u64> {
     let mut edges = p.link_edges();
     edges.sort_unstable();
     k.push(edges.len() as u64);
-    for (par, slot, ch, writable) in edges {
+    for (par, slot, ch, writable, leaf) in edges {
         k.extend([
             u64::from(par),
             u64::from(slot),
             u64::from(ch),
             writable as u64,
+            // `leaf` is behaviourally live: it selects which reference `unlink` releases, and
+            // it distinguishes a superpage (a leaf above `L1`) from an interior table pointer.
+            // Two states that agree on every edge's (parent, slot, child, writable) but differ
+            // in an edge's shape are *not* the same state — keep the bit so they never merge.
+            leaf as u64,
         ]);
     }
     k.push(0xFFFF_0004);

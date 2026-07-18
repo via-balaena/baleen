@@ -124,24 +124,30 @@ pub enum HvCall {
     P2mPin { mfn: Mfn, level: PtLevel },
     /// Unpin one of the caller's page-table frames, dropping the pin's reference.
     P2mUnpin { mfn: Mfn },
-    /// Install a page-table entry: link `parent`'s `slot` to `child`, one paging level
-    /// down. Refused unless `child` is (or can become) exactly the level below `parent`
-    /// — the hierarchy guard. `writable` is the entry's read/write bit for a *leaf* (an
-    /// entry under an `L1`): a writable leaf maps its child read-write, a read-only one
-    /// read-only (which may even point at a page table — the linear-map view). The caller
-    /// must own `parent`; `child` may be a frame *another domain owns*, if that owner has
-    /// granted it to the caller with matching permission (a read-write grant for a
+    /// Install a page-table entry: link `parent`'s `slot` to `child`. `leaf` chooses the
+    /// entry's shape (real hardware's page-size / `PS` bit). An **interior** entry
+    /// (`leaf == false`, `parent` an `Lk`, `k >= 2`) descends one level — refused unless
+    /// `child` is (or can become) exactly the `L(k-1)` table below `parent`, the hierarchy
+    /// guard; an interior entry under an `L1` is refused (nothing sits below it). A **leaf**
+    /// (`leaf == true`) maps an ordinary page and terminates the walk at `parent`'s level,
+    /// so its *size* is that level's: a 4 KiB page at `L1`, or a **superpage** at `L2`
+    /// (2 MiB) or `L3` (1 GiB) — one page mapped directly, skipping the levels beneath.
+    /// `writable` is the entry's read/write bit: for a leaf it maps the child read-write or
+    /// read-only (a read-only leaf may even point at a page table — the linear-map view).
+    /// The caller must own `parent`; `child` may be a frame *another domain owns*, if that
+    /// owner has granted it to the caller with matching permission (a read-write grant for a
     /// writable entry, any grant for a read-only one). A foreign child may sit at **any**
-    /// level: a leaf shares a data page, an interior entry (`parent` an `Lk`, `k >= 2`)
-    /// shares the owner's `L(k-1)` *node* — and, transitively, the whole subtree beneath
-    /// it — the mechanism behind a shared address space. For an interior entry `writable`
-    /// is the traversal read/write bit the MMU ANDs down the walk; it gates the grant
-    /// permission required but never gives a writable-*type* reference on the node.
+    /// level and be either shape: a leaf shares a data page (a superpage above `L1`), an
+    /// interior entry shares the owner's `L(k-1)` *node* — and, transitively, the whole
+    /// subtree beneath it — the mechanism behind a shared address space. For an interior
+    /// entry `writable` is the traversal read/write bit the MMU ANDs down the walk; it gates
+    /// the grant permission required but never gives a writable-*type* reference on the node.
     P2mLink {
         parent: Mfn,
         slot: u32,
         child: Mfn,
         writable: bool,
+        leaf: bool,
     },
     /// Remove the caller's page-table entry at `parent`'s `slot`, dropping the references
     /// the link held.
@@ -648,7 +654,8 @@ impl Hypervisor {
                 slot,
                 child,
                 writable,
-            } => self.p2m_link(caller, parent, slot, child, writable),
+                leaf,
+            } => self.p2m_link(caller, parent, slot, child, writable, leaf),
             HvCall::P2mUnlink { parent, slot } => self
                 .p2m
                 .unlink(caller, parent, slot)
@@ -739,12 +746,15 @@ impl Hypervisor {
     /// domain cannot reach a foreign frame through its page tables, at a given access,
     /// without the owner's consent to that access.
     ///
-    /// The foreign child may sit at **any** paging level — it is not restricted to a leaf.
-    /// A foreign **leaf** (under an `L1`) maps another domain's data page; a foreign
+    /// The foreign child may sit at **any** paging level and be either shape. A foreign
+    /// **leaf** maps another domain's data page — a small page under an `L1`, or a
+    /// **superpage** (2 MiB/1 GiB) mapped directly by an `L2`/`L3` entry; a foreign
     /// **interior** entry (an `Lk`, `k >= 2`, pointing at the owner's `L(k-1)` node) shares
     /// a whole page-table *subtree* — the mechanism behind a shared address space. The
-    /// authorization is *uniform across levels*: one grant of the child frame, at matching
-    /// permission, whether the child is a data page or a table node. Sharing a node is
+    /// authorization is *uniform across levels and shapes*: one grant of the child frame, at
+    /// matching permission, whether the child is a small page, a superpage, or a table node
+    /// — a shared 2 MiB leaf is authorized by exactly the one grant a shared 4 KiB leaf is.
+    /// Sharing a node is
     /// **transitive consent**: the grant of the node frame authorizes the caller's walk
     /// into the entire subtree beneath it, because every edge *inside* the owner's subtree
     /// is same-owner and so needs no grant — only the one boundary-crossing edge does. The
@@ -767,6 +777,7 @@ impl Hypervisor {
         slot: u32,
         child: Mfn,
         writable: bool,
+        leaf: bool,
     ) -> Result<HvOutcome, HvError> {
         if let Some(owner) = self.p2m.owner_of(child) {
             if owner != caller {
@@ -785,7 +796,7 @@ impl Hypervisor {
             }
         }
         self.p2m
-            .link(caller, parent, slot, child, writable)
+            .link(caller, parent, slot, child, writable, leaf)
             .map(|()| HvOutcome::Done)
             .map_err(HvError::P2m)
     }
@@ -1394,7 +1405,7 @@ impl Hypervisor {
         // grant for a read-only one. An unauthorized foreign entry is a domain reaching
         // into another's memory without consent — the isolation breach this join exists to
         // prevent.
-        for (parent, _slot, child, writable) in self.p2m.link_edges() {
+        for (parent, _slot, child, writable, _leaf) in self.p2m.link_edges() {
             let (Some(child_owner), Some(parent_owner)) =
                 (self.p2m.owner_of(child), self.p2m.owner_of(parent))
             else {
@@ -2341,6 +2352,8 @@ mod tests {
                     slot: 0,
                     child,
                     writable: true,
+                    // Interior for L4→L3→L2→L1; the entry under the L1 (frame 3) is the leaf.
+                    leaf: parent == 3,
                 },
             )
             .unwrap();
@@ -2361,7 +2374,8 @@ mod tests {
                     parent: 0,
                     slot: 1,
                     child: 4,
-                    writable: true
+                    writable: true,
+                    leaf: false
                 }
             ),
             Err(HvError::P2m(p2m::P2mError::TypePinned))
@@ -2396,6 +2410,7 @@ mod tests {
                 slot: 0,
                 child: 1,
                 writable: true,
+                leaf: false,
             },
         )
         .unwrap();
@@ -2406,6 +2421,7 @@ mod tests {
                 slot: 0,
                 child: 2,
                 writable: true,
+                leaf: true,
             },
         )
         .unwrap();
@@ -2458,6 +2474,7 @@ mod tests {
                 slot: 0,
                 child: 5,
                 writable: true,
+                leaf: true,
             },
         )
     }
@@ -2470,6 +2487,7 @@ mod tests {
                 slot: 0,
                 child: 5,
                 writable: false,
+                leaf: true,
             },
         )
     }
@@ -2613,7 +2631,8 @@ mod tests {
                     parent: 1,
                     slot: 0,
                     child: 5,
-                    writable: true
+                    writable: true,
+                    leaf: false
                 }
             ),
             Err(HvError::Unauthorized)
@@ -2728,6 +2747,7 @@ mod tests {
                 slot: 0,
                 child: 6,
                 writable: true,
+                leaf: true,
             },
         )
         .unwrap();
@@ -2761,6 +2781,7 @@ mod tests {
                 slot: 0,
                 child: 5,
                 writable,
+                leaf: false, // an interior entry — domain 0's L2 pointing at domain 1's L1 node
             },
         )
     }
@@ -2820,6 +2841,7 @@ mod tests {
                 slot: 0,
                 child: 6,
                 writable: true,
+                leaf: false,
             },
         )
         .unwrap(); // L2 → L1
@@ -2830,6 +2852,7 @@ mod tests {
                 slot: 0,
                 child: 7,
                 writable: true,
+                leaf: true,
             },
         )
         .unwrap(); // L1 → writable leaf
@@ -2864,7 +2887,8 @@ mod tests {
                     parent: 2,
                     slot: 0,
                     child: 5,
-                    writable: true
+                    writable: true,
+                    leaf: false
                 }
             ),
             Ok(HvOutcome::Done)
@@ -2906,6 +2930,7 @@ mod tests {
                 slot: 0,
                 child: 6,
                 writable: true,
+                leaf: true,
             },
         )
         .unwrap();
@@ -2996,7 +3021,8 @@ mod tests {
                     parent: 2,
                     slot: 0,
                     child: 5,
-                    writable: true
+                    writable: true,
+                    leaf: false
                 }
             ),
             Err(HvError::P2m(p2m::P2mError::TypePinned))
