@@ -12,22 +12,33 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: every job here only reads the checkout. No job writes contents,
+# issues, packages, or deployments, so a compromised action or dependency cannot use
+# the workflow token to mutate the repo. Any future job needing more elevates itself.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+# Third-party actions are pinned to a full commit SHA (the tag in the comment is for
+# humans and for Dependabot, which bumps the SHA via reviewed PRs — see
+# .github/dependabot.yml). A moved tag cannot silently change what runs in CI.
 jobs:
   ci:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       # The single source of truth for "green": the same bar `cargo xtask ci`
       # enforces locally — rustfmt --check, clippy -D warnings, then the tests.
@@ -35,20 +46,69 @@ jobs:
         run: cargo xtask ci
 
   # Compile-check the standalone fuzz crate so a broken target is caught in CI,
-  # without spending wall-clock actually fuzzing on every push.
+  # without spending wall-clock actually fuzzing on every push (the scheduled
+  # deep-verify workflow runs the fuzzers).
   fuzz-build:
     name: fuzz targets build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: hv-fuzz
 
       - name: cargo check (hv-fuzz)
         working-directory: hv-fuzz
         run: cargo check --all-targets
+
+  # Supply-chain gate: refuse a dependency carrying a security advisory, a disallowed
+  # license, an untrusted source, or a wildcard version. The shipping workspace has zero
+  # external deps today, so this stays green now and blocks the first bad dep from landing
+  # unreviewed. cargo-deny's advisory check subsumes cargo-audit (same RustSec database).
+  # Covers both manifests: the workspace AND the standalone hv-fuzz crate (where the only
+  # real third-party code — libFuzzer and its deps — actually lives).
+  supply-chain:
+    name: supply-chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-deny
+
+      - name: cargo-deny (workspace)
+        run: cargo deny check
+
+      - name: cargo-deny (hv-fuzz)
+        run: cargo deny --manifest-path hv-fuzz/Cargo.toml check --config deny.toml
+
+  # Enforce the declared MSRV (`rust-version` in the workspace manifest): the code must
+  # compile on the floor, so the promise cannot silently rot as newer std APIs tempt their
+  # way in. A `check` (not a full test run) is the MSRV contract — the stable `ci` job above
+  # already runs the tests.
+  msrv:
+    name: MSRV (1.96)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned MSRV toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: "1.96"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: cargo check on the MSRV floor
+        run: cargo check --workspace --all-targets --locked

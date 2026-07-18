@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+# cargo-deny — the workspace's supply-chain gate. Run locally with `cargo deny check`;
+# enforced in CI (see .github/workflows/ci.yml). The shipping workspace has ZERO external
+# dependencies today (`unsafe` is forbidden and every crate is a path member), so this is
+# mostly forward-looking: it stays green now and refuses the first dependency that carries a
+# security advisory, a disallowed license, or an untrusted source — turning "we happen to
+# have no deps" into "a bad dep cannot land unreviewed".
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Any yanked crate in the lockfile fails the gate; RustSec advisories fail by default in v2.
+yanked = "deny"
+
+[licenses]
+version = 2
+# Every Baleen crate is `Apache-2.0 OR MIT`. Allow exactly that pair plus the permissive
+# licenses a future Rust dependency is most likely to carry; anything else fails the gate and
+# must be reviewed before it lands.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "Unlicense",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    # The NCSA (University of Illinois/NCSA) license covers the LLVM libFuzzer runtime that
+    # `libfuzzer-sys` bundles for the `hv-fuzz` targets — permissive and Apache/MIT-compatible.
+    "NCSA",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions of one crate are a bloat/supply-chain smell — warn (not fail, so an
+# ecosystem-forced duplicate does not block CI). Wildcard version requirements are rejected,
+# except intra-workspace path dependencies (which legitimately carry no version).
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io and the workspace itself: an unreviewed git or alternative-registry
+# dependency is exactly the vector this closes.
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+# Dependabot keeps two supply-chain surfaces current, each as a reviewed PR:
+#  - the GitHub Actions pinned to commit SHAs in .github/workflows (it bumps the SHA and
+#    the version comment together, so pinning never means going stale), and
+#  - the Cargo dependencies of both the workspace and the standalone hv-fuzz crate.
+# Updates are grouped to keep PR noise low; a security update always opens its own PR.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      workspace:
+        patterns: ["*"]
+
+  - package-ecosystem: "cargo"
+    directory: "/hv-fuzz"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(fuzz)"
+    groups:
+      fuzz:
+        patterns: ["*"]
