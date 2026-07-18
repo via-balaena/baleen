@@ -234,16 +234,30 @@ witness entity-set and the domains/frames/… it spans:
 | cross `ControlEdgeOrphaned` (orphan) | edge + delegator cell | 3 | – | – | – | – | – |
 | cross `ControlEdgeOrphaned` (**cycle**) | a provenance cycle | **≤D** ⚠ | – | – | – | – | – |
 
-**27 of the 28 are local**, with a maximum witness of **3 domains** (the orphan case and
-three-party foreign sharing), **2 frames**, **2 ports**, **1 vCPU** (2 to make affinity
-non-trivial), **2 pCPUs**, **2 grants**. That yields the cutoff
+**27 of the 28 are local.** The witness counts above are the entities the invariant *reads*;
+the cutoff also has to account for the entities needed to *reach* that witness from the uniform
+initial state — and because every non-dom0 slot boots `Dead` (§2.1), a domain only becomes live
+by being created, ultimately rooted at dom0. So a witness on *m* live non-dom0 domains needs up
+to *m*+1 domains in the config (dom0 as the creating Root). Two invariant families set the
+domain bound:
 
-> **k0 = (3 domains, 3 frames, 2 ports, 2 vCPUs, 2 pCPUs, 2 grants).**
+- **memory / sharing** (`UnauthorizedForeignLink`, `MisownedGrantMap`, the grant/p2m seams):
+  witness ≤ 2 owners; with dom0 possibly a third distinct party (A grants to B while C also
+  owns/maps), **3 domains** — exactly `grant_p2m_3dom_cfg`.
+- **authority chains** (`ControlEdgeOrphaned` orphan, `ControlEdgeDeadEndpoint`, delegation):
+  the orphan witness is 3 domains (holder, delegator, target), and reaching it needs a Root
+  creator behind the chain — dom0 plus a depth-2 delegation chain = **4 domains** — exactly
+  `delegation_cfg` (4), the smallest world that can even *form* a `Via`-of-a-`Via`.
 
-Note what this means for **Tier A**: its 3-domain / 3-frame sweeps
-(`grant_p2m_3dom_cfg`, `authority_seams_cfg`) were not "just a bigger K for reassurance" — they
-are, in retrospect, exactly the **base case of the cutoff**: a clean exhaustive run at k0. The
-size axis reduces to "does k0 hold?", and Tier A checked k0.
+Taking the max over all families gives the cutoff
+
+> **k0 = (4 domains, 3 frames, 2 ports, 2 vCPUs, 2 pCPUs, 2 grants).**
+
+Note what this means for **Tier A**: its 3-domain grant/p2m sweep (`grant_p2m_3dom_cfg`) and
+4-domain delegation sweep (`delegation_cfg` / `authority_seams_cfg`) were not "just a bigger K
+for reassurance" — *together* they are, in retrospect, exactly the **base case of the cutoff**:
+a clean exhaustive run at k0 for each family that needs it. The size axis reduces to "does k0
+hold?", and Tier A checked k0.
 
 ### 2.3 The projection lemma — the honest gap, stated precisely
 
@@ -307,7 +321,8 @@ transition relation, proven for arbitrary N).
 - **Symmetry** — the reduction from "all id-assignments" to "canonical `0..k−1`" is exact,
   because the code is id-agnostic except for dom0 at boot.
 - **The per-invariant locality analysis and the cutoff k0** — 27 of 28 invariants have a
-  bounded witness; k0 = (3,3,2,2,2,2); Tier A's 3-domain/3-frame sweeps are its base case.
+  bounded witness; k0 = (4,3,2,2,2,2); Tier A's 3-domain grant/p2m + 4-domain delegation
+  sweeps are its combined base case.
 
 **Handed to Tier C (deductive), because enumeration provably cannot reach it:**
 

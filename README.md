@@ -138,10 +138,10 @@ grant↔p2m *together*: a frame can be mapped an unbounded number of times, so t
 state space is genuinely infinite and finite only per depth — precisely the boundary
 where deductive proof (Tier C) becomes unavoidable, since one cannot enumerate an
 infinite space. A per-invariant **locality/cutoff** analysis (each of the 28
-invariants is violated by a bounded witness, so a size cutoff k0 = 3 domains / 3
-frames bounds the search — which Tier A's 3-domain sweeps already cover as the base
-case) and a **data-independence/symmetry** argument (the core branches on no literal
-id except dom0-at-boot) complete the size axis. The full argument, its two honest
+invariants is violated by a bounded witness, so a size cutoff k0 = 4 domains / 3
+frames bounds the search — which Tier A's 3-domain grant/p2m and 4-domain delegation
+sweeps already cover as the base case) and a **data-independence/symmetry** argument
+(the core branches on no literal id except dom0-at-boot) complete the size axis. The full argument, its two honest
 residuals handed to Tier C, and the measured saturation table live in
 [`docs/TIER-B-CUTOFF.md`](docs/TIER-B-CUTOFF.md).
 
