@@ -10,6 +10,12 @@ license = "Apache-2.0 OR MIT"
 authors = ["Via Balaena"]
 publish = false
 
+[features]
+# `selftest` makes Arc 2's boot deliberately execute `BRK #0` so the installed exception vectors
+# catch + decode a real fault (the boot-test asserts the decode). Off by default: the normal boot
+# installs the vectors and parks, leaving a clean path for Arc 3 to build on. See `src/exceptions.rs`.
+selftest = []
+
 # Standalone: its own workspace so the parent's stable `cargo test --workspace` never tries to
 # build this bare-metal binary (it targets `aarch64-unknown-none-softfloat` and would fail on the
 # host). The parent `Cargo.toml` also lists this dir under `exclude`. Mirrors how `hv-fuzz` is kept

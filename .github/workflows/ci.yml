@@ -85,13 +85,14 @@ jobs:
         working-directory: hv-fuzz
         run: cargo check --all-targets
 
-  # Metal boot smoke-test (M3, Arc 0): build the standalone bare-metal `hv-metal` binary for
-  # `aarch64-unknown-none-softfloat` and boot it on the QEMU `virt` machine at EL2, asserting the
-  # serial marker `rust_main` prints. This is the metal side of the "diamond -> CI-green -> merge"
-  # loop — every later metal arc rides this check. `hv-metal` is excluded from the workspace (it
-  # cannot link for the host), so it is built + booted out-of-band via `cargo xtask qemu-test`.
-  # Functional refinement only — see docs/QEMU-AND-METAL.md for what an emulated run does and does
-  # not attest.
+  # Metal boot smoke-test (M3): build the standalone bare-metal `hv-metal` binary for
+  # `aarch64-unknown-none-softfloat` and boot it on the QEMU `virt` machine at EL2. As of Arc 2 it
+  # asserts the serial markers for the alive banner, `CurrentEL = EL2`, and — in the `--features
+  # selftest` build — that the installed exception vectors CATCH and DECODE a deliberate `BRK`
+  # (`EC=0x3c`). This is the metal side of the "diamond -> CI-green -> merge" loop — every later
+  # metal arc rides this check. `hv-metal` is excluded from the workspace (it cannot link for the
+  # host), so it is built + booted out-of-band via `cargo xtask qemu-test`. Functional refinement
+  # only — see docs/QEMU-AND-METAL.md for what an emulated run does and does not attest.
   metal-boot:
     name: metal boot (QEMU)
     runs-on: ubuntu-latest

@@ -22,6 +22,17 @@ SECTIONS {
         *(.text .text.*)
     }
 
+    /*
+     * The EL2 exception vector table (Arc 2). VBAR_EL2[10:0] are RES0, so the table base must be
+     * 2 KiB-aligned; we force that alignment here so it is explicit and auditable rather than
+     * implied by the input section's attributes (the vector `global_asm!` also `.balign 0x800`s).
+     * The input section is named `.vectors` (not `.text.*`) so the `.text` glob above cannot pull
+     * it in and defeat this alignment. KEEP: nothing calls the table statically — it is reached
+     * only via VBAR_EL2 at runtime — so it must not be garbage-collected.
+     */
+    . = ALIGN(0x800);
+    .vectors : { KEEP(*(.vectors)) }
+
     .rodata : { *(.rodata .rodata.*) }
     .data   : { *(.data .data.*) }
 
