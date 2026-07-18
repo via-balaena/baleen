@@ -70,7 +70,8 @@ pub enum RunState {
     Blocked,
 }
 
-/// One virtual CPU: its run state plus its accumulated on-CPU time.
+/// One virtual CPU: its run state, its accumulated on-CPU time, and its hard-affinity
+/// mask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VirtualCpu {
     state: RunState,
@@ -80,6 +81,14 @@ struct VirtualCpu {
     /// When the current `Running` interval began. Meaningful only while `Running`;
     /// closed into `runtime` the moment the vCPU leaves a CPU.
     dispatched_at: Ticks,
+    /// The **hard-affinity mask**: bit `p` set means this vCPU may be dispatched onto
+    /// physical CPU `p`. Real hardware's cpumask (Xen's `cpu_hard_affinity`). A vCPU may
+    /// only ever be `Running` on a pCPU in this set — the affinity invariant. Defaults to
+    /// *all* pCPUs (run anywhere) at boot and is reset to all on [`System::offline`], so an
+    /// `Offline` vCPU always carries the default; [`System::set_affinity`] narrows it while
+    /// the vCPU is live. Bits beyond the system's pCPU count are never set (masks are
+    /// canonicalized to the pCPU range), so two masks that agree on the real pCPUs are equal.
+    affinity: u64,
 }
 
 impl VirtualCpu {
@@ -87,7 +96,29 @@ impl VirtualCpu {
         state: RunState::Offline,
         runtime: 0,
         dispatched_at: 0,
+        // A placeholder; every construction site overrides it with the real pCPU-count
+        // mask (`new`/`offline` set the full mask), since the correct default depends on
+        // how many pCPUs the system has — which a `const` cannot know.
+        affinity: 0,
     };
+}
+
+/// The all-pCPUs affinity mask for a system of `num_pcpus` physical CPUs — every pCPU
+/// permitted. This is the default a vCPU boots and returns to on offline. Saturates to
+/// all-ones at 64 pCPUs (the model's mask width; wider cpumasks are an `hv-metal`
+/// concern past the fence, like the 512-entry page table).
+fn full_mask(num_pcpus: usize) -> u64 {
+    if num_pcpus >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << num_pcpus) - 1
+    }
+}
+
+/// Whether affinity `mask` permits physical CPU `pcpu`. A pCPU at or beyond the 64-bit
+/// mask width is never permitted (a defensive default; the model keeps `pcpu_count <= 64`).
+fn mask_permits(mask: u64, pcpu: Pcpu) -> bool {
+    1u64.checked_shl(pcpu).is_some_and(|bit| mask & bit != 0)
 }
 
 /// One domain's fixed-size table of virtual CPUs.
@@ -121,6 +152,11 @@ pub enum SchedError {
     WrongState,
     /// The target physical CPU is already running another vCPU.
     PcpuBusy,
+    /// The move would place, or leave, a vCPU on a physical CPU outside its hard-affinity
+    /// mask: a [`System::run`] onto a non-permitted pCPU, or a [`System::set_affinity`] that
+    /// would exclude the pCPU a vCPU is currently `Running` on (the scheduler never
+    /// force-migrates — it refuses, a no-op). The guard behind the affinity invariant.
+    NotAffine,
 }
 
 /// A named invariant breach, carrying where it was found. Returned by
@@ -137,14 +173,28 @@ pub enum Violation {
     OccupantNotRunning { pcpu: usize },
     /// A physical CPU names an occupant whose domain/vCPU ids are out of range.
     OccupantGhost { pcpu: usize },
+    /// A `Running` vCPU is on a physical CPU outside its hard-affinity mask — the affinity
+    /// invariant's breach. A vCPU may be dispatched only onto a permitted pCPU
+    /// ([`System::run`] guards it) and its affinity may not be narrowed to exclude the pCPU
+    /// it already runs on ([`System::set_affinity`] guards it), so this can never arise —
+    /// the scheduler's second safety invariant, beside pCPU exclusivity.
+    RunningOffAffinity { dom: usize, vcpu: usize },
 }
 
 impl System {
     /// A system of `num_domains` domains, each with `vcpus_per_domain` offline vCPUs,
     /// over `num_pcpus` idle physical CPUs.
     pub fn new(num_domains: usize, vcpus_per_domain: usize, num_pcpus: usize) -> Self {
+        // Every vCPU boots Offline with *all* pCPUs permitted — the default affinity, so
+        // existing behaviour (a Runnable vCPU may run on any idle pCPU) is unchanged until
+        // some `set_affinity` narrows it.
         let make_domain = || Domain {
-            vcpus: (0..vcpus_per_domain).map(|_| VirtualCpu::OFFLINE).collect(),
+            vcpus: (0..vcpus_per_domain)
+                .map(|_| VirtualCpu {
+                    affinity: full_mask(num_pcpus),
+                    ..VirtualCpu::OFFLINE
+                })
+                .collect(),
         };
         System {
             domains: (0..num_domains).map(|_| make_domain()).collect(),
@@ -184,8 +234,15 @@ impl System {
         if pcpu as usize >= self.pcpus.len() {
             return Err(SchedError::BadPcpu);
         }
-        if self.vcpu(dom, vcpu)?.state != RunState::Runnable {
+        let v = self.vcpu(dom, vcpu)?;
+        if v.state != RunState::Runnable {
             return Err(SchedError::WrongState);
+        }
+        // Affinity: the vCPU may be dispatched only onto a pCPU in its hard-affinity mask.
+        // Checked before occupancy, so an off-affinity dispatch is refused for the same
+        // reason regardless of whether the pCPU happens to be free — and it is a no-op.
+        if !mask_permits(v.affinity, pcpu) {
+            return Err(SchedError::NotAffine);
         }
         if self.pcpus[pcpu as usize].is_some() {
             return Err(SchedError::PcpuBusy);
@@ -238,6 +295,42 @@ impl System {
         Ok(())
     }
 
+    /// Set a vCPU's **hard-affinity mask** — the set of physical CPUs it may be dispatched
+    /// onto (bit `p` = pCPU `p` permitted). The mask is canonicalized to the system's pCPU
+    /// range (bits beyond `pcpu_count` are dropped, so equal-on-real-pCPUs masks compare
+    /// equal). This is the settable analogue of a fixed vCPU↔pCPU binding — Xen's
+    /// `cpu_hard_affinity` / `XEN_DOMCTL_setvcpuaffinity`.
+    ///
+    /// **Refused, never force-migrated.** If the vCPU is `Running` on a pCPU the new mask
+    /// excludes, this returns [`SchedError::NotAffine`] and mutates nothing — the core moves
+    /// vCPUs only through the explicit run-state transitions (a policy layer that wants to
+    /// re-place a running vCPU preempts it first), so "a `Running` vCPU is on an affine pCPU"
+    /// ([`Violation::RunningOffAffinity`]) holds by construction rather than by a migration
+    /// side effect here. Setting affinity on an `Offline`/`Runnable`/`Blocked` vCPU always
+    /// succeeds — none holds a pCPU to strand.
+    ///
+    /// An **empty** mask (run nowhere) is allowed: it makes the vCPU unschedulable until the
+    /// affinity is widened, which is a *liveness* concern, not a safety one — a starved vCPU
+    /// is a policy bug, a double-booked or off-affinity pCPU is the catastrophe this module
+    /// guards against. Keeping a runnable set non-empty is left to the policy layer above.
+    pub fn set_affinity(
+        &mut self,
+        dom: DomId,
+        vcpu: Vcpu,
+        affinity: u64,
+    ) -> Result<(), SchedError> {
+        let mask = affinity & self.full_affinity();
+        let v = self.vcpu(dom, vcpu)?;
+        if let RunState::Running { pcpu } = v.state {
+            if !mask_permits(mask, pcpu) {
+                return Err(SchedError::NotAffine);
+            }
+        }
+        self.vcpu_mut(dom, vcpu).unwrap().affinity = mask;
+        self.check_invariants();
+        Ok(())
+    }
+
     /// Take a vCPU offline from any live state: `Runnable`/`Running`/`Blocked` →
     /// `Offline`. If it was running, its interval is closed at `now` and its physical
     /// CPU freed. Rejects an already-`Offline` vCPU so a caller cannot silently
@@ -251,7 +344,18 @@ impl System {
             }
             RunState::Runnable | RunState::Blocked => {}
         }
-        self.vcpu_mut(dom, vcpu).unwrap().state = RunState::Offline;
+        // Going offline returns the vCPU to a clean baseline: Offline *and* default
+        // (all-pCPUs) affinity. So an Offline vCPU always carries the default, and a vCPU
+        // re-admitted — or reborn in a reused domain slot — starts with no stale scheduling
+        // constraint from a past life. Affinity is behaviourally live (it gates `run`, unlike
+        // `runtime` which gates nothing), so resetting it is what keeps a reborn domain
+        // behaving identically to a fresh one. (A deliberate model choice: Xen preserves
+        // affinity across offline; the brain values the clean-shell/reuse property more — the
+        // same call it made choosing eager cleanup over a generation counter.)
+        let full = self.full_affinity();
+        let v = self.vcpu_mut(dom, vcpu).unwrap();
+        v.state = RunState::Offline;
+        v.affinity = full;
         self.check_invariants();
         Ok(())
     }
@@ -307,6 +411,20 @@ impl System {
         self.pcpus.get(pcpu as usize).copied().flatten()
     }
 
+    /// A vCPU's hard-affinity mask (bit `p` = pCPU `p` permitted), if the ids are in range.
+    /// Behaviourally live — it gates [`Self::run`] — so a faithful state fingerprint must
+    /// include it. Always the all-pCPUs default while the vCPU is `Offline`.
+    pub fn affinity_of(&self, dom: DomId, vcpu: Vcpu) -> Option<u64> {
+        self.vcpu(dom, vcpu).ok().map(|v| v.affinity)
+    }
+
+    /// The all-pCPUs affinity mask for this system — the default every vCPU boots and
+    /// returns to on offline. Exposed so an integrating layer can name the default (e.g. to
+    /// confirm a torn-down domain's vCPUs carry it).
+    pub fn full_affinity(&self) -> u64 {
+        full_mask(self.pcpus.len())
+    }
+
     /// Number of domains.
     pub fn domain_count(&self) -> usize {
         self.domains.len()
@@ -345,6 +463,12 @@ impl System {
                                 return Some(Violation::OccupancyBroken { dom: d, vcpu: c });
                             }
                         }
+                    }
+                    // Affinity: a Running vCPU must be on a pCPU its mask permits. The run
+                    // guard and the set_affinity guard together maintain this, so a breach
+                    // means one of those transitions failed to enforce it.
+                    if !mask_permits(vc.affinity, pcpu) {
+                        return Some(Violation::RunningOffAffinity { dom: d, vcpu: c });
                     }
                 }
             }
@@ -611,6 +735,95 @@ mod tests {
         assert_eq!(s.admit(0, 9), Err(SchedError::BadVcpu));
         s.admit(0, 0).unwrap();
         assert_eq!(s.run(0, 0, 9, 0), Err(SchedError::BadPcpu));
+    }
+
+    // ─── affinity ──────────────────────────────────────────────────────────────
+    // sys() is 3 domains × 2 vCPUs over 2 pCPUs, so the full mask is 0b11 (pCPU 0 = bit 0,
+    // pCPU 1 = bit 1).
+
+    #[test]
+    fn affinity_defaults_to_all_pcpus_and_can_be_narrowed() {
+        let mut s = sys();
+        s.admit(0, 0).unwrap();
+        // Default: may run on any pCPU.
+        assert_eq!(s.affinity_of(0, 0), Some(0b11));
+        assert!(s.run(0, 0, 0, 0).is_ok());
+        s.preempt(0, 0, 1).unwrap();
+
+        // Pin to pCPU 1 only.
+        s.set_affinity(0, 0, 0b10).unwrap();
+        assert_eq!(s.affinity_of(0, 0), Some(0b10));
+        // pCPU 0 is now refused (and the refusal is a no-op); pCPU 1 is fine.
+        assert_eq!(s.run(0, 0, 0, 2), Err(SchedError::NotAffine));
+        assert_eq!(
+            s.state_of(0, 0),
+            Some(RunState::Runnable),
+            "a refused off-affinity run mutates nothing"
+        );
+        assert!(s.run(0, 0, 1, 2).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn set_affinity_is_refused_while_running_on_an_excluded_pcpu() {
+        let mut s = sys();
+        s.admit(0, 0).unwrap();
+        s.run(0, 0, 0, 0).unwrap(); // Running on pCPU 0.
+
+        // Narrowing to exclude pCPU 0 while Running there is refused, mutating nothing — the
+        // scheduler never force-migrates.
+        assert_eq!(s.set_affinity(0, 0, 0b10), Err(SchedError::NotAffine));
+        assert_eq!(s.affinity_of(0, 0), Some(0b11), "a refused set is a no-op");
+        assert_eq!(s.state_of(0, 0), Some(RunState::Running { pcpu: 0 }));
+
+        // A mask that still permits the current pCPU is accepted (even if it drops others).
+        assert!(s.set_affinity(0, 0, 0b01).is_ok());
+        assert_eq!(s.affinity_of(0, 0), Some(0b01));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn offline_resets_affinity_to_the_default() {
+        let mut s = sys();
+        s.admit(0, 0).unwrap();
+        s.set_affinity(0, 0, 0b10).unwrap();
+        assert_eq!(s.affinity_of(0, 0), Some(0b10));
+
+        s.offline(0, 0, 0).unwrap();
+        // Back to the all-pCPUs default — a re-admitted (or reborn) vCPU starts unconstrained.
+        assert_eq!(s.affinity_of(0, 0), Some(0b11));
+        s.admit(0, 0).unwrap();
+        assert!(s.run(0, 0, 0, 0).is_ok(), "runs anywhere again");
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn an_empty_affinity_mask_is_allowed_but_unschedulable() {
+        let mut s = sys();
+        s.admit(0, 0).unwrap();
+        // Allowed to set (no safety content) — but the vCPU can now run nowhere.
+        s.set_affinity(0, 0, 0).unwrap();
+        assert_eq!(s.affinity_of(0, 0), Some(0));
+        assert_eq!(s.run(0, 0, 0, 0), Err(SchedError::NotAffine));
+        assert_eq!(s.run(0, 0, 1, 0), Err(SchedError::NotAffine));
+        // Still consistent, and re-widening restores schedulability.
+        s.set_affinity(0, 0, 0b11).unwrap();
+        assert!(s.run(0, 0, 0, 0).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn affinity_mask_is_canonicalized_to_the_pcpu_range() {
+        let mut s = sys(); // 2 pCPUs → only bits {0, 1} are meaningful.
+        s.admit(0, 0).unwrap();
+        // Bits beyond pCPU 1 are dropped, so this is just "all pCPUs".
+        s.set_affinity(0, 0, u64::MAX).unwrap();
+        assert_eq!(
+            s.affinity_of(0, 0),
+            Some(0b11),
+            "canonicalized to the real pCPUs"
+        );
+        assert!(s.invariants_hold());
     }
 
     #[test]

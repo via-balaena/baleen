@@ -104,6 +104,16 @@ pub enum HvCall {
     SchedWake { vcpu: Vcpu },
     /// Take one of the caller's vCPUs offline, closing any on-CPU interval at `now`.
     SchedOffline { vcpu: Vcpu, now: Ticks },
+    /// Set the **hard-affinity mask** of one of the caller's vCPUs — the set of physical
+    /// CPUs it may be dispatched onto (bit `p` = pCPU `p` permitted). The settable analogue
+    /// of a fixed vCPU↔pCPU binding (Xen's `XEN_DOMCTL_setvcpuaffinity`). Refused
+    /// ([`HvError::Sched`]`(`[`sched::SchedError::NotAffine`]`)`) if the vCPU is currently
+    /// `Running` on a pCPU the new mask excludes — the scheduler refuses rather than
+    /// force-migrate, so a rejected set mutates nothing. The mask is canonicalized to the
+    /// system's pCPU range. Like the other scheduler ops this acts on the *caller's own*
+    /// vCPU; layering the control axis onto it (a controller setting a target's affinity,
+    /// the faithful domctl) is a deferred refinement.
+    SchedSetAffinity { vcpu: Vcpu, affinity: u64 },
 
     /// Allocate a free machine frame to the caller.
     ///
@@ -653,6 +663,11 @@ impl Hypervisor {
             HvCall::SchedOffline { vcpu, now } => self
                 .sched
                 .offline(caller, vcpu, now)
+                .map(|()| HvOutcome::Done)
+                .map_err(HvError::Sched),
+            HvCall::SchedSetAffinity { vcpu, affinity } => self
+                .sched
+                .set_affinity(caller, vcpu, affinity)
                 .map(|()| HvOutcome::Done)
                 .map_err(HvError::Sched),
 
@@ -4282,6 +4297,96 @@ mod tests {
                 },
             ),
             Err(HvError::Evtchn(evtchn::EvtchnError::WrongState))
+        );
+        assert!(h.invariants_hold());
+    }
+
+    // ─── vCPU affinity ─────────────────────────────────────────────────────────
+
+    /// Setting a vCPU's hard affinity through the dispatch seam gates where it may be
+    /// dispatched: a `SchedRun` onto an excluded pCPU is refused, a permitted one succeeds.
+    #[test]
+    fn sched_set_affinity_through_dispatch_gates_run() {
+        let mut h = hv(); // 2 pCPUs → full mask 0b11
+        h.dispatch(1, HvCall::SchedAdmit { vcpu: 0 }).unwrap();
+        // Pin domain 1's vCPU 0 to pCPU 1 only.
+        h.dispatch(
+            1,
+            HvCall::SchedSetAffinity {
+                vcpu: 0,
+                affinity: 0b10,
+            },
+        )
+        .unwrap();
+        // It cannot be dispatched onto pCPU 0...
+        assert_eq!(
+            h.dispatch(
+                1,
+                HvCall::SchedRun {
+                    vcpu: 0,
+                    pcpu: 0,
+                    now: 0
+                }
+            ),
+            Err(HvError::Sched(sched::SchedError::NotAffine))
+        );
+        // ...but pCPU 1 is fine.
+        assert!(h
+            .dispatch(
+                1,
+                HvCall::SchedRun {
+                    vcpu: 0,
+                    pcpu: 1,
+                    now: 0
+                }
+            )
+            .is_ok());
+        assert!(h.invariants_hold());
+    }
+
+    /// Affinity is behaviourally live, so the reuse guarantee extends to it: a domain
+    /// narrows a vCPU's affinity, is torn down, and the slot is reborn — the reborn tenant's
+    /// vCPU inherits the default (all-pCPUs) affinity, no stale scheduling constraint from
+    /// its predecessor. (Teardown offlines every vCPU, and offline resets affinity.)
+    #[test]
+    fn a_reborn_domain_starts_with_default_affinity() {
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        // Domain 1 narrows one of its vCPUs' affinity to a single pCPU.
+        h.dispatch(1, HvCall::SchedAdmit { vcpu: 0 }).unwrap();
+        h.dispatch(
+            1,
+            HvCall::SchedSetAffinity {
+                vcpu: 0,
+                affinity: 0b10,
+            },
+        )
+        .unwrap();
+        assert_eq!(h.sched().affinity_of(1, 0), Some(0b10));
+
+        // Tear domain 1 down and revive the slot as a fresh tenant.
+        h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .unwrap();
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        // The reborn vCPU carries the default affinity, not the predecessor's narrowed mask.
+        assert_eq!(
+            h.sched().affinity_of(1, 0),
+            Some(h.sched().full_affinity()),
+            "a reborn vCPU starts with default (all-pCPUs) affinity"
         );
         assert!(h.invariants_hold());
     }
