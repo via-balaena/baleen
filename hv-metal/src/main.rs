@@ -221,7 +221,9 @@ const PORTS_PER_DOMAIN: usize = 4;
 const GRANTS_PER_DOMAIN: usize = 4;
 const VCPUS_PER_DOMAIN: usize = 2;
 const NUM_PCPUS: usize = 2;
-const NUM_FRAMES: usize = 8;
+/// Machine frames in the model. `pub(crate)` so [`guest`]'s per-frame fault-record array can
+/// compile-time-assert it covers every model frame (see `guest::NFRAMES`).
+pub(crate) const NUM_FRAMES: usize = 8;
 
 /// Domain 0 — the primordial control domain, `Live` from boot with a credit account. The acting
 /// domain for the synthetic call.
