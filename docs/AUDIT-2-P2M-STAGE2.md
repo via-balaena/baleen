@@ -207,11 +207,47 @@ the result: the model→page-table refinement denies exactly what the model forb
 what it authorizes, across read / write / foreign(granted) / unmapped / write-xor-pagetable, witnessed
 on every boot.
 
+## Diamond review pass (post-merge)
+
+After the arc landed, a dedicated review pass re-examined the implementation from three *adversarial*
+angles — **four independent perspectives + empirical mutation testing** — in the arc-4 rhythm
+(design-lesson #26). **Verdict: SOUND, no defect.**
+
+- **Three spec-blind auditors, orthogonal axes, all CLEAN.** (i) *Rust/unsafe soundness* — no UB, no
+  aliasing violation; every table index provably `< 512`, `frame_pa` provably inside the exactly-2 MiB
+  window, `GuestMem::ipa_to_pa` bounds-checked, and **no new exclusive/atomic on Device memory** (the
+  Arc-5 fault-record statics are `.store`/`.load` only; only the pre-existing `IN_GUEST_HANDLER.swap`
+  remains, within the named EL2-MMU gap). (ii) *False-green / witness integrity* — could not construct
+  a false-green: every asserted marker is conditionally gated, `is_translation(0)`/`is_permission(0)`
+  are both `false` so a probe that never faulted is scored *not-denied* (a skip can't masquerade as a
+  denial), and the positives are un-forgeable (`0x5EED` appears in no guest immediate; `rw`/`fgrant`
+  are cross-read by the hypervisor via `GuestMemory`). (iii) *Cross-arc composition* — Stage-2
+  registers mutually consistent, no Arc-2 vector regression, no linker collision; it surfaced that
+  `__guest_data_start == __guest_ram_end`, so the data-frame **host PAs sit outside the guest's only
+  identity mapping** — the guest can reach them solely through the IPA-gated `L3` path, so **isolation
+  holds by construction**, not merely by test.
+- **Empirical mutation testing** (the "remove the fix → tool rejects" discipline, #24). Three
+  single-line perturbations that *should* break isolation were applied and booted; the self-test
+  **caught all three**: (1) mapping the un-granted peer frame (isolation hole) → its read no longer
+  faults → `negative_ok=false` → FAIL; (2) emitting `S2AP=RW` for the read-only leaf (permission
+  bypass) → the RO-write no longer faults → FAIL (while `positive_ok` stays true, so the failure is
+  *exactly* the RO-write dimension); (3) skipping an authorized frame (over-restriction / liveness
+  hole) → the positive readback mismatches *and* `rw_faulted` → FAIL. The test discriminates
+  isolation holes, permission bypasses, **and** over-restriction.
+- **Three below-bar findings, all fixed in the review-pass hardening** (none a soundness defect): a
+  `DFSC`-sentinel comment was imprecise (`DFSC=0x00` is a valid address-size fault, unreachable by the
+  probed IPAs — reworded to state *why* the `0` sentinel is sound: it is never *scored as a denial*);
+  a stale `GUEST_VMID` doc line referenced a guest-side constant that no longer exists (reworded); and
+  `NFRAMES` (the fault-array size and region bound) was independently defined from `NUM_FRAMES` —
+  hardened with a `const _: () = assert!(NFRAMES >= crate::NUM_FRAMES)` so a future model growth can't
+  silently push a probeable frame past the array.
+
 ## Verdict
 
 **The emitted Stage-2 table realizes the proven `p2m` for CPU data access — it denies exactly what
 the model forbids and permits exactly what it authorizes, across read / write / foreign(granted) /
-unmapped, three-way-converged and witnessed on every boot.** `GuestMemory` is now **realized** on ARM
+unmapped, three-way-converged and witnessed on every boot; a four-perspective diamond review pass plus
+mutation testing found no soundness defect.** `GuestMemory` is now **realized** on ARM
 (the assumption Audit #1 named for this arc, closed), behind the neutral fence — no descriptor bit
 leaks into a signature. Superpage and execute-never runtime witnesses are named-deferred; the
 crate-wide EL2-MMU gap is untouched and carried forward. No soundness defect. Arc 5 *refines* the

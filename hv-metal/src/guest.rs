@@ -261,9 +261,17 @@ static LAST_RESULT: AtomicU64 = AtomicU64::new(u64::MAX);
 static IN_GUEST_HANDLER: AtomicBool = AtomicBool::new(false);
 
 /// Per-frame data-abort record: the `DFSC` of the fault taken on that model frame's IPA, or `0` for
-/// no fault (a real `DFSC` is never 0 — translation faults are `0x04..0x07`, permission `0x0D..0x0F`).
-/// Sized to the model's frame count so a frame index is always in range.
+/// no fault. The sentinel is sound because a `0` is never *scored as a denial*: `is_translation`
+/// (`0x04..0x07`) and `is_permission` (`0x0D..0x0F`) both reject it — so a probe that never faulted
+/// reads as "not denied" and fails the matrix. (`DFSC=0x00` is itself a valid code, an address-size
+/// fault at level 0, but none of the probed IPAs — well inside the 39-bit IPA window — can raise one;
+/// and even then a missed write is independently caught by the positive content read-back.)
+/// Sized to the model's frame count so a frame index is always in range. It also bounds the
+/// "guest data region" [`record_data_abort`] accepts, so it MUST cover every model frame — asserted
+/// at compile time against [`crate::NUM_FRAMES`] so a future arc that grows the model can't silently
+/// push a probeable frame past the fault array (which would halt-on-fault rather than record it).
 const NFRAMES: usize = 8;
+const _: () = assert!(NFRAMES >= crate::NUM_FRAMES);
 static FAULT_DFSC: [AtomicU64; NFRAMES] = [const { AtomicU64::new(0) }; NFRAMES];
 /// The `WnR` bit (write-not-read) of that frame's fault — `true` for a store, meaningful with `DFSC`.
 static FAULT_WNR: [AtomicBool; NFRAMES] = [const { AtomicBool::new(false) }; NFRAMES];

@@ -108,7 +108,10 @@ fn data_ram_end() -> u64 {
     core::ptr::addr_of!(__guest_data_end) as u64
 }
 
-/// VMID for the guest — matches [`crate::guest`]'s single-guest VMID so `VTTBR_EL2` is consistent.
+/// VMID for the single guest — stamped into `VTTBR_EL2[55:48]` here, and reached by
+/// [`crate::guest`]'s `tlbi vmalls12e1is` transitively through that `VTTBR_EL2` value (the metal has
+/// no separate guest-side VMID constant). Nonzero to distinguish it from the "no VMID" default;
+/// 8-bit, since `VTCR_EL2.VS=0`.
 const GUEST_VMID: u64 = 1;
 
 // ---------------------------------------------------------------------------------------------
