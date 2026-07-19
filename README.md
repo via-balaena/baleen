@@ -102,9 +102,9 @@ of a sort — one faces guests, one faces hardware — and neither leaks into th
                      │                 │
          ┌───────────▼──────┐   ┌──────▼─────────────────┐
          │ hv-sim (host)    │   │ hv-metal (bare metal)  │
-         │ Vec<u8> memory   │   │ real page tables, VMX  │
+         │ Vec<u8> memory   │   │ real Stage-2 tables    │
          │ manual clock     │   │ the thin unsafe core   │
-         │ deterministic    │   │  — M3 —                │
+         │ deterministic    │   │  — M4 —                │
          └──────────────────┘   └────────────────────────┘
    SOUTHBOUND — hardware (the fence)
 ```
@@ -688,8 +688,10 @@ The decision, repo/CI shape, what is proven, and that finding live in
   fidelity contract for QEMU testing: what a green run does (functional refinement of the proven model
   — CPU-access isolation) and does *not* (timing, memory-ordering, DMA/SMMU, errata) tell you, and why
   on Apple Silicon Baleen-at-EL2 runs under pure-emulation TCG where that gap is maximal.
-- **M4 — first guest: the proof touches reality** *(Arc 4 landed)*: a trivial guest at EL1 whose
-  traps to EL2 become `hv-core` calls — the fence becomes real and load-bearing.
+- **M4 — first guest: the proof touches reality** *(Arcs 4–5 landed)*: a trivial guest at EL1 whose
+  traps to EL2 become `hv-core` calls, and whose unauthorized memory accesses are **faulted by real
+  Stage-2 tables generated from the proven `p2m`** — the fence becomes real and load-bearing, and the
+  first **isolation** content reaches the metal.
   - **Arc 4 — trap-and-service. ✅ DONE**
     ([`docs/ARC-4-TRAP-AND-SERVICE.md`](docs/ARC-4-TRAP-AND-SERVICE.md)): a trivial EL1 guest boots
     behind a minimal Stage-2 (`HCR_EL2.VM=1` + one 2 MiB identity block, `src/guest.rs`), issues
@@ -701,9 +703,23 @@ The decision, repo/CI shape, what is proven, and that finding live in
     the echo proves the guest saw the *serviced* result, across two resume cycles). `VcpuOps::
     set_entry` realized on ARM (`ELR_EL2`); `inject_interrupt`/`GuestMemory` honestly deferred.
     Three-way converged (spec-derived code + blind Arm-ARM auditor + QEMU). **No isolation content.**
-  - **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test** (next): translate the proven
-    `p2m` into faithful AArch64 Stage-2 descriptors; a guest touching unauthorized memory faults to
-    EL2. **🔍 Architecture Audit #2** — does the emitted table deny *exactly* what the model says?
+  - **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test. ✅ DONE**
+    ([`docs/AUDIT-2-P2M-STAGE2.md`](docs/AUDIT-2-P2M-STAGE2.md)): the guest runs behind **real AArch64
+    Stage-2 tables emitted from the proven `p2m`** (`src/stage2.rs`, a leaf-reachability refinement of
+    `p2m::link_edges`). The model is driven — via the actual `Hypervisor::dispatch` — into a
+    two-domain config (guest `G`, peer `P` granting `G` one frame read-write), and the guest runs the
+    full **authorize/deny matrix in one boot** (resume-past-fault): its authorized accesses **succeed**
+    (writable frame, read-only frame seeded by the now-realized `GuestMemory` with an un-forgeable
+    value, foreign granted frame), and every unauthorized access is **faulted by the hardware** — a
+    write to a read-only frame → *permission* fault (`EC=0x24`, `DFSC=0x0F`, `WnR=1`); an un-granted
+    peer frame, an unmapped IPA, and the guest's **own page-table frame as data** (write-xor-pagetable)
+    → *translation* faults (`DFSC=0x07`), each decoded from `ESR_EL2`/`HPFAR_EL2` and confirmed against
+    the model. **🔍 Architecture Audit #2 — the model→page-table refinement**: the emitted table denies
+    *exactly* what the model forbids and permits exactly what it authorizes, across
+    read / write / foreign(granted) / unmapped / write-xor-pagetable; execute (XN) and superpage are
+    audited by construction (runtime witness deferred). Three-way converged (spec-derived code + **two**
+    spec-blind auditors [AArch64 encodings + the model refinement] + QEMU) — verdict **SOUND**. A
+    feature-gated self-test asserts the whole matrix on every boot.
 - **M5+**: the **greenfield "slim Qubes"** capstone — unmodified Linux guests under
   hardware-virt + **virtio**; isolated **disposables** from a template; an offline **vault**;
   a trusted **input/GUI domain**; **direct device attach** (data USB); and **GPU
