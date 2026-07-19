@@ -39,6 +39,7 @@ mod exceptions;
 mod guest;
 mod heap;
 mod pl011;
+mod stage2;
 mod time;
 
 use core::arch::global_asm;

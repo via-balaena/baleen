@@ -202,10 +202,23 @@ timeout) so "diamond → CI-green → merge" stays alive on the metal side.
   honestly deferred. Three-way converged (spec-derived code + blind Arm-ARM auditor + QEMU). No
   isolation content — that is Arc 5.
   *See-it: the proven brain services a real guest's hypercall and the guest observes the result.*
-- **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test.** Translate the model's `p2m` into
-  real AArch64 Stage-2 descriptors; a guest touching unauthorized memory faults to EL2.
-  **🔍 Architecture Audit #2 — model→page-table refinement:** does the emitted table deny *exactly*
-  what the model says, across read/write/execute/foreign/superpage?
+- **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test. ✅ DONE**
+  (`docs/AUDIT-2-P2M-STAGE2.md`). The guest runs behind **real AArch64 Stage-2 tables generated from
+  the proven `p2m`** (`hv-metal/src/stage2.rs`, emitted from `p2m::link_edges` — a leaf-reachability
+  refinement). The model is driven (via real `Hypervisor::dispatch`) into a two-domain config — guest
+  `G`, peer `P` granting `G` one frame RW — and the guest runs the full **authorize/deny matrix in one
+  boot** (resume-past-fault): authorized accesses SUCCEED (writable frame, HV-seeded read-only frame,
+  granted foreign frame — cross-checked through the now-**realized `GuestMemory`**), and every
+  unauthorized access is **faulted by the hardware** — write-to-read-only → *permission* fault
+  (`EC=0x24`, `DFSC=0x0F`, `WnR=1`), un-granted peer frame / unmapped IPA / **own page-table frame as
+  data** (write-xor-pagetable) → *translation* faults (`DFSC=0x07`), each decoded from
+  `ESR_EL2`/`HPFAR_EL2` and confirmed against the model. **🔍 Architecture Audit #2 — model→page-table
+  refinement:** the emitted table denies *exactly* what the model forbids and permits exactly what it
+  authorizes across read / write / foreign(granted) / unmapped / write-xor-pagetable; execute (XN) and
+  superpage are audited by construction with runtime witnesses deferred; the interior-node-sharing
+  dimension is out of Stage-2's leaf-level scope. Three-way converged (spec-derived code + two
+  spec-blind auditors [encodings + model-refinement] + QEMU) — verdict **SOUND**, no defect. A
+  feature-gated self-test asserts the whole matrix on every boot.
   *See-it: **the proof touches reality** — the guest is faulted by the real tables generated from the
   proven `p2m`.*
 
@@ -245,7 +258,7 @@ point of the `hv-hal` fence); only the metal layer does.
 |---|---|---|
 | `hv-core` (M0) | **proven** ∀-N, both non-interference directions | — (it's the model) |
 | M3 HAL / metal | *refines* — `TimeSource` realized+honored (ARM); `GuestMemory`/`VcpuOps` deferred, assumptions named (Audit #1, `docs/AUDIT-1-HAL-FENCE.md`) | no (QEMU-sound) |
-| M4 Stage-2 gen | *refines* (model→page-table bridge; negative-isolation test) | no (QEMU-sound) |
+| M4 Stage-2 gen | *refines* — real `p2m`→Stage-2 emitted + negative-isolation test PASSED; `GuestMemory` realized+honored (ARM); Audit #2 SOUND (`docs/AUDIT-2-P2M-STAGE2.md`) | no (QEMU-sound) |
 | M5 disposables + vault | *refines* (lifecycle + non-interference cashed in) | no (QEMU-sound) |
 | M6 input/GUI domain | *extends* (focus-integrity) + plumbing | no |
 | M7 DMA / IOMMU | **extends** (new `hv-core` DMA-isolation proof) | **yes** |

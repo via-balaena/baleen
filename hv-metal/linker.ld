@@ -80,5 +80,22 @@ SECTIONS {
     . += 0x200000;
     __guest_ram_end = .;
 
+    /*
+     * Guest DATA frames (M4 Arc 5). A separate, 2 MiB-aligned NOLOAD region backing the model's
+     * per-frame `p2m` mappings — deliberately DISTINCT from the guest image window above so the
+     * isolation surface under Architecture Audit #2 is cleanly separable from the infrastructure
+     * that merely runs the guest. Each model machine frame `m` the guest is authorized to reach is
+     * backed at `__guest_data_start + m * 4 KiB` (host PA) and mapped by Stage-2 at a distinct
+     * guest IPA (`stage2::DATA_IPA_BASE + m * 4 KiB`) — IPA != PA, so the emitted table does a real
+     * translation, not an identity pass-through. 2 MiB is far more than the handful of 4 KiB frames
+     * the negative-isolation test uses, and 2 MiB alignment keeps it its own Stage-2 L2 region.
+     * NOLOAD: reserves DRAM without bloating the image; the hypervisor seeds these frames at boot
+     * via the realized `hv_hal::GuestMemory`, so their contents are written, not relied upon zero.
+     */
+    . = ALIGN(0x200000);
+    __guest_data_start = .;
+    . += 0x200000;
+    __guest_data_end = .;
+
     /DISCARD/ : { *(.comment) *(.note .note.*) *(.eh_frame*) }
 }
