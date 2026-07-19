@@ -257,6 +257,16 @@ draws the emulation-vs-metal line); and the timing/side-channel surface (caches,
 outside both the model and QEMU — an M7/M8-and-beyond concern that needs new design (constant-time
 discipline, SMMU config), not just testing.
 
+**Named prerequisite for the first real-hardware run — EL2 MMU bring-up.** Through M4 the hypervisor
+runs with its own stage-1 MMU off (`SCTLR_EL2.M=0`), so on real silicon its data accesses are
+Device-nGnRnE — which makes its **atomics** UNPREDICTABLE (livelock) and leaves its **caches**
+unmanaged. This is invisible under QEMU/TCG (our only environment; Apple Silicon gates EL2) and does
+not affect the proof or any QEMU-based arc, so it is *named-and-deferred*, not fixed inline: the M4
+Arc-4 review pass surfaced it and the clean fix — an EL2 stage-1 Normal-cacheable identity map +
+`SCTLR_EL2.M/C/I` + boot cache-invalidation — is a dedicated arc scheduled **before the first
+real-hardware run**, because its core payoff can only be *validated* on real EL2 silicon (no
+QEMU/spec/auditor oracle reaches it). See `docs/ARC-4-TRAP-AND-SERVICE.md`, "Real-hardware readiness".
+
 ## One-line summary
 
 Build a greenfield, virtio-based **slim Qubes** — GPU-accelerated near-metal disposables, a vault,

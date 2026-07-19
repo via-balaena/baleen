@@ -82,6 +82,19 @@ that environment the timing / memory-ordering gap is **maximal, not incidental**
 functional-correctness tool, full stop, and items (1)–(4) above must be validated later on real
 ARM hardware with EL2 access.
 
+**A concrete instance of items (2) and (4), named by the M4 Arc-4 review pass — the EL2-MMU gap.**
+Through M4 the hypervisor runs with its *own* stage-1 MMU off (`SCTLR_EL2.M=0`), so on real silicon
+every EL2 data access is Device-nGnRnE. That makes the hypervisor's **atomics** (spinless
+`compare_exchange` in the allocator, the guest handler's re-entry flag) architecturally
+**UNPREDICTABLE** — `LDXR/STXR` on Device memory typically livelock — and leaves **caches unmanaged**
+(freshly-written guest code vs. the I-cache; a cacheable Stage-2 walker vs. uncached descriptor
+writes). Both are **completely invisible under TCG** and do not affect the proof; they are the
+distance between a green QEMU boot and a real-metal run. The fix is a named prerequisite arc for the
+first real-hardware run — an EL2 stage-1 Normal-cacheable identity map + `SCTLR_EL2.M/C/I` + boot
+cache-invalidation — deferred because its core payoff can only be *validated* on real EL2 silicon
+(see `docs/ARC-4-TRAP-AND-SERVICE.md`, "Real-hardware readiness"). Read a green QEMU boot as
+functional evidence only, exactly as this doc says.
+
 ## The discipline — how not to be misled
 
 Same move that keeps the proofs honest — name the abstraction:

@@ -97,6 +97,19 @@ boot_and_check() {
 #   - generic timer live          -> the TimeSource read a monotonic, advancing count;
 #   - HvCall CreditGrant ... =100  -> the linked hv-core brain serviced a real hypercall on the metal
 #                                    (printed ONLY when the dispatch returned exactly Balance(100)).
+#
+# Arc-4 review note on which of the guest markers are genuine WITNESSES vs. progress lines:
+#   - "entering EL1 guest" is a PROGRESS line, printed before the `eret` — it does NOT itself prove
+#     entry (an unconditional print, like the Arc-3 "VBAR_EL2 installed" false-green PR#32 fixed). The
+#     actual proof of EL1 entry is the pair of "guest HVC serviced ..." lines below: those print only
+#     when the guest ran, trapped, and the real Hypervisor::dispatch returned — a broken eret/Stage-2
+#     yields none of them and this test FAILS.
+#   - the "-> result=100" / "-> result=70" VALUES are load-bearing: the marker line is an
+#     unconditional print, but its integrity rests on the fixed result value here (grep -F). Do NOT
+#     loosen these to a value-free substring (e.g. "guest HVC serviced: nr=0") — that would let a
+#     rejected/stubbed call (result=u64::MAX) pass. The value is the witness.
+#   - "guest observed HvCall result=70 via HVC round-trip" prints ONLY on an exact echoed==served==70
+#     match — genuine proof the guest observed the serviced balance (70 is no call's input).
 boot_and_check "default" "" \
     "hv-metal alive" \
     "CurrentEL = EL2" \
