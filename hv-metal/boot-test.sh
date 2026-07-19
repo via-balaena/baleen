@@ -6,17 +6,21 @@
 # `virt` machine at EL2, and assert the expected serial markers appear. This is the metal side of
 # the "diamond -> CI-green -> merge" loop; CI runs it (see .github/workflows/ci.yml) and so can you.
 #
-# The boot runs TWICE (through M4 Arc 4):
+# The boot runs TWICE (through M4 Arc 5):
 #   - the DEFAULT build: at EL2, vectors installed, HCR_EL2.RW=1, the generic-timer TimeSource live
 #     and monotonic, a synthetic HvCall dispatched directly into the linked hv-core brain (Arc 3),
-#     and then the Arc-4 headline — a real EL1 guest issues HVC, traps to EL2, and has both
-#     hypercalls serviced through the ACTUAL Hypervisor::dispatch (nr=0 arg=100 -> 100, nr=1 arg=30
-#     -> 70), with the guest observing the serviced balance on a round-trip HVC (asserts each);
+#     the Arc-4 trap-and-service round trip (nr=0 arg=100 -> 100, nr=1 arg=30 -> 70, guest echoes 70),
+#     and then the Arc-5 headline — the NEGATIVE-ISOLATION TEST: the guest runs behind REAL AArch64
+#     Stage-2 tables generated from the proven p2m, its authorized accesses SUCCEED (rw=0xbeef,
+#     ro=0x5eed seeded by the HV through GuestMemory, fgrant=0xf00d) and its unauthorized accesses are
+#     FAULTED by the hardware — a write to a read-only frame -> permission fault, a read of an
+#     un-granted peer frame and of an unmapped IPA -> translation faults — each decoded (EC=0x24) and
+#     confirmed against the model. The matrix PASSED marker prints only when every dimension holds;
 #   - the `--features selftest` build: additionally asserts the Arc-3 accounting witness
-#     (grant 100 / spend 30 -> balance 70), hard-asserts the guest round-trip equality, then — chained
-#     at the end of the guest report — deliberately executes `BRK #0` so the installed exception
-#     vectors must CATCH and DECODE the fault (asserts the class `EC=0x3c` and the slot `vector=4`).
-#     Each marker is a witness produced BY the mechanism under test (design-lessons #23, #24(f)).
+#     (grant 100 / spend 30 -> balance 70), hard-asserts the isolation matrix, then — chained at the
+#     end of the final report — deliberately executes `BRK #0` so the installed exception vectors must
+#     CATCH and DECODE the fault (asserts the class `EC=0x3c` and the slot `vector=4`).
+#     Each marker is a witness produced BY the mechanism under test (design-lessons #23, #24(f), #25).
 #
 # Portable timeout: qemu parks in a wfe loop (it never exits on its own), so we run it in the
 # background, poll the serial log for the markers, and kill it as soon as they all appear (or once
@@ -98,18 +102,30 @@ boot_and_check() {
 #   - HvCall CreditGrant ... =100  -> the linked hv-core brain serviced a real hypercall on the metal
 #                                    (printed ONLY when the dispatch returned exactly Balance(100)).
 #
-# Arc-4 review note on which of the guest markers are genuine WITNESSES vs. progress lines:
+# Note on which of the guest markers are genuine WITNESSES vs. progress lines:
 #   - "entering EL1 guest" is a PROGRESS line, printed before the `eret` — it does NOT itself prove
 #     entry (an unconditional print, like the Arc-3 "VBAR_EL2 installed" false-green PR#32 fixed). The
-#     actual proof of EL1 entry is the pair of "guest HVC serviced ..." lines below: those print only
-#     when the guest ran, trapped, and the real Hypervisor::dispatch returned — a broken eret/Stage-2
+#     actual proof of EL1 entry is the "guest HVC serviced ..." lines below and the isolation markers:
+#     those print only when the guest ran, trapped, and was serviced/faulted — a broken eret/Stage-2
 #     yields none of them and this test FAILS.
-#   - the "-> result=100" / "-> result=70" VALUES are load-bearing: the marker line is an
-#     unconditional print, but its integrity rests on the fixed result value here (grep -F). Do NOT
-#     loosen these to a value-free substring (e.g. "guest HVC serviced: nr=0") — that would let a
-#     rejected/stubbed call (result=u64::MAX) pass. The value is the witness.
-#   - "guest observed HvCall result=70 via HVC round-trip" prints ONLY on an exact echoed==served==70
-#     match — genuine proof the guest observed the serviced balance (70 is no call's input).
+#   - the "-> result=100" / "-> result=70" VALUES are load-bearing: do NOT loosen to a value-free
+#     substring — that would let a rejected/stubbed call (result=u64::MAX) pass. The value is the
+#     witness. Likewise the Arc-5 isolation lines carry load-bearing content:
+#   - "isolation positive OK: rw=0xbeef ro=0x5eed fgrant=0xf00d" prints ONLY when every authorized
+#     access succeeded AND the hypervisor read the guest's writes back through GuestMemory. ro=0x5eed
+#     is un-forgeable: the guest never holds that immediate — it can only echo it by READING the frame
+#     the hypervisor seeded, so it proves the read-only Stage-2 mapping resolves to the right machine
+#     frame. Keep the values (grep -F).
+#   - each "isolation negative OK: ... -> permission/translation fault" line prints ONLY when the
+#     decoded fault (EC=0x24 data abort, ESR.DFSC class, WnR) matches the expected denial — a witness
+#     produced BY the real Stage-2 tables faulting the access. "permission fault" vs "translation
+#     fault" is load-bearing (it distinguishes S2AP-denied-write from unmapped-IPA).
+#   - "own-page-table read -> translation fault" is the write-xor-pagetable case: G's frame typed as
+#     a page table is not a leaf, so it is unmapped and unreachable as data — the headline p2m
+#     invariant, enforced by real hardware.
+#   - "NEGATIVE-ISOLATION TEST PASSED" prints ONLY when the whole authorize/deny matrix holds — the
+#     positive controls succeeded and all four denials faulted with the right class, and the
+#     authorized frames did NOT fault. This is the diamond: deny exactly what the model forbids.
 boot_and_check "default" "" \
     "hv-metal alive" \
     "CurrentEL = EL2" \
@@ -120,7 +136,13 @@ boot_and_check "default" "" \
     "entering EL1 guest" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \
     "guest HVC serviced: nr=1 arg=30 -> result=70" \
-    "guest observed HvCall result=70 via HVC round-trip"
+    "guest observed HvCall result=70 via HVC round-trip" \
+    "isolation positive OK: rw=0xbeef ro=0x5eed fgrant=0xf00d" \
+    "isolation negative OK: RO write -> permission fault" \
+    "isolation negative OK: foreign-ungranted read -> translation fault" \
+    "isolation negative OK: unmapped read -> translation fault" \
+    "isolation negative OK: own-page-table read -> translation fault" \
+    "NEGATIVE-ISOLATION TEST PASSED"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -139,7 +161,13 @@ boot_and_check "selftest" "--features selftest" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \
     "guest HVC serviced: nr=1 arg=30 -> result=70" \
     "guest observed HvCall result=70 via HVC round-trip" \
-    "selftest: guest round-trip OK" \
+    "isolation positive OK: rw=0xbeef ro=0x5eed fgrant=0xf00d" \
+    "isolation negative OK: RO write -> permission fault" \
+    "isolation negative OK: foreign-ungranted read -> translation fault" \
+    "isolation negative OK: unmapped read -> translation fault" \
+    "isolation negative OK: own-page-table read -> translation fault" \
+    "NEGATIVE-ISOLATION TEST PASSED" \
+    "selftest: isolation matrix OK" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
