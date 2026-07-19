@@ -123,6 +123,69 @@ stays architecture-neutral (Audit #1) — this records which are realized on ARM
 - **Runtime invariant checks** remain compiled out on the release metal build (`debug_assert!`), as
   Audit #1 named: the metal trusts the ∀-N proof, it does not re-check it at runtime.
 
+## The diamond review pass — verdict SOUND, with one real-hardware gap named
+
+Before proceeding to Arc 5, Arc 4 got a diamond-grade review pass (the same rigor as Arc 3's PR#32):
+an own adversarial re-read + ELF disassembly, plus **three independent auditors with distinct lenses**
+(Rust-unsafe/soundness; real-silicon fidelity; false-green/test-integrity), converged.
+
+**What held (no defect in any claimed-sound dimension):**
+- **Rust soundness — clean.** The GPR trampoline is byte-exact (disasm-verified: `x0..x30` at the
+  right offsets, `x30` saved/restored around the `bl`, 16-byte-aligned frame); the Stage-2 index math
+  is in-range and identity-correct; the `UnsafeCell`/`Sync` single-CPU-non-nested argument holds; the
+  `eret`/`SP_EL2` switch and the re-entry guard are sound. No UB.
+- **No false-green.** Every load-bearing witness (the round-trip `70`, the two per-call results, the
+  accounting selftest, the `BRK` decode) is genuinely produced by its mechanism and cannot print on a
+  failure path. Slot 8 disassembles to a bare `b __guest_sync_entry` (no `w0` clobber). Two cosmetic
+  markers hardened with comments (see `boot-test.sh`).
+- **QEMU functional correctness — confirmed** three ways; the exception/`eret`/Stage-2 *logic* and all
+  constants (`VTCR=0x8002_3559`, block `0x7FD`, `SPSR=0x3C5`, the `dsb/tlbi/isb` order) re-derived
+  independently and agree. `hv-core` untouched.
+
+### Real-hardware readiness — the EL2-MMU gap (named, deferred)
+
+The real-silicon auditor found a genuine gap the per-mechanism QEMU-vs-metal lines did not close, and
+it is worth stating plainly: **the hypervisor runs the entire time with its own stage-1 MMU off**
+(`SCTLR_EL2.M=0`, never enabled), so on real silicon *every EL2 data access is Device-nGnRnE*. That
+has two consequences, **both invisible under QEMU/TCG** (which ignores memory type — the reason the
+gap was invisible):
+
+1. **Atomics are architecturally UNPREDICTABLE.** `LDXR/STXR` (and LSE atomics) on Device memory are
+   CONSTRAINED UNPREDICTABLE; the common outcome is a perpetually-failing `STXR` — a livelock. This
+   reaches `IN_GUEST_HANDLER` (Arc 4) and, pre-existing since Arc 3, the bump allocator's
+   `compare_exchange`.
+2. **Caches are unmanaged.** Freshly-copied guest code is written (uncached) then fetched (cacheable)
+   with no I-cache maintenance; the Stage-2 walker is programmed cacheable while its descriptors are
+   written by uncached stores. On silicon either can read stale lines out of the UNKNOWN reset cache
+   state. (For Arc 4 *as shipped* the Device write path + the cold first-boot I-cache make it
+   incidentally safe; the gap becomes load-bearing on a guest *reload* into a warm-cache window.)
+
+**Scope of this gap (important):** it is *not* introduced by Arc 4 — it spans arcs 0–4 — it does
+**not** affect QEMU (our only environment; Apple Silicon gates EL2, so we run under TCG) or the proof,
+and it is within the metal's already-declared *real-HW-deferred* scope. It is the honest distance
+between "QEMU-sound" and "runs on metal."
+
+**Why it is named-and-deferred rather than fixed now:** the single clean fix is a dedicated
+prerequisite arc for the first real-hardware run — **an EL2 stage-1 Normal-cacheable identity map +
+`SCTLR_EL2.M/C/I` + boot-time I/D-cache invalidation** (closing atomics *and* caches together). But
+its *core payoff* — "atomics stop being UNPREDICTABLE, caches become coherent *on silicon*" — has **no
+oracle but real EL2 hardware**: no spec, blind auditor, or QEMU run can confirm it (QEMU shows the same
+green boot with or without the fix). Diamonding is oracle-bound; building unvalidatable real-HW code
+early carries weight without cutting a diamond. So — per the roadmap decision — **naming this gap
+precisely here *is* the diamond for it now**, in the exact spirit of `docs/TIER-D-NONINTERFERENCE.md`
+§2.1 (which named the timing channel out of scope rather than proving it). The EL2-MMU arc gets its
+full diamond the moment real silicon joins the oracle set. It does not block Arc 5 (fully diamondable
+on QEMU — Stage-2 fault semantics are the one thing QEMU is faithful about) since the EL2 stage-1 MMU
+is orthogonal to Arc 5's guest Stage-2 work.
+
+### Other below-bar items named by the review
+
+- **FP/SIMD (`v0..v31`, `FPSR`/`FPCR`) not framed across the resume** — harmless for the register-only
+  guest; the FP save/restore lands with the first non-trivial guest (`GuestFrame` doc).
+- **`VTCR_EL2.PS` hardcoded to 40-bit** rather than clamped to `ID_AA64MMFR0_EL1.PARange` — fine on
+  `virt`; a real-hardware-portability fix reads `PARange`.
+- **`SP_EL1` set to the exclusive window end** — a push lands in-window; correct-and-cosmetic.
+
 ## Verdict
 
 **A trivial EL1 guest boots behind a minimal Stage-2, issues `HVC`, traps to EL2, and has its
@@ -133,3 +196,8 @@ their assumptions named. Three-way converged (spec-derived code + blind Arm-ARM 
 QEMU); one auditor refinement folded in; no soundness defect. Arc 4 *refines* the proof and is
 QEMU-sound for the functional round trip — no isolation content, by design. `hv-core` is untouched
 and proven; the `unsafe` surface stays fenced in `hv-metal` and justified per block.
+
+The subsequent **diamond review pass** (above) confirmed this verdict — Rust-soundness clean,
+no false-green, QEMU-functionally correct — and named one real gap (the EL2-MMU / Device-memory
+atomics + cache story) as the prerequisite for the first real-hardware run. Arc 4 is diamond-grade
+for QEMU; the real-hardware readiness item is tracked, not silently carried.

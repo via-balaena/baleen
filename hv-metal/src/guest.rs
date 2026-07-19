@@ -59,6 +59,33 @@
 //!   UNKNOWN on real hardware (QEMU gives a clean one), and leave `DC=0` since no data access needs
 //!   Normal typing.
 //!
+//! ## The crate-wide real-hardware gap this per-mechanism list does NOT close
+//!
+//! The lines above draw the QEMU-vs-metal boundary for each mechanism Arc 4 *adds*, but a
+//! diamond-grade review (the Arc-4 review pass) found a deeper, crate-wide gap they do not reach:
+//! **EL2 itself runs with its own stage-1 MMU off** (`SCTLR_EL2.M=0`, never enabled in `_start` or
+//! anywhere), so on real silicon *every EL2 data access is Device-nGnRnE*. Two consequences, both
+//! **invisible under QEMU/TCG** (which ignores memory type):
+//!
+//! 1. **Atomics are architecturally UNPREDICTABLE.** `LDXR/STXR` (and LSE atomics) on Device memory
+//!    are CONSTRAINED UNPREDICTABLE — the common outcome is a perpetually-failing `STXR`, i.e. a
+//!    livelock. This reaches [`IN_GUEST_HANDLER`] here and, pre-existing since Arc 3, the bump
+//!    allocator's `compare_exchange`.
+//! 2. **Caches are unmanaged.** Freshly-copied guest code is written (uncached) then fetched
+//!    (cacheable) with no I-cache maintenance; the Stage-2 table walker is programmed cacheable
+//!    (`VTCR_EL2.IRGN0/ORGN0`) while its descriptors are written by uncached stores. On silicon
+//!    either can read stale lines out of the UNKNOWN reset cache state.
+//!
+//! This is **not Arc-4-specific** (it spans arcs 0–4), does **not** affect QEMU or the proof, and is
+//! within the metal's already-declared *real-HW-deferred* scope — but it *is* the real distance
+//! between "QEMU-sound" and "runs on metal." The single clean fix is a named prerequisite arc for
+//! the first real-hardware run: an **EL2 stage-1 Normal-cacheable identity map + `SCTLR_EL2.M/C/I` +
+//! boot-time I/D-cache invalidation**, which closes atomics *and* caches together. Its core payoff
+//! (atomics no longer UNPREDICTABLE) can only be *validated* on real EL2 silicon — no current oracle
+//! (spec, blind auditor, QEMU) can — so naming it here is the honest diamond for it, in the spirit of
+//! `docs/TIER-D-NONINTERFERENCE.md` §2.1. See `docs/ARC-4-TRAP-AND-SERVICE.md` ("Real-hardware
+//! readiness"). Until then, treat a green QEMU boot as *functional* evidence only.
+//!
 //! ## Unsafe
 //!
 //! System-register writes (`VTCR_EL2`, `VTTBR_EL2`, `HCR_EL2`, `SCTLR_EL1`, `ELR_EL2`, `SP_EL1`,
@@ -149,6 +176,11 @@ const EXPECTED_BALANCE: u64 = 70;
 /// Inner+Outer WBWA cacheable table walks (`IRGN0=ORGN0=0b01`), Inner Shareable (`SH0=0b11`), 40-bit
 /// PA (`PS=0b010`), and the `RES1` bit 31. Assembled from the field encodings in the Arm ARM
 /// `VTCR_EL2` description.
+///
+/// **Below-bar, named by the Arc-4 review:** `PS` is hardcoded to 40-bit rather than derived from
+/// `ID_AA64MMFR0_EL1.PARange`. On a CPU whose `PARange < 40-bit` this over-declares the output size
+/// (a mis-programming). Harmless here — QEMU `virt`/`-cpu max` supports ≥40-bit and every PA we use
+/// is `< 2^31` — but a real-hardware-portability fix reads `PARange` and clamps `PS` to it.
 const VTCR_EL2: u64 = (1 << 31)      // RES1
     | (0b010 << 16)                  // PS   = 40-bit PA
     | (0b11 << 12)                   // SH0  = Inner Shareable
@@ -250,6 +282,12 @@ const SPSR_EL2_GUEST: u64 = 0b0101 | (0b1111 << 6);
 /// preserved verbatim so the guest resumes unperturbed. `SP_EL1` is banked (untouched by the EL2
 /// handler, which runs on `SP_EL2`) and `ELR_EL2`/`SPSR_EL2` are not modified by the straight-line
 /// handler, so none of them belong in the frame.
+///
+/// **Deferred (named by the Arc-4 review):** the FP/SIMD state (`v0..v31`, `FPSR`/`FPCR`) is *not*
+/// framed. The Rust handler can clobber `v`-registers under AArch64 codegen, so a guest that used
+/// FP/SIMD and expected it preserved across an `HVC` would be corrupted. Harmless for Arc 4's
+/// register-only guest (no FP, and FP is untrapped so no fault); the FP save/restore lands with the
+/// first arc that runs a non-trivial guest.
 #[repr(C)]
 pub struct GuestFrame {
     pub x: [u64; 31],
@@ -355,8 +393,10 @@ fn load_guest() -> (u64, u64) {
         core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
     }
     // Entry = the copied code at guest RAM base; stack top = the window's end (16-aligned by the
-    // 2 MiB size). The trivial guest touches neither the stack nor any data, but SP_EL1 is set to a
-    // valid in-window address by convention.
+    // 2 MiB size). `ram_end` is the *exclusive* end, but a full-descending push lands at `ram_end-16`
+    // (still in-window), and the trivial guest touches neither the stack nor any data — so this is
+    // correct-and-cosmetic (Arc-4 review, below-bar). SP_EL1 is set to a valid in-window address by
+    // convention.
     (ram_start as u64, ram_end as u64)
 }
 
