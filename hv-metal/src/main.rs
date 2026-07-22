@@ -41,6 +41,7 @@ mod heap;
 mod pl011;
 mod stage2;
 mod time;
+mod virtio;
 
 use core::arch::global_asm;
 use core::fmt::Write;
