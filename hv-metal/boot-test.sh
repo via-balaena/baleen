@@ -217,7 +217,7 @@ boot_and_check "default" "" \
     "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
     "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt" \
     "thesis non-interference OK: the disposable's probe of the vault secret -> translation fault" \
-    "thesis channel enumeration: no grant + no shared mapping vault->disposable" \
+    "thesis channel enumeration: no grant, no event channel, no shared page-table link, no control edge between vault and disposable" \
     "thesis reborn OK: a reborn disposable could NOT link the vault's secret" \
     "THESIS TEST PASSED — the vault's secret never reached the disposable"
 
@@ -286,7 +286,7 @@ boot_and_check "selftest" "--features selftest" \
     "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
     "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt" \
     "thesis non-interference OK: the disposable's probe of the vault secret -> translation fault" \
-    "thesis channel enumeration: no grant + no shared mapping vault->disposable" \
+    "thesis channel enumeration: no grant, no event channel, no shared page-table link, no control edge between vault and disposable" \
     "thesis reborn OK: a reborn disposable could NOT link the vault's secret" \
     "THESIS TEST PASSED — the vault's secret never reached the disposable" \
     "vector=4 (cur_el_spx_sync)" \

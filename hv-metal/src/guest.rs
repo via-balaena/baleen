@@ -95,6 +95,7 @@ use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
+use hv_core::evtchn::PortState;
 use hv_core::grant::{Frame, GrantRef};
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::{Mfn, PtLevel};
@@ -4650,6 +4651,25 @@ fn begin_timer_irq_phase(uart: &mut Pl011) -> ! {
     );
 }
 
+/// Whether there is **no** event channel between domains `a` and `b`, in either direction — no half-open
+/// port awaiting either, and no established interdomain port referencing the other. A real scan of the
+/// proven evtchn state (not an assumption), for the thesis channel enumeration (M5 Arc 6).
+fn no_evtchn_between(hv: &Hypervisor, a: DomId, b: DomId) -> bool {
+    if hv.evtchn().any_unbound_into(a) || hv.evtchn().any_unbound_into(b) {
+        return false;
+    }
+    for (d, other) in [(a, b), (b, a)] {
+        for p in 0..hv.evtchn().port_count(d) as u32 {
+            match hv.evtchn().state_of(d, p) {
+                Some(PortState::Interdomain { remote, .. }) if remote == other => return false,
+                Some(PortState::Unbound { remote }) if remote == other => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
 /// First 8 bytes of the vault secret as a little-endian `u64` — what the disposable's probe register
 /// (`x2`) would hold if isolation broke and it read the secret.
 fn vault_secret_prefix() -> u64 {
@@ -4835,7 +4855,7 @@ fn begin_thesis_phase(uart: &mut Pl011) -> ! {
     IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
     let _ = writeln!(
         uart,
-        "baleen: thesis phase — a control domain runs a disposable alongside a no-net vault holding a secret"
+        "baleen: thesis phase — dom0 runs a disposable; a live no-net vault domain holds an un-forgeable secret the disposable must not reach (the vault is modeled + owns its secret; only the disposable executes)"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
     enter_guest(exc_stack_top);
@@ -4866,23 +4886,24 @@ fn finish_thesis_test(uart: &mut Pl011) -> ! {
         );
     }
 
-    // (2) Channel enumeration (by construction — the audit IS the arc): NO grant authorizes either
-    // direction between vault and disposable, and the vault's secret is owned by the vault (so the
-    // disposable's Stage-2 excludes it). Event channels are absent by construction (neither domain issued
-    // `EvtchnAllocUnbound`). No authorized channel ⇒ the secret cannot flow — a concrete instance of the
-    // model's Tier-D non-interference theorem (see docs/AUDIT-3-NON-INTERFERENCE.md).
-    let no_grant = !hv
-        .grant()
-        .authorizes(VAULT_DOM, DISP_DOM, F_VAULT_SECRET as Frame, false)
-        && !hv
-            .grant()
-            .authorizes(DISP_DOM, VAULT_DOM, F_DISP_DATA as Frame, false);
-    let secret_is_vaults = hv.p2m().owner_of(F_VAULT_SECRET) == Some(VAULT_DOM);
-    let no_channel = no_grant && secret_is_vaults;
+    // (2) Channel enumeration — the audit IS the arc. Enumerate EVERY cross-domain channel the model
+    // supports, against the proven `hv-core` state, exhaustively (not on hand-picked frames) and in BOTH
+    // directions: any GRANT reaching either domain, any EVENT CHANNEL between them, any foreign
+    // PAGE-TABLE LINK into either, and any CONTROL edge between the peers (only dom0 — the trusted control
+    // domain — controls them; neither peer controls the other). None present ⇒ no authorizing edge ⇒
+    // `¬(vault ⇝ disposable)` over the model's `⇝` relation — the precondition of the model's Tier-D
+    // non-interference theorem (see docs/AUDIT-3-NON-INTERFERENCE.md). The empirical translation fault
+    // above is the metal witness that this "no channel" is real silicon behaviour.
+    let no_grant = !hv.grant().any_grant_to(DISP_DOM) && !hv.grant().any_grant_to(VAULT_DOM);
+    let no_evtchn = no_evtchn_between(hv, VAULT_DOM, DISP_DOM);
+    let no_foreign_link =
+        !hv.p2m().has_foreign_link_into(VAULT_DOM) && !hv.p2m().has_foreign_link_into(DISP_DOM);
+    let no_control = !hv.controls(VAULT_DOM, DISP_DOM) && !hv.controls(DISP_DOM, VAULT_DOM);
+    let no_channel = no_grant && no_evtchn && no_foreign_link && no_control;
     if no_channel {
         let _ = writeln!(
             uart,
-            "baleen: thesis channel enumeration: no grant + no shared mapping vault->disposable (non-interference by construction; bridges to Tier-D)"
+            "baleen: thesis channel enumeration: no grant, no event channel, no shared page-table link, no control edge between vault and disposable (not(vault -> disposable); bridges to Tier-D)"
         );
     }
 
@@ -4909,7 +4930,9 @@ fn finish_thesis_test(uart: &mut Pl011) -> ! {
     blk_disk().discard_overlay(DISP_TENANT);
     let overlay_gone = !blk_disk().is_dirty(DISP_TENANT, 0);
 
-    // (4) The vault's secret is UNTOUCHED (read it HV-side) and the CoW template is PRISTINE (Arc 4).
+    // (4) The vault's secret is UNTOUCHED (read the real backing HV-side). And the CoW template is
+    // pristine — a model-level re-assertion of the Arc-4 immutability property (here the disposable's
+    // overlay divergence is HV-seeded; the guest-driven trap-and-emulate CoW proof is Arc 4's).
     let vault_untouched = read_frame(F_VAULT_SECRET) == vault_secret_prefix();
     let template_pristine =
         &blk_disk().template_sector(0)[..THESIS_TEMPLATE_MARKER.len()] == THESIS_TEMPLATE_MARKER;
