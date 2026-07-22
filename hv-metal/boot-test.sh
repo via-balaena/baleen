@@ -6,7 +6,13 @@
 # `virt` machine at EL2, and assert the expected serial markers appear. This is the metal side of
 # the "diamond -> CI-green -> merge" loop; CI runs it (see .github/workflows/ci.yml) and so can you.
 #
-# The boot runs TWICE (through M5 Arc 0):
+# The boot runs TWICE (through M5 Arc 1). After the isolation matrix and the lifecycle phase, the
+# M5 Arc 1 SCHEDULER phase runs: two vCPUs of one domain time-slice on the single physical CPU,
+# switched by hv-core's real scheduler (SchedPreempt + SchedRun on each cooperative yield), each
+# carrying a private counter that survives the interleaving; plus two sched-pillar refusals —
+# SchedRun onto the occupied pCPU (PcpuBusy, exclusivity) and onto a non-affine pCPU (NotAffine).
+# The SCHEDULER TEST PASSED marker prints only when both vCPUs' contexts round-tripped intact.
+# The details of the earlier phases:
 #   - the DEFAULT build: at EL2, vectors installed, HCR_EL2.RW=1, the generic-timer TimeSource live
 #     and monotonic, a synthetic HvCall dispatched directly into the linked hv-core brain (Arc 3),
 #     the Arc-4 trap-and-service round trip (nr=0 arg=100 -> 100, nr=1 arg=30 -> 70, guest echoes 70),
@@ -153,7 +159,10 @@ boot_and_check "default" "" \
     "lifecycle: reborn slot could NOT link the destroyed grant" \
     "lifecycle positive OK: reborn guest reached its own fresh frame (rw=0xcafe)" \
     "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
-    "LIFECYCLE ISOLATION TEST PASSED"
+    "LIFECYCLE ISOLATION TEST PASSED" \
+    "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
+    "scheduler affinity OK: SchedRun onto a non-affine pCPU refused (NotAffine)" \
+    "SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -184,6 +193,9 @@ boot_and_check "selftest" "--features selftest" \
     "lifecycle positive OK: reborn guest reached its own fresh frame (rw=0xcafe)" \
     "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
     "LIFECYCLE ISOLATION TEST PASSED" \
+    "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
+    "scheduler affinity OK: SchedRun onto a non-affine pCPU refused (NotAffine)" \
+    "SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 

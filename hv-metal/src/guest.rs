@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # The negative-isolation test + the lifecycle, live (M4 Arc 5 → M5 Arc 0)
+//! # Isolation, lifecycle, and the scheduler — live (M4 Arc 5 → M5 Arc 0 → M5 Arc 1)
+//!
+//! **M5 Arc 1 — the concurrent scheduler, live.** After the lifecycle phase, [`run`]'s chain reaches
+//! [`begin_scheduler_phase3`]: two vCPUs of one domain time-slice on the single physical CPU, switched
+//! by hv-core's **real** scheduler. On each cooperative yield ([`NR_YIELD`]) the metal saves the
+//! running vCPU's full [`GuestContext`], drives `SchedPreempt(cur)` + `SchedRun(other)` through the
+//! proven `Hypervisor::dispatch`, and restores the peer's context (via the trampoline frame, or
+//! [`__enter_guest_ctx`] for a first dispatch). Each vCPU carries a private counter seeded to a
+//! distinct base; both must end at their own base + N iff every switch preserved its state and the two
+//! never crossed. The sched pillar is cashed by two model-level refusals: `SchedRun` onto the occupied
+//! pCPU → `PcpuBusy` (exclusivity), onto a non-affine pCPU → `NotAffine` (affinity). Cooperative, not
+//! preemptive (no timer/GIC yet — that is a later arc); one physical CPU (concurrency is temporal, not
+//! SMP). `hv-core`/`hv-hal` untouched (refines). See `docs/ARC-1-M5-SCHEDULER.md`.
 //!
 //! **M5 Arc 0 — the lifecycle, live.** After the Arc-5 matrix (below) passes, [`run`]'s terminal
 //! handler does not park: it drives the proven *lifecycle* through the real [`Hypervisor::dispatch`]
