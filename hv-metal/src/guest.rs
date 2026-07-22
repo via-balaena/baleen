@@ -367,8 +367,12 @@ const NR_GIC_READY: u64 = 0xd0;
 /// The guest reports the INTID it acknowledged via `ICC_IAR1_EL1` (`x1`); the hypervisor asserts it
 /// equals the injected INTID. A checkpoint.
 const NR_GIC_REPORT: u64 = 0xd1;
-/// The vGIC phase's terminal report.
+/// The vGIC poll phase's terminal — chains into the async-delivery phase.
 const NR_GIC_FINAL: u64 = 0xd2;
+/// The async-delivery guest reports (from its EL1 IRQ vector) the INTID it took (`x1`). A checkpoint.
+const NR_GIC_ASYNC_REPORT: u64 = 0xd3;
+/// The async-delivery phase's terminal report.
+const NR_GIC_ASYNC_FINAL: u64 = 0xd4;
 
 // ---------------------------------------------------------------------------------------------
 // The guest program.
@@ -1036,6 +1040,74 @@ __guest_gic_poll_tpl_end:
     NR_GIC_FINAL = const NR_GIC_FINAL,
 );
 
+// The vGIC ASYNC-delivery test guest program (M5 Arc 5b). Unlike the poll guest, it installs its OWN
+// EL1 exception vector table (`VBAR_EL1`), unmasks IRQs (`DAIFClr`), and *takes* the injected virtual
+// interrupt at its IRQ vector — real vectored delivery, the mechanism Linux depends on. The whole blob
+// is `0x800`-aligned (so the vector table's runtime address, `0x800`-aligned relative to the blob start,
+// is `0x800`-aligned as `VBAR_EL1` requires — the blob is copied to the 2 MiB-aligned guest RAM base).
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 0x800
+    .global __guest_gic_async_tpl_start
+__guest_gic_async_tpl_start:
+    // ── point VBAR_EL1 at our vector table (0x800-aligned, below) ──
+    adr     x0, 9f
+    msr     VBAR_EL1, x0
+    isb
+    // ── enable the GICv3 CPU interface (as the poll guest) ──
+    mrs     x0, ICC_SRE_EL1
+    orr     x0, x0, #1
+    msr     ICC_SRE_EL1, x0
+    isb
+    mov     x0, #0xff
+    msr     ICC_PMR_EL1, x0
+    mov     x0, #1
+    msr     ICC_IGRPEN1_EL1, x0
+    isb
+    // ── ready: the hypervisor injects the virtual interrupt while servicing this HVC ──
+    mov     x0, #{NR_GIC_READY}
+    hvc     #0
+    // ── unmask IRQ: the pending virtual interrupt is now taken at the IRQ vector below ──
+    msr     DAIFClr, #2
+    isb
+1:  wfi
+    b       1b
+
+    // ── EL1 exception vector table (16 entries, 0x80 apart). The guest runs at EL1h (SP_ELx), so an
+    //    IRQ vectors to offset 0x280 (Current EL with SP_ELx, IRQ). Others spin (never expected). ──
+    .balign 0x800
+9:
+    b       8f                            // 0x000 Current EL SP0, Synchronous
+    .balign 0x80
+    b       8f                            // 0x080 Current EL SP0, IRQ
+    .balign 0x80
+    b       8f                            // 0x100 Current EL SP0, FIQ
+    .balign 0x80
+    b       8f                            // 0x180 Current EL SP0, SError
+    .balign 0x80
+    b       8f                            // 0x200 Current EL SPx, Synchronous
+    .balign 0x80
+    // 0x280 Current EL SPx, IRQ — the injected virtual interrupt lands here
+    mrs     x1, ICC_IAR1_EL1              // acknowledge → INTID
+    msr     ICC_EOIR1_EL1, x1             // end of interrupt
+    mov     x0, #{NR_GIC_ASYNC_REPORT}
+    hvc     #0                            // report x1 = the async-delivered INTID
+    mov     x0, #{NR_GIC_ASYNC_FINAL}
+    hvc     #0
+7:  wfe
+    b       7b
+    .balign 0x80
+8:  wfe                                    // catch-all for any unexpected vector
+    b       8b
+    .global __guest_gic_async_tpl_end
+__guest_gic_async_tpl_end:
+    "#,
+    NR_GIC_READY = const NR_GIC_READY,
+    NR_GIC_ASYNC_REPORT = const NR_GIC_ASYNC_REPORT,
+    NR_GIC_ASYNC_FINAL = const NR_GIC_ASYNC_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -1210,6 +1282,9 @@ static BLK_UNGRANTED_REFUSED: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 5a: the guest acknowledged the injected virtual interrupt with the correct INTID (the vGIC
 /// injection path reached the guest's CPU interface).
 static GIC_INJECT_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5b: the guest took the injected virtual interrupt ASYNCHRONOUSLY at its EL1 IRQ vector (not by
+/// polling) with the correct INTID — real vectored interrupt delivery, the mechanism Linux depends on.
+static GIC_ASYNC_OK: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     static __guest_tpl_start: u8;
@@ -1228,6 +1303,8 @@ extern "C" {
     static __guest_blk_write_tpl_end: u8;
     static __guest_gic_poll_tpl_start: u8;
     static __guest_gic_poll_tpl_end: u8;
+    static __guest_gic_async_tpl_start: u8;
+    static __guest_gic_async_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1538,7 +1615,7 @@ fn load_guest_blk_write() -> u64 {
     ram_start as u64
 }
 
-/// Copy the **vGIC test** guest template into guest RAM and return its `entry` guest-physical address
+/// Copy the **vGIC poll** guest template into guest RAM and return its `entry` guest-physical address
 /// (M5 Arc 5a).
 fn load_guest_gic_poll() -> u64 {
     let tpl_start = core::ptr::addr_of!(__guest_gic_poll_tpl_start) as usize;
@@ -1547,6 +1624,23 @@ fn load_guest_gic_poll() -> u64 {
     let len = tpl_end - tpl_start;
     // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
     // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **vGIC async-delivery** guest template into guest RAM and return its `entry` guest-physical
+/// address (M5 Arc 5b). The template is `0x800`-aligned and the guest RAM base is 2 MiB-aligned, so the
+/// vector table (`0x800`-aligned within the blob) lands at a `0x800`-aligned runtime address for `VBAR_EL1`.
+fn load_guest_gic_async() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_gic_async_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_gic_async_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping. `ram_start` is 2 MiB-aligned so the blob's internal 0x800
+    // alignment is preserved at runtime.
     unsafe {
         core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
     }
@@ -1922,9 +2016,11 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_BLK_NEGOTIATED => virtio_blk_report_negotiated(frame, uart), // assert VERSION_1 + FEATURES_OK
         NR_BLK_READ_REPORT => virtio_blk_report_read(frame, uart), // assert the read round-tripped
         NR_BLK_FINAL => finish_virtio_blk_test(uart), // -> ! (block phase → vGIC phase)
-        NR_GIC_READY => gic::inject(GIC_TEST_INTID),  // M5 Arc 5a: inject a virtual interrupt now
+        NR_GIC_READY => gic::inject(GIC_TEST_INTID),  // M5 Arc 5a/b: inject a virtual interrupt now
         NR_GIC_REPORT => gic_report(frame, uart), // assert the guest acknowledged the right INTID
-        NR_GIC_FINAL => finish_gic_test(uart),    // -> ! (vGIC phase terminal)
+        NR_GIC_FINAL => finish_gic_test(uart),    // -> ! (vGIC poll phase → async phase)
+        NR_GIC_ASYNC_REPORT => gic_async_report(frame, uart), // M5 Arc 5b: assert vectored delivery
+        NR_GIC_ASYNC_FINAL => finish_gic_async_test(uart), // -> ! (async phase terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -3860,38 +3956,71 @@ fn gic_report(frame: &mut GuestFrame, uart: &mut Pl011) {
     }
 }
 
-/// **M5 Arc 5a, vGIC phase terminal.** Assert the injection round-trip and finish the boot.
+/// **M5 Arc 5a, vGIC poll phase terminal.** Assert the injection reached the CPU interface, then chain
+/// into the async-delivery phase (5b).
 fn finish_gic_test(uart: &mut Pl011) -> ! {
     if GIC_INJECT_OK.load(Ordering::Relaxed) {
         let _ = writeln!(
             uart,
             "baleen: VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface"
         );
+        // M5 Arc 5b: prove ASYNC vectored delivery (the guest takes the IRQ at its EL1 vector). Never
+        // returns (it ends the boot at the async terminal).
+        begin_gic_async_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: VGIC TEST FAILED — injected interrupt not acknowledged"
+    );
+    crate::park();
+}
+
+/// **M5 Arc 5b** — the guest reported (from its EL1 IRQ vector) the INTID it took asynchronously; assert
+/// it equals the injected [`GIC_TEST_INTID`]. A checkpoint.
+fn gic_async_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let intid = frame.x[1] as u32;
+    let ok = intid == GIC_TEST_INTID;
+    GIC_ASYNC_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID {intid}) at its EL1 IRQ vector"
+        );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: VGIC TEST FAILED — injected interrupt not acknowledged"
+            "baleen: vGIC async-delivery MISMATCH: guest took INTID {intid} (expected {GIC_TEST_INTID})"
+        );
+    }
+}
+
+/// **M5 Arc 5b, async-delivery phase terminal.** Assert vectored delivery and finish the boot.
+fn finish_gic_async_test(uart: &mut Pl011) -> ! {
+    if GIC_ASYNC_OK.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            uart,
+            "baleen: VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: VGIC ASYNC TEST FAILED — interrupt not delivered to the guest vector"
         );
     }
     selftest_brk(uart);
     crate::park();
 }
 
-/// **M5 Arc 5a, vGIC phase — give a guest interrupts.** Build a fresh `Hypervisor`, create a minimal
-/// guest (it touches no guest data memory — only its own code + the GIC system registers), emit its
-/// Stage-2, enable the hardware virtual CPU interface at EL2, and enter. The guest enables its CPU
-/// interface and signals ready; the hypervisor injects a virtual interrupt (`NR_GIC_READY` →
-/// [`gic::inject`]); the guest acknowledges it and reports the INTID. Never returns.
-fn begin_gic_phase(uart: &mut Pl011) -> ! {
+/// Build a fresh `Hypervisor` and create the minimal vGIC guest domain (a pinned page-table root — the
+/// guest touches no guest data memory, only its own code + the GIC system registers). Shared by the poll
+/// (5a) and async (5b) phases.
+fn gic_fresh_guest(uart: &mut Pl011) {
     // SAFETY: single-CPU, one-time rebuild before the vGIC guest runs.
     unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
     let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
         Some(hv) => hv,
         None => crate::park(),
     };
-
-    // The guest needs only a pinned page-table root — its code is the identity RO+X image block; it
-    // touches no guest data frames, so there are no leaves to grant.
     expect(
         hv,
         DOM0,
@@ -3919,9 +4048,16 @@ fn begin_gic_phase(uart: &mut Pl011) -> ! {
         "vGIC pin root",
         uart,
     );
+}
 
+/// Emit the vGIC guest's Stage-2, enable the hardware virtual CPU interface at EL2, and enter the guest
+/// at `entry`. Shared by the poll (5a) and async (5b) phases. Never returns.
+fn run_gic_guest(uart: &mut Pl011, entry: u64, msg: &str) -> ! {
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
     let vttbr = stage2::build_stage2_from_p2m(hv, GIC_DOM, STAGE2_SET_SINGLE);
-    let entry = load_guest_gic_poll();
     let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
     enable_stage2(vttbr);
     gic::enable_el2(); // ICC_SRE_EL2 + ICH_HCR_EL2.En + HCR_EL2.IMO — after enable_stage2
@@ -3931,12 +4067,33 @@ fn begin_gic_phase(uart: &mut Pl011) -> ! {
         ArmVcpu.set_entry(entry);
     }
     IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
-    let _ = writeln!(
-        uart,
-        "baleen: vGIC phase — a guest enables its GICv3 CPU interface and receives an injected virtual interrupt"
-    );
+    let _ = writeln!(uart, "{msg}");
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
     enter_guest(exc_stack_top);
+}
+
+/// **M5 Arc 5a, vGIC poll phase.** The guest enables its CPU interface, signals ready (the hypervisor
+/// injects a virtual interrupt), and POLLS `ICC_IAR1_EL1` to acknowledge it. Never returns.
+fn begin_gic_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    let entry = load_guest_gic_poll();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: vGIC phase — a guest enables its GICv3 CPU interface and receives an injected virtual interrupt",
+    );
+}
+
+/// **M5 Arc 5b, vGIC async-delivery phase.** The guest installs its own EL1 vector table, unmasks IRQs,
+/// and TAKES the injected virtual interrupt at its IRQ vector — real vectored delivery. Never returns.
+fn begin_gic_async_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    let entry = load_guest_gic_async();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: vGIC async phase — a guest takes an injected virtual interrupt at its own EL1 vector table",
+    );
 }
 
 /// **M5 Arc 4, block phase 6 — the virtio-blk run-loop (tenant 0).** Build a fresh `Hypervisor`, seed

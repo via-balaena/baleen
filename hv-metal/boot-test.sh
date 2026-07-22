@@ -205,7 +205,9 @@ boot_and_check "default" "" \
     "virtio-blk read round-trip OK: tenant 1 read sector 0 = the pristine template" \
     "VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused" \
     "vGIC injection OK: guest acknowledged the injected virtual interrupt (INTID 42) via ICC_IAR1_EL1" \
-    "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface"
+    "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
+    "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
+    "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -262,6 +264,8 @@ boot_and_check "selftest" "--features selftest" \
     "VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused" \
     "vGIC injection OK: guest acknowledged the injected virtual interrupt (INTID 42) via ICC_IAR1_EL1" \
     "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
+    "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
+    "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
