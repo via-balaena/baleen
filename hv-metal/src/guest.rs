@@ -2032,6 +2032,10 @@ fn begin_concurrent_iso_phase4(uart: &mut Pl011) -> ! {
 
     // Emit each domain's Stage-2 into its OWN set → distinct VMID-tagged VTTBR. Both sets are disjoint
     // storage, so both live simultaneously; the switch selects between them by VTTBR alone (no flush).
+    // Load-bearing ordering: BOTH sets are built HERE, before the single `enable_stage2` below whose
+    // `dsb ish` publishes every descriptor — so dom B's set (reached later only via the no-`tlbi`
+    // `set_vttbr_no_flush` switch, which issues no barrier of its own) is globally observable before
+    // its walker first runs. A set reached by a no-flush switch must be built before that covering dsb.
     let vttbr_a = stage2::build_stage2_from_p2m(hv, ISO_DOM_A, STAGE2_SET_A);
     let vttbr_b = stage2::build_stage2_from_p2m(hv, ISO_DOM_B, STAGE2_SET_B);
 
@@ -2195,6 +2199,14 @@ fn finish_concurrent_iso_test(uart: &mut Pl011) -> ! {
     // indexed by the faulting frame: dom A probed dom B's frame (F_B_DATA); dom B probed dom A's
     // (F_A_DATA). A cross-probe is a READ, so WnR must be false; the fault class must be translation
     // (no leaf), not permission — pinned per design-lesson #28d.
+    //
+    // Note (witness independence): a negative index is ALSO the peer's OWN frame — e.g. index F_B_DATA
+    // is where dom B writes+reads its own sentinel. So `a_denied` alone is not independent of dom B's
+    // health: a contrived break where B can't map its own frame would fault at F_B_DATA (a read) and
+    // spuriously satisfy `a_denied`. It is load-bearing ONLY in conjunction with `no_corruption`:
+    // whenever `no_corruption` holds, B's own accesses at F_B_DATA all SUCCEEDED (recording nothing
+    // there), so the only fault possibly recorded at F_B_DATA is dom A's genuine cross-probe. The
+    // `PASSED` conjunction below is what makes each negative genuine (surfaced by the false-green audit).
     let a_probe_dfsc = FAULT_DFSC[F_B_DATA as usize].load(Ordering::Relaxed);
     let b_probe_dfsc = FAULT_DFSC[F_A_DATA as usize].load(Ordering::Relaxed);
     let a_denied =

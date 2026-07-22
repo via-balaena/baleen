@@ -34,10 +34,14 @@
 //!
 //! Two disjoint IPA regions keep the isolation surface auditable:
 //!
-//! - **Guest image** — the code + stack the guest runs from. Identity-mapped (IPA == PA) as one
-//!   2 MiB RWX block over the linker's `__guest_ram_*` window. This is *infrastructure*, not
-//!   model-driven: it is the guest's own private RAM (no other domain's memory), so mapping it is no
-//!   more an isolation hole than a guest reaching its own pages.
+//! - **Guest image** — the code the guest runs from. Identity-mapped (IPA == PA) as one 2 MiB
+//!   **read-only + executable** block over the linker's `__guest_ram_*` window. This is
+//!   *infrastructure*, not model-driven. For a single-domain phase it is that domain's own private
+//!   code; under **concurrent inter-domain isolation** (M5 Arc 2) BOTH domains identity-map the SAME
+//!   host frames here — a *shared* code image, so it is mapped **read-only** so it cannot be a
+//!   cross-domain write channel (the guest never writes its code; a store here faults loudly). The
+//!   isolation surface under test is the per-domain *data* frames below, never this shared image; a
+//!   private RW code+stack image per domain is deferred to the real-Linux capstone.
 //! - **Model data frames** — the isolation surface. Model frame `m` lives at host PA
 //!   `__guest_data_start + m*4 KiB` and is mapped by Stage-2 at guest IPA [`DATA_IPA_BASE`]` + m*4 KiB`
 //!   — a *distinct* IPA base, so the emitted table performs a real IPA≠PA translation, not an
@@ -159,10 +163,16 @@ mod desc {
     /// (they are not code); the guest-image block does not (the guest fetches from it).
     pub const XN: u64 = 1 << 54;
 
-    /// The guest-image block: 2 MiB, RWX, Normal WB IS — identity-mapping the guest's own code+stack.
-    /// Equals Arc 4's `0x7FD` (block | Normal WB | S2AP=RW | SH=IS | AF) — kept bit-identical so the
-    /// infra mapping is unchanged from the proven-good Arc-4 value.
-    pub const BLOCK_RWX: u64 = BLOCK | LEAF_COMMON | S2AP_RW;
+    /// The guest-image block: 2 MiB, **read-only + executable**, Normal WB IS — identity-mapping the
+    /// guest's own code. Read-only (`S2AP=RO`, not `RW`) so the shared code image cannot be a
+    /// cross-domain *write* channel under concurrent isolation (M5 Arc 2): the two domains identity-map
+    /// the SAME host frames here, and making them read-only hardware-enforces "the guest never writes
+    /// its code image" rather than asserting it by inspection — a future guest that stores into this
+    /// region (or uses it as a stack) faults **loudly** (an abort outside the data window halts in
+    /// `record_data_abort`) instead of silently cross-corrupting. Executable (no `XN`) so the guest
+    /// still fetches from it. The register-only test guests never write it, so RO is behaviour-neutral
+    /// for them; a private RW code+stack image per domain is the real-Linux capstone (deferred).
+    pub const BLOCK_ROX: u64 = BLOCK | LEAF_COMMON | S2AP_RO;
 
     /// A 4 KiB data leaf, read/write, execute-never.
     pub const PAGE_RW: u64 = PAGE | LEAF_COMMON | S2AP_RW | XN;
@@ -182,7 +192,7 @@ struct Table(UnsafeCell<[u64; 512]>);
 unsafe impl Sync for Table {}
 
 /// One complete per-domain Stage-2 table set: an `L1` (one entry → the guest-image `1 GiB` region's
-/// `L2`, one → the data `1 GiB` region's `L2`), an `L2` for the guest image (a single 2 MiB RWX
+/// `L2`, one → the data `1 GiB` region's `L2`), an `L2` for the guest image (a single 2 MiB RO+X
 /// block), an `L2` for the data region (→ `L3`), and an `L3` for the data region (one 4 KiB page
 /// descriptor per authorized model frame; the rest stay zero → translation-fault holes). Each domain
 /// under concurrent isolation (M5 Arc 2) gets its own set, reached via a distinct VMID-tagged VTTBR.
@@ -218,7 +228,7 @@ static STAGE2_SETS: [Stage2Set; NUM_STAGE2_SETS] = [const {
 /// disjoint storage, building one domain's Stage-2 leaves the other domain's tables untouched — the
 /// two live simultaneously, distinguished by VMID with no flush between them.
 ///
-/// The guest-image region is mapped as infrastructure (identity 2 MiB RWX block). The data region is
+/// The guest-image region is mapped as infrastructure (identity 2 MiB RO+X block). The data region is
 /// the refinement: for every **leaf** page-table edge whose parent `guest_dom` owns, the leaf's
 /// child frame is mapped at [`frame_ipa`] → [`frame_pa`] with the leaf's permission (`writable` →
 /// `S2AP=RW`, else `S2AP=RO`, always execute-never). A foreign child appears here only because
@@ -243,21 +253,32 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
     let data_l1 = ((DATA_IPA_BASE >> 30) & 0x1ff) as usize;
     let data_l2 = ((DATA_IPA_BASE >> 21) & 0x1ff) as usize;
 
-    // SAFETY: single-CPU, one-time initialization before Stage-2 is enabled; every table is 4 KiB
-    // aligned (`#[repr(align(4096))]`) with 512 entries, so all indices below are in range. The two
-    // regions occupy distinct `L1` entries (guest image at `0x4000_0000` → index 1, data at
-    // `0x8000_0000` → index 2), so the two `L1` writes never collide.
+    // SAFETY: single-CPU. The tables are rewritten while executing at EL2, where the EL1&0 Stage-2
+    // regime performs no walks (no walker observes this store mid-rebuild), so even though a *prior*
+    // phase may have Stage-2 enabled (this fn is called once per phase, not only before the first
+    // enable), the rewrite races no translation. `enable_stage2`'s subsequent `dsb`+`tlbi`+`isb`
+    // fences the rewrite (and makes these Non-cacheable EL2 stores globally observable) before the
+    // next `eret`, so a switched-in domain's walker reads correct, published descriptors. Every table
+    // is 4 KiB aligned (`#[repr(align(4096))]`) with 512 entries, so all indices below are in range;
+    // the two regions occupy distinct `L1` entries (guest image → index 1, data → index 2), so the
+    // two `L1` writes never collide.
     unsafe {
-        // Guest image: identity 2 MiB RWX block (infrastructure — the guest's own code+stack).
+        // Guest image: identity 2 MiB RO+X block (infrastructure — the guest's code; read-only so a
+        // shared image can't be a cross-domain write channel, see `desc::BLOCK_ROX`).
         (*l1)[code_l1] = (l2_code_pa & desc::ADDR_4K) | desc::TABLE;
-        (*l2_code)[code_l2] = (ram & desc::ADDR_2M) | desc::BLOCK_RWX;
+        (*l2_code)[code_l2] = (ram & desc::ADDR_2M) | desc::BLOCK_ROX;
 
         // Data region: L1 → L2 → L3, with the L3 leaves emitted from the model below.
         (*l1)[data_l1] = (l2_data_pa & desc::ADDR_4K) | desc::TABLE;
         (*l2_data)[data_l2] = (l3_data_pa & desc::ADDR_4K) | desc::TABLE;
 
-        // Clear any prior L3 leaves so a rebuild is a faithful snapshot of the current p2m (no stale
-        // mapping survives). Only the low slots the model can use need clearing (Mfn < frame_count).
+        // Clear EVERY L3 data slot the model could ever have written, so a rebuild for a new tenant
+        // (a reborn slot, or — under concurrent isolation, where the no-`tlbi` switch relies on set 0
+        // holding ONLY the current domain's leaves — dom A's set) retains no stale leaf. This is
+        // load-bearing for the no-flush isolation: it MUST cover the full model capacity, so it keys
+        // on `frame_count()` (the fixed table capacity `NUM_FRAMES`), NOT a live allocated count —
+        // were it a live count, a freed-then-reused Mfn could leave a stale leaf a peer's Stage-2
+        // still reaches. `min(512)` bounds it to this single L3 table.
         for slot in 0..hv.p2m().frame_count().min(512) {
             (*l3_data)[slot] = 0;
         }

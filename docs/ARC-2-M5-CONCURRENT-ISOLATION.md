@@ -23,9 +23,12 @@ This is the first time two mutually-distrusting address spaces coexist live on t
 - **The isolation surface is the per-domain data frames.** Each domain owns a **distinct machine
   frame** (`Mfn`), and `frame_pa` is injective in `Mfn`, so the two domains' data live at **distinct
   host PA** — physically disjoint, not merely table-separated.
-- **The two domains share their read-execute *code* image** (one register-only program, identity-mapped
-  in both sets) as test infrastructure — they run identical code and never write it. Named, not swept:
-  a production control domain gives each domain a private code image (the real-Linux capstone arc).
+- **The two domains share their *code* image** (one register-only program, identity-mapped in both
+  sets) as test infrastructure — they run identical code and never write it. It is mapped **read-only +
+  executable**, so the shared image **cannot** be a cross-domain write channel: a store there faults
+  loudly (hardware-enforced, not inspection-asserted). Inter-domain isolation is thus complete on the
+  data plane and read-only-shared on the code plane; a private RW code+stack image per domain is the
+  real-Linux capstone arc (deferred, named). *(RO+X hardening folded in from the review pass.)*
 - **`hv-core` / `hv-hal` untouched.** The metal is scheduler *policy* + the Stage-2 refinement; hv-core
   is the mechanism. No new invariant — Arc 2 is strictly *more* isolated than Arc 1 (data now
   per-domain), realized entirely through the proven transitions and the audited emission.
@@ -68,11 +71,17 @@ not aliasing. This is the exact **inverse** of Arc 0's *rebirth*, which reuses a
 tenant and therefore **must** `tlbi` (design-lesson #28f). Distinct VMIDs ⇒ no flush; reused VMID ⇒
 flush.
 
-**The honesty boundary (design-lesson #23):** VMID / TLB caching is **TCG-invisible** — QEMU models no
-TLB retention, so on QEMU the isolation is witnessed through the **tables** (VTTBR → distinct `L1` →
-distinct leaves → distinct host PA), which *is* faithfully modeled. The VMID-tag soundness of the
-no-flush is **reasoned**, not empirically caught by the boot test; it is a silicon property under
-regression watch, named here and in Audit #4 rather than implied to be QEMU-proven.
+**The empirical result (a correction to the #28f assumption).** Design-lesson #28f assumed TLB
+retention is *TCG-invisible*. Arc 2's mutation testing shows otherwise for **this** QEMU/`-cpu max`:
+aliasing the two VMIDs (both → VMID 1) while keeping everything else — distinct tables, distinct PA —
+**is caught** (`docs/AUDIT-4-CONCURRENT-STAGE2.md`, mutation 4). With a shared VMID and no flush, the
+switched-in domain's cross-probe **hits the peer's stale VMID-1 TLB entry** and does *not* fault — the
+exact aliasing bug distinct VMIDs prevent. Because the fault is table-guaranteed regardless of the TLB,
+a *missing* fault proves a stale hit occurred; so TCG here **does** model VMID-tagged Stage-2 TLB
+retention, and the distinct-VMID / no-flush property is **empirically witnessed**, not merely reasoned.
+Real silicon remains the ultimate authority (TCG TLB fidelity is version/config-dependent), so the
+property stays under regression watch — but on this QEMU it is a live, caught witness. This suggests the
+Arc-0 rebirth `tlbi` (#28f) is similarly re-testable; flagged for a future re-examination.
 
 ## How the switch reuses Arc 1's machinery
 
