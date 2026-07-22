@@ -149,6 +149,19 @@ impl BlkDisk {
         self.dirty[tenant][sector] = true;
     }
 
+    /// Whether tenant `t` has written (diverged) sector `s` — for the disposable's disk-discard witness.
+    pub fn is_dirty(&self, tenant: usize, sector: usize) -> bool {
+        self.dirty[tenant][sector]
+    }
+
+    /// **Discard a tenant's CoW overlay** — clear its dirty bits and zero its overlay, so its reads fall
+    /// back through to the shared template (M5 Arc 6). This is a disposable's disk being thrown away on
+    /// teardown: the tenant is left with nothing of its own, the template untouched for the next tenant.
+    pub fn discard_overlay(&mut self, tenant: usize) {
+        self.overlay[tenant] = [[0; SECTOR_SIZE]; DISK_SECTORS];
+        self.dirty[tenant] = [false; DISK_SECTORS];
+    }
+
     /// The template sector's backing, read **directly** (bypassing the CoW fall-through) — for the
     /// HV-side *template-immutability* witness (confirm a guest write never reached the template).
     pub fn template_sector(&self, sector: usize) -> &[u8; SECTOR_SIZE] {
