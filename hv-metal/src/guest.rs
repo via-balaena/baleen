@@ -487,6 +487,10 @@ pub struct GuestFrame {
 /// the EL1/EL2 system state that is NOT in that frame) into this per-vCPU store so a different vCPU's
 /// context can be loaded before `eret`. `hv-core`'s `RunState` stays abstract — this concrete
 /// register/sysreg state is the metal's own, keeping the `hv-hal` fence architecture-neutral.
+///
+/// **Scope:** the FP/SIMD registers (`v0..v31`) are deliberately NOT part of the saved context — the
+/// scheduler guests are integer-register-only. A future FP-using guest would need `v0..v31` added here
+/// (and to `__enter_guest_ctx`), or two such guests would silently cross-leak FP state across a switch.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GuestContext {
@@ -513,6 +517,17 @@ impl GuestContext {
         sctlr_el1: 0,
     };
 }
+
+// The `__enter_guest_ctx` asm hard-codes these field offsets; bind them to the struct so a future
+// field reorder (or a non-`u64` insertion) can't silently desync the asm from the layout — one source
+// of truth, checked at compile time (design-lesson #14c, the `const _` discipline).
+const _: () = {
+    assert!(core::mem::offset_of!(GuestContext, x) == 0);
+    assert!(core::mem::offset_of!(GuestContext, sp_el1) == 248);
+    assert!(core::mem::offset_of!(GuestContext, elr_el2) == 256);
+    assert!(core::mem::offset_of!(GuestContext, spsr_el2) == 264);
+    assert!(core::mem::offset_of!(GuestContext, sctlr_el1) == 272);
+};
 
 struct CtxCell(UnsafeCell<[GuestContext; NUM_VCPUS_METAL]>);
 // SAFETY: single boot CPU; written/read only by the straight-line, non-nested guest trap handler
@@ -1568,30 +1583,32 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
         }
     }
 
-    // ── sched-pillar witness 2: affinity ── narrow B's mask to exclude the pCPU → SchedRun → NotAffine.
+    // ── sched-pillar witness 2: affinity ── Probe onto a FREE pCPU that B's mask excludes, so the
+    // refusal is affinity-ONLY (independent of occupancy AND of hv-core's affinity-vs-occupancy check
+    // order): narrow B to {pCPU0} only, then SchedRun B onto pCPU1 (free, but off B's mask) → NotAffine.
     expect(
         hv,
         DOM0,
         HvCall::SchedSetAffinity {
             target: SCHED_DOM,
             vcpu: SCHED_VCPU_B,
-            affinity: 0b10, // only pCPU 1 — excludes pCPU 0
+            affinity: 0b01, // only pCPU 0 — excludes pCPU 1
         },
-        "set B affinity (exclude pCPU0)",
+        "set B affinity (exclude pCPU1)",
         uart,
     );
     match hv.dispatch(
         SCHED_DOM,
         HvCall::SchedRun {
             vcpu: SCHED_VCPU_B,
-            pcpu: PCPU0,
+            pcpu: 1, // a FREE pCPU, but off B's mask → the refusal can ONLY be affinity
             now,
         },
     ) {
         Err(HvError::Sched(SchedError::NotAffine)) => {
             let _ = writeln!(
                 uart,
-                "baleen: scheduler affinity OK: SchedRun onto a non-affine pCPU refused (NotAffine)"
+                "baleen: scheduler affinity OK: SchedRun onto a non-affine (free) pCPU refused (NotAffine)"
             );
         }
         other => {

@@ -161,7 +161,7 @@ boot_and_check "default" "" \
     "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
     "LIFECYCLE ISOLATION TEST PASSED" \
     "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
-    "scheduler affinity OK: SchedRun onto a non-affine pCPU refused (NotAffine)" \
+    "scheduler affinity OK: SchedRun onto a non-affine (free) pCPU refused (NotAffine)" \
     "SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
@@ -194,7 +194,7 @@ boot_and_check "selftest" "--features selftest" \
     "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
     "LIFECYCLE ISOLATION TEST PASSED" \
     "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
-    "scheduler affinity OK: SchedRun onto a non-affine pCPU refused (NotAffine)" \
+    "scheduler affinity OK: SchedRun onto a non-affine (free) pCPU refused (NotAffine)" \
     "SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"

@@ -96,6 +96,48 @@ scheduler refusals are pure model logic. Blind to timing and to true parallelism
 SMP is out of scope). The single-CPU, interrupt-masked, non-nested execution model the whole crate
 rests on is unchanged — Arc 1 adds no concurrency the `Sync` justifications don't already assume.
 
+## The diamond review pass — verdict SOUND
+
+Hardened by the established method (design-lesson #27(j)/#28(h)): three **spec-blind auditors** on
+orthogonal axes + empirical **mutation testing**.
+
+- **Auditor A — Rust/unsafe + context-switch asm.** Verified every hard-coded offset in
+  `__enter_guest_ctx` against the `repr(C)` layout (size 280, no padding), the register-restore
+  ordering (ctx pointer `x0` loaded last, no read-after-clobber), that `ELR/SPSR` set by `write_sysctx`
+  survive to the trampoline's `eret`, no aliasing in the context seeding, and the full 8-yield
+  interleaving + endgame (the last finisher hits `finish` before running the offlined peer). **SOUND.**
+- **Auditor B — false-green / witness integrity.** Confirmed the counter/id/switch triple is
+  un-forgeable (bases seeded in the *context*, not guest code; the id cross-check binds guest identity
+  to metal slot; a single vCPU running twice is impossible), both refusal markers are strictly gated on
+  the exact `SchedError` variant with loud-halt `other` arms, and no marker is unconditional.
+  **NO FALSE-GREEN.**
+- **Auditor C — model-refinement + composition.** Verified against the *actual* hv-core source that
+  every transition is legal from the state hv-core is in, that `SchedSetAffinity` authority is held
+  (dom0's `Control::Root` edge), that the fresh-Hypervisor rebuild composes with the lifecycle phase,
+  and — the pivotal point — that hv-core's `run()` checks **affinity before pCPU-occupancy**, so the
+  `NotAffine` witness fires for the right reason. **FAITHFUL / SOUND COMPOSITION.**
+
+**Empirical mutation testing** — three perturbations that *should* break the scheduler, each confirmed
+caught (the matrix FAILS / boot halts, `SCHEDULER TEST PASSED` never prints):
+
+| mutation | perturbation | caught by |
+|---|---|---|
+| context cross-leak | `restore_context` always loads slot 0 | `vCPU id mismatch (metal slot=1, guest reported=0); halting` |
+| exclusivity defeat | probe a *free* pCPU (so `SchedRun` succeeds) | `exclusivity BROKEN: got Ok(Done); halting` |
+| affinity wrong-cause | don't narrow the mask (probe fails `PcpuBusy`) | `affinity BROKEN: got PcpuBusy not NotAffine; halting` |
+
+**Three below-bar findings fixed** (none a soundness/false-green defect):
+
+1. *(Auditor A)* Bound the `__enter_guest_ctx` asm offsets to the struct with compile-time
+   `const _: () = assert!(offset_of!(GuestContext, …) == …)`, so a future field reorder can't silently
+   desync the asm (the `const _` discipline, #14c).
+2. *(Auditor A)* Documented the scope boundary that FP/SIMD (`v0..v31`) is not saved — sound for the
+   integer-register-only scheduler guests, flagged so a future FP guest doesn't inherit a silent leak.
+3. *(Auditor B)* Made the affinity probe **occupancy-independent**: it now narrows B to exclude a
+   *free* pCPU and probes there, so `NotAffine` is the only possible refusal — the witness no longer
+   depends on hv-core's affinity-vs-occupancy check order (it failed *safe* before, but is now robust
+   to a future hv-core refactor).
+
 ## Verdict
 
 **SOUND, no defect.** Arc 1 refines the hv-core scheduler onto the metal: two vCPUs time-slice under
