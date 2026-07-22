@@ -308,6 +308,11 @@ const VIRTIO_MMIO_HI: u64 = crate::virtio::VIRTIO_MMIO_BASE >> 16;
 const BLK_DOM: DomId = 1;
 /// The backend domain that services the block device — `dom0`, the grantee of the guest's ring/buffers.
 const BLK_BACKEND: DomId = 0;
+// The block backend reuses the Arc-3 grant gate `backend_authorize`, which names the (grantor, grantee)
+// pair by the console's `VIRTIO_DOM`/`VIRTIO_BACKEND` constants. That is correct ONLY because the block
+// phase uses the same DomIds — pin the coupling at compile time so a future arc that gives the block
+// device distinct DomIds cannot silently mis-gate every access against the wrong grantor.
+const _: () = assert!(BLK_DOM == VIRTIO_DOM && BLK_BACKEND == VIRTIO_BACKEND);
 
 // The block guest's frames (model `Mfn`s): a page-table root, the virtqueue, the request header, the
 // data+status I/O buffer, and (the negative) a buffer it owns but does NOT grant.
@@ -1863,6 +1868,25 @@ fn handle_mmio(frame: &mut GuestFrame, esr: u64, far: u64, uart: &mut Pl011) {
         let _ = writeln!(
             uart,
             "baleen: virtio-mmio abort at 0x{far:016x} without ISV (undecodable access); halting"
+        );
+        crate::park();
+    }
+    // `FnV` (ISS[10]) — if the FAR is not valid we cannot trust the register offset; halt loudly rather
+    // than emulate at a garbage address. `SAS` (ISS[23:22]) — the virtio-mmio register file is 32-bit;
+    // a byte/half/dword access would be mis-emulated at word width, so refuse it (a real Linux driver
+    // reads the registers word-wide, but the config space may differ — the Arc-5 capstone widens this).
+    if (iss >> 10) & 1 != 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-mmio abort with FnV (FAR invalid); halting"
+        );
+        crate::park();
+    }
+    let sas = (iss >> 22) & 0b11;
+    if sas != 0b10 {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-mmio abort at 0x{far:016x} with non-word access size (SAS={sas}); halting"
         );
         crate::park();
     }
@@ -3693,7 +3717,11 @@ fn finish_virtio_blk_test(uart: &mut Pl011) -> ! {
     let t1_read_ok = BLK_READ_TEMPLATE_OK[1].load(Ordering::Relaxed);
     let write_isolated_ok = BLK_WRITE_ISOLATED_OK.load(Ordering::Relaxed);
     let refused_ok = BLK_UNGRANTED_REFUSED.load(Ordering::Relaxed);
-    // overlay-isolation: the two tenants' overlays are distinct storage, never aliased.
+    // The LIVE overlay-isolation discriminators are `t1_read_ok` (tenant 1 round-tripped the *template*,
+    // not tenant 0's poison, which persists in `overlay[0]` during tenant 1's phase) plus the absent
+    // `POISON` forbidden-marker. `overlays_distinct` below is a by-construction *structural* assertion
+    // (the overlays are distinct rows of a fixed array — it cannot fail without rewriting the struct); it
+    // documents the "distinct storage" clause of the property but does not by itself discriminate a leak.
     let disk = blk_disk();
     let overlays_distinct = !core::ptr::eq(disk.overlay_ptr(0, 0), disk.overlay_ptr(1, 0));
 
