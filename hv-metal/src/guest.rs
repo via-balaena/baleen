@@ -542,6 +542,69 @@ struct CtxCell(UnsafeCell<[GuestContext; NUM_VCPUS_METAL]>);
 unsafe impl Sync for CtxCell {}
 static VCPU_CTX: CtxCell = CtxCell(UnsafeCell::new([GuestContext::ZERO; NUM_VCPUS_METAL]));
 
+/// Per-metal-vCPU-slot scheduling identity + address space (M5 Arc 1 unified for Arc 2). The register
+/// state lives in [`GuestContext`] (asm-bound offsets); this is the state the *metal switch* needs but
+/// the trampoline never touches: which hv-core `(dom, vcpu)` this slot drives the scheduler as, and the
+/// VMID-tagged `VTTBR_EL2` to install (no flush) when the slot is switched in.
+///
+/// For the single-domain scheduler phase (Arc 1) both slots carry the SAME domain and the SAME
+/// `vttbr`, so restoring the VTTBR on a switch is an identity write — the concurrent-isolation phase
+/// (Arc 2) is the only place the two slots differ (distinct domain, distinct VMID-tagged VTTBR), which
+/// is exactly the per-domain switch the arc proves.
+#[derive(Clone, Copy)]
+struct VcpuMeta {
+    /// The hv-core domain this slot belongs to — the caller the scheduler ops dispatch as.
+    dom: DomId,
+    /// The vCPU index *within its domain* that hv-core admits/runs/preempts.
+    vcpu: u32,
+    /// The domain's VMID-tagged `VTTBR_EL2` (`L1` PA | VMID<<48), installed with NO `tlbi` on switch.
+    vttbr: u64,
+}
+
+impl VcpuMeta {
+    const ZERO: Self = Self {
+        dom: 0,
+        vcpu: 0,
+        vttbr: 0,
+    };
+}
+
+struct MetaCell(UnsafeCell<[VcpuMeta; NUM_VCPUS_METAL]>);
+// SAFETY: single boot CPU; written only at phase setup (before any scheduler guest runs) and read by
+// the straight-line, non-nested trap handler. No concurrent access. Same discipline as `VCPU_CTX`.
+unsafe impl Sync for MetaCell {}
+static VCPU_META: MetaCell = MetaCell(UnsafeCell::new([VcpuMeta::ZERO; NUM_VCPUS_METAL]));
+
+/// Read a metal vCPU slot's scheduling metadata (M5 Arc 1/2).
+fn vcpu_meta(slot: usize) -> VcpuMeta {
+    // SAFETY: single-CPU, non-nested handler; the metadata was written at phase setup before any guest
+    // ran. Exclusive read.
+    unsafe { (*VCPU_META.0.get())[slot] }
+}
+
+/// Install a VMID-tagged `VTTBR_EL2` with **no TLB flush** (M5 Arc 2 — the headline property). Switching
+/// the active Stage-2 between two domains needs no `tlbi` *because* the two domains' translations are
+/// tagged with distinct VMIDs (`set_vmid(set) = set + 1`): a walk for one domain's VMID can never hit
+/// the other's cached entries, so the stale entries the switch leaves behind are inert, not aliasing.
+/// (Contrast Arc 0's *rebirth*, which REUSES a VMID for a different tenant and therefore MUST `tlbi` —
+/// design-lesson #28f. Distinct VMIDs ⇒ no flush; reused VMID ⇒ flush.) The `isb` makes the register
+/// write take effect before the trampoline's `eret` resumes the switched-in vCPU. VMID/TLB tagging is
+/// TCG-invisible (QEMU models no TLB retention), so on QEMU isolation is witnessed through the *tables*
+/// (VTTBR → distinct `L1` → distinct leaves → distinct host PA); the VMID-tag soundness is reasoned
+/// (design-lesson #23; `docs/AUDIT-4-CONCURRENT-STAGE2.md`).
+fn set_vttbr_no_flush(vttbr: u64) {
+    // SAFETY: `VTTBR_EL2` is RW at EL2; it only redirects Stage-2 walks for EL1&0 (EL2 runs
+    // MMU-off/identity, so this handler's own accesses are unaffected). No memory effect; no `tlbi`.
+    unsafe {
+        asm!(
+            "msr vttbr_el2, {v}",
+            "isb",
+            v = in(reg) vttbr,
+            options(nomem, nostack),
+        );
+    }
+}
+
 // The vector trampoline for a lower-EL/AArch64 synchronous exception (slot 8) — both the guest's
 // `HVC` and its data aborts land here. It must NOT clobber a guest register before saving it, so it
 // saves `x0..x30`, hands the frame pointer to the Rust handler, then restores (reloading the handler's
@@ -812,12 +875,16 @@ fn save_context(vcpu: usize, frame: &GuestFrame) {
 }
 
 /// Restore a vCPU's context — GPRs into the trampoline `frame` (so its `ldp`+`eret` resumes that
-/// vCPU) and system state via `msr` (M5 Arc 1).
+/// vCPU), its EL1/EL2 system state via `msr`, AND its domain's VMID-tagged Stage-2 (`VTTBR_EL2`, no
+/// flush — M5 Arc 2). For the single-domain scheduler phase both slots carry the same VTTBR, so the
+/// Stage-2 install is an identity write; for the concurrent-isolation phase it swaps to the peer
+/// domain's address space.
 fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
     // SAFETY: as [`save_context`] — exclusive single-CPU access.
     let ctx = unsafe { (*VCPU_CTX.0.get())[vcpu] };
     frame.x = ctx.x;
     write_sysctx(ctx.sp_el1, ctx.elr_el2, ctx.spsr_el2, ctx.sctlr_el1);
+    set_vttbr_no_flush(vcpu_meta(vcpu).vttbr);
 }
 
 /// Enter the guest at EL1 and never return: switch `SP_EL2` to the dedicated exception stack, set
@@ -1427,13 +1494,18 @@ fn handle_yield(frame: &mut GuestFrame, uart: &mut Pl011) {
     save_context(cur, frame);
 
     let next = 1 - cur;
+    let (cur_m, next_m) = (vcpu_meta(cur), vcpu_meta(next));
     let now = sched_now();
     let hv = sched_hv(uart);
+    // Preempt the running vCPU (as its owning domain) and dispatch the peer (as ITS owning domain — the
+    // same domain when they share it [Arc 1], distinct domains under concurrent isolation [Arc 2]). The
+    // pCPU-exclusivity invariant is maintained across the preempt→run pair; the peer's Stage-2 (its
+    // VMID-tagged VTTBR) is installed by `restore_context` below, no flush.
     expect(
         hv,
-        SCHED_DOM,
+        cur_m.dom,
         HvCall::SchedPreempt {
-            vcpu: cur as u32,
+            vcpu: cur_m.vcpu,
             now,
         },
         "sched preempt",
@@ -1441,9 +1513,9 @@ fn handle_yield(frame: &mut GuestFrame, uart: &mut Pl011) {
     );
     expect(
         hv,
-        SCHED_DOM,
+        next_m.dom,
         HvCall::SchedRun {
-            vcpu: next as u32,
+            vcpu: next_m.vcpu,
             pcpu: PCPU0,
             now,
         },
@@ -1480,15 +1552,17 @@ fn handle_sched_final(frame: &mut GuestFrame, uart: &mut Pl011) {
     }
 
     // The peer still has work: retire this vCPU (Running → Offline) and dispatch the peer (Runnable →
-    // Running from its last preempt), then resume it.
+    // Running from its last preempt), then resume it. Each op is dispatched as the relevant vCPU's
+    // owning domain (identical under Arc 1, distinct under Arc 2's concurrent isolation).
     let next = 1 - cur;
+    let (cur_m, next_m) = (vcpu_meta(cur), vcpu_meta(next));
     let now = sched_now();
     let hv = sched_hv(uart);
     expect(
         hv,
-        SCHED_DOM,
+        cur_m.dom,
         HvCall::SchedOffline {
-            vcpu: cur as u32,
+            vcpu: cur_m.vcpu,
             now,
         },
         "sched offline finished vcpu",
@@ -1496,9 +1570,9 @@ fn handle_sched_final(frame: &mut GuestFrame, uart: &mut Pl011) {
     );
     expect(
         hv,
-        SCHED_DOM,
+        next_m.dom,
         HvCall::SchedRun {
-            vcpu: next as u32,
+            vcpu: next_m.vcpu,
             pcpu: PCPU0,
             now,
         },
@@ -1647,10 +1721,14 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
     init_guest_el1(ram_end);
     let (sp_el1, _elr, _spsr, sctlr) = read_sysctx();
 
-    // Seed both vCPU contexts: same entry + system state, DISTINCT counter bases and ids.
-    // SAFETY: single-CPU, before any scheduler guest runs → exclusive access to the context store.
+    // Seed both vCPU contexts: same entry + system state, DISTINCT counter bases and ids. Both vCPUs
+    // belong to ONE domain and share ONE address space, so both slots carry the SAME (dom, vttbr) — the
+    // per-slot VTTBR restore on every switch is therefore an identity write here (the concurrent-
+    // isolation phase is where the two slots' VTTBRs differ).
+    // SAFETY: single-CPU, before any scheduler guest runs → exclusive access to the context + meta store.
     unsafe {
         let ctxs = &mut *VCPU_CTX.0.get();
+        let metas = &mut *VCPU_META.0.get();
         for (i, base) in [SCHED_BASE_A, SCHED_BASE_B].into_iter().enumerate() {
             let c = &mut ctxs[i];
             *c = GuestContext::ZERO;
@@ -1661,6 +1739,11 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
             c.elr_el2 = entry;
             c.spsr_el2 = SPSR_EL2_GUEST;
             c.sctlr_el1 = sctlr;
+            metas[i] = VcpuMeta {
+                dom: SCHED_DOM,
+                vcpu: i as u32,
+                vttbr, // both slots: the one domain's single VMID-1 Stage-2
+            };
         }
     }
 
