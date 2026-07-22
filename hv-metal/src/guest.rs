@@ -267,6 +267,22 @@ const NR_ISO_FINAL: u64 = 0xfc;
 
 /// The domain running the virtio-console driver (a fresh `Hypervisor` is built for this phase).
 const VIRTIO_DOM: DomId = 1;
+/// The backend domain that services the device — `dom0`, the control domain and grantee of the ring.
+const VIRTIO_BACKEND: DomId = 0;
+
+// The guest's frames (model `Mfn`s). It owns a page-table root plus the two frames it GRANTS to dom0:
+// the virtqueue frame (descriptor table + available ring + used ring) and the TX data buffer.
+const F_VQ_ROOT: Mfn = 1; // the guest's L1 page table (pinned)
+const F_VQ: Mfn = 2; // the split virtqueue (desc @ +0, avail @ +0x100, used @ +0x200)
+const F_BUF: Mfn = 3; // the TX data buffer
+
+// The driver lays the three rings out within F_VQ at desc @ +0, avail @ +0x100, used @ +0x200 (see the
+// guest program), and programs those as the queue addresses; the backend reads the addresses back from
+// the registers and is layout-agnostic, so the offsets live only in the guest asm.
+
+/// The guest builds the ring/buffer IPAs from these (`movz DATA_HI, lsl#16; movk OFF`).
+const VQ_FRAME_OFF: u64 = F_VQ as u64 * stage2::FRAME_SIZE; // 0x2000 → IPA 0x8000_2000
+const BUF_FRAME_OFF: u64 = F_BUF as u64 * stage2::FRAME_SIZE; // 0x3000 → IPA 0x8000_3000
 
 /// The driver reports the four mmio identity registers it read (`x1`=Magic, `x2`=Version, `x3`=DeviceID,
 /// `x4`=VendorID); the backend asserts them. A checkpoint (resumes), not terminal.
@@ -539,6 +555,53 @@ __guest5_tpl_start:
     mov     x0, #{NR_VIRTIO_NEGOTIATED}
     hvc     #0                             // backend asserts VERSION_1 negotiated + FEATURES_OK sticky
 
+    // ── queue 0 setup ── (x15 = F_VQ ipa: desc@+0, avail@+0x100, used@+0x200; x16 = F_BUF ipa)
+    movz    x15, #{DATA_HI}, lsl #16
+    movk    x15, #{VQ_OFF}
+    movz    x16, #{DATA_HI}, lsl #16
+    movk    x16, #{BUF_OFF}
+    str     wzr, [x10, #0x030]             // QueueSel = 0
+    mov     w0, #8
+    str     w0, [x10, #0x038]              // QueueNum = 8
+    mov     w0, w15
+    str     w0, [x10, #0x080]              // QueueDescLow = F_VQ ipa
+    str     wzr, [x10, #0x084]             // QueueDescHigh = 0
+    add     w0, w15, #0x100
+    str     w0, [x10, #0x090]              // QueueDriverLow = avail ring
+    str     wzr, [x10, #0x094]
+    add     w0, w15, #0x200
+    str     w0, [x10, #0x0a0]              // QueueDeviceLow = used ring
+    str     wzr, [x10, #0x0a4]
+    mov     w0, #1
+    str     w0, [x10, #0x044]              // QueueReady = 1
+    mov     w0, #0xf                       // Status = ACK|DRIVER|FEATURES_OK|DRIVER_OK
+    str     w0, [x10, #0x070]
+
+    // ── copy the message into the granted TX buffer (byte loop until NUL) ──
+    adr     x11, 2f                        // source: the message bytes (in the RO+X guest image)
+    mov     x12, x16                       // dest: F_BUF ipa
+1:  ldrb    w14, [x11], #1
+    cbz     w14, 3f
+    strb    w14, [x12], #1
+    b       1b
+2:  .asciz "baleen-guest: hello over a granted virtqueue\n"
+    .balign 4
+3:  sub     x17, x12, x16                  // desc.len = bytes copied
+
+    // ── build descriptor 0: addr = F_BUF, len, flags = 0 (device-read), next = 0 ──
+    str     x16, [x15, #0]                 // desc[0].addr
+    str     w17, [x15, #8]                 // desc[0].len
+    strh    wzr, [x15, #12]                // desc[0].flags = 0
+    strh    wzr, [x15, #14]                // desc[0].next = 0
+
+    // ── available ring: ring[0] = desc 0, idx = 1 ──
+    strh    wzr, [x15, #0x104]             // avail.ring[0] = 0
+    mov     w0, #1
+    strh    w0, [x15, #0x102]              // avail.idx = 1
+
+    // ── kick the device ──
+    str     wzr, [x10, #0x050]             // QueueNotify = 0 → backend drains the granted ring
+
     // ── terminal ──
     mov     x0, #{NR_VIRTIO_FINAL}
     hvc     #0
@@ -548,6 +611,9 @@ __guest5_tpl_start:
 __guest5_tpl_end:
     "#,
     VIRTIO_HI = const VIRTIO_MMIO_HI,
+    DATA_HI = const DATA_IPA_HI,
+    VQ_OFF = const VQ_FRAME_OFF,
+    BUF_OFF = const BUF_FRAME_OFF,
     NR_VIRTIO_ID = const NR_VIRTIO_ID,
     NR_VIRTIO_NEGOTIATED = const NR_VIRTIO_NEGOTIATED,
     NR_VIRTIO_FINAL = const NR_VIRTIO_FINAL,
@@ -648,6 +714,10 @@ static ISO_DONE: AtomicU64 = AtomicU64::new(0);
 static VIRTIO_ID_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 3: whether the driver negotiated `VIRTIO_F_VERSION_1` and the device left FEATURES_OK set.
 static VIRTIO_NEGOTIATED_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 3: whether the backend drained a buffer from the granted ring to the console (the positive).
+static VIRTIO_DRAINED_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 3: whether the backend REFUSED an un-granted access (the negative / diamond — step 4).
+static VIRTIO_UNGRANTED_REFUSED: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     static __guest_tpl_start: u8;
@@ -1362,12 +1432,183 @@ fn handle_mmio(frame: &mut GuestFrame, esr: u64, far: u64, uart: &mut Pl011) {
     advance_elr_past_fault();
 }
 
-/// **M5 Arc 3 — the queue kick.** The driver wrote `QueueNotify`; the backend processes the TX
-/// virtqueue (walk the available ring → descriptor → buffer, each access grant-authorized, drain to the
-/// PL011 console, write the used ring). Wired in a later step; a no-op stub for step 1 (the driver has
-/// not set up a queue yet).
-fn handle_virtio_notify(_uart: &mut Pl011) {
-    // step 3 wires the grant-checked ring walk + console drain here.
+/// Recover the model frame (`Mfn`) a guest IPA lands in, from the shared data-region layout
+/// (`frame_ipa(m) = DATA_IPA_BASE + m*FRAME_SIZE`). `None` if the IPA is below the data region.
+fn gpa_to_mfn(gpa: u64) -> Option<Mfn> {
+    gpa.checked_sub(stage2::DATA_IPA_BASE)
+        .map(|off| (off / stage2::FRAME_SIZE) as Mfn)
+}
+
+/// **The grant gate — the heart of Arc 3.** Authorize a backend access of `len` bytes at guest IPA
+/// `gpa` (writability `writable`) against the proven grant table: the frame the access lands in must be
+/// GRANTED by the guest to the backend (dom0) at the needed permission. Refuses (records the negative
+/// witness, returns `false`) an access to a frame the guest did not grant, or one that would straddle a
+/// frame boundary (a single grant authorizes a single frame). This is what makes the ring a *grant*:
+/// the descriptor addresses are untrusted guest data, and every one the backend dereferences is checked.
+fn backend_authorize(
+    hv: &Hypervisor,
+    gpa: u64,
+    len: u64,
+    writable: bool,
+    uart: &mut Pl011,
+) -> bool {
+    let Some(mfn) = gpa_to_mfn(gpa) else {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio backend REFUSED access at IPA 0x{gpa:016x} (below the data region); not a granted frame"
+        );
+        VIRTIO_UNGRANTED_REFUSED.store(true, Ordering::Relaxed);
+        return false;
+    };
+    // A single frame grant authorizes a single frame; reject an access that crosses the boundary.
+    if (gpa & (stage2::FRAME_SIZE - 1)) + len > stage2::FRAME_SIZE {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio backend REFUSED access at IPA 0x{gpa:016x} len {len} (crosses a frame boundary)"
+        );
+        VIRTIO_UNGRANTED_REFUSED.store(true, Ordering::Relaxed);
+        return false;
+    }
+    if !hv
+        .grant()
+        .authorizes(VIRTIO_DOM, VIRTIO_BACKEND, mfn as Frame, writable)
+    {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio backend REFUSED un-granted access to Mfn {mfn} (IPA 0x{gpa:016x}, writable={writable}) — the ring is a grant"
+        );
+        VIRTIO_UNGRANTED_REFUSED.store(true, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// Grant-checked backend **read** of `buf.len()` bytes from guest IPA `gpa` (via the fence's
+/// `GuestMemory`, host-PA direct). Returns `false` (leaving `buf` untouched) if the grant refuses.
+fn backend_read(hv: &Hypervisor, gpa: u64, buf: &mut [u8], uart: &mut Pl011) -> bool {
+    backend_authorize(hv, gpa, buf.len() as u64, false, uart) && GuestMem.read(gpa, buf).is_ok()
+}
+
+/// Grant-checked backend **write** of `buf` to guest IPA `gpa`. Requires a *writable* grant. Returns
+/// `false` (writing nothing) if the grant refuses.
+fn backend_write(hv: &Hypervisor, gpa: u64, buf: &[u8], uart: &mut Pl011) -> bool {
+    backend_authorize(hv, gpa, buf.len() as u64, true, uart) && {
+        let mut gm = GuestMem;
+        gm.write(gpa, buf).is_ok()
+    }
+}
+
+/// Grant-checked reads of the little-endian integer types the virtqueue is laid out in.
+fn backend_read_u16(hv: &Hypervisor, gpa: u64, uart: &mut Pl011) -> Option<u16> {
+    let mut b = [0u8; 2];
+    backend_read(hv, gpa, &mut b, uart).then(|| u16::from_le_bytes(b))
+}
+fn backend_read_u32(hv: &Hypervisor, gpa: u64, uart: &mut Pl011) -> Option<u32> {
+    let mut b = [0u8; 4];
+    backend_read(hv, gpa, &mut b, uart).then(|| u32::from_le_bytes(b))
+}
+fn backend_read_u64(hv: &Hypervisor, gpa: u64, uart: &mut Pl011) -> Option<u64> {
+    let mut b = [0u8; 8];
+    backend_read(hv, gpa, &mut b, uart).then(|| u64::from_le_bytes(b))
+}
+
+/// **M5 Arc 3 — the queue kick (the backend).** The driver wrote `QueueNotify`; the backend, acting as
+/// dom0, walks the TX split-virtqueue and drains completed buffers to the PL011 console. EVERY guest-
+/// memory access — the available ring, the descriptor table, the data buffer, and the used ring it
+/// writes back — is authorized by [`backend_authorize`] against the guest's grant. The device is not
+/// live until the driver finished the handshake (`DRIVER_OK`) and marked the queue ready.
+fn handle_virtio_notify(uart: &mut Pl011) {
+    use crate::virtio::{
+        VIRTQ_AVAIL_IDX_OFF, VIRTQ_AVAIL_RING_OFF, VIRTQ_DESC_SIZE, VIRTQ_USED_ELEM_SIZE,
+        VIRTQ_USED_IDX_OFF, VIRTQ_USED_RING_OFF,
+    };
+    // SAFETY: single-CPU, non-nested handler; the Hypervisor was built before the guest ran.
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_ref() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+    let dev = virtio_dev();
+    if !dev.queue_live() {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio QueueNotify before the queue is live (status=0x{:02x} ready={}); ignoring",
+            dev.status, dev.queue_ready
+        );
+        return;
+    }
+    let num = dev.queue_num as u16;
+    if num == 0 {
+        return;
+    }
+
+    // How many buffers has the driver made available?
+    let Some(avail_idx) = backend_read_u16(hv, dev.queue_driver + VIRTQ_AVAIL_IDX_OFF, uart) else {
+        return;
+    };
+
+    while dev.last_avail_idx != avail_idx {
+        // The head descriptor index for this available entry.
+        let slot = (dev.last_avail_idx % num) as u64;
+        let Some(head) =
+            backend_read_u16(hv, dev.queue_driver + VIRTQ_AVAIL_RING_OFF + slot * 2, uart)
+        else {
+            return;
+        };
+
+        // The descriptor: addr / len / flags (we handle a single device-readable buffer, no chaining).
+        let desc = dev.queue_desc + head as u64 * VIRTQ_DESC_SIZE;
+        let (Some(addr), Some(len)) = (
+            backend_read_u64(hv, desc, uart),
+            backend_read_u32(hv, desc + 8, uart),
+        ) else {
+            return;
+        };
+
+        // Drain the buffer to the console — the descriptor's address is untrusted, so this read is
+        // grant-checked like every other. A refusal aborts this buffer (the bytes never reach the
+        // console) but still retires it on the used ring, so the ring stays consistent.
+        let written = backend_drain_to_console(hv, addr, len, uart);
+
+        // Retire the buffer on the used ring: used.ring[used_idx % num] = { id: head, len: written }.
+        let used_slot = (dev.used_idx % num) as u64;
+        let elem = dev.queue_device + VIRTQ_USED_RING_OFF + used_slot * VIRTQ_USED_ELEM_SIZE;
+        let _ = backend_write(hv, elem, &(head as u32).to_le_bytes(), uart);
+        let _ = backend_write(hv, elem + 4, &written.to_le_bytes(), uart);
+        dev.used_idx = dev.used_idx.wrapping_add(1);
+        let _ = backend_write(
+            hv,
+            dev.queue_device + VIRTQ_USED_IDX_OFF,
+            &dev.used_idx.to_le_bytes(),
+            uart,
+        );
+
+        dev.last_avail_idx = dev.last_avail_idx.wrapping_add(1);
+    }
+
+    // Raise a used-buffer notification (bit 0); a real driver reads InterruptStatus + ACKs it.
+    dev.interrupt_status |= 1;
+    VIRTIO_DRAINED_OK.store(true, Ordering::Relaxed);
+}
+
+/// Drain `len` bytes of a granted TX buffer at guest IPA `addr` to the PL011 console, one grant-checked
+/// chunk at a time. Returns the number of bytes actually written (0 if the grant refused the buffer —
+/// the un-granted negative). Bounds `len` to a sane maximum so a corrupt descriptor can't spin.
+fn backend_drain_to_console(hv: &Hypervisor, addr: u64, len: u32, uart: &mut Pl011) -> u32 {
+    const MAX_TX: u32 = 256; // one console line; a larger buffer would chunk, deferred
+    let len = len.min(MAX_TX);
+    let mut buf = [0u8; MAX_TX as usize];
+    let slice = &mut buf[..len as usize];
+    if !backend_read(hv, addr, slice, uart) {
+        return 0; // refused (un-granted buffer) — nothing reaches the console
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: virtio-console backend: draining {len} bytes from the granted ring (grant-authorized)"
+    );
+    for &byte in slice.iter() {
+        uart.put(byte);
+    }
+    len
 }
 
 /// Record a guest data abort (a negative-isolation probe): decode `DFSC`/`WnR`/faulting-IPA, stamp the
@@ -2546,8 +2787,7 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
         None => crate::park(),
     };
 
-    // dom0 creates the guest that runs the virtio-console driver. (Step 1 needs no data frames — the
-    // guest only touches its code image and the mmio window; the granted virtqueue arrives in step 3.)
+    // dom0 creates the guest that runs the virtio-console driver.
     expect(
         hv,
         DOM0,
@@ -2559,8 +2799,74 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
         uart,
     );
 
-    // Stage-2: the guest image (RO+X) and any data leaves; the virtio-mmio window is NOT mapped, so a
-    // device-register access faults to EL2 and is trap-and-emulated.
+    // The guest allocates its page-table root + the two frames it will share: the virtqueue frame and
+    // the TX buffer. It links both as writable leaves (so it can build the ring + write the message),
+    // pins the root, and GRANTS both to dom0 — the virtqueue frame read-write (the backend writes the
+    // used ring), the buffer read-only (the backend only reads the TX data). The ring IS a grant.
+    for mfn in [F_VQ_ROOT, F_VQ, F_BUF] {
+        expect(
+            hv,
+            VIRTIO_DOM,
+            HvCall::P2mAllocate { mfn },
+            "virtio alloc frame",
+            uart,
+        );
+    }
+    expect(
+        hv,
+        VIRTIO_DOM,
+        HvCall::P2mPin {
+            mfn: F_VQ_ROOT,
+            level: PtLevel::L1,
+        },
+        "virtio pin root",
+        uart,
+    );
+    for (slot, child) in [(0u32, F_VQ), (1u32, F_BUF)] {
+        expect(
+            hv,
+            VIRTIO_DOM,
+            HvCall::P2mLink {
+                parent: F_VQ_ROOT,
+                slot,
+                child,
+                writable: true,
+                leaf: true,
+            },
+            "virtio link frame",
+            uart,
+        );
+    }
+    // The guest grants its ring + buffer to the backend (dom0). `gref` 0 = the virtqueue (RW), 1 = the
+    // TX buffer (RO). These are the consent the backend's every access is checked against.
+    expect(
+        hv,
+        VIRTIO_DOM,
+        HvCall::GrantAccess {
+            gref: 0 as GrantRef,
+            grantee: VIRTIO_BACKEND,
+            frame: F_VQ as Frame,
+            readonly: false,
+        },
+        "virtio grant ring",
+        uart,
+    );
+    expect(
+        hv,
+        VIRTIO_DOM,
+        HvCall::GrantAccess {
+            gref: 1 as GrantRef,
+            grantee: VIRTIO_BACKEND,
+            frame: F_BUF as Frame,
+            readonly: true,
+        },
+        "virtio grant buffer",
+        uart,
+    );
+
+    // Stage-2: the guest image (RO+X) and its two writable data leaves (the ring + buffer); the
+    // virtio-mmio window is NOT mapped, so a device-register access faults to EL2 and is
+    // trap-and-emulated.
     let vttbr = stage2::build_stage2_from_p2m(hv, VIRTIO_DOM, STAGE2_SET_SINGLE);
     let entry = load_guest5();
     let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
@@ -2585,15 +2891,16 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
 fn finish_virtio_console_test(uart: &mut Pl011) -> ! {
     let id_ok = VIRTIO_ID_OK.load(Ordering::Relaxed);
     let negotiated_ok = VIRTIO_NEGOTIATED_OK.load(Ordering::Relaxed);
-    if id_ok && negotiated_ok {
+    let drained_ok = VIRTIO_DRAINED_OK.load(Ordering::Relaxed);
+    if id_ok && negotiated_ok && drained_ok {
         let _ = writeln!(
             uart,
-            "baleen: VIRTIO CONSOLE TEST PASSED — virtio-mmio device identified + VERSION_1 negotiated"
+            "baleen: VIRTIO CONSOLE TEST PASSED — device identified + VERSION_1 negotiated + guest bytes delivered over a granted virtqueue"
         );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok})"
+            "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok} drained_ok={drained_ok})"
         );
     }
     selftest_brk(uart);

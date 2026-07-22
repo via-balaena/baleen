@@ -88,11 +88,29 @@ pub const VIRTIO_F_VERSION_1_BIT: u32 = 32;
 /// `VIRTIO_F_VERSION_1` as a mask within device-features **word 1**.
 pub const VERSION_1_WORD1_MASK: u32 = 1 << (VIRTIO_F_VERSION_1_BIT - 32);
 
-// Device `Status` bits (virtio 1.x §2.1) — the handshake the driver walks. `DRIVER_OK` (bit 2) is
-// added in step 3 (the driver sets it after queue setup; the backend gates notify processing on it).
+// Device `Status` bits (virtio 1.x §2.1) — the handshake the driver walks.
 pub const STATUS_ACKNOWLEDGE: u32 = 1;
 pub const STATUS_DRIVER: u32 = 2;
+pub const STATUS_DRIVER_OK: u32 = 4;
 pub const STATUS_FEATURES_OK: u32 = 8;
+
+// ─── split-virtqueue in-memory layout (virtio 1.x §2.7) — the field offsets the backend parses ──────
+//
+// The driver programs the three ring base addresses (Desc/Driver/Device) via the queue registers; the
+// backend reads them back and parses the rings at these sub-field offsets. It is layout-agnostic about
+// where in guest memory the driver *placed* the rings (spec-correct) — only the internal field layout
+// is fixed.
+
+/// Bytes per `virtq_desc` = `{ le64 addr; le32 len; le16 flags; le16 next; }`.
+pub const VIRTQ_DESC_SIZE: u64 = 16;
+/// `virtq_avail` = `{ le16 flags; le16 idx; le16 ring[N]; }` — `idx` at +2, `ring` at +4.
+pub const VIRTQ_AVAIL_IDX_OFF: u64 = 2;
+pub const VIRTQ_AVAIL_RING_OFF: u64 = 4;
+/// `virtq_used` = `{ le16 flags; le16 idx; virtq_used_elem ring[N]; }` with
+/// `virtq_used_elem = { le32 id; le32 len; }` — `idx` at +2, `ring` at +4, 8 bytes/elem.
+pub const VIRTQ_USED_IDX_OFF: u64 = 2;
+pub const VIRTQ_USED_RING_OFF: u64 = 4;
+pub const VIRTQ_USED_ELEM_SIZE: u64 = 8;
 
 /// The maximum queue size the device supports (a power of two, per spec).
 pub const QUEUE_NUM_MAX_VAL: u32 = 8;
@@ -128,6 +146,16 @@ pub struct VirtioConsole {
     pub interrupt_status: u32,
     /// The device's own view of the used ring's next index (how many buffers it has returned).
     pub used_idx: u16,
+    /// The next available-ring index the backend has NOT yet consumed (its private cursor).
+    pub last_avail_idx: u16,
+}
+
+impl VirtioConsole {
+    /// The queue is live for processing iff the driver finished the handshake (`DRIVER_OK`) and marked
+    /// the queue ready. The backend refuses to touch guest memory until both hold.
+    pub fn queue_live(&self) -> bool {
+        self.status & STATUS_DRIVER_OK != 0 && self.queue_ready == 1
+    }
 }
 
 impl VirtioConsole {
@@ -145,6 +173,7 @@ impl VirtioConsole {
             status: 0,
             interrupt_status: 0,
             used_idx: 0,
+            last_avail_idx: 0,
         }
     }
 
