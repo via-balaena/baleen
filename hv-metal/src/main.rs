@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # `hv-metal` — the bare-metal layer (M5 Arc 0)
+//! # `hv-metal` — the bare-metal layer (M5 Arc 1)
 //!
 //! The southbound metal layer beneath the proven `hv-core` brain. Arc 0 stood up the dev + CI
 //! boot-test loop; Arc 1 turned the raw UART poke into a *proper* [`pl011`] console; Arc 2 confirmed
@@ -209,9 +209,11 @@ pub extern "C" fn rust_main() -> ! {
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven
     //     `p2m`, run the Arc-5 authorize/deny isolation matrix (the proof touches reality), then the
     //     M5 Arc 0 LIFECYCLE phase — destroy the guest and reborn a fresh domain in the same slot,
-    //     witnessing that it inherits nothing (the confused-deputy defense, live). Terminal: the
-    //     reborn guest's report handler parks (and, under `selftest`, chains the Arc-2 fault-catch
-    //     first), so this never returns.
+    //     witnessing that it inherits nothing (the confused-deputy defense) — then the M5 Arc 1
+    //     SCHEDULER phase: two vCPUs time-slice under hv-core's real scheduler, each context
+    //     preserved across the switch, exclusivity + affinity enforced. Terminal: the last phase's
+    //     report handler parks (and, under `selftest`, chains the Arc-2 fault-catch first), so this
+    //     never returns.
     guest::run(&mut uart);
 }
 
