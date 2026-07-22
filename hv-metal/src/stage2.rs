@@ -108,11 +108,19 @@ fn data_ram_end() -> u64 {
     core::ptr::addr_of!(__guest_data_end) as u64
 }
 
-/// VMID for the single guest — stamped into `VTTBR_EL2[55:48]` here, and reached by
-/// [`crate::guest`]'s `tlbi vmalls12e1is` transitively through that `VTTBR_EL2` value (the metal has
-/// no separate guest-side VMID constant). Nonzero to distinguish it from the "no VMID" default;
-/// 8-bit, since `VTCR_EL2.VS=0`.
-const GUEST_VMID: u64 = 1;
+/// Number of independent per-domain Stage-2 table sets the metal can hold live at once. Two, for the
+/// M5 Arc-2 concurrent-inter-domain-isolation test (two domains, each its own set + VMID); the
+/// single-domain phases (Arc 0/5 isolation + lifecycle, Arc 1 scheduler) all use [`set`] `0`.
+pub const NUM_STAGE2_SETS: usize = 2;
+
+/// The `VMID` a Stage-2 set is tagged with — **`set + 1`**, stamped into `VTTBR_EL2[55:48]`. Distinct
+/// per set (set 0 → VMID 1, set 1 → VMID 2) so two domains' TLB entries are VMID-tagged and cannot
+/// alias — which is exactly what makes a context switch between them sound with **no `tlbi`** (M5
+/// Arc 2). Nonzero to distinguish from the "no VMID" default; 8-bit, since `VTCR_EL2.VS=0`. The
+/// single-domain callers on set 0 keep VMID 1, unchanged from Arc 1's `GUEST_VMID`.
+pub const fn set_vmid(set: usize) -> u64 {
+    set as u64 + 1
+}
 
 // ---------------------------------------------------------------------------------------------
 // AArch64 Stage-2 descriptor encodings (4 KiB granule). Re-derived independently from the Arm ARM
@@ -173,19 +181,42 @@ struct Table(UnsafeCell<[u64; 512]>);
 // accesses race. Same discipline as `guest.rs`'s and `heap.rs`'s interior-mutable statics.
 unsafe impl Sync for Table {}
 
-/// Level-1 Stage-2 table: one entry for the guest-image `1 GiB` region (→ `L2_CODE`) and one for the
-/// data `1 GiB` region (→ `L2_DATA`).
-static STAGE2_L1: Table = Table(UnsafeCell::new([0; 512]));
-/// Level-2 table for the guest image: a single 2 MiB RWX block.
-static STAGE2_L2_CODE: Table = Table(UnsafeCell::new([0; 512]));
-/// Level-2 table for the data region: one entry (→ `L3_DATA`).
-static STAGE2_L2_DATA: Table = Table(UnsafeCell::new([0; 512]));
-/// Level-3 table for the data region: one 4 KiB page descriptor per authorized model frame; the rest
-/// stay zero (translation-fault holes).
-static STAGE2_L3_DATA: Table = Table(UnsafeCell::new([0; 512]));
+/// One complete per-domain Stage-2 table set: an `L1` (one entry → the guest-image `1 GiB` region's
+/// `L2`, one → the data `1 GiB` region's `L2`), an `L2` for the guest image (a single 2 MiB RWX
+/// block), an `L2` for the data region (→ `L3`), and an `L3` for the data region (one 4 KiB page
+/// descriptor per authorized model frame; the rest stay zero → translation-fault holes). Each domain
+/// under concurrent isolation (M5 Arc 2) gets its own set, reached via a distinct VMID-tagged VTTBR.
+struct Stage2Set {
+    l1: Table,
+    l2_code: Table,
+    l2_data: Table,
+    l3_data: Table,
+}
 
-/// Build the Stage-2 tables for `guest_dom` from the proven `p2m`, and return the `VTTBR_EL2` value
-/// (`L1` table PA | VMID). Idempotent: every used table slot is written afresh.
+/// The [`NUM_STAGE2_SETS`] independent per-domain table sets. Set 0 is the sole set the single-domain
+/// phases use (byte-identical to Arc 1's single table set); set 1 is the second domain's, used only by
+/// the Arc-2 concurrent-isolation phase. Distinct storage per set, so building one domain's Stage-2
+/// never touches another's. Each set is built via an inline `const` block (an all-zero, interior-mutable
+/// `Table` per level) — the same idiom as `guest.rs`'s `FAULT_DFSC` array, so no named
+/// interior-mutable const is declared.
+static STAGE2_SETS: [Stage2Set; NUM_STAGE2_SETS] = [const {
+    Stage2Set {
+        l1: Table(UnsafeCell::new([0; 512])),
+        l2_code: Table(UnsafeCell::new([0; 512])),
+        l2_data: Table(UnsafeCell::new([0; 512])),
+        l3_data: Table(UnsafeCell::new([0; 512])),
+    }
+}; NUM_STAGE2_SETS];
+
+/// Build the Stage-2 tables for `guest_dom` from the proven `p2m` into table `set`, and return the
+/// `VTTBR_EL2` value (the set's `L1` table PA | its VMID = [`set_vmid`]`(set)`). Idempotent: every used
+/// table slot is written afresh.
+///
+/// `set` selects which of the [`NUM_STAGE2_SETS`] independent table sets to emit into (and thus which
+/// VMID the returned VTTBR carries). Single-domain phases pass `set 0`; the Arc-2 concurrent-isolation
+/// phase emits each of its two domains into its own set (0 and 1 → VMID 1 and 2). Because the sets are
+/// disjoint storage, building one domain's Stage-2 leaves the other domain's tables untouched — the
+/// two live simultaneously, distinguished by VMID with no flush between them.
 ///
 /// The guest-image region is mapped as infrastructure (identity 2 MiB RWX block). The data region is
 /// the refinement: for every **leaf** page-table edge whose parent `guest_dom` owns, the leaf's
@@ -193,11 +224,12 @@ static STAGE2_L3_DATA: Table = Table(UnsafeCell::new([0; 512]));
 /// `S2AP=RW`, else `S2AP=RO`, always execute-never). A foreign child appears here only because
 /// `p2m_link` already required a grant, so the grant dimension is covered transitively; a frame
 /// `guest_dom` may not reach has no leaf edge and so no descriptor — the hardware faults it.
-pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId) -> u64 {
-    let l1 = STAGE2_L1.0.get();
-    let l2_code = STAGE2_L2_CODE.0.get();
-    let l2_data = STAGE2_L2_DATA.0.get();
-    let l3_data = STAGE2_L3_DATA.0.get();
+pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u64 {
+    let tables = &STAGE2_SETS[set];
+    let l1 = tables.l1.0.get();
+    let l2_code = tables.l2_code.0.get();
+    let l2_data = tables.l2_data.0.get();
+    let l3_data = tables.l3_data.0.get();
 
     let l1_pa = l1 as *const u8 as u64;
     let l2_code_pa = l2_code as *const u8 as u64;
@@ -248,7 +280,7 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId) -> u64 {
         }
     }
 
-    l1_pa | (GUEST_VMID << 48)
+    l1_pa | (set_vmid(set) << 48)
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -211,6 +211,12 @@ const SCHED_BASE_B: u64 = 0x200;
 /// Metal-side vCPU context slots (one per scheduler vCPU).
 const NUM_VCPUS_METAL: usize = 2;
 
+/// The single Stage-2 table set (of [`stage2::NUM_STAGE2_SETS`]) every single-domain phase uses —
+/// Arc 0/5 isolation + lifecycle and Arc 1's scheduler (both vCPUs share one address space). VMID 1.
+/// The Arc-2 concurrent-isolation phase is the only caller that uses a second set. Named so a reader
+/// sees at a glance that these phases are deliberately single-set, not accidentally colliding.
+const STAGE2_SET_SINGLE: usize = 0;
+
 // ---------------------------------------------------------------------------------------------
 // The guest program.
 //
@@ -1311,7 +1317,7 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
     // (5) Re-emit Stage-2 from `G′`'s p2m (maps its fresh writable frame; the ex-granted frame has no
     // leaf edge → no descriptor → a hole), and re-enter the phase-2 guest. The re-entry guard is
     // cleared here because we diverge into `eret` rather than returning through the trampoline.
-    let vttbr = stage2::build_stage2_from_p2m(hv, GUEST_DOM);
+    let vttbr = stage2::build_stage2_from_p2m(hv, GUEST_DOM, STAGE2_SET_SINGLE);
     // The per-frame fault records are behaviourally LIVE across the lifecycle boundary: phase 2 scores
     // its negatives from FAULT_DFSC, and a stale phase-1 fault on a frame phase 2 also probes would
     // manufacture a false witness. So reset them here — each incarnation's negatives are its own
@@ -1633,7 +1639,7 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
     );
 
     // Emit Stage-2 (one set, VMID 1 — both vCPUs share the domain's address space) and enable it.
-    let vttbr = stage2::build_stage2_from_p2m(hv, SCHED_DOM);
+    let vttbr = stage2::build_stage2_from_p2m(hv, SCHED_DOM, STAGE2_SET_SINGLE);
     let entry = load_guest3();
     let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
     enable_stage2(vttbr);
@@ -1880,7 +1886,7 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     setup_model(hv, uart);
 
     // Emit Stage-2 from the proven p2m (the refinement — the Audit #2 target).
-    let vttbr = stage2::build_stage2_from_p2m(hv, GUEST_DOM);
+    let vttbr = stage2::build_stage2_from_p2m(hv, GUEST_DOM, STAGE2_SET_SINGLE);
 
     // Seed the read-only frame with a value the guest can only echo back if the RO mapping resolves to
     // the frame the hypervisor wrote — a positive witness the guest cannot forge. Through the fence.
