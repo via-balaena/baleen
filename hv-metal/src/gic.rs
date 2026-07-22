@@ -134,7 +134,10 @@ pub(crate) fn init_physical_vtimer() {
     // (MMU off). Each write targets a documented GICv3 register at its fixed offset; the reads poll the
     // wake handshake. No Rust memory is aliased.
     unsafe {
-        // Distributor: affinity routing + Group 1 enable.
+        // Distributor: affinity routing + Group 1 enable. (On real silicon a write that changes ARE
+        // should be followed by polling `GICD_CTLR.RWP` to observe the register-write completion; QEMU's
+        // GICD completes synchronously from a reset-zeroed state, so it is sound to omit here — noted for
+        // the real-HW port.)
         core::ptr::write_volatile(GICD_BASE as *mut u32, GICD_CTLR_ARE_GRP1);
 
         // Wake this CPU's redistributor: clear ProcessorSleep, wait for ChildrenAsleep to clear.
@@ -162,14 +165,25 @@ pub(crate) fn init_physical_vtimer() {
 /// Enable the EL2 **physical** CPU interface so a physical IRQ (the timer PPI) is delivered to EL2:
 /// priority mask wide open, Group 1 physical interrupts enabled. (Distinct from the guest's EL1 virtual
 /// interface — at EL2 these `ICC_*` registers are the physical ones.)
+///
+/// Sets `ICC_SRE_EL2.SRE` first so the `ICC_*` system-register accesses are always legal — the function
+/// is self-contained and does not rely on a prior phase having enabled the interface (which would be a
+/// latent ordering trap if this path were reused standalone, e.g. at the real-Linux capstone).
 pub(crate) fn enable_physical_cpu_interface_el2() {
-    // SAFETY: `ICC_PMR_EL1`/`ICC_IGRPEN1_EL1` accessed at EL2 are the physical CPU-interface controls;
-    // we open the priority mask and enable Group 1. `isb` before an interrupt can be taken. No memory.
+    // SAFETY: `ICC_SRE_EL2`/`ICC_PMR_EL1`/`ICC_IGRPEN1_EL1` at EL2 are the physical CPU-interface
+    // controls; we set SRE (system-register interface) then open the priority mask and enable Group 1.
+    // `isb` after SRE (a later access depends on it) and before an interrupt can be taken. No memory.
     unsafe {
         asm!(
+            "mrs {t}, ICC_SRE_EL2",
+            "orr {t}, {t}, {sre}",
+            "msr ICC_SRE_EL2, {t}",
+            "isb",
             "msr ICC_PMR_EL1, {pmr}",
             "msr ICC_IGRPEN1_EL1, {en}",
             "isb",
+            t = out(reg) _,
+            sre = in(reg) ICC_SRE_EL2_SRE,
             pmr = in(reg) 0xffu64,
             en = in(reg) 1u64,
             options(nomem, nostack, preserves_flags),
