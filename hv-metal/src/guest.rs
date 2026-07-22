@@ -93,7 +93,7 @@
 use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use hv_core::grant::{Frame, GrantRef};
 use hv_core::hypervisor::DomId;
@@ -297,6 +297,55 @@ const NR_VIRTIO_FINAL: u64 = 0xfa;
 
 /// The high half of [`crate::virtio::VIRTIO_MMIO_BASE`] (`0x0a00`), for the guest's `movz #hi, lsl#16`.
 const VIRTIO_MMIO_HI: u64 = crate::virtio::VIRTIO_MMIO_BASE >> 16;
+
+// ─── M5 Arc 4: virtio-blk + copy-on-write template storage ──────────────────────────────────────────
+//
+// Two synthetic guests drive a real virtio-blk device (DeviceID 2) over a descriptor CHAIN. The disk is
+// a shared read-only template + a per-tenant copy-on-write overlay (see [`crate::blk`]). The diamond:
+// a write hits the overlay, never the template; a second tenant reads the template pristine.
+
+/// The domain running a virtio-blk driver (a fresh `Hypervisor` per phase; both tenant phases reuse it).
+const BLK_DOM: DomId = 1;
+/// The backend domain that services the block device — `dom0`, the grantee of the guest's ring/buffers.
+const BLK_BACKEND: DomId = 0;
+// The block backend reuses the Arc-3 grant gate `backend_authorize`, which names the (grantor, grantee)
+// pair by the console's `VIRTIO_DOM`/`VIRTIO_BACKEND` constants. That is correct ONLY because the block
+// phase uses the same DomIds — pin the coupling at compile time so a future arc that gives the block
+// device distinct DomIds cannot silently mis-gate every access against the wrong grantor.
+const _: () = assert!(BLK_DOM == VIRTIO_DOM && BLK_BACKEND == VIRTIO_BACKEND);
+
+// The block guest's frames (model `Mfn`s): a page-table root, the virtqueue, the request header, the
+// data+status I/O buffer, and (the negative) a buffer it owns but does NOT grant.
+const F_BLK_ROOT: Mfn = 1; // the guest's L1 page table (pinned)
+const F_BLK_VQ: Mfn = 2; // the split virtqueue (desc @ +0, avail @ +0x100, used @ +0x200) — granted RW
+const F_BLK_HDR: Mfn = 3; // the virtio_blk_req header (device-readable) — granted RO
+const F_BLK_IO: Mfn = 4; // data buffer @ +0 (512 B) + status byte @ +0x200 — granted RW (device-writable)
+const F_BLK_UNGRANTED: Mfn = 5; // owned, NOT granted — a descriptor pointing here is the negative
+
+/// The block guest builds the ring/buffer IPAs from these (`movz DATA_HI, lsl#16; movk OFF`).
+const BLK_VQ_OFF: u64 = F_BLK_VQ as u64 * stage2::FRAME_SIZE; // 0x2000 → IPA 0x8000_2000
+const BLK_HDR_OFF: u64 = F_BLK_HDR as u64 * stage2::FRAME_SIZE; // 0x3000 → IPA 0x8000_3000
+const BLK_IO_OFF: u64 = F_BLK_IO as u64 * stage2::FRAME_SIZE; // 0x4000 → IPA 0x8000_4000
+const BLK_UNGRANTED_OFF: u64 = F_BLK_UNGRANTED as u64 * stage2::FRAME_SIZE; // 0x5000 → 0x8000_5000
+/// The status byte sits at +0x200 within the I/O frame (past the 512-byte data area).
+const BLK_STATUS_OFF_IN_IO: u64 = 0x200;
+
+/// The template sector 0 content — the shared golden image a clean read falls through to. A printable
+/// marker so the backend's echo of a served read is a positive boot-test witness.
+const BLK_TEMPLATE_MARKER: &[u8] = b"baleen-blk-template-sector-0-pristine\n";
+/// The first-tenant write payload — MUST NOT ever appear on the console (it is confined to tenant 0's
+/// overlay). A `FORBIDDEN_MARKERS` guard catches it if a write reaches the template or overlays alias.
+const BLK_POISON_MARKER: &[u8] = b"POISON-blk-guest0-write-must-not-cross\n";
+
+/// The driver reports the four virtio-mmio identity registers (`x1`=Magic..`x4`=VendorID); checkpoint.
+const NR_BLK_ID: u64 = 0xe0;
+/// The driver reports negotiation (`x1`=device features word 1, `x2`=Status readback); checkpoint.
+const NR_BLK_NEGOTIATED: u64 = 0xe1;
+/// The driver reports the first 8 bytes it read back from the (device-written) data buffer (`x1`); the
+/// backend asserts they equal the template seed — the round-trip witness. Checkpoint.
+const NR_BLK_READ_REPORT: u64 = 0xe2;
+/// The block phase's terminal report — the backend asserts the matrix and finishes (boot's last act).
+const NR_BLK_FINAL: u64 = 0xe3;
 
 // ---------------------------------------------------------------------------------------------
 // The guest program.
@@ -647,6 +696,281 @@ __guest5_tpl_end:
     NR_VIRTIO_FINAL = const NR_VIRTIO_FINAL,
 );
 
+// The virtio-blk READER driver guest program (M5 Arc 4). It identifies + negotiates the block device
+// (identical handshake to the console — the shared virtio-mmio transport), sets up queue 0, then issues
+// ONE read request: a descriptor CHAIN of { header (device-read) → data buffer (device-WRITE) → status
+// (device-write) } for sector 0, kicks QueueNotify, and reports the first 8 bytes the backend DMA'd into
+// its data buffer. Used by BOTH block tenant phases (phase 6 tenant 0's read de-risk; phase 7 tenant 1's
+// isolation read). Position-independent as the others.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_blk_read_tpl_start
+__guest_blk_read_tpl_start:
+    // x10 = VIRTIO_MMIO_BASE (0x0a00_0000). Every access below faults (unmapped) → trap-and-emulate.
+    movz    x10, #{VIRTIO_HI}, lsl #16
+    // ── identity registers ──
+    ldr     w1, [x10, #0x000]              // MagicValue → "virt"
+    ldr     w2, [x10, #0x004]              // Version    → 2
+    ldr     w3, [x10, #0x008]              // DeviceID   → 2 (block)
+    ldr     w4, [x10, #0x00c]              // VendorID
+    mov     x0, #{NR_BLK_ID}
+    hvc     #0
+    // ── negotiation handshake (virtio 1.x §3.1.1) — identical to the console ──
+    str     wzr, [x10, #0x070]            // Status = 0 (reset)
+    mov     w0, #3
+    str     w0, [x10, #0x070]             // ACKNOWLEDGE | DRIVER
+    mov     w0, #1
+    str     w0, [x10, #0x014]             // DeviceFeaturesSel = 1
+    ldr     w5, [x10, #0x010]             // DeviceFeatures[word 1]
+    mov     w0, #1
+    str     w0, [x10, #0x024]             // DriverFeaturesSel = 1
+    str     w5, [x10, #0x020]             // DriverFeatures[word 1] = VERSION_1
+    mov     w0, #0xb
+    str     w0, [x10, #0x070]             // ACKNOWLEDGE | DRIVER | FEATURES_OK
+    ldr     w6, [x10, #0x070]             // Status readback
+    mov     x1, x5
+    mov     x2, x6
+    mov     x0, #{NR_BLK_NEGOTIATED}
+    hvc     #0
+    // ── queue 0 setup ── (x15 = F_BLK_VQ ipa; x13 = F_BLK_HDR ipa; x14 = F_BLK_IO ipa)
+    movz    x15, #{DATA_HI}, lsl #16
+    movk    x15, #{VQ_OFF}
+    movz    x13, #{DATA_HI}, lsl #16
+    movk    x13, #{HDR_OFF}
+    movz    x14, #{DATA_HI}, lsl #16
+    movk    x14, #{IO_OFF}
+    str     wzr, [x10, #0x030]            // QueueSel = 0
+    mov     w0, #8
+    str     w0, [x10, #0x038]             // QueueNum = 8
+    mov     w0, w15
+    str     w0, [x10, #0x080]             // QueueDescLow = F_BLK_VQ
+    str     wzr, [x10, #0x084]
+    add     w0, w15, #0x100
+    str     w0, [x10, #0x090]             // QueueDriverLow = avail ring
+    str     wzr, [x10, #0x094]
+    add     w0, w15, #0x200
+    str     w0, [x10, #0x0a0]             // QueueDeviceLow = used ring
+    str     wzr, [x10, #0x0a4]
+    mov     w0, #1
+    str     w0, [x10, #0x044]             // QueueReady = 1
+    mov     w0, #0xf
+    str     w0, [x10, #0x070]             // Status = ACK|DRIVER|FEATURES_OK|DRIVER_OK
+    // ── build the request header @ F_BLK_HDR: type=T_IN(0), reserved=0, sector=0 = 16 zero bytes ──
+    stp     xzr, xzr, [x13]
+    // ── build the descriptor chain @ F_BLK_VQ (desc table @ +0) ──
+    // desc[0]: header — addr=F_BLK_HDR, len=16, flags=NEXT(1), next=1
+    str     x13, [x15, #0]
+    mov     w0, #16
+    str     w0, [x15, #8]
+    mov     w0, #1
+    strh    w0, [x15, #12]                // flags = NEXT
+    mov     w0, #1
+    strh    w0, [x15, #14]                // next = 1
+    // desc[1]: data — addr=F_BLK_IO, len=512, flags=NEXT|WRITE(3), next=2  (device-writable)
+    str     x14, [x15, #16]
+    mov     w0, #512
+    str     w0, [x15, #24]
+    mov     w0, #3
+    strh    w0, [x15, #28]                // flags = NEXT | WRITE
+    mov     w0, #2
+    strh    w0, [x15, #30]                // next = 2
+    // desc[2]: status — addr=F_BLK_IO+0x200, len=1, flags=WRITE(2), next=0  (device-writable)
+    add     x0, x14, #{STATUS_OFF}
+    str     x0, [x15, #32]
+    mov     w0, #1
+    str     w0, [x15, #40]
+    mov     w0, #2
+    strh    w0, [x15, #44]                // flags = WRITE
+    strh    wzr, [x15, #46]               // next = 0
+    // ── available ring: ring[0] = desc 0, idx = 1 ──
+    strh    wzr, [x15, #0x104]            // avail.ring[0] = 0
+    mov     w0, #1
+    strh    w0, [x15, #0x102]             // avail.idx = 1
+    // ── kick the device → backend walks the chain, CoW-reads sector 0, DMAs it into F_BLK_IO ──
+    str     wzr, [x10, #0x050]            // QueueNotify = 0
+    // ── report the first 8 bytes the backend wrote into the data buffer ──
+    ldr     x1, [x14, #0]
+    mov     x0, #{NR_BLK_READ_REPORT}
+    hvc     #0
+    // ── terminal ──
+    mov     x0, #{NR_BLK_FINAL}
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_blk_read_tpl_end
+__guest_blk_read_tpl_end:
+    "#,
+    VIRTIO_HI = const VIRTIO_MMIO_HI,
+    DATA_HI = const DATA_IPA_HI,
+    VQ_OFF = const BLK_VQ_OFF,
+    HDR_OFF = const BLK_HDR_OFF,
+    IO_OFF = const BLK_IO_OFF,
+    STATUS_OFF = const BLK_STATUS_OFF_IN_IO,
+    NR_BLK_ID = const NR_BLK_ID,
+    NR_BLK_NEGOTIATED = const NR_BLK_NEGOTIATED,
+    NR_BLK_READ_REPORT = const NR_BLK_READ_REPORT,
+    NR_BLK_FINAL = const NR_BLK_FINAL,
+);
+
+// The virtio-blk WRITER driver guest program (M5 Arc 4, tenant 0 / phase 6). It identifies + negotiates,
+// sets up queue 0, then issues THREE requests over the shared descriptor chain:
+//   (1) READ sector 0 — de-risks the read path and reports the template it round-tripped (positive);
+//   (2) WRITE the poison payload to sector 0 — lands in tenant 0's CoW overlay, never the template;
+//   (3) the NEGATIVE — a READ whose data buffer points at an UN-GRANTED frame → the backend refuses.
+// desc0 (header) and desc2 (status) are built once; only desc1 (the data buffer) + the header contents
+// change per request. Position-independent as the others.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_blk_write_tpl_start
+__guest_blk_write_tpl_start:
+    movz    x10, #{VIRTIO_HI}, lsl #16
+    // ── identity ──
+    ldr     w1, [x10, #0x000]
+    ldr     w2, [x10, #0x004]
+    ldr     w3, [x10, #0x008]
+    ldr     w4, [x10, #0x00c]
+    mov     x0, #{NR_BLK_ID}
+    hvc     #0
+    // ── negotiation (identical to the console/reader) ──
+    str     wzr, [x10, #0x070]
+    mov     w0, #3
+    str     w0, [x10, #0x070]
+    mov     w0, #1
+    str     w0, [x10, #0x014]
+    ldr     w5, [x10, #0x010]
+    mov     w0, #1
+    str     w0, [x10, #0x024]
+    str     w5, [x10, #0x020]
+    mov     w0, #0xb
+    str     w0, [x10, #0x070]
+    ldr     w6, [x10, #0x070]
+    mov     x1, x5
+    mov     x2, x6
+    mov     x0, #{NR_BLK_NEGOTIATED}
+    hvc     #0
+    // ── queue 0 setup ──  x15=F_BLK_VQ, x13=F_BLK_HDR, x14=F_BLK_IO, x18=F_BLK_UNGRANTED
+    movz    x15, #{DATA_HI}, lsl #16
+    movk    x15, #{VQ_OFF}
+    movz    x13, #{DATA_HI}, lsl #16
+    movk    x13, #{HDR_OFF}
+    movz    x14, #{DATA_HI}, lsl #16
+    movk    x14, #{IO_OFF}
+    movz    x18, #{DATA_HI}, lsl #16
+    movk    x18, #{UNGRANTED_OFF}
+    str     wzr, [x10, #0x030]
+    mov     w0, #8
+    str     w0, [x10, #0x038]
+    mov     w0, w15
+    str     w0, [x10, #0x080]
+    str     wzr, [x10, #0x084]
+    add     w0, w15, #0x100
+    str     w0, [x10, #0x090]
+    str     wzr, [x10, #0x094]
+    add     w0, w15, #0x200
+    str     w0, [x10, #0x0a0]
+    str     wzr, [x10, #0x0a4]
+    mov     w0, #1
+    str     w0, [x10, #0x044]
+    mov     w0, #0xf
+    str     w0, [x10, #0x070]
+    // ── desc[0] (header) and desc[2] (status) — same for every request, build once ──
+    str     x13, [x15, #0]                // desc0.addr = header
+    mov     w0, #16
+    str     w0, [x15, #8]                 // desc0.len = 16
+    mov     w0, #1
+    strh    w0, [x15, #12]                // desc0.flags = NEXT
+    mov     w0, #1
+    strh    w0, [x15, #14]                // desc0.next = 1
+    add     x0, x14, #{STATUS_OFF}
+    str     x0, [x15, #32]                // desc2.addr = status
+    mov     w0, #1
+    str     w0, [x15, #40]                // desc2.len = 1
+    mov     w0, #2
+    strh    w0, [x15, #44]                // desc2.flags = WRITE
+    strh    wzr, [x15, #46]               // desc2.next = 0
+
+    // ── Request 1: READ sector 0 (template) ──
+    stp     xzr, xzr, [x13]               // header: type=T_IN(0), reserved=0, sector=0
+    str     x14, [x15, #16]               // desc1.addr = F_BLK_IO (data)
+    mov     w0, #512
+    str     w0, [x15, #24]                // desc1.len = 512
+    mov     w0, #3
+    strh    w0, [x15, #28]                // desc1.flags = NEXT | WRITE (device-writable)
+    mov     w0, #2
+    strh    w0, [x15, #30]                // desc1.next = 2
+    strh    wzr, [x15, #0x104]            // avail.ring[0] = 0
+    mov     w0, #1
+    strh    w0, [x15, #0x102]             // avail.idx = 1
+    str     wzr, [x10, #0x050]            // kick → backend CoW-reads sector 0 into F_BLK_IO
+    ldr     x1, [x14, #0]
+    mov     x0, #{NR_BLK_READ_REPORT}
+    hvc     #0                            // report the template bytes round-tripped
+
+    // ── Request 2: WRITE the poison payload to sector 0 (→ tenant 0's overlay) ──
+    adr     x11, 7f                       // copy the poison into F_BLK_IO's data area
+    mov     x12, x14
+1:  ldrb    w0, [x11], #1
+    cbz     w0, 8f
+    strb    w0, [x12], #1
+    b       1b
+7:  .asciz "POISON-blk-guest0-write-must-not-cross\n"
+    .balign 4
+8:  mov     w0, #1
+    str     w0, [x13, #0]                 // header: type = T_OUT(1)
+    str     wzr, [x13, #4]                // reserved = 0
+    str     xzr, [x13, #8]                // sector = 0
+    str     x14, [x15, #16]               // desc1.addr = F_BLK_IO (data)
+    mov     w0, #512
+    str     w0, [x15, #24]
+    mov     w0, #1
+    strh    w0, [x15, #28]                // desc1.flags = NEXT (device-READABLE, no WRITE)
+    mov     w0, #2
+    strh    w0, [x15, #30]                // desc1.next = 2
+    strh    wzr, [x15, #0x106]            // avail.ring[1] = 0
+    mov     w0, #2
+    strh    w0, [x15, #0x102]             // avail.idx = 2
+    str     wzr, [x10, #0x050]            // kick → backend CoW-writes tenant 0's overlay
+
+    // ── Request 3: the NEGATIVE — READ into an UN-GRANTED buffer (backend must refuse) ──
+    str     xzr, [x13, #0]                // header: type = T_IN(0), reserved=0
+    str     xzr, [x13, #8]                // sector = 0
+    str     x18, [x15, #16]               // desc1.addr = F_BLK_UNGRANTED (owned, NOT granted)
+    mov     w0, #512
+    str     w0, [x15, #24]
+    mov     w0, #3
+    strh    w0, [x15, #28]                // desc1.flags = NEXT | WRITE
+    mov     w0, #2
+    strh    w0, [x15, #30]                // desc1.next = 2
+    strh    wzr, [x15, #0x108]            // avail.ring[2] = 0
+    mov     w0, #3
+    strh    w0, [x15, #0x102]             // avail.idx = 3
+    str     wzr, [x10, #0x050]            // kick → backend refuses the un-granted data buffer
+
+    // ── terminal ──
+    mov     x0, #{NR_BLK_FINAL}
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_blk_write_tpl_end
+__guest_blk_write_tpl_end:
+    "#,
+    VIRTIO_HI = const VIRTIO_MMIO_HI,
+    DATA_HI = const DATA_IPA_HI,
+    VQ_OFF = const BLK_VQ_OFF,
+    HDR_OFF = const BLK_HDR_OFF,
+    IO_OFF = const BLK_IO_OFF,
+    UNGRANTED_OFF = const BLK_UNGRANTED_OFF,
+    STATUS_OFF = const BLK_STATUS_OFF_IN_IO,
+    NR_BLK_ID = const NR_BLK_ID,
+    NR_BLK_NEGOTIATED = const NR_BLK_NEGOTIATED,
+    NR_BLK_READ_REPORT = const NR_BLK_READ_REPORT,
+    NR_BLK_FINAL = const NR_BLK_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -679,6 +1003,58 @@ static VIRTIO_DEV: VirtioCell = VirtioCell(UnsafeCell::new(crate::virtio::Virtio
 fn virtio_dev() -> &'static mut crate::virtio::VirtioConsole {
     // SAFETY: single-CPU, non-nested handler; exclusive access.
     unsafe { &mut *VIRTIO_DEV.0.get() }
+}
+
+/// The virtio-blk device state (M5 Arc 4) — a second trap-and-emulate register file, active only during
+/// the block phases. Same single-CPU discipline as [`VIRTIO_DEV`].
+struct BlkCell(UnsafeCell<crate::blk::VirtioBlk>);
+// SAFETY: single boot CPU; touched only by the straight-line, non-nested guest trap handler and the
+// block-phase setup before that guest runs. No concurrent access.
+unsafe impl Sync for BlkCell {}
+static BLK_DEV: BlkCell = BlkCell(UnsafeCell::new(crate::blk::VirtioBlk::new()));
+
+/// Borrow the virtio-blk device register state (M5 Arc 4).
+fn blk_dev() -> &'static mut crate::blk::VirtioBlk {
+    // SAFETY: single-CPU, non-nested handler; exclusive access.
+    unsafe { &mut *BLK_DEV.0.get() }
+}
+
+/// The copy-on-write disk (M5 Arc 4) — the shared read-only template + per-tenant overlays. **Persists
+/// across the two block-phase `Hypervisor` rebuilds** (it is backend/device-model storage, not part of
+/// the model), which is exactly what lets tenant 1 read the template tenant 0 left pristine. Seeded once
+/// before the first block phase; never mapped into any guest's Stage-2 (unreachable by construction).
+struct BlkDiskCell(UnsafeCell<crate::blk::BlkDisk>);
+// SAFETY: single boot CPU; touched only by the non-nested backend (via the trap handler) and the
+// one-time seed before the first block guest runs. No concurrent access.
+unsafe impl Sync for BlkDiskCell {}
+static BLK_DISK: BlkDiskCell = BlkDiskCell(UnsafeCell::new(crate::blk::BlkDisk::new()));
+
+/// Borrow the copy-on-write disk (M5 Arc 4).
+fn blk_disk() -> &'static mut crate::blk::BlkDisk {
+    // SAFETY: single-CPU, non-nested handler; exclusive access.
+    unsafe { &mut *BLK_DISK.0.get() }
+}
+
+/// Which virtio device the mmio window ([`crate::virtio::VIRTIO_MMIO_BASE`]) currently emulates — set at
+/// each device phase's entry so [`handle_mmio`] routes a trapped register access to the right device.
+/// The console (Arc 3) and block (Arc 4) phases run sequentially; only one device is live at a time.
+#[derive(Clone, Copy, PartialEq)]
+enum ActiveVirtio {
+    None = 0,
+    Console = 1,
+    Blk = 2,
+}
+static ACTIVE_VIRTIO: AtomicU8 = AtomicU8::new(ActiveVirtio::None as u8);
+
+fn set_active_virtio(which: ActiveVirtio) {
+    ACTIVE_VIRTIO.store(which as u8, Ordering::Relaxed);
+}
+fn active_virtio() -> ActiveVirtio {
+    match ACTIVE_VIRTIO.load(Ordering::Relaxed) {
+        1 => ActiveVirtio::Console,
+        2 => ActiveVirtio::Blk,
+        _ => ActiveVirtio::None,
+    }
 }
 
 /// The balance the hypervisor last returned to the guest (across trap invocations), so the credit
@@ -747,6 +1123,25 @@ static VIRTIO_DRAINED_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 3: whether the backend REFUSED an un-granted access (the negative / diamond — step 4).
 static VIRTIO_UNGRANTED_REFUSED: AtomicBool = AtomicBool::new(false);
 
+/// M5 Arc 4: which tenant (per-guest CoW overlay) the current block phase runs — the backend keys its
+/// disk accesses on this. Set at each block phase's entry.
+static BLK_TENANT: AtomicU64 = AtomicU64::new(0);
+/// M5 Arc 4: the driver read the four virtio-blk identity registers correctly (magic/version/id=2/vendor).
+static BLK_ID_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 4: the driver negotiated `VIRTIO_F_VERSION_1` and the device left FEATURES_OK set.
+static BLK_NEGOTIATED_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 4: whether a T_IN read the backend served for tenant `t` fell through to the TEMPLATE (a clean
+/// sector) AND the round-trip bytes the guest reported matched the template seed — per tenant. Tenant 0's
+/// bit witnesses "a clean sector reads the template"; tenant 1's witnesses **overlay-isolation** (it read
+/// the template pristine, not tenant 0's poison).
+static BLK_READ_TEMPLATE_OK: [AtomicBool; crate::blk::N_TENANTS] =
+    [const { AtomicBool::new(false) }; crate::blk::N_TENANTS];
+/// M5 Arc 4: a WRITE landed in the tenant's overlay and left the template pristine (template-immutability,
+/// checked HV-side after tenant 0's write). Set in a later step.
+static BLK_WRITE_ISOLATED_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 4: the backend REFUSED an un-granted descriptor in the chain (the grant regression negative).
+static BLK_UNGRANTED_REFUSED: AtomicBool = AtomicBool::new(false);
+
 extern "C" {
     static __guest_tpl_start: u8;
     static __guest_tpl_end: u8;
@@ -758,6 +1153,10 @@ extern "C" {
     static __guest4_tpl_end: u8;
     static __guest5_tpl_start: u8;
     static __guest5_tpl_end: u8;
+    static __guest_blk_read_tpl_start: u8;
+    static __guest_blk_read_tpl_end: u8;
+    static __guest_blk_write_tpl_start: u8;
+    static __guest_blk_write_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1028,6 +1427,36 @@ fn load_guest4() -> u64 {
 fn load_guest5() -> u64 {
     let tpl_start = core::ptr::addr_of!(__guest5_tpl_start) as usize;
     let tpl_end = core::ptr::addr_of!(__guest5_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **virtio-blk reader** guest template into guest RAM and return its `entry` guest-physical
+/// address (M5 Arc 4). Used by phase 7 (tenant 1's isolation read).
+fn load_guest_blk_read() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_blk_read_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_blk_read_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **virtio-blk writer** guest template into guest RAM and return its `entry` guest-physical
+/// address (M5 Arc 4). Used by phase 6 (tenant 0: read, write-poison, and the un-granted negative).
+fn load_guest_blk_write() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_blk_write_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_blk_write_tpl_end) as usize;
     let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
     let len = tpl_end - tpl_start;
     // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
@@ -1402,7 +1831,11 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_ISO_FINAL => handle_iso_final(frame, uart), // M5 Arc 2: records + switches, or finishes
         NR_VIRTIO_ID => virtio_report_id(frame, uart), // M5 Arc 3: assert the mmio identity registers
         NR_VIRTIO_NEGOTIATED => virtio_report_negotiated(frame, uart), // assert VERSION_1 + FEATURES_OK
-        NR_VIRTIO_FINAL => finish_virtio_console_test(uart),           // -> ! (phase-5 terminal)
+        NR_VIRTIO_FINAL => finish_virtio_console_test(uart), // -> ! (phase-5 → block phases)
+        NR_BLK_ID => virtio_blk_report_id(frame, uart), // M5 Arc 4: assert the virtio-blk identity
+        NR_BLK_NEGOTIATED => virtio_blk_report_negotiated(frame, uart), // assert VERSION_1 + FEATURES_OK
+        NR_BLK_READ_REPORT => virtio_blk_report_read(frame, uart), // assert the read round-tripped
+        NR_BLK_FINAL => finish_virtio_blk_test(uart),              // -> ! (block phase terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -1438,21 +1871,62 @@ fn handle_mmio(frame: &mut GuestFrame, esr: u64, far: u64, uart: &mut Pl011) {
         );
         crate::park();
     }
+    // `FnV` (ISS[10]) — if the FAR is not valid we cannot trust the register offset; halt loudly rather
+    // than emulate at a garbage address. `SAS` (ISS[23:22]) — the virtio-mmio register file is 32-bit;
+    // a byte/half/dword access would be mis-emulated at word width, so refuse it (a real Linux driver
+    // reads the registers word-wide, but the config space may differ — the Arc-5 capstone widens this).
+    if (iss >> 10) & 1 != 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-mmio abort with FnV (FAR invalid); halting"
+        );
+        crate::park();
+    }
+    let sas = (iss >> 22) & 0b11;
+    if sas != 0b10 {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-mmio abort at 0x{far:016x} with non-word access size (SAS={sas}); halting"
+        );
+        crate::park();
+    }
     let srt = ((iss >> 16) & 0x1f) as usize; // target GP register (31 = XZR/discard)
     let wnr = (iss >> 6) & 1 != 0; // write-not-read
     let offset = far - crate::virtio::VIRTIO_MMIO_BASE;
 
-    let dev = virtio_dev();
+    // Route to whichever virtio device the current phase installed at this window (console in Arc 3,
+    // block in Arc 4). Only one is live at a time — the phases run sequentially.
+    let active = active_virtio();
+    if active == ActiveVirtio::None {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-mmio access with no active device; halting"
+        );
+        crate::park();
+    }
     if wnr {
         // A store: the value is the guest's source register (XZR reads as 0).
         let value = if srt < 31 { frame.x[srt] } else { 0 } as u32;
-        let notify = dev.mmio_write(offset, value);
+        let notify = match active {
+            ActiveVirtio::Console => virtio_dev().mmio_write(offset, value),
+            ActiveVirtio::Blk => blk_dev().mmio_write(offset, value),
+            ActiveVirtio::None => crate::park(),
+        };
         if notify {
-            handle_virtio_notify(uart); // the queue kick (later step processes the ring)
+            // The queue kick — dispatched to the active device's backend (both grant-gated).
+            match active {
+                ActiveVirtio::Console => handle_virtio_notify(uart),
+                ActiveVirtio::Blk => handle_virtio_blk_notify(uart),
+                ActiveVirtio::None => crate::park(),
+            }
         }
     } else {
         // A load: service the register and write the result back into the guest's saved frame.
-        let value = dev.mmio_read(offset) as u64;
+        let value = match active {
+            ActiveVirtio::Console => virtio_dev().mmio_read(offset),
+            ActiveVirtio::Blk => blk_dev().mmio_read(offset),
+            ActiveVirtio::None => crate::park(),
+        } as u64;
         if srt < 31 {
             frame.x[srt] = value;
         }
@@ -1637,6 +2111,211 @@ fn backend_drain_to_console(hv: &Hypervisor, addr: u64, len: u32, uart: &mut Pl0
         uart.put(byte);
     }
     len
+}
+
+/// One split-virtqueue descriptor, read (grant-checked) from the guest's descriptor table (M5 Arc 4).
+struct BlkDesc {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+/// Grant-checked read of descriptor `index` from the guest's descriptor table at `desc_table`. `None`
+/// if the index is out of the negotiated ring or any field access is refused (an un-granted ring).
+fn backend_read_desc(
+    hv: &Hypervisor,
+    desc_table: u64,
+    index: u16,
+    num: u16,
+    uart: &mut Pl011,
+) -> Option<BlkDesc> {
+    if index >= num {
+        return None; // a chain index outside the negotiated ring — malformed
+    }
+    let d = desc_table + index as u64 * crate::virtio::VIRTQ_DESC_SIZE;
+    Some(BlkDesc {
+        addr: backend_read_u64(hv, d, uart)?,
+        len: backend_read_u32(hv, d + 8, uart)?,
+        flags: backend_read_u16(hv, d + 12, uart)?,
+        next: backend_read_u16(hv, d + 14, uart)?,
+    })
+}
+
+/// **M5 Arc 4 — the block queue kick (the backend).** The driver wrote `QueueNotify`; the backend, acting
+/// as dom0, walks each available request — a **descriptor chain** { header → data → status } — and serves
+/// it against the copy-on-write disk. EVERY guest-memory access (ring, each descriptor, the header, the
+/// data buffer, the status byte, the used ring) is grant-authorized exactly as Arc 3; the new content is
+/// the chain walk, the device-writable data buffer of a read, and the CoW disk.
+fn handle_virtio_blk_notify(uart: &mut Pl011) {
+    use crate::virtio::{
+        VIRTQ_AVAIL_IDX_OFF, VIRTQ_AVAIL_RING_OFF, VIRTQ_USED_ELEM_SIZE, VIRTQ_USED_IDX_OFF,
+        VIRTQ_USED_RING_OFF,
+    };
+    // SAFETY: single-CPU, non-nested handler; the Hypervisor was built before the guest ran.
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_ref() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+    let dev = blk_dev();
+    if !dev.queue_live() {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk QueueNotify before the queue is live (status=0x{:02x} ready={}); ignoring",
+            dev.status, dev.queue_ready
+        );
+        return;
+    }
+    let num = dev.queue_num as u16;
+    if num == 0 {
+        return;
+    }
+    let Some(avail_idx) = backend_read_u16(hv, dev.queue_driver + VIRTQ_AVAIL_IDX_OFF, uart) else {
+        return;
+    };
+    while dev.last_avail_idx != avail_idx {
+        let slot = (dev.last_avail_idx % num) as u64;
+        let Some(head) =
+            backend_read_u16(hv, dev.queue_driver + VIRTQ_AVAIL_RING_OFF + slot * 2, uart)
+        else {
+            return;
+        };
+        process_blk_request(hv, dev.queue_desc, num, head, uart);
+
+        // Retire the request on the used ring (grant-checked, like the console). virtio-blk drivers do
+        // not rely on the reported `len` for the status byte, so 0 is sufficient for the synthetic guest.
+        let used_slot = (dev.used_idx % num) as u64;
+        let elem = dev.queue_device + VIRTQ_USED_RING_OFF + used_slot * VIRTQ_USED_ELEM_SIZE;
+        let _ = backend_write(hv, elem, &(head as u32).to_le_bytes(), uart);
+        let _ = backend_write(hv, elem + 4, &0u32.to_le_bytes(), uart);
+        dev.used_idx = dev.used_idx.wrapping_add(1);
+        let _ = backend_write(
+            hv,
+            dev.queue_device + VIRTQ_USED_IDX_OFF,
+            &dev.used_idx.to_le_bytes(),
+            uart,
+        );
+        dev.last_avail_idx = dev.last_avail_idx.wrapping_add(1);
+    }
+    dev.interrupt_status |= 1;
+}
+
+/// Service one virtio-blk request chain for the current tenant: parse the { header → data → status }
+/// descriptors (each grant-checked), then serve a read (CoW-read the sector → grant-**write** the guest's
+/// device-writable buffer) or a write (grant-**read** the buffer → CoW-**write** the tenant's overlay,
+/// never the template), and write the status byte. A grant refusal on the data buffer is the negative —
+/// the request errors and no bytes cross ([`BLK_UNGRANTED_REFUSED`] records the cause).
+fn process_blk_request(hv: &Hypervisor, desc_table: u64, num: u16, head: u16, uart: &mut Pl011) {
+    use crate::blk::{
+        BLK_HDR_SECTOR_OFF, BLK_HDR_SIZE, DISK_SECTORS, SECTOR_SIZE, VIRTIO_BLK_S_IOERR,
+        VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
+    };
+    let tenant = BLK_TENANT.load(Ordering::Relaxed) as usize;
+    let disk = blk_disk();
+
+    // desc0: the request header (device-readable), chained to the data descriptor.
+    let Some(d0) = backend_read_desc(hv, desc_table, head, num, uart) else {
+        return;
+    };
+    if d0.flags & VIRTQ_DESC_F_NEXT == 0 || (d0.len as u64) < BLK_HDR_SIZE {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk malformed request: header not chained or under-sized"
+        );
+        return;
+    }
+    let (Some(typ), Some(sector64)) = (
+        backend_read_u32(hv, d0.addr, uart),
+        backend_read_u64(hv, d0.addr + BLK_HDR_SECTOR_OFF, uart),
+    ) else {
+        return;
+    };
+    // desc1: the data buffer, chained to the status descriptor.
+    let Some(d1) = backend_read_desc(hv, desc_table, d0.next, num, uart) else {
+        return;
+    };
+    if d1.flags & VIRTQ_DESC_F_NEXT == 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk malformed request: data not chained"
+        );
+        return;
+    }
+
+    let sector = sector64 as usize;
+    let n = (d1.len as usize).min(SECTOR_SIZE);
+    // The data descriptor's direction must match the request: a read (T_IN) delivers into a
+    // device-WRITABLE buffer; a write (T_OUT) sources a device-READABLE one. Refuse a mismatch loudly
+    // rather than DMA in the wrong direction (a real driver always sets these consistently).
+    let data_writable = d1.flags & VIRTQ_DESC_F_WRITE != 0;
+    let direction_ok = match typ {
+        VIRTIO_BLK_T_IN => data_writable,
+        VIRTIO_BLK_T_OUT => !data_writable,
+        _ => false,
+    };
+    // desc2: the status byte (device-writable).
+    let Some(d2) = backend_read_desc(hv, desc_table, d1.next, num, uart) else {
+        return;
+    };
+
+    let mut status = VIRTIO_BLK_S_OK;
+    if sector >= DISK_SECTORS || !direction_ok {
+        status = VIRTIO_BLK_S_IOERR;
+    } else {
+        match typ {
+            VIRTIO_BLK_T_IN => {
+                // The data buffer is device-WRITABLE: authorize a WRITE into guest memory, then DMA the
+                // (CoW-read) sector into it. A refusal is the negative — nothing crosses.
+                if !backend_authorize(hv, d1.addr, n as u64, true, uart) {
+                    BLK_UNGRANTED_REFUSED.store(true, Ordering::Relaxed);
+                    status = VIRTIO_BLK_S_IOERR;
+                } else {
+                    let sector_data = *disk.read(tenant, sector); // CoW: overlay if written, else template
+                    let mut gm = GuestMem;
+                    if gm.write(d1.addr, &sector_data[..n]).is_ok() {
+                        // Echo the served bytes: a positive witness (the template marker) — and, were
+                        // isolation ever broken, the forbidden poison would surface here (FORBIDDEN guard).
+                        let _ = writeln!(
+                            uart,
+                            "baleen: virtio-blk READ served sector {sector} to tenant {tenant} ({n} bytes, grant-authorized)"
+                        );
+                        // Echo up to the sector's NUL terminator (the markers are NUL-padded), so a leak
+                        // of the forbidden poison would still surface without printing 474 pad bytes.
+                        for &b in &sector_data[..n] {
+                            if b == 0 {
+                                break;
+                            }
+                            uart.put(b);
+                        }
+                    } else {
+                        status = VIRTIO_BLK_S_IOERR;
+                    }
+                }
+            }
+            VIRTIO_BLK_T_OUT => {
+                // The data buffer is device-READABLE: authorize a READ of guest memory, then CoW-write
+                // the tenant's OVERLAY (never the template).
+                if !backend_authorize(hv, d1.addr, n as u64, false, uart) {
+                    BLK_UNGRANTED_REFUSED.store(true, Ordering::Relaxed);
+                    status = VIRTIO_BLK_S_IOERR;
+                } else {
+                    let mut buf = [0u8; SECTOR_SIZE];
+                    if GuestMem.read(d1.addr, &mut buf[..n]).is_ok() {
+                        disk.write(tenant, sector, &buf[..n]);
+                        let _ = writeln!(
+                            uart,
+                            "baleen: virtio-blk WRITE by tenant {tenant} landed in its CoW overlay (sector {sector}; template untouched)"
+                        );
+                    } else {
+                        status = VIRTIO_BLK_S_IOERR;
+                    }
+                }
+            }
+            _ => status = VIRTIO_BLK_S_IOERR,
+        }
+    }
+    // The status byte is device-writable — grant-checked like every other guest-memory access.
+    let _ = backend_write(hv, d2.addr, &[status], uart);
 }
 
 /// Record a guest data abort (a negative-isolation probe): decode `DFSC`/`WnR`/faulting-IPA, stamp the
@@ -2907,6 +3586,7 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
         ArmVcpu.set_entry(entry);
     }
     IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    set_active_virtio(ActiveVirtio::Console); // route trapped mmio to the console register file
     let _ = writeln!(
         uart,
         "baleen: virtio-console phase — guest drives a virtio-mmio v2 console device (MMIO trap-and-emulate)"
@@ -2930,14 +3610,319 @@ fn finish_virtio_console_test(uart: &mut Pl011) -> ! {
             uart,
             "baleen: VIRTIO CONSOLE TEST PASSED — granted bytes delivered, un-granted access refused (the ring is a proven grant)"
         );
+        // M5 Arc 4: the ring is a proven grant → now the DISK is a CoW template. Chain into the
+        // virtio-blk phases; the last one ends the boot (running the deliberate-fault selftest).
+        begin_virtio_blk_phase6(uart); // never returns
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok} drained_ok={drained_ok} refused_ok={refused_ok})"
+    );
+    crate::park();
+}
+
+/// **M5 Arc 4** — the driver reported the four virtio-blk identity registers (`x1`=Magic..`x4`=VendorID);
+/// assert them (`DeviceID` = 2, block). A checkpoint (resumes the guest).
+fn virtio_blk_report_id(frame: &mut GuestFrame, uart: &mut Pl011) {
+    use crate::blk::DEVICE_ID_BLK;
+    use crate::virtio::{MAGIC, VENDOR, VERSION_V2};
+    let magic = frame.x[1] as u32;
+    let version = frame.x[2] as u32;
+    let device = frame.x[3] as u32;
+    let vendor = frame.x[4] as u32;
+    let ok = magic == MAGIC && version == VERSION_V2 && device == DEVICE_ID_BLK && vendor == VENDOR;
+    BLK_ID_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk device identified: magic=\"virt\" version=2 id=2 (block) via trap-and-emulate"
+        );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok} drained_ok={drained_ok} refused_ok={refused_ok})"
+            "baleen: virtio-blk identity MISMATCH (magic=0x{magic:08x} version={version} id={device} vendor=0x{vendor:08x})"
+        );
+    }
+}
+
+/// **M5 Arc 4** — the driver reported negotiation (`x1`=device features word 1, `x2`=Status readback);
+/// assert `VIRTIO_F_VERSION_1` was offered+accepted and FEATURES_OK stuck. A checkpoint.
+fn virtio_blk_report_negotiated(frame: &mut GuestFrame, uart: &mut Pl011) {
+    use crate::virtio::{STATUS_FEATURES_OK, VERSION_1_WORD1_MASK};
+    let dev_features_w1 = frame.x[1] as u32;
+    let status = frame.x[2] as u32;
+    let version_1 = dev_features_w1 & VERSION_1_WORD1_MASK != 0;
+    let features_ok = status & STATUS_FEATURES_OK != 0;
+    let ok = version_1 && features_ok;
+    BLK_NEGOTIATED_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set (status=0x{status:02x})"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk negotiation FAILED (version_1={version_1} features_ok={features_ok})"
+        );
+    }
+}
+
+/// The first 8 bytes of the template marker as a little-endian `u64` — what a clean read of sector 0
+/// must round-trip back through the guest's data buffer (the guest does `ldr x1, [data]`).
+fn blk_template_prefix() -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&BLK_TEMPLATE_MARKER[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// **M5 Arc 4** — the driver reported the first 8 bytes it read back from the (device-written) data
+/// buffer (`x1`); assert they equal the template seed. For tenant 0 this witnesses "a clean sector reads
+/// the template"; for tenant 1 it witnesses **overlay-isolation** (it read the template pristine, not
+/// tenant 0's poison). A checkpoint.
+fn virtio_blk_report_read(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let reported = frame.x[1];
+    let tenant = BLK_TENANT.load(Ordering::Relaxed) as usize;
+    let ok = reported == blk_template_prefix();
+    if ok {
+        BLK_READ_TEMPLATE_OK[tenant].store(true, Ordering::Relaxed);
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk read round-trip OK: tenant {tenant} read sector 0 = the pristine template"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk read round-trip MISMATCH: tenant {tenant} got 0x{reported:016x} (expected the template)"
+        );
+    }
+}
+
+/// **M5 Arc 4, block phase terminal.** Phase 6 (tenant 0): after its read/write/negative, check
+/// template-immutability (HV-side) and chain into phase 7 (the second tenant). Phase 7 (tenant 1): assert
+/// the whole block matrix — identity, negotiation, both tenants' template reads, template-immutability,
+/// overlay-isolation (distinct overlays), and the grant negative — then finish the boot.
+fn finish_virtio_blk_test(uart: &mut Pl011) -> ! {
+    let tenant = BLK_TENANT.load(Ordering::Relaxed);
+    if tenant == 0 {
+        // Phase 6 done: tenant 0 read the template, wrote poison, and issued the un-granted negative.
+        check_template_immutability(uart);
+        begin_virtio_blk_phase7(uart); // never returns — the second tenant reads the shared template
+    }
+
+    // Phase 7 (tenant 1) done — assert the full diamond.
+    let id_ok = BLK_ID_OK.load(Ordering::Relaxed);
+    let negotiated_ok = BLK_NEGOTIATED_OK.load(Ordering::Relaxed);
+    let t0_read_ok = BLK_READ_TEMPLATE_OK[0].load(Ordering::Relaxed);
+    let t1_read_ok = BLK_READ_TEMPLATE_OK[1].load(Ordering::Relaxed);
+    let write_isolated_ok = BLK_WRITE_ISOLATED_OK.load(Ordering::Relaxed);
+    let refused_ok = BLK_UNGRANTED_REFUSED.load(Ordering::Relaxed);
+    // The LIVE overlay-isolation discriminators are `t1_read_ok` (tenant 1 round-tripped the *template*,
+    // not tenant 0's poison, which persists in `overlay[0]` during tenant 1's phase) plus the absent
+    // `POISON` forbidden-marker. `overlays_distinct` below is a by-construction *structural* assertion
+    // (the overlays are distinct rows of a fixed array — it cannot fail without rewriting the struct); it
+    // documents the "distinct storage" clause of the property but does not by itself discriminate a leak.
+    let disk = blk_disk();
+    let overlays_distinct = !core::ptr::eq(disk.overlay_ptr(0, 0), disk.overlay_ptr(1, 0));
+
+    if id_ok
+        && negotiated_ok
+        && t0_read_ok
+        && t1_read_ok
+        && write_isolated_ok
+        && refused_ok
+        && overlays_distinct
+    {
+        // Printed ONLY when the whole matrix holds: a write hit the overlay (template pristine), a second
+        // tenant read the template pristine over distinct overlays, and the un-granted access was refused.
+        let _ = writeln!(
+            uart,
+            "baleen: VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: VIRTIO-BLK TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok} t0_read_ok={t0_read_ok} t1_read_ok={t1_read_ok} write_isolated_ok={write_isolated_ok} refused_ok={refused_ok} overlays_distinct={overlays_distinct})"
         );
     }
     selftest_brk(uart);
     crate::park();
+}
+
+/// **M5 Arc 4, block phase 6 — the virtio-blk run-loop (tenant 0).** Build a fresh `Hypervisor`, seed
+/// the shared template ONCE (it is backend storage that persists across the block phases), create the
+/// tenant guest, grant its ring/header/io frames to dom0 (RW ring, RO header, RW io), emit its Stage-2
+/// (the mmio window deliberately unmapped), and enter the reader driver. Never returns.
+fn begin_virtio_blk_phase6(uart: &mut Pl011) -> ! {
+    // Seed the shared read-only template once, before any tenant runs. This is the golden image a clean
+    // read falls through to; it is written here and never again (template-immutability).
+    blk_disk().seed_template(0, BLK_TEMPLATE_MARKER);
+    BLK_TENANT.store(0, Ordering::Relaxed);
+
+    // A fresh Hypervisor: the console phase mutated the previous one. SAFETY: single-CPU, one-time
+    // rebuild before the block guest runs; no handler is touching the cell.
+    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+
+    setup_blk_guest(hv, uart);
+
+    let vttbr = stage2::build_stage2_from_p2m(hv, BLK_DOM, STAGE2_SET_SINGLE);
+    let entry = load_guest_blk_write();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    init_guest_el1(ram_end);
+    {
+        use hv_hal::VcpuOps;
+        ArmVcpu.set_entry(entry);
+    }
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    set_active_virtio(ActiveVirtio::Blk); // route trapped mmio to the block register file
+    let _ = writeln!(
+        uart,
+        "baleen: virtio-blk phase (tenant 0) — guest drives a virtio-blk v2 device over a CoW template"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    enter_guest(exc_stack_top);
+}
+
+/// **M5 Arc 4, block phase 7 — the second tenant (tenant 1).** A fresh `Hypervisor` and a fresh guest,
+/// but the **same persisted disk** — the template tenant 0 left pristine, and a distinct overlay. The
+/// tenant reads sector 0 and must see the pristine template, not tenant 0's poison: *overlay-isolation*.
+/// Never returns.
+fn begin_virtio_blk_phase7(uart: &mut Pl011) -> ! {
+    // Do NOT re-seed the template: it must survive tenant 0's phase untouched (that survival IS the
+    // template-immutability property). Just switch tenant.
+    BLK_TENANT.store(1, Ordering::Relaxed);
+
+    // SAFETY: single-CPU, one-time rebuild before the phase-7 guest runs.
+    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+
+    setup_blk_guest(hv, uart);
+
+    let vttbr = stage2::build_stage2_from_p2m(hv, BLK_DOM, STAGE2_SET_SINGLE);
+    let entry = load_guest_blk_read();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    init_guest_el1(ram_end);
+    {
+        use hv_hal::VcpuOps;
+        ArmVcpu.set_entry(entry);
+    }
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    set_active_virtio(ActiveVirtio::Blk);
+    let _ = writeln!(
+        uart,
+        "baleen: virtio-blk phase (tenant 1) — a second tenant reads the shared template (must see it pristine)"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    enter_guest(exc_stack_top);
+}
+
+/// **M5 Arc 4 — template-immutability (HV-side), checked after tenant 0's write.** Read the disk's
+/// backing storage **directly** (the backend owns it): tenant 0's write must be in its OVERLAY, and the
+/// template must be byte-for-byte the seed — a guest write reached the overlay, never the template.
+fn check_template_immutability(uart: &mut Pl011) {
+    let disk = blk_disk();
+    let template_pristine =
+        &disk.template_sector(0)[..BLK_TEMPLATE_MARKER.len()] == BLK_TEMPLATE_MARKER;
+    let overlay_has_write =
+        &disk.overlay_sector(0, 0)[..BLK_POISON_MARKER.len()] == BLK_POISON_MARKER;
+    if template_pristine && overlay_has_write {
+        BLK_WRITE_ISOLATED_OK.store(true, Ordering::Relaxed);
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk template-immutability OK: tenant 0's write landed in its CoW overlay; the template is pristine"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio-blk template-immutability FAILED (template_pristine={template_pristine} overlay_has_write={overlay_has_write})"
+        );
+    }
+}
+
+/// Create the block tenant guest and its granted frames in `hv` (shared by both tenant phases). The guest
+/// owns a page-table root + the virtqueue, header, and I/O frames it links writable and grants to dom0:
+/// the ring RW (the backend writes the used ring), the header RO (device-readable), the I/O frame RW (the
+/// backend writes the read data + status). `F_BLK_UNGRANTED` is allocated + linked but deliberately NOT
+/// granted — a later step points a descriptor at it as the grant negative.
+fn setup_blk_guest(hv: &mut Hypervisor, uart: &mut Pl011) {
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: BLK_DOM,
+            may_create: false,
+        },
+        "create blk guest",
+        uart,
+    );
+    for mfn in [F_BLK_ROOT, F_BLK_VQ, F_BLK_HDR, F_BLK_IO, F_BLK_UNGRANTED] {
+        expect(
+            hv,
+            BLK_DOM,
+            HvCall::P2mAllocate { mfn },
+            "blk alloc frame",
+            uart,
+        );
+    }
+    expect(
+        hv,
+        BLK_DOM,
+        HvCall::P2mPin {
+            mfn: F_BLK_ROOT,
+            level: PtLevel::L1,
+        },
+        "blk pin root",
+        uart,
+    );
+    for (slot, child) in [
+        (0u32, F_BLK_VQ),
+        (1u32, F_BLK_HDR),
+        (2u32, F_BLK_IO),
+        (3u32, F_BLK_UNGRANTED),
+    ] {
+        expect(
+            hv,
+            BLK_DOM,
+            HvCall::P2mLink {
+                parent: F_BLK_ROOT,
+                slot,
+                child,
+                writable: true,
+                leaf: true,
+            },
+            "blk link frame",
+            uart,
+        );
+    }
+    // Grant the ring (RW), header (RO — device only reads it), and I/O frame (RW — device writes read
+    // data + status). `F_BLK_UNGRANTED` is intentionally left un-granted.
+    for (gref, frame, readonly) in [
+        (0u32, F_BLK_VQ, false),
+        (1u32, F_BLK_HDR, true),
+        (2u32, F_BLK_IO, false),
+    ] {
+        expect(
+            hv,
+            BLK_DOM,
+            HvCall::GrantAccess {
+                gref: gref as GrantRef,
+                grantee: BLK_BACKEND,
+                frame: frame as Frame,
+                readonly,
+            },
+            "blk grant frame",
+            uart,
+        );
+    }
 }
 
 /// Drive the proven model into the multi-domain memory configuration the test exercises, entirely
