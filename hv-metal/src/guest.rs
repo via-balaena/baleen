@@ -86,6 +86,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hv_core::grant::{Frame, GrantRef};
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::{Mfn, PtLevel};
+use hv_core::sched::SchedError;
 use hv_core::{HvCall, HvError, HvOutcome, Hypercall, Hypervisor, RawHypercall};
 
 use hv_hal::GuestMemory;
@@ -167,25 +168,35 @@ const NR_FINAL2: u64 = 0xfe;
 /// overwritten; see the audit's content-scrub scope note).
 const SENTINEL_RW2: u64 = 0xCAFE;
 
-// ─── M5 Arc 1: the vCPU context switch + scheduler run-loop ────────────────────────────────────
+// ─── M5 Arc 1: the vCPU context switch + concurrent scheduler run-loop ─────────────────────────
 //
-// Step 1 (this commit): a single guest yields to EL2 (`NR_YIELD`), the metal saves its FULL vCPU
-// context (GPRs + SP_EL1 + ELR/SPSR + SCTLR_EL1) into a per-vCPU [`GuestContext`], (re)selects a
-// vCPU, and restores that context before resuming — a real save/restore round trip, proven in
-// isolation before concurrency is layered on (step 2 makes the "reselect" pick the OTHER guest).
-// The witness: the guest carries a counter across N yields and reports it; == N only if every
-// resume restored its state faithfully.
+// Two vCPUs (of one domain) time-slice on the single physical CPU, switched by hv-core's REAL
+// scheduler: on each cooperative yield (`NR_YIELD`) the metal saves the running vCPU's full context
+// ([`GuestContext`]: GPRs + SP_EL1 + ELR/SPSR + SCTLR_EL1), drives `SchedPreempt(cur)` +
+// `SchedRun(other)` through the proven `Hypervisor::dispatch`, and restores the other vCPU's context.
+// Each vCPU carries a private counter (seeded to a DISTINCT base) across the interleaving; both must
+// arrive at base+SCHED_YIELDS iff every switch preserved its own state and the two never crossed.
+// The sched pillar is cashed by two model-level refusals: `SchedRun` onto an occupied pCPU →
+// `PcpuBusy` (exclusivity); onto a non-affine pCPU → `NotAffine` (affinity).
 
-/// The scheduler-test guest's yield hypercall — cooperative preemption point (no timer/GIC yet).
+/// The scheduler guest's yield hypercall — cooperative preemption point (no timer/GIC yet).
 const NR_YIELD: u64 = 0xf4;
-/// The scheduler-test terminal report — carries the guest's across-yields counter.
+/// The scheduler guest's terminal report — carries its across-yields counter (`x1`) and vCPU id (`x2`).
 const NR_SCHED_FINAL: u64 = 0xfd;
-/// The domain the step-1 scheduler guest runs as.
+/// The domain the scheduler vCPUs belong to.
 const SCHED_DOM: DomId = 1;
-/// How many times the scheduler guest yields before its final report. The counter it carries must
-/// equal this if every context save/restore round trip preserved its register state.
+/// The two vCPU indices (within [`SCHED_DOM`]) that time-slice.
+const SCHED_VCPU_A: u32 = 0;
+const SCHED_VCPU_B: u32 = 1;
+/// The single physical CPU the vCPUs contend for.
+const PCPU0: u32 = 0;
+/// How many yields each vCPU performs; its counter must end at its base + this.
 const SCHED_YIELDS: u64 = 4;
-/// Metal-side vCPU context slots. Two so step 2 can hold both guests' contexts; step 1 uses slot 0.
+/// Distinct counter bases seeded into each vCPU's context, so a context cross-leak is detectable
+/// (a value in the wrong hundreds would betray it) and the two vCPUs are un-forgeably distinguished.
+const SCHED_BASE_A: u64 = 0x100;
+const SCHED_BASE_B: u64 = 0x200;
+/// Metal-side vCPU context slots (one per scheduler vCPU).
 const NUM_VCPUS_METAL: usize = 2;
 
 // ---------------------------------------------------------------------------------------------
@@ -337,10 +348,11 @@ __guest2_tpl_end:
 );
 
 // ---------------------------------------------------------------------------------------------
-// The scheduler-test guest program (M5 Arc 1, step 1). Register-only (no memory access beyond its
-// own PC): it carries a counter in a callee-saved register ACROSS N yields, so the final value ==
-// N iff every context save/restore round trip preserved its register state. `x20` is the counter,
-// `x21` the remaining-yields countdown.
+// The scheduler-test guest program (M5 Arc 1). Register-only (no memory access beyond its own PC),
+// and BOTH vCPUs run this SAME code — they diverge only by the per-vCPU register state the metal
+// seeds via `__enter_guest_ctx`: `x20` = counter (seeded to a distinct base), `x21` = yields
+// remaining, `x22` = vCPU id. Each carries its counter across the interleaving and reports it, so a
+// context cross-leak (a counter in the wrong hundreds) or a lost switch is caught.
 // ---------------------------------------------------------------------------------------------
 global_asm!(
     r#"
@@ -348,15 +360,15 @@ global_asm!(
     .balign 4
     .global __guest3_tpl_start
 __guest3_tpl_start:
-    mov     x20, #0                        // across-yields counter (callee-saved)
-    mov     x21, #{SCHED_YIELDS}           // yields remaining
+    // x20 = counter (seeded base), x21 = yields remaining (seeded), x22 = vCPU id (seeded)
 1:  add     x20, x20, #1
     mov     x0, #{NR_YIELD}
-    hvc     #0                             // cooperative yield → EL2 saves+restores this vCPU's ctx
+    hvc     #0                             // cooperative yield → EL2 switches to the peer vCPU
     sub     x21, x21, #1
     cbnz    x21, 1b
-    // final report: carry the counter (expect == SCHED_YIELDS)
+    // final report: counter in x1, vCPU id in x2
     mov     x1, x20
+    mov     x2, x22
     mov     x0, #{NR_SCHED_FINAL}
     hvc     #0
 0:  wfe                                     // terminal
@@ -364,7 +376,6 @@ __guest3_tpl_start:
     .global __guest3_tpl_end
 __guest3_tpl_end:
     "#,
-    SCHED_YIELDS = const SCHED_YIELDS,
     NR_YIELD = const NR_YIELD,
     NR_SCHED_FINAL = const NR_SCHED_FINAL,
 );
@@ -425,13 +436,16 @@ static CREDIT_ECHO: AtomicU64 = AtomicU64::new(u64::MAX);
 static POS_RW2: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// M5 Arc 1: which metal vCPU slot is currently on the (single physical) CPU — the index into
-/// [`VCPU_CTX`] whose context is live in the trampoline frame. Step 1 keeps it 0; step 2 alternates.
+/// [`VCPU_CTX`] whose context is live in the trampoline frame. Alternates on each yield.
 static CUR_VCPU: AtomicU64 = AtomicU64::new(0);
-/// M5 Arc 1: how many `NR_YIELD` context switches the metal has serviced (cross-checks the guest's
-/// own across-yields counter — both must equal the expected total).
+/// M5 Arc 1: how many `NR_YIELD` context switches the metal has serviced across both vCPUs.
 static YIELDS_HANDLED: AtomicU64 = AtomicU64::new(0);
-/// M5 Arc 1: the across-yields counter the scheduler guest reports at [`NR_SCHED_FINAL`].
-static SCHED_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+/// M5 Arc 1: the final counter each scheduler vCPU reports at [`NR_SCHED_FINAL`] (indexed by vCPU).
+static SCHED_REPORT: [AtomicU64; NUM_VCPUS_METAL] =
+    [const { AtomicU64::new(u64::MAX) }; NUM_VCPUS_METAL];
+/// M5 Arc 1: bitmask of which vCPUs have hit their terminal report; the whole test finishes when
+/// both bits are set.
+static SCHED_DONE: AtomicU64 = AtomicU64::new(0);
 
 extern "C" {
     static __guest_tpl_start: u8;
@@ -461,9 +475,12 @@ pub struct GuestFrame {
 /// the EL1/EL2 system state that is NOT in that frame) into this per-vCPU store so a different vCPU's
 /// context can be loaded before `eret`. `hv-core`'s `RunState` stays abstract — this concrete
 /// register/sysreg state is the metal's own, keeping the `hv-hal` fence architecture-neutral.
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct GuestContext {
-    /// `x0..x30`, mirrored to/from the trampoline frame.
+    /// `x0..x30`, mirrored to/from the trampoline frame. (`repr(C)` fixes the field offsets the
+    /// `__enter_guest_ctx` asm hard-codes: `x[i]`@`i*8`, `sp_el1`@248, `elr_el2`@256, `spsr_el2`@264,
+    /// `sctlr_el1`@272.)
     x: [u64; 31],
     /// `SP_EL1` — the guest's stack pointer (per-vCPU; not in the trampoline frame).
     sp_el1: u64,
@@ -653,6 +670,56 @@ fn init_guest_el1(stack_top: u64) {
             options(nomem, nostack),
         );
     }
+}
+
+// The initial vCPU dispatch (M5 Arc 1): load a seeded [`GuestContext`] into the real registers +
+// system state and `eret` into it. Unlike [`enter_guest`] (which erets with whatever GPRs are live),
+// this seeds `x0..x30` from the context, so the metal gives each vCPU its own private initial
+// register state (counter base, id). Used for each vCPU's FIRST entry; later switches go through the
+// trampoline frame (see [`handle_yield`]). Offsets mirror `GuestContext`'s `repr(C)` layout.
+global_asm!(
+    r#"
+    .section .text
+    .balign 0x40
+    .global __enter_guest_ctx
+__enter_guest_ctx:
+    // x0 = &GuestContext, x1 = exc_stack_top
+    mov     sp, x1                          // SP_EL2 (for future traps)
+    ldr     x2, [x0, #248]
+    msr     sp_el1, x2
+    ldr     x2, [x0, #256]
+    msr     elr_el2, x2
+    ldr     x2, [x0, #264]
+    msr     spsr_el2, x2
+    ldr     x2, [x0, #272]
+    msr     sctlr_el1, x2
+    ldp     x2, x3,   [x0, #16]
+    ldp     x4, x5,   [x0, #32]
+    ldp     x6, x7,   [x0, #48]
+    ldp     x8, x9,   [x0, #64]
+    ldp     x10, x11, [x0, #80]
+    ldp     x12, x13, [x0, #96]
+    ldp     x14, x15, [x0, #112]
+    ldp     x16, x17, [x0, #128]
+    ldp     x18, x19, [x0, #144]
+    ldp     x20, x21, [x0, #160]
+    ldp     x22, x23, [x0, #176]
+    ldp     x24, x25, [x0, #192]
+    ldp     x26, x27, [x0, #208]
+    ldp     x28, x29, [x0, #224]
+    ldr     x30,      [x0, #240]
+    ldr     x1,       [x0, #8]
+    ldr     x0,       [x0, #0]              // x0 last — destroys the context pointer
+    dsb     ish
+    isb
+    eret
+    "#
+);
+
+extern "C" {
+    /// Load `*ctx` into the registers/sysregs and `eret` into the vCPU. `ctx` must be a valid,
+    /// aligned `GuestContext`; `exc_stack_top` becomes `SP_EL2`. Never returns (transfers to EL1).
+    fn __enter_guest_ctx(ctx: *const GuestContext, exc_stack_top: u64) -> !;
 }
 
 /// Read the guest's per-vCPU system state that lives OUTSIDE the trampoline GPR frame — `SP_EL1`,
@@ -894,11 +961,8 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_FINAL => finish_isolation_test(uart), // -> ! (phase 1 terminal → drives phase 2)
         NR_POS_RW2 => POS_RW2.store(arg0, Ordering::Relaxed),
         NR_FINAL2 => finish_lifecycle_test(uart), // -> ! (phase 2 terminal → drives phase 3)
-        NR_YIELD => handle_yield(frame), // M5 Arc 1: save+restore the vCPU context, then resume
-        NR_SCHED_FINAL => {
-            SCHED_COUNTER.store(arg0, Ordering::Relaxed);
-            finish_scheduler_test(uart) // -> ! (phase 3 terminal)
-        }
+        NR_YIELD => handle_yield(frame, uart), // M5 Arc 1: switch to the peer vCPU (sched-driven)
+        NR_SCHED_FINAL => handle_sched_final(frame, uart), // records + switches, or finishes
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -1302,37 +1366,133 @@ fn finish_lifecycle_test(uart: &mut Pl011) -> ! {
     crate::park();
 }
 
-/// **M5 Arc 1 — the vCPU yield handler.** Save the running vCPU's full context, (re)select the vCPU
-/// to run, and restore that vCPU's context so the trampoline's `eret` resumes it. Step 1 reselects
-/// the SAME vCPU (a self-yield: an identity round trip that exercises every save/restore path before
-/// concurrency is layered on); step 2 will pick the peer. Returns to the trampoline, which restores
-/// the (now-selected) GPR frame and `eret`s.
-fn handle_yield(frame: &mut GuestFrame) {
+/// The current generic-timer count, for stamping the sched ops' `now` (M5 Arc 1). `hv-core` owns no
+/// clock, so the caller reads [`hv_hal::TimeSource`] and passes the tick in.
+fn sched_now() -> u64 {
+    use hv_hal::TimeSource;
+    crate::time::GenericTimer.now()
+}
+
+/// Borrow the global scheduler `Hypervisor` (built in [`begin_scheduler_phase3`]); halts if unbuilt.
+fn sched_hv(uart: &mut Pl011) -> &'static mut Hypervisor {
+    // SAFETY: single-CPU, non-nested handler; the Hypervisor was built before any scheduler guest ran.
+    match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => {
+            let _ = writeln!(uart, "baleen: scheduler: no Hypervisor built; halting");
+            crate::park();
+        }
+    }
+}
+
+/// **M5 Arc 1 — the vCPU yield handler.** Save the running vCPU's context, drive hv-core's REAL
+/// scheduler to preempt it and dispatch the peer (`SchedPreempt(cur)` + `SchedRun(other)` — the
+/// pCPU-exclusivity invariant is maintained across the pair), then restore the peer's context so the
+/// trampoline `eret`s into it. Returns to the trampoline.
+fn handle_yield(frame: &mut GuestFrame, uart: &mut Pl011) {
     let cur = CUR_VCPU.load(Ordering::Relaxed) as usize;
     save_context(cur, frame);
-    // Step 1: reselect the same vCPU. (Step 2 alternates to the peer here, driven by hv-core sched.)
-    let next = cur;
+
+    let next = 1 - cur;
+    let now = sched_now();
+    let hv = sched_hv(uart);
+    expect(
+        hv,
+        SCHED_DOM,
+        HvCall::SchedPreempt {
+            vcpu: cur as u32,
+            now,
+        },
+        "sched preempt",
+        uart,
+    );
+    expect(
+        hv,
+        SCHED_DOM,
+        HvCall::SchedRun {
+            vcpu: next as u32,
+            pcpu: PCPU0,
+            now,
+        },
+        "sched run peer",
+        uart,
+    );
+
     CUR_VCPU.store(next as u64, Ordering::Relaxed);
     restore_context(next, frame);
     YIELDS_HANDLED.fetch_add(1, Ordering::Relaxed);
 }
 
-/// **M5 Arc 1, phase 3 — the scheduler run-loop (step 1: self-yield context switch).** Build a fresh
-/// `Hypervisor`, create the scheduler domain, emit its Stage-2, and enter a register-only guest that
-/// yields `SCHED_YIELDS` times. Each yield round-trips the vCPU context through [`VCPU_CTX`] (see
-/// [`handle_yield`]); the guest carries a counter across every yield. Never returns — the guest's
-/// terminal report ([`finish_scheduler_test`]) parks.
+/// **M5 Arc 1 — a vCPU's terminal report.** Record its final counter (cross-checking its self-reported
+/// id against the slot the metal switched to), and mark it done. When BOTH vCPUs have finished, assert
+/// the scheduler matrix ([`finish_scheduler_test`]); otherwise retire this vCPU (`SchedOffline`) and
+/// dispatch the peer so it can finish.
+fn handle_sched_final(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let cur = CUR_VCPU.load(Ordering::Relaxed) as usize;
+    let counter = frame.x[1];
+    let reported_id = frame.x[2];
+    // The guest's self-reported id (seeded x22) must match the slot the metal switched to — a
+    // cross-check that the intended vCPU's context actually ran.
+    if reported_id != cur as u64 {
+        let _ = writeln!(
+            uart,
+            "baleen: scheduler: vCPU id mismatch (metal slot={cur}, guest reported={reported_id}); halting"
+        );
+        crate::park();
+    }
+    SCHED_REPORT[cur].store(counter, Ordering::Relaxed);
+    let done = SCHED_DONE.fetch_or(1 << cur, Ordering::Relaxed) | (1 << cur);
+    if done == (1u64 << NUM_VCPUS_METAL) - 1 {
+        finish_scheduler_test(uart); // -> !
+    }
+
+    // The peer still has work: retire this vCPU (Running → Offline) and dispatch the peer (Runnable →
+    // Running from its last preempt), then resume it.
+    let next = 1 - cur;
+    let now = sched_now();
+    let hv = sched_hv(uart);
+    expect(
+        hv,
+        SCHED_DOM,
+        HvCall::SchedOffline {
+            vcpu: cur as u32,
+            now,
+        },
+        "sched offline finished vcpu",
+        uart,
+    );
+    expect(
+        hv,
+        SCHED_DOM,
+        HvCall::SchedRun {
+            vcpu: next as u32,
+            pcpu: PCPU0,
+            now,
+        },
+        "sched run remaining vcpu",
+        uart,
+    );
+    CUR_VCPU.store(next as u64, Ordering::Relaxed);
+    restore_context(next, frame);
+    // No YIELDS_HANDLED bump — this was a terminal report, not a yield.
+}
+
+/// **M5 Arc 1, phase 3 — the concurrent scheduler run-loop.** Build a fresh `Hypervisor`, create the
+/// scheduler domain, admit both vCPUs, and dispatch vCPU A. Witness the sched pillar's two refusals
+/// (exclusivity: `SchedRun` onto the occupied pCPU → `PcpuBusy`; affinity: onto a non-affine pCPU →
+/// `NotAffine`), then seed both vCPUs' contexts (distinct counter bases) and enter vCPU A via
+/// [`__enter_guest_ctx`]. The two then time-slice on each yield ([`handle_yield`]). Never returns.
 fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
-    // A fresh Hypervisor: the lifecycle phase mutated the previous one (destroy/reborn). SAFETY:
-    // single-CPU, one-time rebuild before any scheduler guest runs; no handler is touching the cell.
+    // A fresh Hypervisor: the lifecycle phase mutated the previous one. SAFETY: single-CPU, one-time
+    // rebuild before any scheduler guest runs; no handler is touching the cell.
     unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
     let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
         Some(hv) => hv,
         None => crate::park(),
     };
 
-    // Create the scheduler domain. The step-1 guest is register-only, so it needs no data frames —
-    // `build_stage2_from_p2m` emits just the guest-image identity block (its code + stack).
+    // Both vCPUs belong to ONE domain (a single address space — concurrent isolation between two
+    // DOMAINS is step 2b). Register-only guests → no data frames; Stage-2 is just the image block.
     expect(
         hv,
         DOM0,
@@ -1344,46 +1504,171 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
         uart,
     );
 
+    let now = sched_now();
+    // Admit both vCPUs (Offline → Runnable); dispatch A onto the pCPU (Runnable → Running).
+    expect(
+        hv,
+        SCHED_DOM,
+        HvCall::SchedAdmit { vcpu: SCHED_VCPU_A },
+        "admit vcpu A",
+        uart,
+    );
+    expect(
+        hv,
+        SCHED_DOM,
+        HvCall::SchedAdmit { vcpu: SCHED_VCPU_B },
+        "admit vcpu B",
+        uart,
+    );
+    expect(
+        hv,
+        SCHED_DOM,
+        HvCall::SchedRun {
+            vcpu: SCHED_VCPU_A,
+            pcpu: PCPU0,
+            now,
+        },
+        "run vcpu A",
+        uart,
+    );
+
+    // ── sched-pillar witness 1: pCPU exclusivity ── SchedRun B onto the pCPU A occupies → PcpuBusy.
+    match hv.dispatch(
+        SCHED_DOM,
+        HvCall::SchedRun {
+            vcpu: SCHED_VCPU_B,
+            pcpu: PCPU0,
+            now,
+        },
+    ) {
+        Err(HvError::Sched(SchedError::PcpuBusy)) => {
+            let _ = writeln!(
+                uart,
+                "baleen: scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)"
+            );
+        }
+        other => {
+            let _ = writeln!(
+                uart,
+                "baleen: scheduler exclusivity BROKEN: expected PcpuBusy, got {other:?}; halting"
+            );
+            crate::park();
+        }
+    }
+
+    // ── sched-pillar witness 2: affinity ── narrow B's mask to exclude the pCPU → SchedRun → NotAffine.
+    expect(
+        hv,
+        DOM0,
+        HvCall::SchedSetAffinity {
+            target: SCHED_DOM,
+            vcpu: SCHED_VCPU_B,
+            affinity: 0b10, // only pCPU 1 — excludes pCPU 0
+        },
+        "set B affinity (exclude pCPU0)",
+        uart,
+    );
+    match hv.dispatch(
+        SCHED_DOM,
+        HvCall::SchedRun {
+            vcpu: SCHED_VCPU_B,
+            pcpu: PCPU0,
+            now,
+        },
+    ) {
+        Err(HvError::Sched(SchedError::NotAffine)) => {
+            let _ = writeln!(
+                uart,
+                "baleen: scheduler affinity OK: SchedRun onto a non-affine pCPU refused (NotAffine)"
+            );
+        }
+        other => {
+            let _ = writeln!(
+                uart,
+                "baleen: scheduler affinity BROKEN: expected NotAffine, got {other:?}; halting"
+            );
+            crate::park();
+        }
+    }
+    // Restore B's affinity so it may run on the pCPU in the loop.
+    expect(
+        hv,
+        DOM0,
+        HvCall::SchedSetAffinity {
+            target: SCHED_DOM,
+            vcpu: SCHED_VCPU_B,
+            affinity: u64::MAX,
+        },
+        "restore B affinity",
+        uart,
+    );
+
+    // Emit Stage-2 (one set, VMID 1 — both vCPUs share the domain's address space) and enable it.
     let vttbr = stage2::build_stage2_from_p2m(hv, SCHED_DOM);
     let entry = load_guest3();
     let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
     enable_stage2(vttbr);
+    // Set the initial EL1 system state (MMU off, stack), then read it back to seed both contexts.
     init_guest_el1(ram_end);
-    {
-        use hv_hal::VcpuOps;
-        ArmVcpu.set_entry(entry);
+    let (sp_el1, _elr, _spsr, sctlr) = read_sysctx();
+
+    // Seed both vCPU contexts: same entry + system state, DISTINCT counter bases and ids.
+    // SAFETY: single-CPU, before any scheduler guest runs → exclusive access to the context store.
+    unsafe {
+        let ctxs = &mut *VCPU_CTX.0.get();
+        for (i, base) in [SCHED_BASE_A, SCHED_BASE_B].into_iter().enumerate() {
+            let c = &mut ctxs[i];
+            *c = GuestContext::ZERO;
+            c.x[20] = base; // counter (distinct seeded base)
+            c.x[21] = SCHED_YIELDS; // yields remaining
+            c.x[22] = i as u64; // vCPU id
+            c.sp_el1 = sp_el1;
+            c.elr_el2 = entry;
+            c.spsr_el2 = SPSR_EL2_GUEST;
+            c.sctlr_el1 = sctlr;
+        }
     }
-    // Reset the per-vCPU run state for this phase; clear the guard because we diverge into `eret`.
-    CUR_VCPU.store(0, Ordering::Relaxed);
+
+    CUR_VCPU.store(SCHED_VCPU_A as u64, Ordering::Relaxed);
     YIELDS_HANDLED.store(0, Ordering::Relaxed);
+    SCHED_DONE.store(0, Ordering::Relaxed);
     IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
     let _ = writeln!(
         uart,
-        "baleen: scheduler phase — entering vCPU 0 (self-yield context-switch test, {SCHED_YIELDS} yields)"
+        "baleen: scheduler phase — two vCPUs time-slice ({SCHED_YIELDS} yields each), hv-core sched drives the switch"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
-    enter_guest(exc_stack_top);
+    // SAFETY: VCPU_CTX[A] is a valid, seeded GuestContext; exc_stack_top is the dedicated EL2 stack.
+    unsafe { __enter_guest_ctx(&(*VCPU_CTX.0.get())[SCHED_VCPU_A as usize], exc_stack_top) }
 }
 
-/// **M5 Arc 1, phase 3 terminal.** Assert the vCPU context survived every yield: the guest's carried
-/// counter and the metal's yield count must both equal `SCHED_YIELDS`. Under `--features selftest`
-/// chains the Arc-2 deliberate-fault self-test (the boot's last act, moved here from phase 2).
+/// **M5 Arc 1, phase 3 terminal.** Assert the concurrent scheduler matrix: each vCPU's counter ended
+/// at its own seeded base + `SCHED_YIELDS` (its private context was preserved across the interleaving,
+/// with no cross-leak between the two), and the metal serviced exactly `2 * SCHED_YIELDS` switches.
+/// Under `--features selftest` chains the Arc-2 deliberate-fault self-test (the boot's last act).
 fn finish_scheduler_test(uart: &mut Pl011) -> ! {
-    let counter = SCHED_COUNTER.load(Ordering::Relaxed);
+    let a = SCHED_REPORT[SCHED_VCPU_A as usize].load(Ordering::Relaxed);
+    let b = SCHED_REPORT[SCHED_VCPU_B as usize].load(Ordering::Relaxed);
     let handled = YIELDS_HANDLED.load(Ordering::Relaxed);
-    if counter == SCHED_YIELDS && handled == SCHED_YIELDS {
-        // Printed ONLY when the counter round-tripped through every context save/restore: the vCPU's
-        // register state was preserved across all SCHED_YIELDS yields.
+    let a_ok = a == SCHED_BASE_A + SCHED_YIELDS;
+    let b_ok = b == SCHED_BASE_B + SCHED_YIELDS;
+    let switches_ok = handled == 2 * SCHED_YIELDS;
+    if a_ok && b_ok && switches_ok {
+        // Printed ONLY when both counters ended at their OWN base + SCHED_YIELDS: each vCPU's private
+        // register state survived every context switch, and the two never crossed (a leak would land a
+        // counter in the wrong hundreds).
         let _ = writeln!(
             uart,
-            "baleen: SCHEDULER CONTEXT-SWITCH TEST PASSED — vCPU state survived {SCHED_YIELDS} yields \
-             (guest counter={counter}, metal yields={handled})"
+            "baleen: SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved \
+             (A={a:#x}, B={b:#x}, {handled} switches)"
         );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: SCHEDULER CONTEXT-SWITCH TEST FAILED (guest counter={counter} metal yields={handled} \
-             expected={SCHED_YIELDS})"
+            "baleen: SCHEDULER TEST FAILED (A={a:#x} B={b:#x} switches={handled}; expected A={:#x} B={:#x} switches={})",
+            SCHED_BASE_A + SCHED_YIELDS,
+            SCHED_BASE_B + SCHED_YIELDS,
+            2 * SCHED_YIELDS
         );
     }
 
