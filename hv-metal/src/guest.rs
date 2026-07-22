@@ -95,6 +95,7 @@ use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
+use hv_core::evtchn::PortState;
 use hv_core::grant::{Frame, GrantRef};
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::{Mfn, PtLevel};
@@ -417,6 +418,56 @@ const NR_PSCI_REPORT: u64 = 0xb0;
 const NR_TIMER_IRQ_REPORT: u64 = 0xa0;
 /// The timer-tick phase's terminal report (the boot's last act).
 const NR_TIMER_IRQ_FINAL: u64 = 0xa1;
+
+// ─── M5 Arc 6: the thesis — vault + disposable, non-interference ──────────────────────────────────────
+//
+// The finale, composing the proven arcs. A control domain (dom0) spawns a VAULT (holds an un-forgeable
+// secret in its own distinct-VMID Stage-2, no channels out) and a DISPOSABLE (its own frames + a CoW
+// overlay on the shared RO template). The disposable runs and PROBES the vault's secret → hardware
+// translation fault (non-interference, Arc 2); then dom0 destroys the disposable clean (Arc 0), leaving
+// the vault's secret untouched and the CoW template pristine (Arc 4). "The audit IS the arc" (Audit #3):
+// enumerate every vault→disposable channel → none → bridge to the model's Tier-D non-interference.
+
+/// The disposable domain (the running guest — a fresh `Hypervisor` for this phase).
+const DISP_DOM: DomId = 1;
+/// The vault domain (holds the secret; created + live, its secret seeded by the hypervisor).
+const VAULT_DOM: DomId = 2;
+
+// Frames (distinct global `Mfn`s). The disposable owns a root + a data frame; the vault owns a root + a
+// secret frame. Distinct Mfn → distinct host PA → distinct per-VMID Stage-2 leaf (Arc 2).
+const F_DISP_ROOT: Mfn = 1;
+const F_DISP_DATA: Mfn = 2;
+const F_VAULT_ROOT: Mfn = 3;
+const F_VAULT_SECRET: Mfn = 4;
+
+/// The disposable's own-frame sentinel (proves its authorized write works).
+const SENTINEL_DISP: u64 = 0xD15D;
+/// The vault's un-forgeable secret — a distinctive marker seeded HV-side into the vault's secret frame.
+/// Its first 8 bytes (`V4ULTSEC`) are what the disposable's probe would read if isolation broke; a
+/// `FORBIDDEN_MARKERS` guard on that token catches it on the console (it appears there only if the probe
+/// read it). Must NEVER reach the disposable.
+const VAULT_SECRET_MARKER: &[u8] = b"V4ULTSEC-forbidden-must-not-reach-the-disposable\n";
+
+/// The disposable's CoW tenant (its disk = an overlay on the shared template).
+const DISP_TENANT: usize = 0;
+/// The shared template the disposable's disk is a CoW overlay on — seeded once; must stay pristine when
+/// the disposable is destroyed (the Arc-4 property, re-cashed on the lifecycle).
+const THESIS_TEMPLATE_MARKER: &[u8] = b"thesis-golden-template-pristine";
+/// What the disposable's overlay is seeded with, so its disk has diverged from the template before it is
+/// discarded on teardown.
+const DISP_DISK_MARKER: &[u8] = b"disposable-overlay-scratch";
+
+/// The frame offsets the disposable guest builds its IPAs from (`movz DATA_HI, lsl#16; movk OFF`).
+const OFF_DISP_DATA: u64 = F_DISP_DATA as u64 * stage2::FRAME_SIZE;
+const OFF_VAULT_SECRET: u64 = F_VAULT_SECRET as u64 * stage2::FRAME_SIZE;
+
+/// The disposable reports (`x1`=own-frame readback, `x2`=the value its probe of the vault secret read —
+/// stale iff the probe faulted). The hypervisor asserts its own write landed AND the probe did not read
+/// the secret. A checkpoint.
+const NR_THESIS_POS: u64 = 0x90;
+/// The thesis phase's terminal — the hypervisor destroys the disposable and runs the non-interference +
+/// lifecycle + channel-enumeration audit (the boot's last act).
+const NR_THESIS_FINAL: u64 = 0x91;
 
 // ---------------------------------------------------------------------------------------------
 // The guest program.
@@ -1280,6 +1331,46 @@ __guest_timer_irq_tpl_end:
     NR_TIMER_IRQ_FINAL = const NR_TIMER_IRQ_FINAL,
 );
 
+// The DISPOSABLE guest program (M5 Arc 6). It writes its own data frame (authorized — succeeds), reads it
+// back, then PROBES the vault's secret frame — an IPA its Stage-2 does not map (the secret lives in the
+// vault's distinct-VMID Stage-2) — which faults to EL2 (translation); the handler records it and resumes
+// past. It reports its own read-back (x1) and the value the probe read (x2, stale iff it faulted — the
+// disposable NEVER obtains the secret). Straight-line / stack-free, position-independent.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_disposable_tpl_start
+__guest_disposable_tpl_start:
+    // ── authorized: write my own data frame, read it back ──
+    movz    x2, #{DATA_HI}, lsl #16
+    movk    x2, #{OFF_MINE}
+    movz    x3, #{SENTINEL_DISP}
+    str     x3, [x2]
+    ldr     x1, [x2]                        // x1 = my read-back (expect SENTINEL_DISP)
+    // ── non-interference: probe the vault's secret → translation fault (recorded, resumed past) ──
+    movz    x2, #{DATA_HI}, lsl #16
+    movk    x2, #{OFF_SECRET}
+    mov     x4, #0
+    ldr     x4, [x2]                        // faults; on resume x4 is UNCHANGED (0) — never the secret
+    mov     x2, x4                          // x2 = the value the probe read (0 iff it faulted)
+    mov     x0, #{NR_THESIS_POS}
+    hvc     #0                              // report x1 = own read-back, x2 = probe value
+    mov     x0, #{NR_THESIS_FINAL}
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_disposable_tpl_end
+__guest_disposable_tpl_end:
+    "#,
+    DATA_HI = const DATA_IPA_HI,
+    OFF_MINE = const OFF_DISP_DATA,
+    OFF_SECRET = const OFF_VAULT_SECRET,
+    SENTINEL_DISP = const SENTINEL_DISP,
+    NR_THESIS_POS = const NR_THESIS_POS,
+    NR_THESIS_FINAL = const NR_THESIS_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -1470,6 +1561,10 @@ static TIMER_IRQ_FIRED: AtomicBool = AtomicBool::new(false);
 /// physical-IRQ → EL2 → inject → guest-vIRQ path — a real hardware-driven timer tick).
 static TIMER_IRQ_OK: AtomicBool = AtomicBool::new(false);
 
+/// M5 Arc 6: the disposable's authorized write landed AND its probe of the vault secret did NOT read it
+/// (`x1`==sentinel, `x2`!=secret) — the disposable never obtained the secret.
+static THESIS_POS_OK: AtomicBool = AtomicBool::new(false);
+
 extern "C" {
     static __guest_tpl_start: u8;
     static __guest_tpl_end: u8;
@@ -1495,6 +1590,8 @@ extern "C" {
     static __guest_psci_tpl_end: u8;
     static __guest_timer_irq_tpl_start: u8;
     static __guest_timer_irq_tpl_end: u8;
+    static __guest_disposable_tpl_start: u8;
+    static __guest_disposable_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1956,6 +2053,21 @@ fn load_guest_timer_irq() -> u64 {
     ram_start as u64
 }
 
+/// Copy the **disposable** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 6).
+fn load_guest_disposable() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_disposable_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_disposable_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
 /// Program Stage-2 and enable it: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM`, then invalidate
 /// Stage-1&2 TLBs for the VMID and synchronize. The `dsb`/`tlbi`/`isb` are load-bearing on silicon and
 /// invisible-but-harmless under QEMU. The table is built (invalid→valid) *before* this runs, so no
@@ -2341,7 +2453,9 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_TIMER_FINAL => finish_timer_test(uart), // -> ! (timer phase → PSCI phase)
         NR_PSCI_REPORT => psci_report(frame, uart), // M5 Arc 5c: assert the guest read the PSCI version
         NR_TIMER_IRQ_REPORT => timer_irq_report(frame, uart), // M5 Arc 5d: assert the tick was taken
-        NR_TIMER_IRQ_FINAL => finish_timer_irq_test(uart),    // -> ! (timer-tick phase terminal)
+        NR_TIMER_IRQ_FINAL => finish_timer_irq_test(uart), // -> ! (timer-tick phase → thesis phase)
+        NR_THESIS_POS => thesis_pos_report(frame, uart), // M5 Arc 6: disposable own-write + probe report
+        NR_THESIS_FINAL => finish_thesis_test(uart), // -> ! (thesis phase terminal — destroy + audit)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -4501,13 +4615,14 @@ fn finish_timer_irq_test(uart: &mut Pl011) -> ! {
             uart,
             "baleen: TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt"
         );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: TIMER TICK TEST FAILED (fired={fired} taken={taken})"
-        );
+        // M5 Arc 6: the finale — assemble the thesis (vault + disposable, non-interference, destroy
+        // clean). Never returns (it ends the boot at the thesis terminal).
+        begin_thesis_phase(uart);
     }
-    selftest_brk(uart);
+    let _ = writeln!(
+        uart,
+        "baleen: TIMER TICK TEST FAILED (fired={fired} taken={taken})"
+    );
     crate::park();
 }
 
@@ -4534,6 +4649,364 @@ fn begin_timer_irq_phase(uart: &mut Pl011) -> ! {
         entry,
         "baleen: timer-tick phase — a guest programs its virtual timer and takes the tick as an interrupt",
     );
+}
+
+/// Whether there is **no** event channel between domains `a` and `b`, in either direction — no half-open
+/// port awaiting either, and no established interdomain port referencing the other. A real scan of the
+/// proven evtchn state (not an assumption), for the thesis channel enumeration (M5 Arc 6).
+fn no_evtchn_between(hv: &Hypervisor, a: DomId, b: DomId) -> bool {
+    if hv.evtchn().any_unbound_into(a) || hv.evtchn().any_unbound_into(b) {
+        return false;
+    }
+    for (d, other) in [(a, b), (b, a)] {
+        for p in 0..hv.evtchn().port_count(d) as u32 {
+            match hv.evtchn().state_of(d, p) {
+                Some(PortState::Interdomain { remote, .. }) if remote == other => return false,
+                Some(PortState::Unbound { remote }) if remote == other => return false,
+                _ => {}
+            }
+        }
+    }
+    true
+}
+
+/// First 8 bytes of the vault secret as a little-endian `u64` — what the disposable's probe register
+/// (`x2`) would hold if isolation broke and it read the secret.
+fn vault_secret_prefix() -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&VAULT_SECRET_MARKER[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// **M5 Arc 6** — the disposable reported its own-frame read-back (`x1`) and the value its probe of the
+/// vault secret read (`x2`, stale iff the probe faulted). Assert its authorized write landed AND it did
+/// NOT obtain the secret. If it did (isolation broke), emit the read bytes so the `FORBIDDEN_MARKERS`
+/// guard catches the leak. A checkpoint.
+fn thesis_pos_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let readback = frame.x[1];
+    let probed = frame.x[2];
+    let own_ok = readback == SENTINEL_DISP;
+    let secret = vault_secret_prefix();
+    if probed == secret {
+        // Isolation broke — the disposable read the vault secret. Surface the token so FORBIDDEN fires.
+        for &b in &probed.to_le_bytes() {
+            uart.put(b);
+        }
+        let _ = writeln!(
+            uart,
+            "\nbaleen: THESIS BUG — the disposable read the vault secret"
+        );
+    }
+    let secret_not_read = probed != secret;
+    THESIS_POS_OK.store(own_ok && secret_not_read, Ordering::Relaxed);
+    if own_ok && secret_not_read {
+        let _ = writeln!(
+            uart,
+            "baleen: thesis: disposable wrote+read its own frame (0x{readback:x}); its probe of the vault secret obtained nothing"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: thesis positive FAILED (own_ok={own_ok} secret_not_read={secret_not_read})"
+        );
+    }
+}
+
+/// Create the disposable + the vault, drive their p2m through the real dispatch, seed the vault's secret
+/// and the disposable's CoW disk (M5 Arc 6). The disposable owns a root + data frame; the vault owns a
+/// root + a secret frame (distinct `Mfn`s → distinct PA → distinct per-VMID Stage-2 leaf).
+fn setup_thesis_model(hv: &mut Hypervisor, uart: &mut Pl011) {
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: DISP_DOM,
+            may_create: false,
+        },
+        "create disposable",
+        uart,
+    );
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: VAULT_DOM,
+            may_create: false,
+        },
+        "create vault",
+        uart,
+    );
+    // Disposable: root + data, pin root, link data writable.
+    for mfn in [F_DISP_ROOT, F_DISP_DATA] {
+        expect(
+            hv,
+            DISP_DOM,
+            HvCall::P2mAllocate { mfn },
+            "disp alloc",
+            uart,
+        );
+    }
+    expect(
+        hv,
+        DISP_DOM,
+        HvCall::P2mPin {
+            mfn: F_DISP_ROOT,
+            level: PtLevel::L1,
+        },
+        "disp pin root",
+        uart,
+    );
+    expect(
+        hv,
+        DISP_DOM,
+        HvCall::P2mLink {
+            parent: F_DISP_ROOT,
+            slot: 0,
+            child: F_DISP_DATA,
+            writable: true,
+            leaf: true,
+        },
+        "disp link data",
+        uart,
+    );
+    // Vault: root + secret, pin root, link secret. The vault owns the secret, so it is NOT in the
+    // disposable's Stage-2 (owner filter) — the disposable's probe of it faults.
+    for mfn in [F_VAULT_ROOT, F_VAULT_SECRET] {
+        expect(
+            hv,
+            VAULT_DOM,
+            HvCall::P2mAllocate { mfn },
+            "vault alloc",
+            uart,
+        );
+    }
+    expect(
+        hv,
+        VAULT_DOM,
+        HvCall::P2mPin {
+            mfn: F_VAULT_ROOT,
+            level: PtLevel::L1,
+        },
+        "vault pin root",
+        uart,
+    );
+    expect(
+        hv,
+        VAULT_DOM,
+        HvCall::P2mLink {
+            parent: F_VAULT_ROOT,
+            slot: 0,
+            child: F_VAULT_SECRET,
+            writable: true,
+            leaf: true,
+        },
+        "vault link secret",
+        uart,
+    );
+    // Seed the vault's secret HV-side (un-forgeable — the disposable cannot guess or reach it).
+    {
+        let mut gm = GuestMem;
+        if gm
+            .write(stage2::frame_ipa(F_VAULT_SECRET), VAULT_SECRET_MARKER)
+            .is_err()
+        {
+            let _ = writeln!(
+                uart,
+                "baleen: thesis: failed to seed the vault secret; halting"
+            );
+            crate::park();
+        }
+    }
+    // The disposable's CoW disk: seed the shared template, then write the disposable's overlay so its
+    // disk has diverged (the overlay is discarded on teardown, the template staying pristine).
+    let disk = blk_disk();
+    disk.seed_template(0, THESIS_TEMPLATE_MARKER);
+    disk.write(DISP_TENANT, 0, DISP_DISK_MARKER);
+}
+
+/// **M5 Arc 6, the thesis phase.** Build a fresh `Hypervisor`, create the disposable + vault, emit the
+/// disposable's Stage-2 (which does NOT map the vault's secret), and enter the disposable. It writes its
+/// own frame and probes the vault secret → fault. The terminal ([`finish_thesis_test`]) then destroys the
+/// disposable and runs the non-interference + lifecycle + channel-enumeration audit. Never returns.
+fn begin_thesis_phase(uart: &mut Pl011) -> ! {
+    // Reset the per-frame fault records for this incarnation (design-lesson #16).
+    for f in 0..NFRAMES {
+        FAULT_DFSC[f].store(0, Ordering::Relaxed);
+        FAULT_WNR[f].store(false, Ordering::Relaxed);
+    }
+    // SAFETY: single-CPU, one-time rebuild before the disposable runs.
+    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+
+    setup_thesis_model(hv, uart);
+
+    let vttbr = stage2::build_stage2_from_p2m(hv, DISP_DOM, STAGE2_SET_SINGLE);
+    let entry = load_guest_disposable();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    init_guest_el1(ram_end);
+    {
+        use hv_hal::VcpuOps;
+        ArmVcpu.set_entry(entry);
+    }
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    let _ = writeln!(
+        uart,
+        "baleen: thesis phase — dom0 runs a disposable; a live no-net vault domain holds an un-forgeable secret the disposable must not reach (the vault is modeled + owns its secret; only the disposable executes)"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    enter_guest(exc_stack_top);
+}
+
+/// **M5 Arc 6, thesis terminal — Audit #3, the audit IS the arc.** After the disposable's run, assert the
+/// whole thesis: non-interference (the probe faulted + the secret was not read), the channel enumeration
+/// (no grant / no shared mapping vault→disposable — the by-construction proof, bridged to the model's
+/// Tier-D non-interference theorem), the disposable destroyed clean (Arc 0) with its overlay discarded,
+/// and the vault's secret + the CoW template both pristine (Arc 4), plus a reborn disposable that inherits
+/// no reach to the secret. Then finish the boot.
+fn finish_thesis_test(uart: &mut Pl011) -> ! {
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+
+    let pos_ok = THESIS_POS_OK.load(Ordering::Relaxed);
+
+    // (1) Non-interference (empirical): the disposable's probe of the vault secret took a translation
+    // fault — its Stage-2 has no leaf for the vault's frame.
+    let probe_dfsc = FAULT_DFSC[F_VAULT_SECRET as usize].load(Ordering::Relaxed);
+    let faulted = is_translation(probe_dfsc);
+    if faulted {
+        let _ = writeln!(
+            uart,
+            "baleen: thesis non-interference OK: the disposable's probe of the vault secret -> translation fault (DFSC=0x{probe_dfsc:02x})"
+        );
+    }
+
+    // (2) Channel enumeration — the audit IS the arc. Enumerate EVERY cross-domain channel the model
+    // supports, against the proven `hv-core` state, exhaustively (not on hand-picked frames) and in BOTH
+    // directions: any GRANT reaching either domain, any EVENT CHANNEL between them, any foreign
+    // PAGE-TABLE LINK into either, and any CONTROL edge between the peers (only dom0 — the trusted control
+    // domain — controls them; neither peer controls the other). None present ⇒ no authorizing edge ⇒
+    // `¬(vault ⇝ disposable)` over the model's `⇝` relation — the precondition of the model's Tier-D
+    // non-interference theorem (see docs/AUDIT-3-NON-INTERFERENCE.md). The empirical translation fault
+    // above is the metal witness that this "no channel" is real silicon behaviour.
+    let no_grant = !hv.grant().any_grant_to(DISP_DOM) && !hv.grant().any_grant_to(VAULT_DOM);
+    let no_evtchn = no_evtchn_between(hv, VAULT_DOM, DISP_DOM);
+    let no_foreign_link =
+        !hv.p2m().has_foreign_link_into(VAULT_DOM) && !hv.p2m().has_foreign_link_into(DISP_DOM);
+    let no_control = !hv.controls(VAULT_DOM, DISP_DOM) && !hv.controls(DISP_DOM, VAULT_DOM);
+    let no_channel = no_grant && no_evtchn && no_foreign_link && no_control;
+    if no_channel {
+        let _ = writeln!(
+            uart,
+            "baleen: thesis channel enumeration: no grant, no event channel, no shared page-table link, no control edge between vault and disposable (not(vault -> disposable); bridges to Tier-D)"
+        );
+    }
+
+    // (3) Destroy the disposable — the proven teardown (Arc 0). Clean shell: Dead + owns no frames.
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainDestroy {
+            target: DISP_DOM,
+            now,
+        },
+        "destroy disposable",
+        uart,
+    );
+    let destroy_clean = !hv.is_live(DISP_DOM)
+        && hv.p2m().owner_of(F_DISP_ROOT) != Some(DISP_DOM)
+        && hv.p2m().owner_of(F_DISP_DATA) != Some(DISP_DOM);
+
+    // Discard the disposable's disk (its CoW overlay) — a disposable's storage is thrown away on teardown.
+    blk_disk().discard_overlay(DISP_TENANT);
+    let overlay_gone = !blk_disk().is_dirty(DISP_TENANT, 0);
+
+    // (4) The vault's secret is UNTOUCHED (read the real backing HV-side). And the CoW template is
+    // pristine — a model-level re-assertion of the Arc-4 immutability property (here the disposable's
+    // overlay divergence is HV-seeded; the guest-driven trap-and-emulate CoW proof is Arc 4's).
+    let vault_untouched = read_frame(F_VAULT_SECRET) == vault_secret_prefix();
+    let template_pristine =
+        &blk_disk().template_sector(0)[..THESIS_TEMPLATE_MARKER.len()] == THESIS_TEMPLATE_MARKER;
+
+    // (5) Reborn inherits nothing (Arc 0): a fresh disposable in the same slot still cannot reach the
+    // vault's secret — a `p2m_link` of it is refused `Unauthorized` (not the reborn's frame, no grant).
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: DISP_DOM,
+            may_create: false,
+        },
+        "reborn disposable",
+        uart,
+    );
+    expect(
+        hv,
+        DISP_DOM,
+        HvCall::P2mAllocate { mfn: F_DISP_ROOT },
+        "reborn alloc root",
+        uart,
+    );
+    expect(
+        hv,
+        DISP_DOM,
+        HvCall::P2mPin {
+            mfn: F_DISP_ROOT,
+            level: PtLevel::L1,
+        },
+        "reborn pin root",
+        uart,
+    );
+    let reborn_denied = matches!(
+        hv.dispatch(
+            DISP_DOM,
+            HvCall::P2mLink {
+                parent: F_DISP_ROOT,
+                slot: 0,
+                child: F_VAULT_SECRET,
+                writable: true,
+                leaf: true,
+            },
+        ),
+        Err(HvError::Unauthorized)
+    );
+    if reborn_denied {
+        let _ = writeln!(
+            uart,
+            "baleen: thesis reborn OK: a reborn disposable could NOT link the vault's secret (no inherited reach)"
+        );
+    }
+
+    let ok = pos_ok
+        && faulted
+        && no_channel
+        && destroy_clean
+        && overlay_gone
+        && vault_untouched
+        && template_pristine
+        && reborn_denied;
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: THESIS TEST PASSED — the vault's secret never reached the disposable; the disposable was destroyed clean (overlay discarded), the vault secret + CoW template pristine (non-interference, bridged to Tier-D)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: THESIS TEST FAILED (pos_ok={pos_ok} faulted={faulted} no_channel={no_channel} destroy_clean={destroy_clean} overlay_gone={overlay_gone} vault_untouched={vault_untouched} template_pristine={template_pristine} reborn_denied={reborn_denied})"
+        );
+    }
+    selftest_brk(uart);
+    crate::park();
 }
 
 /// **M5 Arc 5b, virtual-timer phase.** Build a fresh minimal guest, zero `CNTVOFF_EL2` so the guest's
