@@ -34,6 +34,7 @@
 #![no_std]
 #![no_main]
 
+mod blk;
 mod el2;
 mod exceptions;
 mod guest;

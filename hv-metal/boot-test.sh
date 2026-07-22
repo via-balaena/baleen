@@ -116,9 +116,12 @@ boot_and_check() {
 }
 
 # Strings that must NEVER appear in a boot (checked by boot_and_check on every run). The virtio-console
-# negative (M5 Arc 3): the un-granted buffer's SECRET payload the backend refused to read.
+# negative (M5 Arc 3): the un-granted buffer's SECRET payload the backend refused to read. The virtio-blk
+# negatives (M5 Arc 4): tenant 0's write POISON must never cross to the template or to tenant 1's view —
+# it appears on the console only if a write reaches the template or two tenants' overlays alias.
 FORBIDDEN_MARKERS=(
     "SECRET-ungranted-must-not-appear"
+    "POISON-blk-guest0-write-must-not-cross"
 )
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
@@ -190,7 +193,17 @@ boot_and_check "default" "" \
     "virtio-console backend: draining" \
     "baleen-guest: hello over a granted virtqueue" \
     "virtio backend REFUSED un-granted access to Mfn 4" \
-    "VIRTIO CONSOLE TEST PASSED — granted bytes delivered, un-granted access refused (the ring is a proven grant)"
+    "VIRTIO CONSOLE TEST PASSED — granted bytes delivered, un-granted access refused (the ring is a proven grant)" \
+    "virtio-blk device identified: magic=\"virt\" version=2 id=2 (block) via trap-and-emulate" \
+    "virtio-blk negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set" \
+    "virtio-blk READ served sector 0 to tenant 0" \
+    "baleen-blk-template-sector-0-pristine" \
+    "virtio-blk read round-trip OK: tenant 0 read sector 0 = the pristine template" \
+    "virtio-blk WRITE by tenant 0 landed in its CoW overlay" \
+    "virtio-blk template-immutability OK: tenant 0's write landed in its CoW overlay; the template is pristine" \
+    "virtio backend REFUSED un-granted access to Mfn 5" \
+    "virtio-blk read round-trip OK: tenant 1 read sector 0 = the pristine template" \
+    "VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -235,6 +248,16 @@ boot_and_check "selftest" "--features selftest" \
     "baleen-guest: hello over a granted virtqueue" \
     "virtio backend REFUSED un-granted access to Mfn 4" \
     "VIRTIO CONSOLE TEST PASSED — granted bytes delivered, un-granted access refused (the ring is a proven grant)" \
+    "virtio-blk device identified: magic=\"virt\" version=2 id=2 (block) via trap-and-emulate" \
+    "virtio-blk negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set" \
+    "virtio-blk READ served sector 0 to tenant 0" \
+    "baleen-blk-template-sector-0-pristine" \
+    "virtio-blk read round-trip OK: tenant 0 read sector 0 = the pristine template" \
+    "virtio-blk WRITE by tenant 0 landed in its CoW overlay" \
+    "virtio-blk template-immutability OK: tenant 0's write landed in its CoW overlay; the template is pristine" \
+    "virtio backend REFUSED un-granted access to Mfn 5" \
+    "virtio-blk read round-trip OK: tenant 1 read sector 0 = the pristine template" \
+    "VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 

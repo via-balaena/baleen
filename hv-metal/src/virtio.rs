@@ -50,7 +50,9 @@ pub fn in_mmio_window(addr: u64) -> bool {
 }
 
 // ─── virtio-mmio v2 register offsets (from the mmio base) ──────────────────────────────────────────
-mod reg {
+// `pub(crate)`: the register offsets are the shared virtio-mmio v2 transport convention, reused by the
+// virtio-blk device model ([`crate::blk`], M5 Arc 4) so the two devices don't duplicate offsets.
+pub(crate) mod reg {
     pub const MAGIC_VALUE: u64 = 0x000; // R  — 0x74726976 "virt"
     pub const VERSION: u64 = 0x004; // R  — 2 (modern)
     pub const DEVICE_ID: u64 = 0x008; // R  — 3 (console)
