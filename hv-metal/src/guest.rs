@@ -274,7 +274,8 @@ const VIRTIO_BACKEND: DomId = 0;
 // the virtqueue frame (descriptor table + available ring + used ring) and the TX data buffer.
 const F_VQ_ROOT: Mfn = 1; // the guest's L1 page table (pinned)
 const F_VQ: Mfn = 2; // the split virtqueue (desc @ +0, avail @ +0x100, used @ +0x200)
-const F_BUF: Mfn = 3; // the TX data buffer
+const F_BUF: Mfn = 3; // the TX data buffer (granted RO to dom0)
+const F_BUF_UNGRANTED: Mfn = 4; // a buffer the guest owns but does NOT grant (the negative — step 4)
 
 // The driver lays the three rings out within F_VQ at desc @ +0, avail @ +0x100, used @ +0x200 (see the
 // guest program), and programs those as the queue addresses; the backend reads the addresses back from
@@ -283,6 +284,7 @@ const F_BUF: Mfn = 3; // the TX data buffer
 /// The guest builds the ring/buffer IPAs from these (`movz DATA_HI, lsl#16; movk OFF`).
 const VQ_FRAME_OFF: u64 = F_VQ as u64 * stage2::FRAME_SIZE; // 0x2000 → IPA 0x8000_2000
 const BUF_FRAME_OFF: u64 = F_BUF as u64 * stage2::FRAME_SIZE; // 0x3000 → IPA 0x8000_3000
+const UNGRANTED_FRAME_OFF: u64 = F_BUF_UNGRANTED as u64 * stage2::FRAME_SIZE; // 0x4000 → 0x8000_4000
 
 /// The driver reports the four mmio identity registers it read (`x1`=Magic, `x2`=Version, `x3`=DeviceID,
 /// `x4`=VendorID); the backend asserts them. A checkpoint (resumes), not terminal.
@@ -602,6 +604,31 @@ __guest5_tpl_start:
     // ── kick the device ──
     str     wzr, [x10, #0x050]             // QueueNotify = 0 → backend drains the granted ring
 
+    // ── the negative: a second buffer in an UN-GRANTED frame → the backend must refuse ──
+    movz    x18, #{DATA_HI}, lsl #16
+    movk    x18, #{UNGRANTED_OFF}          // x18 = frame_ipa(F_BUF_UNGRANTED) — owned, NOT granted
+    adr     x11, 5f                        // a secret the backend must NOT be able to read
+    mov     x12, x18
+4:  ldrb    w14, [x11], #1
+    cbz     w14, 6f
+    strb    w14, [x12], #1
+    b       4b
+5:  .asciz "SECRET-ungranted-must-not-appear\n"
+    .balign 4
+6:  sub     x17, x12, x18                  // len
+    // descriptor 1: addr = F_BUF_UNGRANTED, len, flags = 0
+    add     x19, x15, #16                  // &desc[1]
+    str     x18, [x19, #0]
+    str     w17, [x19, #8]
+    strh    wzr, [x19, #12]
+    strh    wzr, [x19, #14]
+    // available ring: ring[1] = desc 1, idx = 2
+    mov     w0, #1
+    strh    w0, [x15, #0x106]              // avail.ring[1] = 1
+    mov     w0, #2
+    strh    w0, [x15, #0x102]              // avail.idx = 2
+    str     wzr, [x10, #0x050]             // kick again → backend refuses the un-granted buffer
+
     // ── terminal ──
     mov     x0, #{NR_VIRTIO_FINAL}
     hvc     #0
@@ -614,6 +641,7 @@ __guest5_tpl_end:
     DATA_HI = const DATA_IPA_HI,
     VQ_OFF = const VQ_FRAME_OFF,
     BUF_OFF = const BUF_FRAME_OFF,
+    UNGRANTED_OFF = const UNGRANTED_FRAME_OFF,
     NR_VIRTIO_ID = const NR_VIRTIO_ID,
     NR_VIRTIO_NEGOTIATED = const NR_VIRTIO_NEGOTIATED,
     NR_VIRTIO_FINAL = const NR_VIRTIO_FINAL,
@@ -2803,7 +2831,7 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
     // the TX buffer. It links both as writable leaves (so it can build the ring + write the message),
     // pins the root, and GRANTS both to dom0 — the virtqueue frame read-write (the backend writes the
     // used ring), the buffer read-only (the backend only reads the TX data). The ring IS a grant.
-    for mfn in [F_VQ_ROOT, F_VQ, F_BUF] {
+    for mfn in [F_VQ_ROOT, F_VQ, F_BUF, F_BUF_UNGRANTED] {
         expect(
             hv,
             VIRTIO_DOM,
@@ -2822,7 +2850,9 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
         "virtio pin root",
         uart,
     );
-    for (slot, child) in [(0u32, F_VQ), (1u32, F_BUF)] {
+    // Link all three data frames writable (the guest writes each). It grants only F_VQ + F_BUF below;
+    // F_BUF_UNGRANTED is deliberately NOT granted — a descriptor pointing at it is the step-4 negative.
+    for (slot, child) in [(0u32, F_VQ), (1u32, F_BUF), (2u32, F_BUF_UNGRANTED)] {
         expect(
             hv,
             VIRTIO_DOM,
@@ -2892,15 +2922,18 @@ fn finish_virtio_console_test(uart: &mut Pl011) -> ! {
     let id_ok = VIRTIO_ID_OK.load(Ordering::Relaxed);
     let negotiated_ok = VIRTIO_NEGOTIATED_OK.load(Ordering::Relaxed);
     let drained_ok = VIRTIO_DRAINED_OK.load(Ordering::Relaxed);
-    if id_ok && negotiated_ok && drained_ok {
+    // The negative: the backend refused the descriptor pointing at the un-granted frame (so the secret
+    // never reached the console). This is the diamond — the ring is a grant, not a hole.
+    let refused_ok = VIRTIO_UNGRANTED_REFUSED.load(Ordering::Relaxed);
+    if id_ok && negotiated_ok && drained_ok && refused_ok {
         let _ = writeln!(
             uart,
-            "baleen: VIRTIO CONSOLE TEST PASSED — device identified + VERSION_1 negotiated + guest bytes delivered over a granted virtqueue"
+            "baleen: VIRTIO CONSOLE TEST PASSED — granted bytes delivered, un-granted access refused (the ring is a proven grant)"
         );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok} drained_ok={drained_ok})"
+            "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok} drained_ok={drained_ok} refused_ok={refused_ok})"
         );
     }
     selftest_brk(uart);

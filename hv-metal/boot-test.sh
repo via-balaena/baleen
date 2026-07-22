@@ -95,6 +95,17 @@ boot_and_check() {
             failed=1
         fi
     done
+    # Forbidden markers — strings that must NEVER appear. The virtio-console negative (M5 Arc 3): the
+    # backend refused the descriptor pointing at the un-granted frame, so its SECRET payload must not
+    # have reached the console. A mutation that bypassed the grant check would leak it — caught here.
+    for m in "${FORBIDDEN_MARKERS[@]}"; do
+        if grep -qF "$m" "$out"; then
+            echo "boot-test: FAIL ($label) — FORBIDDEN marker '$m' appeared (isolation/grant leak)"
+            failed=1
+        else
+            echo "boot-test: OK ($label) — forbidden '$m' absent"
+        fi
+    done
     if [ "$failed" -ne 0 ]; then
         echo "----------------------------------------"
         cat "$out"
@@ -103,6 +114,12 @@ boot_and_check() {
     fi
     rm -f "$out"
 }
+
+# Strings that must NEVER appear in a boot (checked by boot_and_check on every run). The virtio-console
+# negative (M5 Arc 3): the un-granted buffer's SECRET payload the backend refused to read.
+FORBIDDEN_MARKERS=(
+    "SECRET-ungranted-must-not-appear"
+)
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
 # a regression in any one is caught even without the self-test:
@@ -172,7 +189,8 @@ boot_and_check "default" "" \
     "virtio negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set" \
     "virtio-console backend: draining" \
     "baleen-guest: hello over a granted virtqueue" \
-    "VIRTIO CONSOLE TEST PASSED — device identified + VERSION_1 negotiated + guest bytes delivered over a granted virtqueue"
+    "virtio backend REFUSED un-granted access to Mfn 4" \
+    "VIRTIO CONSOLE TEST PASSED — granted bytes delivered, un-granted access refused (the ring is a proven grant)"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -215,7 +233,8 @@ boot_and_check "selftest" "--features selftest" \
     "virtio negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set" \
     "virtio-console backend: draining" \
     "baleen-guest: hello over a granted virtqueue" \
-    "VIRTIO CONSOLE TEST PASSED — device identified + VERSION_1 negotiated + guest bytes delivered over a granted virtqueue" \
+    "virtio backend REFUSED un-granted access to Mfn 4" \
+    "VIRTIO CONSOLE TEST PASSED — granted bytes delivered, un-granted access refused (the ring is a proven grant)" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
