@@ -209,7 +209,10 @@ boot_and_check "default" "" \
     "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
     "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
     "virtual timer OK: CNTVCT advanced" \
-    "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping"
+    "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
+    "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
+    "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
+    "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -270,6 +273,9 @@ boot_and_check "selftest" "--features selftest" \
     "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
     "virtual timer OK: CNTVCT advanced" \
     "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
+    "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
+    "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
+    "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 

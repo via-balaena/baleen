@@ -383,8 +383,27 @@ const NR_GIC_ASYNC_FINAL: u64 = 0xd4;
 /// The guest reports the timer fired: `x1` = `CNTV_CTL_EL0` (with `ISTATUS`), `x2` = count before, `x3` =
 /// count after. The hypervisor asserts the condition fired and the counter advanced. A checkpoint.
 const NR_TIMER_REPORT: u64 = 0xc0;
-/// The virtual-timer phase's terminal report (the boot's last act).
+/// The virtual-timer phase's terminal — chains into the PSCI phase.
 const NR_TIMER_FINAL: u64 = 0xc1;
+
+// ─── M5 Arc 5c: PSCI ─────────────────────────────────────────────────────────────────────────────────
+//
+// The Power State Coordination Interface — how a guest (and Linux) queries power management and powers
+// down. The guest invokes PSCI via `HVC` (the DTB will say `method = "hvc"`); the hypervisor recognizes
+// the PSCI function IDs and services them. A synthetic guest queries the version and powers off.
+
+/// PSCI function IDs (SMC Calling Convention). `PSCI_VERSION`/`SYSTEM_OFF`/`PSCI_FEATURES` are the 32-bit
+/// (SMC32) IDs; `CPU_ON`/`AFFINITY_INFO` are 64-bit (SMC64) and not needed for a single-CPU guest.
+const PSCI_VERSION_FID: u64 = 0x8400_0000;
+const PSCI_FEATURES_FID: u64 = 0x8400_000A;
+const PSCI_SYSTEM_OFF_FID: u64 = 0x8400_0008;
+/// The PSCI version the hypervisor reports: v1.1 (major 1 << 16 | minor 1).
+const PSCI_VERSION_1_1: u64 = 0x0001_0001;
+/// PSCI return code: the requested function is not implemented.
+const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
+
+/// The guest reports the PSCI version it read (`x1`); the hypervisor asserts it equals what it returned.
+const NR_PSCI_REPORT: u64 = 0xb0;
 
 // ---------------------------------------------------------------------------------------------
 // The guest program.
@@ -1154,6 +1173,34 @@ __guest_timer_tpl_end:
     NR_TIMER_FINAL = const NR_TIMER_FINAL,
 );
 
+// The PSCI test guest program (M5 Arc 5c). It queries the PSCI version via HVC, reports it, then powers
+// off via PSCI SYSTEM_OFF (which the hypervisor treats as the guest's terminal — SYSTEM_OFF never
+// returns). This is exactly how Linux uses PSCI (version probe at boot, SYSTEM_OFF at shutdown), with
+// `method = "hvc"`. Straight-line / stack-free, position-independent.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_psci_tpl_start
+__guest_psci_tpl_start:
+    // PSCI_VERSION (0x84000000) via HVC → version in x0
+    movz    x0, #0x8400, lsl #16
+    hvc     #0
+    mov     x1, x0                         // report the version the hypervisor returned
+    mov     x0, #{NR_PSCI_REPORT}
+    hvc     #0
+    // SYSTEM_OFF (0x84000008) — the guest powers off; the hypervisor does not return
+    movz    x0, #0x8400, lsl #16
+    movk    x0, #0x0008
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_psci_tpl_end
+__guest_psci_tpl_end:
+    "#,
+    NR_PSCI_REPORT = const NR_PSCI_REPORT,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -1334,6 +1381,10 @@ static GIC_ASYNC_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 5b: the guest used the virtual timer — programmed a deadline, the `CNTVCT` counter advanced,
 /// and the `ISTATUS` compare condition fired (timekeeping, what Linux depends on).
 static TIMER_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5c: the guest read the PSCI version the hypervisor reported (PSCI is discoverable).
+static PSCI_VERSION_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5c: the guest powered off via PSCI `SYSTEM_OFF` (the hypervisor serviced it).
+static PSCI_OFF_OK: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     static __guest_tpl_start: u8;
@@ -1356,6 +1407,8 @@ extern "C" {
     static __guest_gic_async_tpl_end: u8;
     static __guest_timer_tpl_start: u8;
     static __guest_timer_tpl_end: u8;
+    static __guest_psci_tpl_start: u8;
+    static __guest_psci_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1713,6 +1766,21 @@ fn load_guest_timer() -> u64 {
     ram_start as u64
 }
 
+/// Copy the **PSCI** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5c).
+fn load_guest_psci() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_psci_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_psci_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
 /// Program Stage-2 and enable it: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM`, then invalidate
 /// Stage-1&2 TLBs for the VMID and synchronize. The `dsb`/`tlbi`/`isb` are load-bearing on silicon and
 /// invisible-but-harmless under QEMU. The table is built (invalid→valid) *before* this runs, so no
@@ -2031,6 +2099,13 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
     let nr = frame.x[0];
     let arg0 = frame.x[1];
 
+    // PSCI calls arrive via HVC with an SMC-convention function ID in x0 (M5 Arc 5c); route them to the
+    // PSCI handler before the small internal test-`nr` dispatch below (no collision — PSCI FIDs are huge).
+    if is_psci_fid(nr) {
+        handle_psci(frame, uart);
+        return;
+    }
+
     match nr {
         NR_GRANT | NR_SPEND => {
             // SAFETY: the global `Hypervisor` was built in `run` before the guest ran; single-CPU,
@@ -2088,7 +2163,8 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_GIC_ASYNC_REPORT => gic_async_report(frame, uart), // M5 Arc 5b: assert vectored delivery
         NR_GIC_ASYNC_FINAL => finish_gic_async_test(uart), // -> ! (async phase → timer phase)
         NR_TIMER_REPORT => timer_report(frame, uart), // M5 Arc 5b: assert the virtual timer fired
-        NR_TIMER_FINAL => finish_timer_test(uart), // -> ! (timer phase terminal)
+        NR_TIMER_FINAL => finish_timer_test(uart), // -> ! (timer phase → PSCI phase)
+        NR_PSCI_REPORT => psci_report(frame, uart), // M5 Arc 5c: assert the guest read the PSCI version
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -4104,21 +4180,118 @@ fn timer_report(frame: &mut GuestFrame, uart: &mut Pl011) {
     }
 }
 
-/// **M5 Arc 5b, virtual-timer phase terminal.** Assert the timer worked and finish the boot.
+/// **M5 Arc 5b, virtual-timer phase terminal.** Assert the timer worked, then chain into the PSCI phase.
 fn finish_timer_test(uart: &mut Pl011) -> ! {
     if TIMER_OK.load(Ordering::Relaxed) {
         let _ = writeln!(
             uart,
             "baleen: TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping"
         );
+        // M5 Arc 5c: prove PSCI (version query + power off). Never returns.
+        begin_psci_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: TIMER TEST FAILED — the virtual timer did not fire"
+    );
+    crate::park();
+}
+
+/// Whether `nr` is a PSCI function ID (SMC Calling Convention): the Standard Secure/Power service ranges
+/// `0x8400_00xx` (SMC32) and `0xC400_00xx` (SMC64). Test-internal `nr`s are tiny, so there is no overlap.
+fn is_psci_fid(nr: u64) -> bool {
+    let base = nr & 0xFFFF_FF00;
+    base == 0x8400_0000 || base == 0xC400_0000
+}
+
+/// **M5 Arc 5c — service a PSCI call** the guest made via `HVC`. Supports the calls a single-CPU guest
+/// (and Linux) needs: `PSCI_VERSION` (report v1.1), `PSCI_FEATURES` (report `SYSTEM_OFF` implemented),
+/// and `SYSTEM_OFF` (the guest powers off — the phase terminal, never returns). Anything else returns
+/// `NOT_SUPPORTED`.
+fn handle_psci(frame: &mut GuestFrame, uart: &mut Pl011) {
+    match frame.x[0] {
+        PSCI_VERSION_FID => {
+            frame.x[0] = PSCI_VERSION_1_1;
+            let _ = writeln!(
+                uart,
+                "baleen: PSCI_VERSION -> 0x{PSCI_VERSION_1_1:08x} (v1.1)"
+            );
+        }
+        PSCI_FEATURES_FID => {
+            // x1 = the queried function ID; SYSTEM_OFF is implemented (0), others not.
+            frame.x[0] = if frame.x[1] == PSCI_SYSTEM_OFF_FID {
+                0
+            } else {
+                PSCI_NOT_SUPPORTED
+            };
+        }
+        PSCI_SYSTEM_OFF_FID => {
+            PSCI_OFF_OK.store(true, Ordering::Relaxed);
+            let _ = writeln!(
+                uart,
+                "baleen: PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)"
+            );
+            finish_psci_test(uart); // -> ! (the guest is gone; this is the phase terminal)
+        }
+        other => {
+            frame.x[0] = PSCI_NOT_SUPPORTED;
+            let _ = writeln!(
+                uart,
+                "baleen: PSCI unsupported FID 0x{other:08x} -> NOT_SUPPORTED"
+            );
+        }
+    }
+}
+
+/// **M5 Arc 5c** — the guest reported the PSCI version it read (`x1`); assert it equals what the
+/// hypervisor returned. A checkpoint.
+fn psci_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let version = frame.x[1];
+    let ok = version == PSCI_VERSION_1_1;
+    PSCI_VERSION_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: PSCI version OK: guest read 0x{version:08x} (v1.1) — PSCI is discoverable"
+        );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: TIMER TEST FAILED — the virtual timer did not fire"
+            "baleen: PSCI version MISMATCH: guest read 0x{version:08x} (expected 0x{PSCI_VERSION_1_1:08x})"
+        );
+    }
+}
+
+/// **M5 Arc 5c, PSCI phase terminal.** Assert the version query + power-off both worked and finish the
+/// boot. Reached when the guest calls `SYSTEM_OFF`.
+fn finish_psci_test(uart: &mut Pl011) -> ! {
+    let version_ok = PSCI_VERSION_OK.load(Ordering::Relaxed);
+    let off_ok = PSCI_OFF_OK.load(Ordering::Relaxed);
+    if version_ok && off_ok {
+        let _ = writeln!(
+            uart,
+            "baleen: PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: PSCI TEST FAILED (version_ok={version_ok} off_ok={off_ok})"
         );
     }
     selftest_brk(uart);
     crate::park();
+}
+
+/// **M5 Arc 5c, PSCI phase.** Build a fresh minimal guest and enter; the guest queries the PSCI version
+/// and powers off. Never returns.
+fn begin_psci_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    let entry = load_guest_psci();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: PSCI phase — a guest queries the PSCI version and powers off via SYSTEM_OFF",
+    );
 }
 
 /// **M5 Arc 5b, virtual-timer phase.** Build a fresh minimal guest, zero `CNTVOFF_EL2` so the guest's
