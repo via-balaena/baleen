@@ -103,6 +103,7 @@ use hv_core::{HvCall, HvError, HvOutcome, Hypercall, Hypervisor, RawHypercall};
 
 use hv_hal::GuestMemory;
 
+use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, GuestMem};
 
@@ -346,6 +347,76 @@ const NR_BLK_NEGOTIATED: u64 = 0xe1;
 const NR_BLK_READ_REPORT: u64 = 0xe2;
 /// The block phase's terminal report — the backend asserts the matrix and finishes (boot's last act).
 const NR_BLK_FINAL: u64 = 0xe3;
+
+// ─── M5 Arc 5a: vGIC interrupt injection ────────────────────────────────────────────────────────────
+//
+// A synthetic guest enables the GICv3 CPU interface, signals the hypervisor to inject a virtual
+// interrupt (via the list registers, see `crate::gic`), then acknowledges it through `ICC_IAR1_EL1` and
+// reports the INTID. Proves the vGIC injection path end to end before any of it drives real Linux.
+
+/// The domain running the vGIC test guest (a fresh `Hypervisor` for this phase).
+const GIC_DOM: DomId = 1;
+/// The guest's page-table root (the only frame it needs — it touches no guest data memory).
+const F_GIC_ROOT: Mfn = 1;
+/// The virtual INTID the hypervisor injects and the guest must acknowledge (an arbitrary SPI).
+const GIC_TEST_INTID: u32 = 42;
+
+/// The guest signals it has enabled its CPU interface and is ready for an injection (the hypervisor
+/// injects [`GIC_TEST_INTID`] while servicing this HVC). A checkpoint.
+const NR_GIC_READY: u64 = 0xd0;
+/// The guest reports the INTID it acknowledged via `ICC_IAR1_EL1` (`x1`); the hypervisor asserts it
+/// equals the injected INTID. A checkpoint.
+const NR_GIC_REPORT: u64 = 0xd1;
+/// The vGIC poll phase's terminal — chains into the async-delivery phase.
+const NR_GIC_FINAL: u64 = 0xd2;
+/// The async-delivery guest reports (from its EL1 IRQ vector) the INTID it took (`x1`). A checkpoint.
+const NR_GIC_ASYNC_REPORT: u64 = 0xd3;
+/// The async-delivery phase's terminal — chains into the virtual-timer phase.
+const NR_GIC_ASYNC_FINAL: u64 = 0xd4;
+
+// ─── M5 Arc 5b: the virtual timer ────────────────────────────────────────────────────────────────────
+//
+// A synthetic guest uses the ARM architected VIRTUAL timer (`CNTV`) for timekeeping: it reads the virtual
+// count `CNTVCT_EL0`, programs a short deadline via `CNTV_TVAL_EL0`, enables the timer, and polls
+// `CNTV_CTL_EL0.ISTATUS` until the compare condition fires — exactly the timer Linux reads constantly.
+
+/// The guest reports the timer fired: `x1` = `CNTV_CTL_EL0` (with `ISTATUS`), `x2` = count before, `x3` =
+/// count after. The hypervisor asserts the condition fired and the counter advanced. A checkpoint.
+const NR_TIMER_REPORT: u64 = 0xc0;
+/// The virtual-timer phase's terminal — chains into the PSCI phase.
+const NR_TIMER_FINAL: u64 = 0xc1;
+
+// ─── M5 Arc 5c: PSCI ─────────────────────────────────────────────────────────────────────────────────
+//
+// The Power State Coordination Interface — how a guest (and Linux) queries power management and powers
+// down. The guest invokes PSCI via `HVC` (the DTB will say `method = "hvc"`); the hypervisor recognizes
+// the PSCI function IDs and services them. A synthetic guest queries the version and powers off.
+
+/// PSCI function IDs (SMC Calling Convention). `PSCI_VERSION`/`SYSTEM_OFF`/`PSCI_FEATURES` are the 32-bit
+/// (SMC32) IDs; `CPU_ON`/`AFFINITY_INFO` are 64-bit (SMC64) and not needed for a single-CPU guest.
+const PSCI_VERSION_FID: u64 = 0x8400_0000;
+const PSCI_FEATURES_FID: u64 = 0x8400_000A;
+const PSCI_SYSTEM_OFF_FID: u64 = 0x8400_0008;
+/// The PSCI version the hypervisor reports: v1.1 (major 1 << 16 | minor 1).
+const PSCI_VERSION_1_1: u64 = 0x0001_0001;
+/// PSCI return code: the requested function is not implemented.
+const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
+
+/// The guest reports the PSCI version it read (`x1`); the hypervisor asserts it equals what it returned.
+const NR_PSCI_REPORT: u64 = 0xb0;
+
+// ─── M5 Arc 5d: the timer TICK — a physical interrupt delivered to the guest ──────────────────────────
+//
+// The keystone. A guest's virtual timer (`CNTV`) fires the physical PPI 27, routed to EL2 by
+// `HCR_EL2.IMO`; the EL2 IRQ handler ([`handle_guest_irq`]) acknowledges it and injects the matching
+// VIRTUAL interrupt, which the guest takes at its EL1 vector — a real, asynchronous, hardware-driven
+// timer tick (the same receive→inject path virtio interrupts will reuse).
+
+/// The guest reports (from its EL1 IRQ vector) the INTID of the timer tick it took (`x1`); the hypervisor
+/// asserts it is the virtual-timer INTID. A checkpoint.
+const NR_TIMER_IRQ_REPORT: u64 = 0xa0;
+/// The timer-tick phase's terminal report (the boot's last act).
+const NR_TIMER_IRQ_FINAL: u64 = 0xa1;
 
 // ---------------------------------------------------------------------------------------------
 // The guest program.
@@ -971,6 +1042,244 @@ __guest_blk_write_tpl_end:
     NR_BLK_FINAL = const NR_BLK_FINAL,
 );
 
+// The vGIC test guest program (M5 Arc 5a). It enables the GICv3 CPU interface (system-register access,
+// priority mask, Group 1), signals the hypervisor to inject a virtual interrupt, then ACKNOWLEDGES the
+// pending interrupt via `ICC_IAR1_EL1` and reports the INTID. This first step POLLS the acknowledge
+// register with interrupts still masked (proving the injection reaches the CPU interface); async
+// vectored delivery is the next step. Straight-line / stack-free, position-independent as the others.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_gic_poll_tpl_start
+__guest_gic_poll_tpl_start:
+    // ── enable the GICv3 CPU system-register interface at EL1 ──
+    mrs     x0, ICC_SRE_EL1
+    orr     x0, x0, #1                     // SRE = 1 (use the system-register interface)
+    msr     ICC_SRE_EL1, x0
+    isb
+    mov     x0, #0xff
+    msr     ICC_PMR_EL1, x0                // priority mask = allow every priority
+    mov     x0, #1
+    msr     ICC_IGRPEN1_EL1, x0            // enable Group 1 interrupts
+    isb
+    // ── ready: the hypervisor injects GIC_TEST_INTID while servicing this HVC ──
+    mov     x0, #{NR_GIC_READY}
+    hvc     #0
+    // ── acknowledge the injected virtual interrupt and report its INTID ──
+    mrs     x1, ICC_IAR1_EL1               // → the pending INTID (1023 if none/spurious)
+    msr     ICC_EOIR1_EL1, x1              // end of interrupt (priority drop + deactivate)
+    mov     x0, #{NR_GIC_REPORT}
+    hvc     #0                             // report x1 = the acknowledged INTID
+    // ── terminal ──
+    mov     x0, #{NR_GIC_FINAL}
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_gic_poll_tpl_end
+__guest_gic_poll_tpl_end:
+    "#,
+    NR_GIC_READY = const NR_GIC_READY,
+    NR_GIC_REPORT = const NR_GIC_REPORT,
+    NR_GIC_FINAL = const NR_GIC_FINAL,
+);
+
+// The vGIC ASYNC-delivery test guest program (M5 Arc 5b). Unlike the poll guest, it installs its OWN
+// EL1 exception vector table (`VBAR_EL1`), unmasks IRQs (`DAIFClr`), and *takes* the injected virtual
+// interrupt at its IRQ vector — real vectored delivery, the mechanism Linux depends on. The whole blob
+// is `0x800`-aligned (so the vector table's runtime address, `0x800`-aligned relative to the blob start,
+// is `0x800`-aligned as `VBAR_EL1` requires — the blob is copied to the 2 MiB-aligned guest RAM base).
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 0x800
+    .global __guest_gic_async_tpl_start
+__guest_gic_async_tpl_start:
+    // ── point VBAR_EL1 at our vector table (0x800-aligned, below) ──
+    adr     x0, 9f
+    msr     VBAR_EL1, x0
+    isb
+    // ── enable the GICv3 CPU interface (as the poll guest) ──
+    mrs     x0, ICC_SRE_EL1
+    orr     x0, x0, #1
+    msr     ICC_SRE_EL1, x0
+    isb
+    mov     x0, #0xff
+    msr     ICC_PMR_EL1, x0
+    mov     x0, #1
+    msr     ICC_IGRPEN1_EL1, x0
+    isb
+    // ── ready: the hypervisor injects the virtual interrupt while servicing this HVC ──
+    mov     x0, #{NR_GIC_READY}
+    hvc     #0
+    // ── unmask IRQ: the pending virtual interrupt is now taken at the IRQ vector below ──
+    msr     DAIFClr, #2
+    isb
+1:  wfi
+    b       1b
+
+    // ── EL1 exception vector table (16 entries, 0x80 apart). The guest runs at EL1h (SP_ELx), so an
+    //    IRQ vectors to offset 0x280 (Current EL with SP_ELx, IRQ). Others spin (never expected). ──
+    .balign 0x800
+9:
+    b       8f                            // 0x000 Current EL SP0, Synchronous
+    .balign 0x80
+    b       8f                            // 0x080 Current EL SP0, IRQ
+    .balign 0x80
+    b       8f                            // 0x100 Current EL SP0, FIQ
+    .balign 0x80
+    b       8f                            // 0x180 Current EL SP0, SError
+    .balign 0x80
+    b       8f                            // 0x200 Current EL SPx, Synchronous
+    .balign 0x80
+    // 0x280 Current EL SPx, IRQ — the injected virtual interrupt lands here
+    mrs     x1, ICC_IAR1_EL1              // acknowledge → INTID
+    msr     ICC_EOIR1_EL1, x1             // end of interrupt
+    mov     x0, #{NR_GIC_ASYNC_REPORT}
+    hvc     #0                            // report x1 = the async-delivered INTID
+    mov     x0, #{NR_GIC_ASYNC_FINAL}
+    hvc     #0
+7:  wfe
+    b       7b
+    .balign 0x80
+8:  wfe                                    // catch-all for any unexpected vector
+    b       8b
+    .global __guest_gic_async_tpl_end
+__guest_gic_async_tpl_end:
+    "#,
+    NR_GIC_READY = const NR_GIC_READY,
+    NR_GIC_ASYNC_REPORT = const NR_GIC_ASYNC_REPORT,
+    NR_GIC_ASYNC_FINAL = const NR_GIC_ASYNC_FINAL,
+);
+
+// The virtual-timer test guest program (M5 Arc 5b). It uses the ARM architected VIRTUAL timer for
+// timekeeping: read the count, program a short deadline (CNTV_TVAL), enable the timer, and poll
+// CNTV_CTL.ISTATUS until the compare condition fires — no interrupts (the timer *interrupt* rides the
+// shared EL2-physical-IRQ delivery path, a later step). Straight-line / stack-free, position-independent.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_timer_tpl_start
+__guest_timer_tpl_start:
+    mrs     x2, CNTVCT_EL0                 // virtual count BEFORE
+    mov     x0, #0x8000
+    msr     CNTV_TVAL_EL0, x0              // fire after ~0x8000 ticks (a short, deterministic deadline)
+    mov     x0, #1
+    msr     CNTV_CTL_EL0, x0               // ENABLE = 1, IMASK = 0
+    isb
+1:  mrs     x0, CNTV_CTL_EL0
+    tbz     x0, #2, 1b                     // spin until ISTATUS (bit 2) — the compare condition fired
+    mrs     x3, CNTVCT_EL0                 // virtual count AFTER
+    msr     CNTV_CTL_EL0, xzr              // disable the timer
+    mov     x1, x0                         // report: CNTV_CTL (with ISTATUS set)
+    mov     x0, #{NR_TIMER_REPORT}
+    hvc     #0                             // x1=ctl, x2=before, x3=after
+    mov     x0, #{NR_TIMER_FINAL}
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_timer_tpl_end
+__guest_timer_tpl_end:
+    "#,
+    NR_TIMER_REPORT = const NR_TIMER_REPORT,
+    NR_TIMER_FINAL = const NR_TIMER_FINAL,
+);
+
+// The PSCI test guest program (M5 Arc 5c). It queries the PSCI version via HVC, reports it, then powers
+// off via PSCI SYSTEM_OFF (which the hypervisor treats as the guest's terminal — SYSTEM_OFF never
+// returns). This is exactly how Linux uses PSCI (version probe at boot, SYSTEM_OFF at shutdown), with
+// `method = "hvc"`. Straight-line / stack-free, position-independent.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_psci_tpl_start
+__guest_psci_tpl_start:
+    // PSCI_VERSION (0x84000000) via HVC → version in x0
+    movz    x0, #0x8400, lsl #16
+    hvc     #0
+    mov     x1, x0                         // report the version the hypervisor returned
+    mov     x0, #{NR_PSCI_REPORT}
+    hvc     #0
+    // SYSTEM_OFF (0x84000008) — the guest powers off; the hypervisor does not return
+    movz    x0, #0x8400, lsl #16
+    movk    x0, #0x0008
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_psci_tpl_end
+__guest_psci_tpl_end:
+    "#,
+    NR_PSCI_REPORT = const NR_PSCI_REPORT,
+);
+
+// The timer-TICK test guest program (M5 Arc 5d). It installs its EL1 vector table, enables its virtual
+// CPU interface, programs the virtual timer (CNTV) with IMASK=0, unmasks IRQs, and waits (`wfi`). When
+// the timer fires, the physical PPI goes to EL2, which injects the virtual timer interrupt; the guest
+// TAKES it at its IRQ vector — a real hardware-driven tick. 0x800-aligned blob (for VBAR_EL1, as the
+// async guest). Position-independent.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 0x800
+    .global __guest_timer_irq_tpl_start
+__guest_timer_irq_tpl_start:
+    adr     x0, 9f
+    msr     VBAR_EL1, x0
+    isb
+    mrs     x0, ICC_SRE_EL1
+    orr     x0, x0, #1
+    msr     ICC_SRE_EL1, x0
+    isb
+    mov     x0, #0xff
+    msr     ICC_PMR_EL1, x0
+    mov     x0, #1
+    msr     ICC_IGRPEN1_EL1, x0
+    isb
+    // program the virtual timer: fire after ~0x8000 ticks, ENABLE=1, IMASK=0 (interrupt not masked)
+    mov     x0, #0x8000
+    msr     CNTV_TVAL_EL0, x0
+    mov     x0, #1
+    msr     CNTV_CTL_EL0, x0
+    isb
+    // unmask IRQ and wait — the tick arrives asynchronously at the vector below
+    msr     DAIFClr, #2
+    isb
+1:  wfi
+    b       1b
+
+    .balign 0x800
+9:
+    b       8f                            // 0x000 Current EL SP0, Synchronous
+    .balign 0x80
+    b       8f                            // 0x080 Current EL SP0, IRQ
+    .balign 0x80
+    b       8f                            // 0x100 Current EL SP0, FIQ
+    .balign 0x80
+    b       8f                            // 0x180 Current EL SP0, SError
+    .balign 0x80
+    b       8f                            // 0x200 Current EL SPx, Synchronous
+    .balign 0x80
+    // 0x280 Current EL SPx, IRQ — the virtual timer tick lands here
+    mrs     x1, ICC_IAR1_EL1              // acknowledge → INTID (27, the virtual timer)
+    msr     ICC_EOIR1_EL1, x1
+    mov     x0, #{NR_TIMER_IRQ_REPORT}
+    hvc     #0
+    mov     x0, #{NR_TIMER_IRQ_FINAL}
+    hvc     #0
+7:  wfe
+    b       7b
+    .balign 0x80
+8:  wfe
+    b       8b
+    .global __guest_timer_irq_tpl_end
+__guest_timer_irq_tpl_end:
+    "#,
+    NR_TIMER_IRQ_REPORT = const NR_TIMER_IRQ_REPORT,
+    NR_TIMER_IRQ_FINAL = const NR_TIMER_IRQ_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -1142,6 +1451,25 @@ static BLK_WRITE_ISOLATED_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 4: the backend REFUSED an un-granted descriptor in the chain (the grant regression negative).
 static BLK_UNGRANTED_REFUSED: AtomicBool = AtomicBool::new(false);
 
+/// M5 Arc 5a: the guest acknowledged the injected virtual interrupt with the correct INTID (the vGIC
+/// injection path reached the guest's CPU interface).
+static GIC_INJECT_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5b: the guest took the injected virtual interrupt ASYNCHRONOUSLY at its EL1 IRQ vector (not by
+/// polling) with the correct INTID — real vectored interrupt delivery, the mechanism Linux depends on.
+static GIC_ASYNC_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5b: the guest used the virtual timer — programmed a deadline, the `CNTVCT` counter advanced,
+/// and the `ISTATUS` compare condition fired (timekeeping, what Linux depends on).
+static TIMER_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5c: the guest read the PSCI version the hypervisor reported (PSCI is discoverable).
+static PSCI_VERSION_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5c: the guest powered off via PSCI `SYSTEM_OFF` (the hypervisor serviced it).
+static PSCI_OFF_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5d: the EL2 IRQ handler fielded the physical virtual-timer interrupt (the tick reached EL2).
+static TIMER_IRQ_FIRED: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5d: the guest TOOK the timer tick at its EL1 IRQ vector with the virtual-timer INTID (the full
+/// physical-IRQ → EL2 → inject → guest-vIRQ path — a real hardware-driven timer tick).
+static TIMER_IRQ_OK: AtomicBool = AtomicBool::new(false);
+
 extern "C" {
     static __guest_tpl_start: u8;
     static __guest_tpl_end: u8;
@@ -1157,6 +1485,16 @@ extern "C" {
     static __guest_blk_read_tpl_end: u8;
     static __guest_blk_write_tpl_start: u8;
     static __guest_blk_write_tpl_end: u8;
+    static __guest_gic_poll_tpl_start: u8;
+    static __guest_gic_poll_tpl_end: u8;
+    static __guest_gic_async_tpl_start: u8;
+    static __guest_gic_async_tpl_end: u8;
+    static __guest_timer_tpl_start: u8;
+    static __guest_timer_tpl_end: u8;
+    static __guest_psci_tpl_start: u8;
+    static __guest_psci_tpl_end: u8;
+    static __guest_timer_irq_tpl_start: u8;
+    static __guest_timer_irq_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1341,6 +1679,79 @@ __guest_sync_entry:
     "#
 );
 
+// The vector trampoline for a lower-EL/AArch64 IRQ (slot 9) — a physical interrupt taken while the guest
+// runs (M5 Arc 5d, the timer tick routed to EL2 by `HCR_EL2.IMO`). Same save/restore discipline as the
+// sync trampoline: save x0..x30 so the guest is resumed byte-identical, field the interrupt in the Rust
+// handler, restore, and `eret` — after which the pending *virtual* interrupt the handler injected is
+// taken by the guest at its own EL1 vector.
+global_asm!(
+    r#"
+    .section .text
+    .balign 0x40
+    .global __guest_irq_entry
+__guest_irq_entry:
+    sub     sp, sp, #(16 * 16)
+    stp     x0, x1,   [sp, #(16 * 0)]
+    stp     x2, x3,   [sp, #(16 * 1)]
+    stp     x4, x5,   [sp, #(16 * 2)]
+    stp     x6, x7,   [sp, #(16 * 3)]
+    stp     x8, x9,   [sp, #(16 * 4)]
+    stp     x10, x11, [sp, #(16 * 5)]
+    stp     x12, x13, [sp, #(16 * 6)]
+    stp     x14, x15, [sp, #(16 * 7)]
+    stp     x16, x17, [sp, #(16 * 8)]
+    stp     x18, x19, [sp, #(16 * 9)]
+    stp     x20, x21, [sp, #(16 * 10)]
+    stp     x22, x23, [sp, #(16 * 11)]
+    stp     x24, x25, [sp, #(16 * 12)]
+    stp     x26, x27, [sp, #(16 * 13)]
+    stp     x28, x29, [sp, #(16 * 14)]
+    str     x30,      [sp, #(16 * 15)]
+    mov     x0, sp
+    bl      handle_guest_irq
+    ldp     x0, x1,   [sp, #(16 * 0)]
+    ldp     x2, x3,   [sp, #(16 * 1)]
+    ldp     x4, x5,   [sp, #(16 * 2)]
+    ldp     x6, x7,   [sp, #(16 * 3)]
+    ldp     x8, x9,   [sp, #(16 * 4)]
+    ldp     x10, x11, [sp, #(16 * 5)]
+    ldp     x12, x13, [sp, #(16 * 6)]
+    ldp     x14, x15, [sp, #(16 * 7)]
+    ldp     x16, x17, [sp, #(16 * 8)]
+    ldp     x18, x19, [sp, #(16 * 9)]
+    ldp     x20, x21, [sp, #(16 * 10)]
+    ldp     x22, x23, [sp, #(16 * 11)]
+    ldp     x24, x25, [sp, #(16 * 12)]
+    ldp     x26, x27, [sp, #(16 * 13)]
+    ldp     x28, x29, [sp, #(16 * 14)]
+    ldr     x30,      [sp, #(16 * 15)]
+    add     sp, sp, #(16 * 16)
+    eret
+    "#
+);
+
+/// **M5 Arc 5d — the EL2 IRQ handler.** A physical interrupt was taken to EL2 while the guest ran.
+/// Acknowledge it; if it is the virtual-timer PPI, disable the (level-triggered) timer so it does not
+/// immediately re-fire, then inject the matching *virtual* interrupt into the guest (delivered at the
+/// guest's EL1 vector after the trampoline `eret`s). End the physical interrupt either way.
+///
+/// # Safety
+/// `_frame` is the valid `&mut GuestFrame` the trampoline saved on the exception stack (unused here — the
+/// handler touches only GIC/timer system state — but kept in the ABI so the trampoline is uniform).
+#[no_mangle]
+extern "C" fn handle_guest_irq(_frame: *mut GuestFrame) {
+    let intid = gic::ack_physical();
+    if intid == gic::VTIMER_INTID {
+        gic::disable_vtimer(); // one-shot: stop the level-triggered PPI re-asserting after EOI
+        TIMER_IRQ_FIRED.store(true, Ordering::Relaxed);
+        gic::inject(gic::VTIMER_INTID); // hand the guest its own virtual timer interrupt
+    }
+    // INTID 1023 (spurious) or anything else: just complete it.
+    if intid < 1020 {
+        gic::eoi_physical(intid);
+    }
+}
+
 /// A minimal `hv_hal::VcpuOps` realized on ARM (Arc 4). `set_entry` writes `ELR_EL2`;
 /// `inject_interrupt` is honestly deferred (no GIC yet).
 struct ArmVcpu;
@@ -1461,6 +1872,84 @@ fn load_guest_blk_write() -> u64 {
     let len = tpl_end - tpl_start;
     // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
     // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **vGIC poll** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5a).
+fn load_guest_gic_poll() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_gic_poll_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_gic_poll_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **vGIC async-delivery** guest template into guest RAM and return its `entry` guest-physical
+/// address (M5 Arc 5b). The template is `0x800`-aligned and the guest RAM base is 2 MiB-aligned, so the
+/// vector table (`0x800`-aligned within the blob) lands at a `0x800`-aligned runtime address for `VBAR_EL1`.
+fn load_guest_gic_async() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_gic_async_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_gic_async_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping. `ram_start` is 2 MiB-aligned so the blob's internal 0x800
+    // alignment is preserved at runtime.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **virtual-timer** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5b).
+fn load_guest_timer() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_timer_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_timer_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **PSCI** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5c).
+fn load_guest_psci() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_psci_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_psci_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **timer-tick** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5d). 0x800-aligned blob → 0x800-aligned vector table at runtime (for `VBAR_EL1`).
+fn load_guest_timer_irq() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_timer_irq_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_timer_irq_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping. `ram_start` is 2 MiB-aligned so the blob's internal 0x800
+    // alignment is preserved at runtime.
     unsafe {
         core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
     }
@@ -1785,6 +2274,13 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
     let nr = frame.x[0];
     let arg0 = frame.x[1];
 
+    // PSCI calls arrive via HVC with an SMC-convention function ID in x0 (M5 Arc 5c); route them to the
+    // PSCI handler before the small internal test-`nr` dispatch below (no collision — PSCI FIDs are huge).
+    if is_psci_fid(nr) {
+        handle_psci(frame, uart);
+        return;
+    }
+
     match nr {
         NR_GRANT | NR_SPEND => {
             // SAFETY: the global `Hypervisor` was built in `run` before the guest ran; single-CPU,
@@ -1835,7 +2331,17 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_BLK_ID => virtio_blk_report_id(frame, uart), // M5 Arc 4: assert the virtio-blk identity
         NR_BLK_NEGOTIATED => virtio_blk_report_negotiated(frame, uart), // assert VERSION_1 + FEATURES_OK
         NR_BLK_READ_REPORT => virtio_blk_report_read(frame, uart), // assert the read round-tripped
-        NR_BLK_FINAL => finish_virtio_blk_test(uart),              // -> ! (block phase terminal)
+        NR_BLK_FINAL => finish_virtio_blk_test(uart), // -> ! (block phase → vGIC phase)
+        NR_GIC_READY => gic::inject(GIC_TEST_INTID),  // M5 Arc 5a/b: inject a virtual interrupt now
+        NR_GIC_REPORT => gic_report(frame, uart), // assert the guest acknowledged the right INTID
+        NR_GIC_FINAL => finish_gic_test(uart),    // -> ! (vGIC poll phase → async phase)
+        NR_GIC_ASYNC_REPORT => gic_async_report(frame, uart), // M5 Arc 5b: assert vectored delivery
+        NR_GIC_ASYNC_FINAL => finish_gic_async_test(uart), // -> ! (async phase → timer phase)
+        NR_TIMER_REPORT => timer_report(frame, uart), // M5 Arc 5b: assert the virtual timer fired
+        NR_TIMER_FINAL => finish_timer_test(uart), // -> ! (timer phase → PSCI phase)
+        NR_PSCI_REPORT => psci_report(frame, uart), // M5 Arc 5c: assert the guest read the PSCI version
+        NR_TIMER_IRQ_REPORT => timer_irq_report(frame, uart), // M5 Arc 5d: assert the tick was taken
+        NR_TIMER_IRQ_FINAL => finish_timer_irq_test(uart),    // -> ! (timer-tick phase terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -3739,6 +4245,9 @@ fn finish_virtio_blk_test(uart: &mut Pl011) -> ! {
             uart,
             "baleen: VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused"
         );
+        // M5 Arc 5a: with the device arcs proven, drive the vGIC phase — give a guest interrupts (the
+        // first step toward a real Linux guest). Never returns (it ends the boot at the vGIC terminal).
+        begin_gic_phase(uart);
     } else {
         let _ = writeln!(
             uart,
@@ -3747,6 +4256,390 @@ fn finish_virtio_blk_test(uart: &mut Pl011) -> ! {
     }
     selftest_brk(uart);
     crate::park();
+}
+
+/// **M5 Arc 5a** — the guest reported the INTID it acknowledged (`x1`); assert it equals the injected
+/// [`GIC_TEST_INTID`]. A checkpoint (resumes the guest).
+fn gic_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let intid = frame.x[1] as u32;
+    let ok = intid == GIC_TEST_INTID;
+    GIC_INJECT_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC injection OK: guest acknowledged the injected virtual interrupt (INTID {intid}) via ICC_IAR1_EL1"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC injection MISMATCH: guest acknowledged INTID {intid} (expected {GIC_TEST_INTID})"
+        );
+    }
+}
+
+/// **M5 Arc 5a, vGIC poll phase terminal.** Assert the injection reached the CPU interface, then chain
+/// into the async-delivery phase (5b).
+fn finish_gic_test(uart: &mut Pl011) -> ! {
+    if GIC_INJECT_OK.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            uart,
+            "baleen: VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface"
+        );
+        // M5 Arc 5b: prove ASYNC vectored delivery (the guest takes the IRQ at its EL1 vector). Never
+        // returns (it ends the boot at the async terminal).
+        begin_gic_async_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: VGIC TEST FAILED — injected interrupt not acknowledged"
+    );
+    crate::park();
+}
+
+/// **M5 Arc 5b** — the guest reported (from its EL1 IRQ vector) the INTID it took asynchronously; assert
+/// it equals the injected [`GIC_TEST_INTID`]. A checkpoint.
+fn gic_async_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let intid = frame.x[1] as u32;
+    let ok = intid == GIC_TEST_INTID;
+    GIC_ASYNC_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID {intid}) at its EL1 IRQ vector"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC async-delivery MISMATCH: guest took INTID {intid} (expected {GIC_TEST_INTID})"
+        );
+    }
+}
+
+/// **M5 Arc 5b, async-delivery phase terminal.** Assert vectored delivery, then chain into the
+/// virtual-timer phase.
+fn finish_gic_async_test(uart: &mut Pl011) -> ! {
+    if GIC_ASYNC_OK.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            uart,
+            "baleen: VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector"
+        );
+        // M5 Arc 5b: prove the guest can use the virtual timer for timekeeping. Never returns.
+        begin_timer_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: VGIC ASYNC TEST FAILED — interrupt not delivered to the guest vector"
+    );
+    crate::park();
+}
+
+/// **M5 Arc 5b** — the guest reported the virtual timer fired (`x1` = `CNTV_CTL` with `ISTATUS`, `x2` =
+/// count before, `x3` = count after); assert the compare condition fired and the counter advanced. A
+/// checkpoint.
+fn timer_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let ctl = frame.x[1];
+    let before = frame.x[2];
+    let after = frame.x[3];
+    let istatus = ctl & (1 << 2) != 0;
+    let advanced = after > before;
+    let ok = istatus && advanced;
+    TIMER_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: virtual timer OK: CNTVCT advanced ({before} -> {after}) and the compare condition fired (ISTATUS set)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: virtual timer FAILED (istatus={istatus} advanced={advanced} before={before} after={after})"
+        );
+    }
+}
+
+/// **M5 Arc 5b, virtual-timer phase terminal.** Assert the timer worked, then chain into the PSCI phase.
+fn finish_timer_test(uart: &mut Pl011) -> ! {
+    if TIMER_OK.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            uart,
+            "baleen: TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping"
+        );
+        // M5 Arc 5c: prove PSCI (version query + power off). Never returns.
+        begin_psci_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: TIMER TEST FAILED — the virtual timer did not fire"
+    );
+    crate::park();
+}
+
+/// Whether `nr` is a PSCI function ID (SMC Calling Convention): the Standard Secure/Power service ranges
+/// `0x8400_00xx` (SMC32) and `0xC400_00xx` (SMC64). Test-internal `nr`s are tiny, so there is no overlap.
+fn is_psci_fid(nr: u64) -> bool {
+    let base = nr & 0xFFFF_FF00;
+    base == 0x8400_0000 || base == 0xC400_0000
+}
+
+/// **M5 Arc 5c — service a PSCI call** the guest made via `HVC`. Supports the calls a single-CPU guest
+/// (and Linux) needs: `PSCI_VERSION` (report v1.1), `PSCI_FEATURES` (report `SYSTEM_OFF` implemented),
+/// and `SYSTEM_OFF` (the guest powers off — the phase terminal, never returns). Anything else returns
+/// `NOT_SUPPORTED`.
+fn handle_psci(frame: &mut GuestFrame, uart: &mut Pl011) {
+    match frame.x[0] {
+        PSCI_VERSION_FID => {
+            frame.x[0] = PSCI_VERSION_1_1;
+            let _ = writeln!(
+                uart,
+                "baleen: PSCI_VERSION -> 0x{PSCI_VERSION_1_1:08x} (v1.1)"
+            );
+        }
+        PSCI_FEATURES_FID => {
+            // x1 = the queried function ID; SYSTEM_OFF is implemented (0), others not.
+            frame.x[0] = if frame.x[1] == PSCI_SYSTEM_OFF_FID {
+                0
+            } else {
+                PSCI_NOT_SUPPORTED
+            };
+        }
+        PSCI_SYSTEM_OFF_FID => {
+            PSCI_OFF_OK.store(true, Ordering::Relaxed);
+            let _ = writeln!(
+                uart,
+                "baleen: PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)"
+            );
+            finish_psci_test(uart); // -> ! (the guest is gone; this is the phase terminal)
+        }
+        other => {
+            frame.x[0] = PSCI_NOT_SUPPORTED;
+            let _ = writeln!(
+                uart,
+                "baleen: PSCI unsupported FID 0x{other:08x} -> NOT_SUPPORTED"
+            );
+        }
+    }
+}
+
+/// **M5 Arc 5c** — the guest reported the PSCI version it read (`x1`); assert it equals what the
+/// hypervisor returned. A checkpoint.
+fn psci_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let version = frame.x[1];
+    let ok = version == PSCI_VERSION_1_1;
+    PSCI_VERSION_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: PSCI version OK: guest read 0x{version:08x} (v1.1) — PSCI is discoverable"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: PSCI version MISMATCH: guest read 0x{version:08x} (expected 0x{PSCI_VERSION_1_1:08x})"
+        );
+    }
+}
+
+/// **M5 Arc 5c, PSCI phase terminal.** Assert the version query + power-off both worked and finish the
+/// boot. Reached when the guest calls `SYSTEM_OFF`.
+fn finish_psci_test(uart: &mut Pl011) -> ! {
+    let version_ok = PSCI_VERSION_OK.load(Ordering::Relaxed);
+    let off_ok = PSCI_OFF_OK.load(Ordering::Relaxed);
+    if version_ok && off_ok {
+        let _ = writeln!(
+            uart,
+            "baleen: PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF"
+        );
+        // M5 Arc 5d: prove the timer TICK — a physical interrupt delivered to the guest. Never returns.
+        begin_timer_irq_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: PSCI TEST FAILED (version_ok={version_ok} off_ok={off_ok})"
+    );
+    crate::park();
+}
+
+/// **M5 Arc 5c, PSCI phase.** Build a fresh minimal guest and enter; the guest queries the PSCI version
+/// and powers off. Never returns.
+fn begin_psci_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    let entry = load_guest_psci();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: PSCI phase — a guest queries the PSCI version and powers off via SYSTEM_OFF",
+    );
+}
+
+/// **M5 Arc 5d** — the guest reported (from its EL1 IRQ vector) the INTID of the timer tick it took
+/// (`x1`); assert it is the virtual-timer INTID. A checkpoint.
+fn timer_irq_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let intid = frame.x[1] as u32;
+    let ok = intid == gic::VTIMER_INTID;
+    TIMER_IRQ_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID {intid}) at its EL1 vector"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: timer tick MISMATCH: guest took INTID {intid} (expected {})",
+            gic::VTIMER_INTID
+        );
+    }
+}
+
+/// **M5 Arc 5d, timer-tick phase terminal.** Assert the physical tick reached EL2 and the guest took the
+/// injected virtual interrupt — the full receive→inject→deliver path — and finish the boot.
+fn finish_timer_irq_test(uart: &mut Pl011) -> ! {
+    let fired = TIMER_IRQ_FIRED.load(Ordering::Relaxed);
+    let taken = TIMER_IRQ_OK.load(Ordering::Relaxed);
+    if fired && taken {
+        let _ = writeln!(
+            uart,
+            "baleen: TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: TIMER TICK TEST FAILED (fired={fired} taken={taken})"
+        );
+    }
+    selftest_brk(uart);
+    crate::park();
+}
+
+/// **M5 Arc 5d, timer-tick phase.** Build a fresh minimal guest, initialize the physical GICv3 to receive
+/// the virtual-timer PPI at EL2, enable the EL2 physical CPU interface, zero `CNTVOFF_EL2`, and enter. The
+/// guest programs its virtual timer with the interrupt un-masked; the tick rides the physical-IRQ → EL2 →
+/// inject path to the guest's EL1 vector. Never returns.
+fn begin_timer_irq_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    // Physical side: let EL2 receive PPI 27 (the guest's CNTV) and hand it on as a virtual interrupt.
+    gic::init_physical_vtimer();
+    gic::enable_physical_cpu_interface_el2();
+    // SAFETY: `CNTVOFF_EL2` is an EL2 timer register; writing 0 makes the guest's virtual count track the
+    // physical count cleanly (its reset is UNKNOWN). No memory effect.
+    unsafe {
+        asm!(
+            "msr cntvoff_el2, xzr",
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+    let entry = load_guest_timer_irq();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: timer-tick phase — a guest programs its virtual timer and takes the tick as an interrupt",
+    );
+}
+
+/// **M5 Arc 5b, virtual-timer phase.** Build a fresh minimal guest, zero `CNTVOFF_EL2` so the guest's
+/// virtual count tracks the physical count cleanly, and enter. The guest programs the virtual timer and
+/// polls it to expiry. Never returns.
+fn begin_timer_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    // Zero the virtual-count offset so `CNTVCT_EL0` (guest) == the physical count (its reset is UNKNOWN).
+    // SAFETY: `CNTVOFF_EL2` is an EL2 timer register; writing 0 has no memory effect.
+    unsafe {
+        asm!(
+            "msr cntvoff_el2, xzr",
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+    let entry = load_guest_timer();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: virtual-timer phase — a guest programs the virtual timer and polls it to expiry",
+    );
+}
+
+/// Build a fresh `Hypervisor` and create the minimal vGIC guest domain (a pinned page-table root — the
+/// guest touches no guest data memory, only its own code + the GIC system registers). Shared by the poll
+/// (5a) and async (5b) phases.
+fn gic_fresh_guest(uart: &mut Pl011) {
+    // SAFETY: single-CPU, one-time rebuild before the vGIC guest runs.
+    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: GIC_DOM,
+            may_create: false,
+        },
+        "create vGIC guest",
+        uart,
+    );
+    expect(
+        hv,
+        GIC_DOM,
+        HvCall::P2mAllocate { mfn: F_GIC_ROOT },
+        "vGIC alloc root",
+        uart,
+    );
+    expect(
+        hv,
+        GIC_DOM,
+        HvCall::P2mPin {
+            mfn: F_GIC_ROOT,
+            level: PtLevel::L1,
+        },
+        "vGIC pin root",
+        uart,
+    );
+}
+
+/// Emit the vGIC guest's Stage-2, enable the hardware virtual CPU interface at EL2, and enter the guest
+/// at `entry`. Shared by the poll (5a) and async (5b) phases. Never returns.
+fn run_gic_guest(uart: &mut Pl011, entry: u64, msg: &str) -> ! {
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+    let vttbr = stage2::build_stage2_from_p2m(hv, GIC_DOM, STAGE2_SET_SINGLE);
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    gic::enable_el2(); // ICC_SRE_EL2 + ICH_HCR_EL2.En + HCR_EL2.IMO — after enable_stage2
+    init_guest_el1(ram_end);
+    {
+        use hv_hal::VcpuOps;
+        ArmVcpu.set_entry(entry);
+    }
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    let _ = writeln!(uart, "{msg}");
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    enter_guest(exc_stack_top);
+}
+
+/// **M5 Arc 5a, vGIC poll phase.** The guest enables its CPU interface, signals ready (the hypervisor
+/// injects a virtual interrupt), and POLLS `ICC_IAR1_EL1` to acknowledge it. Never returns.
+fn begin_gic_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    let entry = load_guest_gic_poll();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: vGIC phase — a guest enables its GICv3 CPU interface and receives an injected virtual interrupt",
+    );
+}
+
+/// **M5 Arc 5b, vGIC async-delivery phase.** The guest installs its own EL1 vector table, unmasks IRQs,
+/// and TAKES the injected virtual interrupt at its IRQ vector — real vectored delivery. Never returns.
+fn begin_gic_async_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    let entry = load_guest_gic_async();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: vGIC async phase — a guest takes an injected virtual interrupt at its own EL1 vector table",
+    );
 }
 
 /// **M5 Arc 4, block phase 6 — the virtio-blk run-loop (tenant 0).** Build a fresh `Hypervisor`, seed

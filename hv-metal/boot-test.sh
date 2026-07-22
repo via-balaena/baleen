@@ -62,7 +62,7 @@ boot_and_check() {
     local out
     out="$(mktemp)"
     qemu-system-aarch64 \
-        -M virt,virtualization=on \
+        -M virt,virtualization=on,gic-version=3 \
         -cpu max \
         -nographic \
         -net none \
@@ -203,7 +203,18 @@ boot_and_check "default" "" \
     "virtio-blk template-immutability OK: tenant 0's write landed in its CoW overlay; the template is pristine" \
     "virtio backend REFUSED un-granted access to Mfn 5" \
     "virtio-blk read round-trip OK: tenant 1 read sector 0 = the pristine template" \
-    "VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused"
+    "VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused" \
+    "vGIC injection OK: guest acknowledged the injected virtual interrupt (INTID 42) via ICC_IAR1_EL1" \
+    "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
+    "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
+    "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
+    "virtual timer OK: CNTVCT advanced" \
+    "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
+    "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
+    "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
+    "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF" \
+    "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
+    "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -258,6 +269,17 @@ boot_and_check "selftest" "--features selftest" \
     "virtio backend REFUSED un-granted access to Mfn 5" \
     "virtio-blk read round-trip OK: tenant 1 read sector 0 = the pristine template" \
     "VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused" \
+    "vGIC injection OK: guest acknowledged the injected virtual interrupt (INTID 42) via ICC_IAR1_EL1" \
+    "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
+    "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
+    "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
+    "virtual timer OK: CNTVCT advanced" \
+    "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
+    "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
+    "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
+    "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF" \
+    "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
+    "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 

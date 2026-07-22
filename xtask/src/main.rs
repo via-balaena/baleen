@@ -24,7 +24,7 @@ fn main() {
                     "qemu-system-aarch64",
                     &[
                         "-M",
-                        "virt,virtualization=on",
+                        "virt,virtualization=on,gic-version=3",
                         "-cpu",
                         "max",
                         "-nographic",

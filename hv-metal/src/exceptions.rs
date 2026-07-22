@@ -73,7 +73,13 @@ __exception_vectors:
     // to the trampoline (`guest.rs`), which saves x0..x30 first, services, and `eret`s to resume.
     .balign 0x80
     b       __guest_sync_entry
-    ventry 9    // 0x480  Lower EL, AArch64   — IRQ/vIRQ
+    // 0x480  Lower EL, AArch64 — IRQ: a physical IRQ taken while a guest runs (M5 Arc 5d, the timer
+    // tick). Like slot 8 it must NOT clobber a guest register, so it branches straight to the trampoline
+    // (`guest.rs`), which saves x0..x30, fields the interrupt (ack + inject the virtual), and `eret`s.
+    // Only ever fires when a phase has enabled a physical interrupt with `HCR_EL2.IMO` set (5d onward);
+    // the cooperative arcs leave it dormant.
+    .balign 0x80
+    b       __guest_irq_entry
     ventry 10   // 0x500  Lower EL, AArch64   — FIQ/vFIQ
     ventry 11   // 0x580  Lower EL, AArch64   — SError/vSError
     ventry 12   // 0x600  Lower EL, AArch32   — Synchronous
