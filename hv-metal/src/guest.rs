@@ -371,8 +371,20 @@ const NR_GIC_REPORT: u64 = 0xd1;
 const NR_GIC_FINAL: u64 = 0xd2;
 /// The async-delivery guest reports (from its EL1 IRQ vector) the INTID it took (`x1`). A checkpoint.
 const NR_GIC_ASYNC_REPORT: u64 = 0xd3;
-/// The async-delivery phase's terminal report.
+/// The async-delivery phase's terminal — chains into the virtual-timer phase.
 const NR_GIC_ASYNC_FINAL: u64 = 0xd4;
+
+// ─── M5 Arc 5b: the virtual timer ────────────────────────────────────────────────────────────────────
+//
+// A synthetic guest uses the ARM architected VIRTUAL timer (`CNTV`) for timekeeping: it reads the virtual
+// count `CNTVCT_EL0`, programs a short deadline via `CNTV_TVAL_EL0`, enables the timer, and polls
+// `CNTV_CTL_EL0.ISTATUS` until the compare condition fires — exactly the timer Linux reads constantly.
+
+/// The guest reports the timer fired: `x1` = `CNTV_CTL_EL0` (with `ISTATUS`), `x2` = count before, `x3` =
+/// count after. The hypervisor asserts the condition fired and the counter advanced. A checkpoint.
+const NR_TIMER_REPORT: u64 = 0xc0;
+/// The virtual-timer phase's terminal report (the boot's last act).
+const NR_TIMER_FINAL: u64 = 0xc1;
 
 // ---------------------------------------------------------------------------------------------
 // The guest program.
@@ -1108,6 +1120,40 @@ __guest_gic_async_tpl_end:
     NR_GIC_ASYNC_FINAL = const NR_GIC_ASYNC_FINAL,
 );
 
+// The virtual-timer test guest program (M5 Arc 5b). It uses the ARM architected VIRTUAL timer for
+// timekeeping: read the count, program a short deadline (CNTV_TVAL), enable the timer, and poll
+// CNTV_CTL.ISTATUS until the compare condition fires — no interrupts (the timer *interrupt* rides the
+// shared EL2-physical-IRQ delivery path, a later step). Straight-line / stack-free, position-independent.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_timer_tpl_start
+__guest_timer_tpl_start:
+    mrs     x2, CNTVCT_EL0                 // virtual count BEFORE
+    mov     x0, #0x8000
+    msr     CNTV_TVAL_EL0, x0              // fire after ~0x8000 ticks (a short, deterministic deadline)
+    mov     x0, #1
+    msr     CNTV_CTL_EL0, x0               // ENABLE = 1, IMASK = 0
+    isb
+1:  mrs     x0, CNTV_CTL_EL0
+    tbz     x0, #2, 1b                     // spin until ISTATUS (bit 2) — the compare condition fired
+    mrs     x3, CNTVCT_EL0                 // virtual count AFTER
+    msr     CNTV_CTL_EL0, xzr              // disable the timer
+    mov     x1, x0                         // report: CNTV_CTL (with ISTATUS set)
+    mov     x0, #{NR_TIMER_REPORT}
+    hvc     #0                             // x1=ctl, x2=before, x3=after
+    mov     x0, #{NR_TIMER_FINAL}
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_timer_tpl_end
+__guest_timer_tpl_end:
+    "#,
+    NR_TIMER_REPORT = const NR_TIMER_REPORT,
+    NR_TIMER_FINAL = const NR_TIMER_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -1285,6 +1331,9 @@ static GIC_INJECT_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 5b: the guest took the injected virtual interrupt ASYNCHRONOUSLY at its EL1 IRQ vector (not by
 /// polling) with the correct INTID — real vectored interrupt delivery, the mechanism Linux depends on.
 static GIC_ASYNC_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5b: the guest used the virtual timer — programmed a deadline, the `CNTVCT` counter advanced,
+/// and the `ISTATUS` compare condition fired (timekeeping, what Linux depends on).
+static TIMER_OK: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     static __guest_tpl_start: u8;
@@ -1305,6 +1354,8 @@ extern "C" {
     static __guest_gic_poll_tpl_end: u8;
     static __guest_gic_async_tpl_start: u8;
     static __guest_gic_async_tpl_end: u8;
+    static __guest_timer_tpl_start: u8;
+    static __guest_timer_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1641,6 +1692,21 @@ fn load_guest_gic_async() -> u64 {
     // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
     // than the template, non-overlapping. `ram_start` is 2 MiB-aligned so the blob's internal 0x800
     // alignment is preserved at runtime.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **virtual-timer** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5b).
+fn load_guest_timer() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_timer_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_timer_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
     unsafe {
         core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
     }
@@ -2020,7 +2086,9 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_GIC_REPORT => gic_report(frame, uart), // assert the guest acknowledged the right INTID
         NR_GIC_FINAL => finish_gic_test(uart),    // -> ! (vGIC poll phase → async phase)
         NR_GIC_ASYNC_REPORT => gic_async_report(frame, uart), // M5 Arc 5b: assert vectored delivery
-        NR_GIC_ASYNC_FINAL => finish_gic_async_test(uart), // -> ! (async phase terminal)
+        NR_GIC_ASYNC_FINAL => finish_gic_async_test(uart), // -> ! (async phase → timer phase)
+        NR_TIMER_REPORT => timer_report(frame, uart), // M5 Arc 5b: assert the virtual timer fired
+        NR_TIMER_FINAL => finish_timer_test(uart), // -> ! (timer phase terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -3994,21 +4062,84 @@ fn gic_async_report(frame: &mut GuestFrame, uart: &mut Pl011) {
     }
 }
 
-/// **M5 Arc 5b, async-delivery phase terminal.** Assert vectored delivery and finish the boot.
+/// **M5 Arc 5b, async-delivery phase terminal.** Assert vectored delivery, then chain into the
+/// virtual-timer phase.
 fn finish_gic_async_test(uart: &mut Pl011) -> ! {
     if GIC_ASYNC_OK.load(Ordering::Relaxed) {
         let _ = writeln!(
             uart,
             "baleen: VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector"
         );
+        // M5 Arc 5b: prove the guest can use the virtual timer for timekeeping. Never returns.
+        begin_timer_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: VGIC ASYNC TEST FAILED — interrupt not delivered to the guest vector"
+    );
+    crate::park();
+}
+
+/// **M5 Arc 5b** — the guest reported the virtual timer fired (`x1` = `CNTV_CTL` with `ISTATUS`, `x2` =
+/// count before, `x3` = count after); assert the compare condition fired and the counter advanced. A
+/// checkpoint.
+fn timer_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let ctl = frame.x[1];
+    let before = frame.x[2];
+    let after = frame.x[3];
+    let istatus = ctl & (1 << 2) != 0;
+    let advanced = after > before;
+    let ok = istatus && advanced;
+    TIMER_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: virtual timer OK: CNTVCT advanced ({before} -> {after}) and the compare condition fired (ISTATUS set)"
+        );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: VGIC ASYNC TEST FAILED — interrupt not delivered to the guest vector"
+            "baleen: virtual timer FAILED (istatus={istatus} advanced={advanced} before={before} after={after})"
+        );
+    }
+}
+
+/// **M5 Arc 5b, virtual-timer phase terminal.** Assert the timer worked and finish the boot.
+fn finish_timer_test(uart: &mut Pl011) -> ! {
+    if TIMER_OK.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            uart,
+            "baleen: TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: TIMER TEST FAILED — the virtual timer did not fire"
         );
     }
     selftest_brk(uart);
     crate::park();
+}
+
+/// **M5 Arc 5b, virtual-timer phase.** Build a fresh minimal guest, zero `CNTVOFF_EL2` so the guest's
+/// virtual count tracks the physical count cleanly, and enter. The guest programs the virtual timer and
+/// polls it to expiry. Never returns.
+fn begin_timer_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    // Zero the virtual-count offset so `CNTVCT_EL0` (guest) == the physical count (its reset is UNKNOWN).
+    // SAFETY: `CNTVOFF_EL2` is an EL2 timer register; writing 0 has no memory effect.
+    unsafe {
+        asm!(
+            "msr cntvoff_el2, xzr",
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+    let entry = load_guest_timer();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: virtual-timer phase — a guest programs the virtual timer and polls it to expiry",
+    );
 }
 
 /// Build a fresh `Hypervisor` and create the minimal vGIC guest domain (a pinned page-table root — the

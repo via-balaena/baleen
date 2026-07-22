@@ -207,7 +207,9 @@ boot_and_check "default" "" \
     "vGIC injection OK: guest acknowledged the injected virtual interrupt (INTID 42) via ICC_IAR1_EL1" \
     "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
     "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
-    "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector"
+    "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
+    "virtual timer OK: CNTVCT advanced" \
+    "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -266,6 +268,8 @@ boot_and_check "selftest" "--features selftest" \
     "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
     "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
     "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
+    "virtual timer OK: CNTVCT advanced" \
+    "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
