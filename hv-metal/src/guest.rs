@@ -271,6 +271,9 @@ const VIRTIO_DOM: DomId = 1;
 /// The driver reports the four mmio identity registers it read (`x1`=Magic, `x2`=Version, `x3`=DeviceID,
 /// `x4`=VendorID); the backend asserts them. A checkpoint (resumes), not terminal.
 const NR_VIRTIO_ID: u64 = 0xfb;
+/// The driver reports the negotiation result (`x1`=device features word 1, `x2`=Status read back after
+/// FEATURES_OK); the backend asserts VERSION_1 was offered+accepted and FEATURES_OK stuck. Checkpoint.
+const NR_VIRTIO_NEGOTIATED: u64 = 0xf9;
 /// The virtio-console phase's terminal report — the backend asserts the whole matrix and finishes.
 const NR_VIRTIO_FINAL: u64 = 0xfa;
 
@@ -514,6 +517,28 @@ __guest5_tpl_start:
     ldr     w4, [x10, #0x00c]              // VendorID
     mov     x0, #{NR_VIRTIO_ID}
     hvc     #0                             // backend asserts the four identity values
+
+    // ── device negotiation handshake (virtio 1.x §3.1.1) ──
+    str     wzr, [x10, #0x070]             // Status = 0 (reset)
+    mov     w0, #3                         // ACKNOWLEDGE | DRIVER
+    str     w0, [x10, #0x070]
+    // read device features word 1 (bits 32..63) → expect VIRTIO_F_VERSION_1 (bit 0 of word 1)
+    mov     w0, #1
+    str     w0, [x10, #0x014]              // DeviceFeaturesSel = 1
+    ldr     w5, [x10, #0x010]              // DeviceFeatures[word 1]
+    // accept exactly those features: DriverFeatures[word 1] = what the device offered
+    mov     w0, #1
+    str     w0, [x10, #0x024]              // DriverFeaturesSel = 1
+    str     w5, [x10, #0x020]              // DriverFeatures[word 1] = VERSION_1
+    // FEATURES_OK, then read Status back — the device must leave FEATURES_OK set (features accepted)
+    mov     w0, #0xb                       // ACKNOWLEDGE | DRIVER | FEATURES_OK (1|2|8)
+    str     w0, [x10, #0x070]
+    ldr     w6, [x10, #0x070]              // Status readback
+    mov     x1, x5                         // report: device features word 1
+    mov     x2, x6                         // report: status readback
+    mov     x0, #{NR_VIRTIO_NEGOTIATED}
+    hvc     #0                             // backend asserts VERSION_1 negotiated + FEATURES_OK sticky
+
     // ── terminal ──
     mov     x0, #{NR_VIRTIO_FINAL}
     hvc     #0
@@ -524,6 +549,7 @@ __guest5_tpl_end:
     "#,
     VIRTIO_HI = const VIRTIO_MMIO_HI,
     NR_VIRTIO_ID = const NR_VIRTIO_ID,
+    NR_VIRTIO_NEGOTIATED = const NR_VIRTIO_NEGOTIATED,
     NR_VIRTIO_FINAL = const NR_VIRTIO_FINAL,
 );
 
@@ -620,6 +646,8 @@ static ISO_DONE: AtomicU64 = AtomicU64::new(0);
 /// M5 Arc 3: whether the driver read the four virtio-mmio identity registers correctly (magic /
 /// version / device-id / vendor).
 static VIRTIO_ID_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 3: whether the driver negotiated `VIRTIO_F_VERSION_1` and the device left FEATURES_OK set.
+static VIRTIO_NEGOTIATED_OK: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     static __guest_tpl_start: u8;
@@ -1275,7 +1303,8 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_SCHED_FINAL => handle_sched_final(frame, uart), // records + switches, or finishes
         NR_ISO_FINAL => handle_iso_final(frame, uart), // M5 Arc 2: records + switches, or finishes
         NR_VIRTIO_ID => virtio_report_id(frame, uart), // M5 Arc 3: assert the mmio identity registers
-        NR_VIRTIO_FINAL => finish_virtio_console_test(uart), // -> ! (phase-5 terminal)
+        NR_VIRTIO_NEGOTIATED => virtio_report_negotiated(frame, uart), // assert VERSION_1 + FEATURES_OK
+        NR_VIRTIO_FINAL => finish_virtio_console_test(uart),           // -> ! (phase-5 terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -2474,6 +2503,36 @@ fn virtio_report_id(frame: &mut GuestFrame, uart: &mut Pl011) {
     }
 }
 
+/// **M5 Arc 3 — assert the device negotiation.** The driver walked the `Status` handshake
+/// (ACKNOWLEDGE → DRIVER → FEATURES_OK) and negotiated features; confirm it saw `VIRTIO_F_VERSION_1`
+/// offered in device-features word 1 (`x1`) and that the device left `FEATURES_OK` set in the `Status`
+/// it read back (`x2`) — i.e. the device accepted the driver's feature selection. A checkpoint.
+fn virtio_report_negotiated(frame: &mut GuestFrame, uart: &mut Pl011) {
+    use crate::virtio::{
+        STATUS_ACKNOWLEDGE, STATUS_DRIVER, STATUS_FEATURES_OK, VERSION_1_WORD1_MASK,
+    };
+    let dev_features_w1 = frame.x[1] as u32;
+    let status = frame.x[2] as u32;
+    let version_1_offered = dev_features_w1 & VERSION_1_WORD1_MASK != 0;
+    // The device left the full handshake set after FEATURES_OK: ACKNOWLEDGE|DRIVER|FEATURES_OK, i.e. it
+    // accepted the driver's feature selection (it did not clear FEATURES_OK to reject).
+    let expected = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
+    let features_ok_sticky = status & expected == expected;
+    let ok = version_1_offered && features_ok_sticky;
+    VIRTIO_NEGOTIATED_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set (status=0x{status:02x})"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: virtio negotiation FAILED: version_1_offered={version_1_offered} features_ok={features_ok_sticky} (features_w1=0x{dev_features_w1:08x} status=0x{status:02x})"
+        );
+    }
+}
+
 /// **M5 Arc 3, phase 5 — the virtio-console run-loop.** Build a fresh `Hypervisor`, create the guest
 /// domain, emit its Stage-2 (the guest image mapped; the virtio-mmio window deliberately UNMAPPED so
 /// device accesses trap), and enter the driver guest. Its mmio accesses are trap-and-emulated
@@ -2525,13 +2584,17 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
 /// add the grant-checked TX path (guest bytes reach the console) and the negative (un-granted refused).
 fn finish_virtio_console_test(uart: &mut Pl011) -> ! {
     let id_ok = VIRTIO_ID_OK.load(Ordering::Relaxed);
-    if id_ok {
+    let negotiated_ok = VIRTIO_NEGOTIATED_OK.load(Ordering::Relaxed);
+    if id_ok && negotiated_ok {
         let _ = writeln!(
             uart,
-            "baleen: VIRTIO CONSOLE TEST PASSED — virtio-mmio device identified via trap-and-emulate"
+            "baleen: VIRTIO CONSOLE TEST PASSED — virtio-mmio device identified + VERSION_1 negotiated"
         );
     } else {
-        let _ = writeln!(uart, "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok})");
+        let _ = writeln!(
+            uart,
+            "baleen: VIRTIO CONSOLE TEST FAILED (id_ok={id_ok} negotiated_ok={negotiated_ok})"
+        );
     }
     selftest_brk(uart);
     crate::park();

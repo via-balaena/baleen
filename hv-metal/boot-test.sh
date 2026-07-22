@@ -169,7 +169,8 @@ boot_and_check "default" "" \
     "concurrent isolation OK: dom B probing dom A's frame -> translation fault" \
     "CONCURRENT ISOLATION TEST PASSED — two domains (VMID 1/2) time-sliced in distinct Stage-2, each faulted on the peer's memory, no cross-corruption, no tlbi on switch" \
     "virtio-mmio device identified: magic=\"virt\" version=2 id=3 (console) via trap-and-emulate" \
-    "VIRTIO CONSOLE TEST PASSED — virtio-mmio device identified via trap-and-emulate"
+    "virtio negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set" \
+    "VIRTIO CONSOLE TEST PASSED — virtio-mmio device identified + VERSION_1 negotiated"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -209,7 +210,8 @@ boot_and_check "selftest" "--features selftest" \
     "concurrent isolation OK: dom B probing dom A's frame -> translation fault" \
     "CONCURRENT ISOLATION TEST PASSED — two domains (VMID 1/2) time-sliced in distinct Stage-2, each faulted on the peer's memory, no cross-corruption, no tlbi on switch" \
     "virtio-mmio device identified: magic=\"virt\" version=2 id=3 (console) via trap-and-emulate" \
-    "VIRTIO CONSOLE TEST PASSED — virtio-mmio device identified via trap-and-emulate" \
+    "virtio negotiation OK: VIRTIO_F_VERSION_1 accepted, FEATURES_OK set" \
+    "VIRTIO CONSOLE TEST PASSED — virtio-mmio device identified + VERSION_1 negotiated" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 

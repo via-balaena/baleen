@@ -83,8 +83,16 @@ pub const DEVICE_ID_CONSOLE: u32 = 3;
 pub const VENDOR: u32 = 0x4c41_4256; // "VBAL"
 
 /// The single feature we require: `VIRTIO_F_VERSION_1` (bit 32) — modern, non-legacy. Advertised in
-/// device-features word 1 (bits 32..63).
+/// device-features word 1 (bits 32..63), so bit `0` of word 1.
 pub const VIRTIO_F_VERSION_1_BIT: u32 = 32;
+/// `VIRTIO_F_VERSION_1` as a mask within device-features **word 1**.
+pub const VERSION_1_WORD1_MASK: u32 = 1 << (VIRTIO_F_VERSION_1_BIT - 32);
+
+// Device `Status` bits (virtio 1.x §2.1) — the handshake the driver walks. `DRIVER_OK` (bit 2) is
+// added in step 3 (the driver sets it after queue setup; the backend gates notify processing on it).
+pub const STATUS_ACKNOWLEDGE: u32 = 1;
+pub const STATUS_DRIVER: u32 = 2;
+pub const STATUS_FEATURES_OK: u32 = 8;
 
 /// The maximum queue size the device supports (a power of two, per spec).
 pub const QUEUE_NUM_MAX_VAL: u32 = 8;
@@ -199,7 +207,18 @@ impl VirtioConsole {
             reg::QUEUE_DEVICE_HIGH => {
                 self.queue_device = (self.queue_device & 0xffff_ffff) | ((value as u64) << 32)
             }
-            reg::STATUS => self.status = value,
+            reg::STATUS => {
+                self.status = value;
+                // When the driver sets FEATURES_OK, the device confirms it accepts the negotiated
+                // features (virtio 1.x §3.1.1 step 6). We require VIRTIO_F_VERSION_1; if the driver did
+                // not accept it, the device clears FEATURES_OK to signal rejection — the driver reads
+                // Status back and must see it still set to proceed.
+                if value & STATUS_FEATURES_OK != 0
+                    && self.driver_features[1] & VERSION_1_WORD1_MASK == 0
+                {
+                    self.status &= !STATUS_FEATURES_OK;
+                }
+            }
             reg::INTERRUPT_ACK => self.interrupt_status &= !value,
             reg::QUEUE_NOTIFY => return true, // a kick — the caller processes the queue
             _ => {}
