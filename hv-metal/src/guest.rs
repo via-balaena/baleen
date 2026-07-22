@@ -167,6 +167,27 @@ const NR_FINAL2: u64 = 0xfe;
 /// overwritten; see the audit's content-scrub scope note).
 const SENTINEL_RW2: u64 = 0xCAFE;
 
+// ─── M5 Arc 1: the vCPU context switch + scheduler run-loop ────────────────────────────────────
+//
+// Step 1 (this commit): a single guest yields to EL2 (`NR_YIELD`), the metal saves its FULL vCPU
+// context (GPRs + SP_EL1 + ELR/SPSR + SCTLR_EL1) into a per-vCPU [`GuestContext`], (re)selects a
+// vCPU, and restores that context before resuming — a real save/restore round trip, proven in
+// isolation before concurrency is layered on (step 2 makes the "reselect" pick the OTHER guest).
+// The witness: the guest carries a counter across N yields and reports it; == N only if every
+// resume restored its state faithfully.
+
+/// The scheduler-test guest's yield hypercall — cooperative preemption point (no timer/GIC yet).
+const NR_YIELD: u64 = 0xf4;
+/// The scheduler-test terminal report — carries the guest's across-yields counter.
+const NR_SCHED_FINAL: u64 = 0xfd;
+/// The domain the step-1 scheduler guest runs as.
+const SCHED_DOM: DomId = 1;
+/// How many times the scheduler guest yields before its final report. The counter it carries must
+/// equal this if every context save/restore round trip preserved its register state.
+const SCHED_YIELDS: u64 = 4;
+/// Metal-side vCPU context slots. Two so step 2 can hold both guests' contexts; step 1 uses slot 0.
+const NUM_VCPUS_METAL: usize = 2;
+
 // ---------------------------------------------------------------------------------------------
 // The guest program.
 //
@@ -315,6 +336,39 @@ __guest2_tpl_end:
     SENTINEL_RW2 = const SENTINEL_RW2,
 );
 
+// ---------------------------------------------------------------------------------------------
+// The scheduler-test guest program (M5 Arc 1, step 1). Register-only (no memory access beyond its
+// own PC): it carries a counter in a callee-saved register ACROSS N yields, so the final value ==
+// N iff every context save/restore round trip preserved its register state. `x20` is the counter,
+// `x21` the remaining-yields countdown.
+// ---------------------------------------------------------------------------------------------
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest3_tpl_start
+__guest3_tpl_start:
+    mov     x20, #0                        // across-yields counter (callee-saved)
+    mov     x21, #{SCHED_YIELDS}           // yields remaining
+1:  add     x20, x20, #1
+    mov     x0, #{NR_YIELD}
+    hvc     #0                             // cooperative yield → EL2 saves+restores this vCPU's ctx
+    sub     x21, x21, #1
+    cbnz    x21, 1b
+    // final report: carry the counter (expect == SCHED_YIELDS)
+    mov     x1, x20
+    mov     x0, #{NR_SCHED_FINAL}
+    hvc     #0
+0:  wfe                                     // terminal
+    b       0b
+    .global __guest3_tpl_end
+__guest3_tpl_end:
+    "#,
+    SCHED_YIELDS = const SCHED_YIELDS,
+    NR_YIELD = const NR_YIELD,
+    NR_SCHED_FINAL = const NR_SCHED_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -370,11 +424,22 @@ static CREDIT_ECHO: AtomicU64 = AtomicU64::new(u64::MAX);
 /// (M5 Arc 0, phase 2).
 static POS_RW2: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// M5 Arc 1: which metal vCPU slot is currently on the (single physical) CPU — the index into
+/// [`VCPU_CTX`] whose context is live in the trampoline frame. Step 1 keeps it 0; step 2 alternates.
+static CUR_VCPU: AtomicU64 = AtomicU64::new(0);
+/// M5 Arc 1: how many `NR_YIELD` context switches the metal has serviced (cross-checks the guest's
+/// own across-yields counter — both must equal the expected total).
+static YIELDS_HANDLED: AtomicU64 = AtomicU64::new(0);
+/// M5 Arc 1: the across-yields counter the scheduler guest reports at [`NR_SCHED_FINAL`].
+static SCHED_COUNTER: AtomicU64 = AtomicU64::new(u64::MAX);
+
 extern "C" {
     static __guest_tpl_start: u8;
     static __guest_tpl_end: u8;
     static __guest2_tpl_start: u8;
     static __guest2_tpl_end: u8;
+    static __guest3_tpl_start: u8;
+    static __guest3_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -390,6 +455,42 @@ const SPSR_EL2_GUEST: u64 = 0b0101 | (0b1111 << 6);
 pub struct GuestFrame {
     pub x: [u64; 31],
 }
+
+/// A metal-side vCPU's full saved context (M5 Arc 1). The GPRs (`x0..x30`) live transiently in the
+/// trampoline's on-stack [`GuestFrame`] between trap and `eret`; a *context switch* moves them (plus
+/// the EL1/EL2 system state that is NOT in that frame) into this per-vCPU store so a different vCPU's
+/// context can be loaded before `eret`. `hv-core`'s `RunState` stays abstract — this concrete
+/// register/sysreg state is the metal's own, keeping the `hv-hal` fence architecture-neutral.
+#[derive(Clone, Copy)]
+struct GuestContext {
+    /// `x0..x30`, mirrored to/from the trampoline frame.
+    x: [u64; 31],
+    /// `SP_EL1` — the guest's stack pointer (per-vCPU; not in the trampoline frame).
+    sp_el1: u64,
+    /// `ELR_EL2` — where this vCPU resumes (its PC at the yield/preempt point).
+    elr_el2: u64,
+    /// `SPSR_EL2` — the saved processor state to restore on `eret`.
+    spsr_el2: u64,
+    /// `SCTLR_EL1` — the guest's EL1 system control (MMU/cache enables etc.).
+    sctlr_el1: u64,
+}
+
+impl GuestContext {
+    const ZERO: Self = Self {
+        x: [0; 31],
+        sp_el1: 0,
+        elr_el2: 0,
+        spsr_el2: 0,
+        sctlr_el1: 0,
+    };
+}
+
+struct CtxCell(UnsafeCell<[GuestContext; NUM_VCPUS_METAL]>);
+// SAFETY: single boot CPU; written/read only by the straight-line, non-nested guest trap handler
+// (and phase-3 setup before any scheduler guest runs). No concurrent access. Same discipline as
+// `GUEST_HV` and the `stage2` tables.
+unsafe impl Sync for CtxCell {}
+static VCPU_CTX: CtxCell = CtxCell(UnsafeCell::new([GuestContext::ZERO; NUM_VCPUS_METAL]));
 
 // The vector trampoline for a lower-EL/AArch64 synchronous exception (slot 8) — both the guest's
 // `HVC` and its data aborts land here. It must NOT clobber a guest register before saving it, so it
@@ -492,6 +593,21 @@ fn load_guest2() -> u64 {
     ram_start as u64
 }
 
+/// Copy the **phase-3** (scheduler-test) guest template into guest RAM and return its `entry`
+/// guest-physical address (M5 Arc 1).
+fn load_guest3() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest3_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest3_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
 /// Program Stage-2 and enable it: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM`, then invalidate
 /// Stage-1&2 TLBs for the VMID and synchronize. The `dsb`/`tlbi`/`isb` are load-bearing on silicon and
 /// invisible-but-harmless under QEMU. The table is built (invalid→valid) *before* this runs, so no
@@ -537,6 +653,71 @@ fn init_guest_el1(stack_top: u64) {
             options(nomem, nostack),
         );
     }
+}
+
+/// Read the guest's per-vCPU system state that lives OUTSIDE the trampoline GPR frame — `SP_EL1`,
+/// `ELR_EL2`, `SPSR_EL2`, `SCTLR_EL1` — for a context save (M5 Arc 1).
+fn read_sysctx() -> (u64, u64, u64, u64) {
+    let (sp_el1, elr, spsr, sctlr): (u64, u64, u64, u64);
+    // SAFETY: all four are readable at EL2 (SP_EL1/SCTLR_EL1 are EL1 regs accessible from EL2). No
+    // memory effect.
+    unsafe {
+        asm!(
+            "mrs {0}, sp_el1",
+            "mrs {1}, elr_el2",
+            "mrs {2}, spsr_el2",
+            "mrs {3}, sctlr_el1",
+            out(reg) sp_el1,
+            out(reg) elr,
+            out(reg) spsr,
+            out(reg) sctlr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (sp_el1, elr, spsr, sctlr)
+}
+
+/// Write the guest's per-vCPU system state — the inverse of [`read_sysctx`] — for a context restore.
+/// `ELR_EL2`/`SPSR_EL2` are consumed by the trampoline's terminal `eret`; `SP_EL1`/`SCTLR_EL1` are the
+/// resumed vCPU's own EL1 state.
+fn write_sysctx(sp_el1: u64, elr: u64, spsr: u64, sctlr: u64) {
+    // SAFETY: all four are writable at EL2; the values come from a previously-saved [`GuestContext`].
+    // No memory effect. The trampoline's `eret` (after this handler returns) reads back ELR/SPSR.
+    unsafe {
+        asm!(
+            "msr sp_el1, {0}",
+            "msr elr_el2, {1}",
+            "msr spsr_el2, {2}",
+            "msr sctlr_el1, {3}",
+            in(reg) sp_el1,
+            in(reg) elr,
+            in(reg) spsr,
+            in(reg) sctlr,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Save the running vCPU's context — GPRs from the trampoline `frame` plus its live system state —
+/// into `VCPU_CTX[vcpu]` (M5 Arc 1).
+fn save_context(vcpu: usize, frame: &GuestFrame) {
+    let (sp_el1, elr, spsr, sctlr) = read_sysctx();
+    // SAFETY: single-CPU, non-nested handler → exclusive access to the context store.
+    let ctx = unsafe { &mut (*VCPU_CTX.0.get())[vcpu] };
+    ctx.x = frame.x;
+    ctx.sp_el1 = sp_el1;
+    ctx.elr_el2 = elr;
+    ctx.spsr_el2 = spsr;
+    ctx.sctlr_el1 = sctlr;
+}
+
+/// Restore a vCPU's context — GPRs into the trampoline `frame` (so its `ldp`+`eret` resumes that
+/// vCPU) and system state via `msr` (M5 Arc 1).
+fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
+    // SAFETY: as [`save_context`] — exclusive single-CPU access.
+    let ctx = unsafe { (*VCPU_CTX.0.get())[vcpu] };
+    frame.x = ctx.x;
+    write_sysctx(ctx.sp_el1, ctx.elr_el2, ctx.spsr_el2, ctx.sctlr_el1);
 }
 
 /// Enter the guest at EL1 and never return: switch `SP_EL2` to the dedicated exception stack, set
@@ -712,7 +893,12 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_POS_RO => POS_RO.store(arg0, Ordering::Relaxed),
         NR_FINAL => finish_isolation_test(uart), // -> ! (phase 1 terminal → drives phase 2)
         NR_POS_RW2 => POS_RW2.store(arg0, Ordering::Relaxed),
-        NR_FINAL2 => finish_lifecycle_test(uart), // -> ! (phase 2 terminal)
+        NR_FINAL2 => finish_lifecycle_test(uart), // -> ! (phase 2 terminal → drives phase 3)
+        NR_YIELD => handle_yield(frame), // M5 Arc 1: save+restore the vCPU context, then resume
+        NR_SCHED_FINAL => {
+            SCHED_COUNTER.store(arg0, Ordering::Relaxed);
+            finish_scheduler_test(uart) // -> ! (phase 3 terminal)
+        }
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -1092,7 +1278,8 @@ fn finish_lifecycle_test(uart: &mut Pl011) -> ! {
         );
     }
 
-    if pos_ok && inherit_denied && !rw2_faulted {
+    let lifecycle_ok = pos_ok && inherit_denied && !rw2_faulted;
+    if lifecycle_ok {
         // Printed ONLY when the whole lifecycle matrix holds: a reborn slot gets a fresh isolated
         // address space and inherits NO authority from the domain that died in it.
         let _ = writeln!(
@@ -1104,6 +1291,99 @@ fn finish_lifecycle_test(uart: &mut Pl011) -> ! {
             uart,
             "baleen: LIFECYCLE ISOLATION TEST FAILED (pos_ok={pos_ok} inherit_denied={inherit_denied} \
              rw2_faulted={rw2_faulted} fgrant_dfsc=0x{fgrant_dfsc:02x})"
+        );
+    }
+
+    // M5 Arc 1: with the lifecycle confirmed, drive phase 3 — the vCPU context switch + scheduler
+    // run-loop (never returns). A broken lifecycle baseline parks rather than proceeding.
+    if lifecycle_ok {
+        begin_scheduler_phase3(uart);
+    }
+    crate::park();
+}
+
+/// **M5 Arc 1 — the vCPU yield handler.** Save the running vCPU's full context, (re)select the vCPU
+/// to run, and restore that vCPU's context so the trampoline's `eret` resumes it. Step 1 reselects
+/// the SAME vCPU (a self-yield: an identity round trip that exercises every save/restore path before
+/// concurrency is layered on); step 2 will pick the peer. Returns to the trampoline, which restores
+/// the (now-selected) GPR frame and `eret`s.
+fn handle_yield(frame: &mut GuestFrame) {
+    let cur = CUR_VCPU.load(Ordering::Relaxed) as usize;
+    save_context(cur, frame);
+    // Step 1: reselect the same vCPU. (Step 2 alternates to the peer here, driven by hv-core sched.)
+    let next = cur;
+    CUR_VCPU.store(next as u64, Ordering::Relaxed);
+    restore_context(next, frame);
+    YIELDS_HANDLED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// **M5 Arc 1, phase 3 — the scheduler run-loop (step 1: self-yield context switch).** Build a fresh
+/// `Hypervisor`, create the scheduler domain, emit its Stage-2, and enter a register-only guest that
+/// yields `SCHED_YIELDS` times. Each yield round-trips the vCPU context through [`VCPU_CTX`] (see
+/// [`handle_yield`]); the guest carries a counter across every yield. Never returns — the guest's
+/// terminal report ([`finish_scheduler_test`]) parks.
+fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
+    // A fresh Hypervisor: the lifecycle phase mutated the previous one (destroy/reborn). SAFETY:
+    // single-CPU, one-time rebuild before any scheduler guest runs; no handler is touching the cell.
+    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+
+    // Create the scheduler domain. The step-1 guest is register-only, so it needs no data frames —
+    // `build_stage2_from_p2m` emits just the guest-image identity block (its code + stack).
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: SCHED_DOM,
+            may_create: false,
+        },
+        "create scheduler domain",
+        uart,
+    );
+
+    let vttbr = stage2::build_stage2_from_p2m(hv, SCHED_DOM);
+    let entry = load_guest3();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    init_guest_el1(ram_end);
+    {
+        use hv_hal::VcpuOps;
+        ArmVcpu.set_entry(entry);
+    }
+    // Reset the per-vCPU run state for this phase; clear the guard because we diverge into `eret`.
+    CUR_VCPU.store(0, Ordering::Relaxed);
+    YIELDS_HANDLED.store(0, Ordering::Relaxed);
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    let _ = writeln!(
+        uart,
+        "baleen: scheduler phase — entering vCPU 0 (self-yield context-switch test, {SCHED_YIELDS} yields)"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    enter_guest(exc_stack_top);
+}
+
+/// **M5 Arc 1, phase 3 terminal.** Assert the vCPU context survived every yield: the guest's carried
+/// counter and the metal's yield count must both equal `SCHED_YIELDS`. Under `--features selftest`
+/// chains the Arc-2 deliberate-fault self-test (the boot's last act, moved here from phase 2).
+fn finish_scheduler_test(uart: &mut Pl011) -> ! {
+    let counter = SCHED_COUNTER.load(Ordering::Relaxed);
+    let handled = YIELDS_HANDLED.load(Ordering::Relaxed);
+    if counter == SCHED_YIELDS && handled == SCHED_YIELDS {
+        // Printed ONLY when the counter round-tripped through every context save/restore: the vCPU's
+        // register state was preserved across all SCHED_YIELDS yields.
+        let _ = writeln!(
+            uart,
+            "baleen: SCHEDULER CONTEXT-SWITCH TEST PASSED — vCPU state survived {SCHED_YIELDS} yields \
+             (guest counter={counter}, metal yields={handled})"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: SCHEDULER CONTEXT-SWITCH TEST FAILED (guest counter={counter} metal yields={handled} \
+             expected={SCHED_YIELDS})"
         );
     }
 
