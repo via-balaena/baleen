@@ -102,3 +102,109 @@ pub(crate) fn inject(intid: u32) {
         );
     }
 }
+
+// ─── physical GICv3 (for receiving the virtual-timer PPI at EL2 — M5 Arc 5d) ─────────────────────────
+//
+// So far the vGIC only INJECTED. To deliver a real timer TICK, EL2 must RECEIVE the physical virtual-
+// timer interrupt (the guest's `CNTV` fires PPI INTID 27, routed to EL2 by `HCR_EL2.IMO`) and inject the
+// matching virtual interrupt. That requires the physical GICv3 distributor + this CPU's redistributor to
+// be initialized, plus the EL2 physical CPU interface enabled. QEMU `virt` GICv3 memory map:
+
+/// GICv3 distributor base (QEMU `virt`).
+const GICD_BASE: u64 = 0x0800_0000;
+/// GICv3 redistributor RD_base for CPU 0 (QEMU `virt`); the SGI/PPI frame is the next 64 KiB frame.
+const GICR_RD_BASE: u64 = 0x080A_0000;
+const GICR_SGI_BASE: u64 = GICR_RD_BASE + 0x1_0000;
+
+/// `GICD_CTLR` — `ARE_NS` (bit 4, affinity routing) + `EnableGrp1NS` (bit 1).
+const GICD_CTLR_ARE_GRP1: u32 = (1 << 4) | (1 << 1);
+/// `GICR_WAKER.ProcessorSleep` (bit 1) and `.ChildrenAsleep` (bit 2).
+const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
+const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
+
+/// The EL1 architected **virtual timer** interrupt — PPI 11 = INTID 27 (Arm ARM / GIC spec). This is the
+/// interrupt the guest's `CNTV` raises; the guest also sees it as vINTID 27 after we inject.
+pub(crate) const VTIMER_INTID: u32 = 27;
+
+/// Initialize the physical GICv3 enough to receive the virtual-timer PPI at EL2: enable the distributor
+/// (affinity routing + Group 1), wake this CPU's redistributor, and enable PPI [`VTIMER_INTID`] as a
+/// Group 1 interrupt at a deliverable priority. MMIO at EL2 (MMU-off, direct physical addressing).
+pub(crate) fn init_physical_vtimer() {
+    // SAFETY: the GICD/GICR windows are device memory on the `virt` machine, addressed directly at EL2
+    // (MMU off). Each write targets a documented GICv3 register at its fixed offset; the reads poll the
+    // wake handshake. No Rust memory is aliased.
+    unsafe {
+        // Distributor: affinity routing + Group 1 enable.
+        core::ptr::write_volatile(GICD_BASE as *mut u32, GICD_CTLR_ARE_GRP1);
+
+        // Wake this CPU's redistributor: clear ProcessorSleep, wait for ChildrenAsleep to clear.
+        let waker = (GICR_RD_BASE + 0x0014) as *mut u32;
+        let w = core::ptr::read_volatile(waker) & !GICR_WAKER_PROCESSOR_SLEEP;
+        core::ptr::write_volatile(waker, w);
+        while core::ptr::read_volatile(waker) & GICR_WAKER_CHILDREN_ASLEEP != 0 {
+            core::hint::spin_loop();
+        }
+
+        // PPI 27 in the SGI/PPI frame: Group 1, a deliverable priority, then enable it.
+        let igroupr0 = (GICR_SGI_BASE + 0x0080) as *mut u32;
+        let g = core::ptr::read_volatile(igroupr0) | (1 << VTIMER_INTID);
+        core::ptr::write_volatile(igroupr0, g);
+        // IPRIORITYR is byte-addressed per INTID; write a mid priority (below the PMR mask 0xff).
+        core::ptr::write_volatile(
+            (GICR_SGI_BASE + 0x0400 + VTIMER_INTID as u64) as *mut u8,
+            0x80,
+        );
+        // ISENABLER0: set the enable bit for INTID 27.
+        core::ptr::write_volatile((GICR_SGI_BASE + 0x0100) as *mut u32, 1 << VTIMER_INTID);
+    }
+}
+
+/// Enable the EL2 **physical** CPU interface so a physical IRQ (the timer PPI) is delivered to EL2:
+/// priority mask wide open, Group 1 physical interrupts enabled. (Distinct from the guest's EL1 virtual
+/// interface — at EL2 these `ICC_*` registers are the physical ones.)
+pub(crate) fn enable_physical_cpu_interface_el2() {
+    // SAFETY: `ICC_PMR_EL1`/`ICC_IGRPEN1_EL1` accessed at EL2 are the physical CPU-interface controls;
+    // we open the priority mask and enable Group 1. `isb` before an interrupt can be taken. No memory.
+    unsafe {
+        asm!(
+            "msr ICC_PMR_EL1, {pmr}",
+            "msr ICC_IGRPEN1_EL1, {en}",
+            "isb",
+            pmr = in(reg) 0xffu64,
+            en = in(reg) 1u64,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Acknowledge the highest-priority pending **physical** Group 1 interrupt at EL2 (`ICC_IAR1_EL1`) →
+/// its INTID (1023 = spurious).
+pub(crate) fn ack_physical() -> u32 {
+    let intid: u64;
+    // SAFETY: reading `ICC_IAR1_EL1` at EL2 acknowledges a physical interrupt; no memory effect.
+    unsafe {
+        asm!("mrs {i}, ICC_IAR1_EL1", i = out(reg) intid, options(nomem, nostack, preserves_flags));
+    }
+    intid as u32
+}
+
+/// End-of-interrupt the physical interrupt `intid` at EL2 (`ICC_EOIR1_EL1`).
+pub(crate) fn eoi_physical(intid: u32) {
+    // SAFETY: writing `ICC_EOIR1_EL1` at EL2 completes a physical interrupt; no memory effect.
+    unsafe {
+        asm!("msr ICC_EOIR1_EL1, {i}", i = in(reg) intid as u64, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Disable the guest's virtual timer (`CNTV_CTL_EL0 = 0`) from EL2 — used when EL2 fields the timer PPI,
+/// so the level-triggered interrupt de-asserts and does not immediately re-fire (a one-shot; periodic
+/// timer virtualization for Linux is a 5e concern).
+pub(crate) fn disable_vtimer() {
+    // SAFETY: `CNTV_CTL_EL0` is accessible at EL2; writing 0 clears ENABLE. No memory effect.
+    unsafe {
+        asm!(
+            "msr CNTV_CTL_EL0, xzr",
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}

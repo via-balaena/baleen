@@ -405,6 +405,19 @@ const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
 /// The guest reports the PSCI version it read (`x1`); the hypervisor asserts it equals what it returned.
 const NR_PSCI_REPORT: u64 = 0xb0;
 
+// ─── M5 Arc 5d: the timer TICK — a physical interrupt delivered to the guest ──────────────────────────
+//
+// The keystone. A guest's virtual timer (`CNTV`) fires the physical PPI 27, routed to EL2 by
+// `HCR_EL2.IMO`; the EL2 IRQ handler ([`handle_guest_irq`]) acknowledges it and injects the matching
+// VIRTUAL interrupt, which the guest takes at its EL1 vector — a real, asynchronous, hardware-driven
+// timer tick (the same receive→inject path virtio interrupts will reuse).
+
+/// The guest reports (from its EL1 IRQ vector) the INTID of the timer tick it took (`x1`); the hypervisor
+/// asserts it is the virtual-timer INTID. A checkpoint.
+const NR_TIMER_IRQ_REPORT: u64 = 0xa0;
+/// The timer-tick phase's terminal report (the boot's last act).
+const NR_TIMER_IRQ_FINAL: u64 = 0xa1;
+
 // ---------------------------------------------------------------------------------------------
 // The guest program.
 //
@@ -1201,6 +1214,72 @@ __guest_psci_tpl_end:
     NR_PSCI_REPORT = const NR_PSCI_REPORT,
 );
 
+// The timer-TICK test guest program (M5 Arc 5d). It installs its EL1 vector table, enables its virtual
+// CPU interface, programs the virtual timer (CNTV) with IMASK=0, unmasks IRQs, and waits (`wfi`). When
+// the timer fires, the physical PPI goes to EL2, which injects the virtual timer interrupt; the guest
+// TAKES it at its IRQ vector — a real hardware-driven tick. 0x800-aligned blob (for VBAR_EL1, as the
+// async guest). Position-independent.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 0x800
+    .global __guest_timer_irq_tpl_start
+__guest_timer_irq_tpl_start:
+    adr     x0, 9f
+    msr     VBAR_EL1, x0
+    isb
+    mrs     x0, ICC_SRE_EL1
+    orr     x0, x0, #1
+    msr     ICC_SRE_EL1, x0
+    isb
+    mov     x0, #0xff
+    msr     ICC_PMR_EL1, x0
+    mov     x0, #1
+    msr     ICC_IGRPEN1_EL1, x0
+    isb
+    // program the virtual timer: fire after ~0x8000 ticks, ENABLE=1, IMASK=0 (interrupt not masked)
+    mov     x0, #0x8000
+    msr     CNTV_TVAL_EL0, x0
+    mov     x0, #1
+    msr     CNTV_CTL_EL0, x0
+    isb
+    // unmask IRQ and wait — the tick arrives asynchronously at the vector below
+    msr     DAIFClr, #2
+    isb
+1:  wfi
+    b       1b
+
+    .balign 0x800
+9:
+    b       8f                            // 0x000 Current EL SP0, Synchronous
+    .balign 0x80
+    b       8f                            // 0x080 Current EL SP0, IRQ
+    .balign 0x80
+    b       8f                            // 0x100 Current EL SP0, FIQ
+    .balign 0x80
+    b       8f                            // 0x180 Current EL SP0, SError
+    .balign 0x80
+    b       8f                            // 0x200 Current EL SPx, Synchronous
+    .balign 0x80
+    // 0x280 Current EL SPx, IRQ — the virtual timer tick lands here
+    mrs     x1, ICC_IAR1_EL1              // acknowledge → INTID (27, the virtual timer)
+    msr     ICC_EOIR1_EL1, x1
+    mov     x0, #{NR_TIMER_IRQ_REPORT}
+    hvc     #0
+    mov     x0, #{NR_TIMER_IRQ_FINAL}
+    hvc     #0
+7:  wfe
+    b       7b
+    .balign 0x80
+8:  wfe
+    b       8b
+    .global __guest_timer_irq_tpl_end
+__guest_timer_irq_tpl_end:
+    "#,
+    NR_TIMER_IRQ_REPORT = const NR_TIMER_IRQ_REPORT,
+    NR_TIMER_IRQ_FINAL = const NR_TIMER_IRQ_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -1385,6 +1464,11 @@ static TIMER_OK: AtomicBool = AtomicBool::new(false);
 static PSCI_VERSION_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 5c: the guest powered off via PSCI `SYSTEM_OFF` (the hypervisor serviced it).
 static PSCI_OFF_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5d: the EL2 IRQ handler fielded the physical virtual-timer interrupt (the tick reached EL2).
+static TIMER_IRQ_FIRED: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 5d: the guest TOOK the timer tick at its EL1 IRQ vector with the virtual-timer INTID (the full
+/// physical-IRQ → EL2 → inject → guest-vIRQ path — a real hardware-driven timer tick).
+static TIMER_IRQ_OK: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
     static __guest_tpl_start: u8;
@@ -1409,6 +1493,8 @@ extern "C" {
     static __guest_timer_tpl_end: u8;
     static __guest_psci_tpl_start: u8;
     static __guest_psci_tpl_end: u8;
+    static __guest_timer_irq_tpl_start: u8;
+    static __guest_timer_irq_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1593,6 +1679,79 @@ __guest_sync_entry:
     "#
 );
 
+// The vector trampoline for a lower-EL/AArch64 IRQ (slot 9) — a physical interrupt taken while the guest
+// runs (M5 Arc 5d, the timer tick routed to EL2 by `HCR_EL2.IMO`). Same save/restore discipline as the
+// sync trampoline: save x0..x30 so the guest is resumed byte-identical, field the interrupt in the Rust
+// handler, restore, and `eret` — after which the pending *virtual* interrupt the handler injected is
+// taken by the guest at its own EL1 vector.
+global_asm!(
+    r#"
+    .section .text
+    .balign 0x40
+    .global __guest_irq_entry
+__guest_irq_entry:
+    sub     sp, sp, #(16 * 16)
+    stp     x0, x1,   [sp, #(16 * 0)]
+    stp     x2, x3,   [sp, #(16 * 1)]
+    stp     x4, x5,   [sp, #(16 * 2)]
+    stp     x6, x7,   [sp, #(16 * 3)]
+    stp     x8, x9,   [sp, #(16 * 4)]
+    stp     x10, x11, [sp, #(16 * 5)]
+    stp     x12, x13, [sp, #(16 * 6)]
+    stp     x14, x15, [sp, #(16 * 7)]
+    stp     x16, x17, [sp, #(16 * 8)]
+    stp     x18, x19, [sp, #(16 * 9)]
+    stp     x20, x21, [sp, #(16 * 10)]
+    stp     x22, x23, [sp, #(16 * 11)]
+    stp     x24, x25, [sp, #(16 * 12)]
+    stp     x26, x27, [sp, #(16 * 13)]
+    stp     x28, x29, [sp, #(16 * 14)]
+    str     x30,      [sp, #(16 * 15)]
+    mov     x0, sp
+    bl      handle_guest_irq
+    ldp     x0, x1,   [sp, #(16 * 0)]
+    ldp     x2, x3,   [sp, #(16 * 1)]
+    ldp     x4, x5,   [sp, #(16 * 2)]
+    ldp     x6, x7,   [sp, #(16 * 3)]
+    ldp     x8, x9,   [sp, #(16 * 4)]
+    ldp     x10, x11, [sp, #(16 * 5)]
+    ldp     x12, x13, [sp, #(16 * 6)]
+    ldp     x14, x15, [sp, #(16 * 7)]
+    ldp     x16, x17, [sp, #(16 * 8)]
+    ldp     x18, x19, [sp, #(16 * 9)]
+    ldp     x20, x21, [sp, #(16 * 10)]
+    ldp     x22, x23, [sp, #(16 * 11)]
+    ldp     x24, x25, [sp, #(16 * 12)]
+    ldp     x26, x27, [sp, #(16 * 13)]
+    ldp     x28, x29, [sp, #(16 * 14)]
+    ldr     x30,      [sp, #(16 * 15)]
+    add     sp, sp, #(16 * 16)
+    eret
+    "#
+);
+
+/// **M5 Arc 5d — the EL2 IRQ handler.** A physical interrupt was taken to EL2 while the guest ran.
+/// Acknowledge it; if it is the virtual-timer PPI, disable the (level-triggered) timer so it does not
+/// immediately re-fire, then inject the matching *virtual* interrupt into the guest (delivered at the
+/// guest's EL1 vector after the trampoline `eret`s). End the physical interrupt either way.
+///
+/// # Safety
+/// `_frame` is the valid `&mut GuestFrame` the trampoline saved on the exception stack (unused here — the
+/// handler touches only GIC/timer system state — but kept in the ABI so the trampoline is uniform).
+#[no_mangle]
+extern "C" fn handle_guest_irq(_frame: *mut GuestFrame) {
+    let intid = gic::ack_physical();
+    if intid == gic::VTIMER_INTID {
+        gic::disable_vtimer(); // one-shot: stop the level-triggered PPI re-asserting after EOI
+        TIMER_IRQ_FIRED.store(true, Ordering::Relaxed);
+        gic::inject(gic::VTIMER_INTID); // hand the guest its own virtual timer interrupt
+    }
+    // INTID 1023 (spurious) or anything else: just complete it.
+    if intid < 1020 {
+        gic::eoi_physical(intid);
+    }
+}
+
 /// A minimal `hv_hal::VcpuOps` realized on ARM (Arc 4). `set_entry` writes `ELR_EL2`;
 /// `inject_interrupt` is honestly deferred (no GIC yet).
 struct ArmVcpu;
@@ -1775,6 +1934,22 @@ fn load_guest_psci() -> u64 {
     let len = tpl_end - tpl_start;
     // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
     // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **timer-tick** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5d). 0x800-aligned blob → 0x800-aligned vector table at runtime (for `VBAR_EL1`).
+fn load_guest_timer_irq() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_timer_irq_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_timer_irq_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping. `ram_start` is 2 MiB-aligned so the blob's internal 0x800
+    // alignment is preserved at runtime.
     unsafe {
         core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
     }
@@ -2165,6 +2340,8 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_TIMER_REPORT => timer_report(frame, uart), // M5 Arc 5b: assert the virtual timer fired
         NR_TIMER_FINAL => finish_timer_test(uart), // -> ! (timer phase → PSCI phase)
         NR_PSCI_REPORT => psci_report(frame, uart), // M5 Arc 5c: assert the guest read the PSCI version
+        NR_TIMER_IRQ_REPORT => timer_irq_report(frame, uart), // M5 Arc 5d: assert the tick was taken
+        NR_TIMER_IRQ_FINAL => finish_timer_irq_test(uart),    // -> ! (timer-tick phase terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -4272,13 +4449,13 @@ fn finish_psci_test(uart: &mut Pl011) -> ! {
             uart,
             "baleen: PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF"
         );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: PSCI TEST FAILED (version_ok={version_ok} off_ok={off_ok})"
-        );
+        // M5 Arc 5d: prove the timer TICK — a physical interrupt delivered to the guest. Never returns.
+        begin_timer_irq_phase(uart);
     }
-    selftest_brk(uart);
+    let _ = writeln!(
+        uart,
+        "baleen: PSCI TEST FAILED (version_ok={version_ok} off_ok={off_ok})"
+    );
     crate::park();
 }
 
@@ -4291,6 +4468,71 @@ fn begin_psci_phase(uart: &mut Pl011) -> ! {
         uart,
         entry,
         "baleen: PSCI phase — a guest queries the PSCI version and powers off via SYSTEM_OFF",
+    );
+}
+
+/// **M5 Arc 5d** — the guest reported (from its EL1 IRQ vector) the INTID of the timer tick it took
+/// (`x1`); assert it is the virtual-timer INTID. A checkpoint.
+fn timer_irq_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let intid = frame.x[1] as u32;
+    let ok = intid == gic::VTIMER_INTID;
+    TIMER_IRQ_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID {intid}) at its EL1 vector"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: timer tick MISMATCH: guest took INTID {intid} (expected {})",
+            gic::VTIMER_INTID
+        );
+    }
+}
+
+/// **M5 Arc 5d, timer-tick phase terminal.** Assert the physical tick reached EL2 and the guest took the
+/// injected virtual interrupt — the full receive→inject→deliver path — and finish the boot.
+fn finish_timer_irq_test(uart: &mut Pl011) -> ! {
+    let fired = TIMER_IRQ_FIRED.load(Ordering::Relaxed);
+    let taken = TIMER_IRQ_OK.load(Ordering::Relaxed);
+    if fired && taken {
+        let _ = writeln!(
+            uart,
+            "baleen: TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: TIMER TICK TEST FAILED (fired={fired} taken={taken})"
+        );
+    }
+    selftest_brk(uart);
+    crate::park();
+}
+
+/// **M5 Arc 5d, timer-tick phase.** Build a fresh minimal guest, initialize the physical GICv3 to receive
+/// the virtual-timer PPI at EL2, enable the EL2 physical CPU interface, zero `CNTVOFF_EL2`, and enter. The
+/// guest programs its virtual timer with the interrupt un-masked; the tick rides the physical-IRQ → EL2 →
+/// inject path to the guest's EL1 vector. Never returns.
+fn begin_timer_irq_phase(uart: &mut Pl011) -> ! {
+    gic_fresh_guest(uart);
+    // Physical side: let EL2 receive PPI 27 (the guest's CNTV) and hand it on as a virtual interrupt.
+    gic::init_physical_vtimer();
+    gic::enable_physical_cpu_interface_el2();
+    // SAFETY: `CNTVOFF_EL2` is an EL2 timer register; writing 0 makes the guest's virtual count track the
+    // physical count cleanly (its reset is UNKNOWN). No memory effect.
+    unsafe {
+        asm!(
+            "msr cntvoff_el2, xzr",
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+    let entry = load_guest_timer_irq();
+    run_gic_guest(
+        uart,
+        entry,
+        "baleen: timer-tick phase — a guest programs its virtual timer and takes the tick as an interrupt",
     );
 }
 

@@ -212,7 +212,9 @@ boot_and_check "default" "" \
     "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
     "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
     "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
-    "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF"
+    "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF" \
+    "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
+    "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -276,6 +278,8 @@ boot_and_check "selftest" "--features selftest" \
     "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
     "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
     "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF" \
+    "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
+    "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
