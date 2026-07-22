@@ -13,7 +13,7 @@ ENTRY(_start)
 
 RAM_START = 0x40080000;
 STACK_SIZE = 0x10000; /* 64 KiB */
-EXC_STACK_SIZE = 0x4000; /* 16 KiB — the EL2 exception stack (Arc 4) */
+EXC_STACK_SIZE = 0x8000; /* 32 KiB — the EL2 exception stack (Arc 4; grown in M5 Arc 0) */
 
 SECTIONS {
     . = RAM_START;
@@ -58,9 +58,14 @@ SECTIONS {
     /*
      * The dedicated EL2 exception stack (M4 Arc 4). Guest trap-and-service runs the vector
      * handler on SP_EL2 switched to this region — separate from the boot stack, which rust_main
-     * abandons the moment it `eret`s into the guest (that path is terminal). One frame deep per
-     * trap (saved + restored around each service), so 16 KiB is generous. Arc 2's diagnostic
-     * handler had no save-frame and needed no such stack; resuming a guest does.
+     * abandons the moment it `eret`s into the guest (that path is terminal). Each trap saves +
+     * restores one GPR frame; most handlers are shallow. But since **M5 Arc 0** the phase-1
+     * terminal trap no longer parks — it runs the WHOLE lifecycle on this stack (`begin_lifecycle_phase2`:
+     * ~a dozen `Hypervisor::dispatch` calls into hv-core, `build_stage2_from_p2m`, then a re-`eret`
+     * into the reborn guest), which previously ran on the 64 KiB boot stack. hv-core dispatch is
+     * shallow and non-recursive with no large buffers, so this stays comfortably bounded; 32 KiB
+     * (grown from 16 KiB this arc) restores the margin the added workload consumed. There is no
+     * guard page (see the boot-stack note above), so revisit on real hardware / if a handler grows.
      */
     . = ALIGN(16);
     . += EXC_STACK_SIZE;

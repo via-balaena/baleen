@@ -86,7 +86,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use hv_core::grant::{Frame, GrantRef};
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::{Mfn, PtLevel};
-use hv_core::{HvCall, HvOutcome, Hypercall, Hypervisor, RawHypercall};
+use hv_core::{HvCall, HvError, HvOutcome, Hypercall, Hypervisor, RawHypercall};
 
 use hv_hal::GuestMemory;
 
@@ -1003,7 +1003,12 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
             leaf: true,
         },
     ) {
-        Err(_) => {
+        // Pin the witness to the RIGHT cause: refused because `G′` holds no grant (`Unauthorized` at
+        // the p2m↔grant seam), not any incidental refusal. A different `Err` would mean the frame is
+        // unreachable for some OTHER reason (e.g. a future arc that also destroyed the peer would make
+        // `owner_of(F_FGRANT)` None → a wrong-state refusal) — still denied, but not the property we
+        // claim, so halt loudly rather than score it as the ID-reuse witness.
+        Err(HvError::Unauthorized) => {
             let _ = writeln!(
                 uart,
                 "baleen: lifecycle: reborn slot could NOT link the destroyed grant \
@@ -1017,12 +1022,29 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
             );
             crate::park();
         }
+        Err(e) => {
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle: reborn link refused for the WRONG reason ({e:?}) — not the no-grant witness; halting"
+            );
+            crate::park();
+        }
     }
 
     // (5) Re-emit Stage-2 from `G′`'s p2m (maps its fresh writable frame; the ex-granted frame has no
     // leaf edge → no descriptor → a hole), and re-enter the phase-2 guest. The re-entry guard is
     // cleared here because we diverge into `eret` rather than returning through the trampoline.
     let vttbr = stage2::build_stage2_from_p2m(hv, GUEST_DOM);
+    // The per-frame fault records are behaviourally LIVE across the lifecycle boundary: phase 2 scores
+    // its negatives from FAULT_DFSC, and a stale phase-1 fault on a frame phase 2 also probes would
+    // manufacture a false witness. So reset them here — each incarnation's negatives are its own
+    // (design-lesson #16: a live field resets on lifecycle exit). Phase 2 probes only F_FGRANT/F_RW
+    // (both non-faulting positives in phase 1 → already 0), but resetting all keeps the reborn slot a
+    // genuinely fresh page for any future phase-2 probe.
+    for f in 0..NFRAMES {
+        FAULT_DFSC[f].store(0, Ordering::Relaxed);
+        FAULT_WNR[f].store(false, Ordering::Relaxed);
+    }
     let entry = load_guest2();
     let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
     enable_stage2(vttbr);

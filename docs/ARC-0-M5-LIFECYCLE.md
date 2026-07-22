@@ -111,6 +111,53 @@ Arcs 4–5. Blind to timing, weak-memory ordering, and DMA/SMMU — none of whic
 crate-wide EL2-MMU real-hardware gap (`docs/ARC-4-TRAP-AND-SERVICE.md`) is orthogonal and stays
 named-and-deferred.
 
+## The diamond review pass — verdict SOUND
+
+The arc was hardened by the M4-Arc-5 method (design-lesson #27(j)): three **spec-blind auditors** on
+orthogonal axes, each deriving its own expectations and trying to break the arc, plus empirical
+**mutation testing**.
+
+- **Auditor A — Rust/unsafe + re-entry soundness.** Traced `SP_EL2` across the whole re-entry
+  (phase-1 `enter_guest` → guest → trap → handler → phase-2 `enter_guest` → guest → trap): SP is
+  reset to `__exc_stack_top` before every `eret`, so the second incarnation's traps land on a clean
+  frame and the abandoned handler chain is dead memory below it. The `IN_GUEST_HANDLER` guard is
+  cleared before the divergent re-`eret`; `GUEST_HV`'s `UnsafeCell` access is exclusive (single CPU,
+  non-nested, DAIF-masked); `Relaxed` atomics are sound on one observer; the in-place table rebuild is
+  safe (no live EL1&0 regime during the write + full VMID `tlbi` before re-entry). **Verdict SOUND.**
+- **Auditor B — false-green / witness integrity.** Confirmed no marker is unconditional and the
+  headline cannot print while the property is false: `is_translation(0)` is false so the zero
+  fault-record sentinel is never scored as a denial; the positive is un-forgeable (the HV's own
+  `read_frame` cross-check requires `0xCAFE`, which the HV never writes and phase 1 never left there);
+  fault classes are disjoint and a read cannot raise a permission fault here. **Verdict NO FALSE-GREEN.**
+- **Auditor C — model-refinement + composition.** Verified against the *actual* `hv-core` source that
+  teardown runs `revoke_grants_to(target)` (sweeping the peer's inbound grant) and `free_all` (so
+  `owner_of` → `None`), that the reborn link is refused at the p2m↔grant seam for the *right* reason
+  (no grant → `Unauthorized`), and that the Stage-2 re-emit clears the stale F_FGRANT leaf so it
+  becomes a hole. **Verdict FAITHFUL / SOUND COMPOSITION.**
+
+**Empirical mutation testing** — three perturbations that *should* break the lifecycle isolation,
+each confirmed caught (the matrix FAILS / boot halts, `LIFECYCLE ISOLATION TEST PASSED` never prints):
+
+| mutation | perturbation | caught by |
+|---|---|---|
+| inheritance leak | peer re-grants F_FGRANT to `G′` + `G′` links it (reachable) | `inherit_denied=false, fgrant_dfsc=0x00` — matrix FAILS (and the no-fault sentinel is not scored as a denial) |
+| over-restriction | drop `G′`'s link to its own fresh frame | `pos_ok=false, rw2_faulted=true` — matrix FAILS |
+| skip teardown | remove the `DomainDestroy` before rebirth | clean-shell witness halts: `teardown INCOMPLETE (dead=false)` |
+
+**Three below-bar findings fixed** (none a soundness/false-green defect):
+
+1. *(Auditor A)* The exception stack now carries the whole lifecycle (the terminal trap no longer
+   parks — ~a dozen `hv-core` dispatches + `build_stage2` run on it, previously on the 64 KiB boot
+   stack). Grew `EXC_STACK_SIZE` 16 KiB → 32 KiB to restore the margin and corrected the stale
+   "one frame deep" comment.
+2. *(Auditor A)* The per-frame `FAULT_DFSC`/`FAULT_WNR` records are behaviourally live across the
+   incarnation boundary — reset them in `begin_lifecycle_phase2` so each incarnation's negatives are
+   its own (design-lesson #16), rather than relying on phase 2 happening to probe only phase-1
+   positives.
+3. *(Auditor C)* The ID-reuse witness matched any `Err`; pinned it to `Err(HvError::Unauthorized)`
+   (the no-grant refusal), so a future arc that made the frame unreachable for an incidental reason
+   cannot pass the witness for the wrong cause — a wrong-reason refusal now halts loudly.
+
 ## Verdict
 
 **SOUND, no defect.** Arc 0 refines the `hv-core` lifecycle onto the metal: a destroyed domain leaves
