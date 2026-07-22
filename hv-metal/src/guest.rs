@@ -217,6 +217,48 @@ const NUM_VCPUS_METAL: usize = 2;
 /// sees at a glance that these phases are deliberately single-set, not accidentally colliding.
 const STAGE2_SET_SINGLE: usize = 0;
 
+// ─── M5 Arc 2: concurrent INTER-domain isolation (VMID-tagged) ─────────────────────────────────────
+//
+// The spatial complement of Arc 1's temporal multiplexing. TWO domains (each one vCPU) time-slice on
+// the single physical CPU under the SAME hv-core scheduler, but now each runs in its OWN Stage-2 —
+// a distinct table set, tagged with a distinct VMID (set + 1) — and the switch installs the peer
+// domain's VTTBR with NO `tlbi` (distinct VMIDs stop the two domains' TLB entries aliasing). Each
+// domain owns a distinct machine frame (distinct `Mfn` → distinct host PA), mapped by its own Stage-2
+// at a per-domain IPA; the isolation falls straight out of the per-domain p2m → per-domain Stage-2
+// refinement (each set emits only leaves whose parent that domain owns), with no hand-built holes.
+//
+// Witnesses: (1) concurrent isolation — each domain FAULTS (translation) probing the IPA the OTHER
+// domain's frame lives at; (2) no cross-corruption — after the full interleave each frame still holds
+// its OWN sentinel (guest read-back + the HV reads it back through `GuestMemory`); (3) VMID-tagged /
+// no-flush — the isolation holds despite no `tlbi` on the switch.
+
+/// The two concurrently-scheduled domains (a fresh `Hypervisor` is built for this phase, so these reuse
+/// the low ids). Each owns one page-table root and one writable data frame.
+const ISO_DOM_A: DomId = 1;
+const ISO_DOM_B: DomId = 2;
+
+/// dom A's frames: its `L1` page table (pinned) and its writable data leaf.
+const F_A_ROOT: Mfn = 1;
+const F_A_DATA: Mfn = 2;
+/// dom B's frames — DISTINCT `Mfn`s, hence distinct host PA (`frame_pa` is injective in `Mfn`), so the
+/// two domains' data are physically disjoint, not merely table-separated.
+const F_B_ROOT: Mfn = 3;
+const F_B_DATA: Mfn = 4;
+
+/// Each domain's Stage-2 table set (and thus VMID: set 0 → VMID 1, set 1 → VMID 2).
+const STAGE2_SET_A: usize = 0;
+const STAGE2_SET_B: usize = 1;
+
+/// The un-forgeable sentinel each domain writes to its OWN frame — distinct per domain and from every
+/// other sentinel/hypercall input, so a cross-domain corruption (a peer's value landing in one's frame)
+/// or a mis-mapped read is immediately visible.
+const SENTINEL_ISO_A: u64 = 0xA1A1;
+const SENTINEL_ISO_B: u64 = 0xB2B2;
+
+/// The concurrent-isolation guest's terminal report — carries its OWN-frame read-back (`x1`) and its
+/// vCPU id (`x2`). Distinct from every other `NR_*` (outside `hv-core`'s decoder range).
+const NR_ISO_FINAL: u64 = 0xfc;
+
 // ---------------------------------------------------------------------------------------------
 // The guest program.
 //
@@ -398,6 +440,41 @@ __guest3_tpl_end:
     NR_SCHED_FINAL = const NR_SCHED_FINAL,
 );
 
+// ---------------------------------------------------------------------------------------------
+// The concurrent-inter-domain-isolation guest program (M5 Arc 2). BOTH domains' vCPUs run this SAME
+// code from the shared code image; they diverge only by the per-vCPU register state the metal seeds:
+//   x20 = my sentinel, x22 = my vCPU id, x23 = MINE ipa (my own data frame), x24 = PEER ipa (the IPA
+//   the OTHER domain's frame lives at, which my Stage-2 does NOT map).
+// It writes its sentinel to its own frame (authorized), yields so the peer runs (and writes ITS frame),
+// reads its own frame back (must be unchanged — the peer's run didn't corrupt it), then probes the
+// peer's IPA (must FAULT — its Stage-2 has no leaf there), and finally reports its own-frame read-back.
+// ---------------------------------------------------------------------------------------------
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest4_tpl_start
+__guest4_tpl_start:
+    // x20 = my sentinel, x22 = vCPU id, x23 = MINE ipa, x24 = PEER ipa
+    str     x20, [x23]                     // write my sentinel to MY frame (authorized RW leaf)
+    mov     x0, #{NR_YIELD}
+    hvc     #0                             // yield → the peer domain runs (writes its own frame), back
+    ldr     x25, [x23]                     // read MY frame back — must still hold my sentinel
+    ldr     x26, [x24]                     // probe the PEER's frame IPA → translation FAULT (recorded)
+    // terminal report: x1 = my-frame read-back, x2 = my vCPU id
+    mov     x1, x25
+    mov     x2, x22
+    mov     x0, #{NR_ISO_FINAL}
+    hvc     #0
+0:  wfe                                    // terminal
+    b       0b
+    .global __guest4_tpl_end
+__guest4_tpl_end:
+    "#,
+    NR_YIELD = const NR_YIELD,
+    NR_ISO_FINAL = const NR_ISO_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -465,6 +542,15 @@ static SCHED_REPORT: [AtomicU64; NUM_VCPUS_METAL] =
 /// both bits are set.
 static SCHED_DONE: AtomicU64 = AtomicU64::new(0);
 
+/// M5 Arc 2: each concurrent-isolation domain's read-back of its OWN data frame (reported at
+/// [`NR_ISO_FINAL`], indexed by metal vCPU slot) — must equal that domain's sentinel (no cross-domain
+/// corruption after the peer ran).
+static ISO_READBACK: [AtomicU64; NUM_VCPUS_METAL] =
+    [const { AtomicU64::new(u64::MAX) }; NUM_VCPUS_METAL];
+/// M5 Arc 2: bitmask of which concurrent-isolation vCPUs have hit their terminal report; the phase
+/// finishes when both bits are set.
+static ISO_DONE: AtomicU64 = AtomicU64::new(0);
+
 extern "C" {
     static __guest_tpl_start: u8;
     static __guest_tpl_end: u8;
@@ -472,6 +558,8 @@ extern "C" {
     static __guest2_tpl_end: u8;
     static __guest3_tpl_start: u8;
     static __guest3_tpl_end: u8;
+    static __guest4_tpl_start: u8;
+    static __guest4_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -711,6 +799,22 @@ fn load_guest2() -> u64 {
 fn load_guest3() -> u64 {
     let tpl_start = core::ptr::addr_of!(__guest3_tpl_start) as usize;
     let tpl_end = core::ptr::addr_of!(__guest3_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **phase-4** (concurrent-isolation) guest template into guest RAM and return its `entry`
+/// guest-physical address (M5 Arc 2). BOTH domains run this one shared code image — the isolation
+/// surface is the per-domain *data* frames, not the code (see the phase-4 setup's scope note).
+fn load_guest4() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest4_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest4_tpl_end) as usize;
     let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
     let len = tpl_end - tpl_start;
     // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
@@ -1063,6 +1167,7 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_FINAL2 => finish_lifecycle_test(uart), // -> ! (phase 2 terminal → drives phase 3)
         NR_YIELD => handle_yield(frame, uart), // M5 Arc 1: switch to the peer vCPU (sched-driven)
         NR_SCHED_FINAL => handle_sched_final(frame, uart), // records + switches, or finishes
+        NR_ISO_FINAL => handle_iso_final(frame, uart), // M5 Arc 2: records + switches, or finishes
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -1551,9 +1656,17 @@ fn handle_sched_final(frame: &mut GuestFrame, uart: &mut Pl011) {
         finish_scheduler_test(uart); // -> !
     }
 
-    // The peer still has work: retire this vCPU (Running → Offline) and dispatch the peer (Runnable →
-    // Running from its last preempt), then resume it. Each op is dispatched as the relevant vCPU's
-    // owning domain (identical under Arc 1, distinct under Arc 2's concurrent isolation).
+    // The peer still has work: retire this vCPU and dispatch the peer, then resume it.
+    retire_and_switch_to_peer(cur, frame, uart);
+    // No YIELDS_HANDLED bump — this was a terminal report, not a yield.
+}
+
+/// After a vCPU hits its terminal report while the peer still has work: retire it (Running → Offline)
+/// and dispatch the peer (Runnable → Running from its last preempt), then restore the peer's context so
+/// the trampoline `eret`s into it. Each op is dispatched as the relevant vCPU's OWNING domain (from
+/// [`vcpu_meta`]) — identical under Arc 1's single domain, distinct under Arc 2's concurrent isolation.
+/// One shared tail for both terminals so the retire→switch sequence cannot drift between them.
+fn retire_and_switch_to_peer(cur: usize, frame: &mut GuestFrame, uart: &mut Pl011) {
     let next = 1 - cur;
     let (cur_m, next_m) = (vcpu_meta(cur), vcpu_meta(next));
     let now = sched_now();
@@ -1581,7 +1694,6 @@ fn handle_sched_final(frame: &mut GuestFrame, uart: &mut Pl011) {
     );
     CUR_VCPU.store(next as u64, Ordering::Relaxed);
     restore_context(next, frame);
-    // No YIELDS_HANDLED bump — this was a terminal report, not a yield.
 }
 
 /// **M5 Arc 1, phase 3 — the concurrent scheduler run-loop.** Build a fresh `Hypervisor`, create the
@@ -1771,7 +1883,8 @@ fn finish_scheduler_test(uart: &mut Pl011) -> ! {
     let a_ok = a == SCHED_BASE_A + SCHED_YIELDS;
     let b_ok = b == SCHED_BASE_B + SCHED_YIELDS;
     let switches_ok = handled == 2 * SCHED_YIELDS;
-    if a_ok && b_ok && switches_ok {
+    let sched_ok = a_ok && b_ok && switches_ok;
+    if sched_ok {
         // Printed ONLY when both counters ended at their OWN base + SCHED_YIELDS: each vCPU's private
         // register state survived every context switch, and the two never crossed (a leak would land a
         // counter in the wrong hundreds).
@@ -1790,10 +1903,343 @@ fn finish_scheduler_test(uart: &mut Pl011) -> ! {
         );
     }
 
+    // M5 Arc 2: with the scheduler confirmed, drive phase 4 — concurrent INTER-domain isolation (two
+    // domains, each its own VMID-tagged Stage-2, time-slicing under the same scheduler; each faults on
+    // the peer's memory). Never returns (it ends the boot, chaining the selftest BRK as the last act).
+    // A broken scheduler baseline parks rather than layering a fresh phase on it.
+    if sched_ok {
+        begin_concurrent_iso_phase4(uart);
+    }
+    crate::park();
+}
+
+/// **M5 Arc 2 — the concurrent-isolation terminal report handler.** Record this domain's read-back of
+/// its OWN frame (cross-checking its self-reported id against the metal slot the switch selected), mark
+/// it done, and either assert the isolation matrix (when both domains have finished) or retire this
+/// vCPU and switch to the peer so it can finish. Mirrors [`handle_sched_final`]'s shape.
+fn handle_iso_final(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let cur = CUR_VCPU.load(Ordering::Relaxed) as usize;
+    let readback = frame.x[1];
+    let reported_id = frame.x[2];
+    // The guest's self-reported id (seeded x22) must match the metal slot the switch selected — the
+    // cross-check that the intended domain's context actually ran (a leaked/wrong switch is caught).
+    if reported_id != cur as u64 {
+        let _ = writeln!(
+            uart,
+            "baleen: concurrent-iso: vCPU id mismatch (metal slot={cur}, guest reported={reported_id}); halting"
+        );
+        crate::park();
+    }
+    ISO_READBACK[cur].store(readback, Ordering::Relaxed);
+    let done = ISO_DONE.fetch_or(1 << cur, Ordering::Relaxed) | (1 << cur);
+    if done == (1u64 << NUM_VCPUS_METAL) - 1 {
+        finish_concurrent_iso_test(uart); // -> !
+    }
+    // The peer domain still has work: retire this vCPU and switch to it.
+    retire_and_switch_to_peer(cur, frame, uart);
+}
+
+/// Drive the proven model into the **two-domain** concurrent-isolation configuration, entirely through
+/// the real [`Hypervisor::dispatch`] — so each domain's Stage-2 is a translation of state the proven
+/// transitions produced. Each domain creates its own page-table root + one writable data frame (a
+/// DISTINCT `Mfn` per domain → distinct host PA), pins the root, and links the data frame as a writable
+/// leaf. Every step must succeed; a failure is a setup bug and halts loudly.
+fn setup_concurrent_model(hv: &mut Hypervisor, uart: &mut Pl011) {
+    // dom0 creates the two peer domains (neither gets the creation capability).
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: ISO_DOM_A,
+            may_create: false,
+        },
+        "create iso dom A",
+        uart,
+    );
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: ISO_DOM_B,
+            may_create: false,
+        },
+        "create iso dom B",
+        uart,
+    );
+
+    // Each domain: allocate its own root page table + one writable data frame, pin the root as an L1
+    // page table, and link the data frame as a writable leaf. Distinct Mfns per domain → distinct PA.
+    for (dom, root, data) in [
+        (ISO_DOM_A, F_A_ROOT, F_A_DATA),
+        (ISO_DOM_B, F_B_ROOT, F_B_DATA),
+    ] {
+        expect(
+            hv,
+            dom,
+            HvCall::P2mAllocate { mfn: root },
+            "iso alloc root",
+            uart,
+        );
+        expect(
+            hv,
+            dom,
+            HvCall::P2mAllocate { mfn: data },
+            "iso alloc data",
+            uart,
+        );
+        expect(
+            hv,
+            dom,
+            HvCall::P2mPin {
+                mfn: root,
+                level: PtLevel::L1,
+            },
+            "iso pin root",
+            uart,
+        );
+        expect(
+            hv,
+            dom,
+            HvCall::P2mLink {
+                parent: root,
+                slot: 0,
+                child: data,
+                writable: true,
+                leaf: true,
+            },
+            "iso link data",
+            uart,
+        );
+    }
+}
+
+/// **M5 Arc 2, phase 4 — the concurrent inter-domain isolation run-loop.** Build a fresh `Hypervisor`,
+/// drive the two-domain model, emit EACH domain's Stage-2 into its OWN set (distinct VMID), admit both
+/// domains' vCPUs, and dispatch dom A. Witness cross-domain pCPU exclusivity (dom B `SchedRun` onto dom
+/// A's pCPU → `PcpuBusy`), then seed both vCPU contexts (distinct sentinel + MINE/PEER IPAs) and enter
+/// dom A via [`__enter_guest_ctx`]. The two domains then time-slice on each yield, each in its own
+/// VMID-tagged Stage-2 (the switch installs the peer's VTTBR with no `tlbi`). Never returns.
+fn begin_concurrent_iso_phase4(uart: &mut Pl011) -> ! {
+    // A fresh Hypervisor: the scheduler phase mutated the previous one. SAFETY: single-CPU, one-time
+    // rebuild before any phase-4 guest runs; no handler is touching the cell.
+    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+
+    setup_concurrent_model(hv, uart);
+
+    // Emit each domain's Stage-2 into its OWN set → distinct VMID-tagged VTTBR. Both sets are disjoint
+    // storage, so both live simultaneously; the switch selects between them by VTTBR alone (no flush).
+    let vttbr_a = stage2::build_stage2_from_p2m(hv, ISO_DOM_A, STAGE2_SET_A);
+    let vttbr_b = stage2::build_stage2_from_p2m(hv, ISO_DOM_B, STAGE2_SET_B);
+
+    let now = sched_now();
+    // Admit each domain's single vCPU (vcpu 0 within its domain) and dispatch dom A onto the pCPU.
+    expect(
+        hv,
+        ISO_DOM_A,
+        HvCall::SchedAdmit { vcpu: 0 },
+        "iso admit A",
+        uart,
+    );
+    expect(
+        hv,
+        ISO_DOM_B,
+        HvCall::SchedAdmit { vcpu: 0 },
+        "iso admit B",
+        uart,
+    );
+    expect(
+        hv,
+        ISO_DOM_A,
+        HvCall::SchedRun {
+            vcpu: 0,
+            pcpu: PCPU0,
+            now,
+        },
+        "iso run A",
+        uart,
+    );
+
+    // ── cross-domain exclusivity witness ── dom B's SchedRun onto the pCPU dom A occupies → PcpuBusy.
+    // Now genuinely CROSS-domain (two distinct domains contend for one physical CPU), a stronger form
+    // of Arc 1's same-domain exclusivity probe.
+    match hv.dispatch(
+        ISO_DOM_B,
+        HvCall::SchedRun {
+            vcpu: 0,
+            pcpu: PCPU0,
+            now,
+        },
+    ) {
+        Err(HvError::Sched(SchedError::PcpuBusy)) => {
+            let _ = writeln!(
+                uart,
+                "baleen: cross-domain exclusivity OK: dom B SchedRun onto dom A's pCPU refused (PcpuBusy)"
+            );
+        }
+        other => {
+            let _ = writeln!(
+                uart,
+                "baleen: cross-domain exclusivity BROKEN: expected PcpuBusy, got {other:?}; halting"
+            );
+            crate::park();
+        }
+    }
+
+    // Enable dom A's Stage-2 for the first entry; load the shared program; set the initial EL1 state and
+    // read it back to seed both contexts. (Both domains run this ONE code image — see the scope note.)
+    let entry = load_guest4();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr_a);
+    init_guest_el1(ram_end);
+    let (sp_el1, _elr, _spsr, sctlr) = read_sysctx();
+
+    // Seed both vCPU contexts + metadata. Slot 0 = dom A, slot 1 = dom B. Each carries its own sentinel,
+    // its own frame's IPA (MINE, x23) and the PEER domain's frame IPA (x24, which its Stage-2 does NOT
+    // map → the cross-probe faults). The metadata carries each slot's domain + VMID-tagged VTTBR.
+    //
+    // Scope note (named, not swept): the two domains SHARE their read-execute code image (this one
+    // register-only program, identity-mapped in both sets) as test infrastructure — they run identical
+    // code and never write it (verified by inspection: only `str`/`ldr` to the seeded DATA IPAs, `hvc`,
+    // `mov`, `b`; no stack use, no self-modification). The isolation surface under test is the per-domain
+    // DATA frames (distinct Mfn → distinct PA → distinct per-VMID Stage-2 leaf). A production control
+    // domain would give each domain a private code image (the real-Linux capstone arc); deferred.
+    // SAFETY: single-CPU, before any phase-4 guest runs → exclusive access to the context + meta store.
+    unsafe {
+        let ctxs = &mut *VCPU_CTX.0.get();
+        let metas = &mut *VCPU_META.0.get();
+        let seeds = [
+            (
+                ISO_DOM_A,
+                vttbr_a,
+                SENTINEL_ISO_A,
+                stage2::frame_ipa(F_A_DATA),
+                stage2::frame_ipa(F_B_DATA),
+            ),
+            (
+                ISO_DOM_B,
+                vttbr_b,
+                SENTINEL_ISO_B,
+                stage2::frame_ipa(F_B_DATA),
+                stage2::frame_ipa(F_A_DATA),
+            ),
+        ];
+        for (i, (dom, vttbr, sentinel, mine, peer)) in seeds.into_iter().enumerate() {
+            let c = &mut ctxs[i];
+            *c = GuestContext::ZERO;
+            c.x[20] = sentinel; // my sentinel
+            c.x[22] = i as u64; // vCPU id (metal slot)
+            c.x[23] = mine; // MINE ipa (my own data frame)
+            c.x[24] = peer; // PEER ipa (the other domain's frame — my Stage-2 has no leaf here)
+            c.sp_el1 = sp_el1;
+            c.elr_el2 = entry;
+            c.spsr_el2 = SPSR_EL2_GUEST;
+            c.sctlr_el1 = sctlr;
+            metas[i] = VcpuMeta {
+                dom,
+                vcpu: 0, // vcpu 0 within its own domain
+                vttbr,
+            };
+        }
+    }
+
+    // Reset per-incarnation switch + fault state (design-lesson #16: a field a future incarnation reads
+    // must reset at the boundary). Phase 4 scores its negatives from FAULT_DFSC, so a stale phase-1/2
+    // fault on a frame index phase 4 also uses would manufacture a false witness.
+    CUR_VCPU.store(0, Ordering::Relaxed);
+    ISO_DONE.store(0, Ordering::Relaxed);
+    for f in 0..NFRAMES {
+        FAULT_DFSC[f].store(0, Ordering::Relaxed);
+        FAULT_WNR[f].store(false, Ordering::Relaxed);
+    }
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+
+    let _ = writeln!(
+        uart,
+        "baleen: concurrent-isolation phase — two domains (VMID 1/2) time-slice, each in its own Stage-2 (no tlbi on switch)"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // SAFETY: VCPU_CTX[0] is a valid, seeded GuestContext for dom A; exc_stack_top is the EL2 stack.
+    unsafe { __enter_guest_ctx(&(*VCPU_CTX.0.get())[0], exc_stack_top) }
+}
+
+/// **M5 Arc 2, phase 4 terminal.** Assert the concurrent inter-domain isolation matrix: (1) no
+/// cross-corruption — each domain read its OWN sentinel back after the peer ran, confirmed by the HV
+/// reading each frame back through `GuestMemory`; (2) isolation — each domain FAULTED (translation, a
+/// read) probing the IPA the OTHER domain's frame lives at (its VMID-tagged Stage-2 has no leaf there).
+/// The fault frame index is the discriminator (a fault at dom B's frame = dom A's cross-probe, and vice
+/// versa). Under `--features selftest` chains the Arc-2 deliberate-fault self-test (the boot's last act).
+fn finish_concurrent_iso_test(uart: &mut Pl011) -> ! {
+    // ── no cross-corruption (positive) ── each domain kept its own sentinel; the HV confirms via the
+    // fence (distinct host PA, so the peer's run could not have touched it).
+    let a_rb = ISO_READBACK[0].load(Ordering::Relaxed);
+    let b_rb = ISO_READBACK[1].load(Ordering::Relaxed);
+    let a_mem = read_frame(F_A_DATA);
+    let b_mem = read_frame(F_B_DATA);
+    let no_corruption = a_rb == SENTINEL_ISO_A
+        && b_rb == SENTINEL_ISO_B
+        && a_mem == SENTINEL_ISO_A
+        && b_mem == SENTINEL_ISO_B;
+    if no_corruption {
+        let _ = writeln!(
+            uart,
+            "baleen: concurrent no-corruption OK: each domain kept its own frame after the peer ran \
+             (A=0x{a_mem:x}, B=0x{b_mem:x})"
+        );
+    }
+
+    // ── isolation (negative) ── each domain faulted probing the other's frame IPA. FAULT_DFSC is
+    // indexed by the faulting frame: dom A probed dom B's frame (F_B_DATA); dom B probed dom A's
+    // (F_A_DATA). A cross-probe is a READ, so WnR must be false; the fault class must be translation
+    // (no leaf), not permission — pinned per design-lesson #28d.
+    let a_probe_dfsc = FAULT_DFSC[F_B_DATA as usize].load(Ordering::Relaxed);
+    let b_probe_dfsc = FAULT_DFSC[F_A_DATA as usize].load(Ordering::Relaxed);
+    let a_denied =
+        is_translation(a_probe_dfsc) && !FAULT_WNR[F_B_DATA as usize].load(Ordering::Relaxed);
+    let b_denied =
+        is_translation(b_probe_dfsc) && !FAULT_WNR[F_A_DATA as usize].load(Ordering::Relaxed);
+    if a_denied {
+        let _ = writeln!(
+            uart,
+            "baleen: concurrent isolation OK: dom A probing dom B's frame -> translation fault \
+             (DFSC=0x{a_probe_dfsc:02x}) at IPA=0x{:08x}",
+            stage2::frame_ipa(F_B_DATA)
+        );
+    }
+    if b_denied {
+        let _ = writeln!(
+            uart,
+            "baleen: concurrent isolation OK: dom B probing dom A's frame -> translation fault \
+             (DFSC=0x{b_probe_dfsc:02x}) at IPA=0x{:08x}",
+            stage2::frame_ipa(F_A_DATA)
+        );
+    }
+
+    let iso_ok = no_corruption && a_denied && b_denied;
+    if iso_ok {
+        // Printed ONLY when the whole matrix holds: two domains time-sliced in distinct VMID-tagged
+        // Stage-2 with no flush between them, each reached its own memory and was faulted on the peer's.
+        let _ = writeln!(
+            uart,
+            "baleen: CONCURRENT ISOLATION TEST PASSED — two domains (VMID 1/2) time-sliced in distinct \
+             Stage-2, each faulted on the peer's memory, no cross-corruption, no tlbi on switch"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: CONCURRENT ISOLATION TEST FAILED (no_corruption={no_corruption} a_denied={a_denied} \
+             b_denied={b_denied} a_rb=0x{a_rb:x} b_rb=0x{b_rb:x} a_dfsc=0x{a_probe_dfsc:02x} b_dfsc=0x{b_probe_dfsc:02x})"
+        );
+    }
+
     #[cfg(feature = "selftest")]
     {
         // Chain the Arc-2 fault-catch: a deliberate BRK at EL2 (SPSel=1) vectors to slot 4, which the
         // diagnostic handler catches and decodes (EC=0x3c) — keeps that witness alive in the same boot.
+        // Moved here (from the scheduler terminal) so it stays the boot's LAST act.
         let _ = writeln!(uart, "baleen: exception self-test — executing BRK #0");
         // SAFETY: `BRK` raises a synchronous exception taken to EL2; the installed handler reports+halts.
         unsafe { asm!("brk #0") };

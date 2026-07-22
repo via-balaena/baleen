@@ -162,7 +162,12 @@ boot_and_check "default" "" \
     "LIFECYCLE ISOLATION TEST PASSED" \
     "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
     "scheduler affinity OK: SchedRun onto a non-affine (free) pCPU refused (NotAffine)" \
-    "SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved"
+    "SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved" \
+    "cross-domain exclusivity OK: dom B SchedRun onto dom A's pCPU refused (PcpuBusy)" \
+    "concurrent no-corruption OK: each domain kept its own frame after the peer ran" \
+    "concurrent isolation OK: dom A probing dom B's frame -> translation fault" \
+    "concurrent isolation OK: dom B probing dom A's frame -> translation fault" \
+    "CONCURRENT ISOLATION TEST PASSED — two domains (VMID 1/2) time-sliced in distinct Stage-2, each faulted on the peer's memory, no cross-corruption, no tlbi on switch"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -196,6 +201,11 @@ boot_and_check "selftest" "--features selftest" \
     "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
     "scheduler affinity OK: SchedRun onto a non-affine (free) pCPU refused (NotAffine)" \
     "SCHEDULER TEST PASSED — two vCPUs time-sliced, each context preserved" \
+    "cross-domain exclusivity OK: dom B SchedRun onto dom A's pCPU refused (PcpuBusy)" \
+    "concurrent no-corruption OK: each domain kept its own frame after the peer ran" \
+    "concurrent isolation OK: dom A probing dom B's frame -> translation fault" \
+    "concurrent isolation OK: dom B probing dom A's frame -> translation fault" \
+    "CONCURRENT ISOLATION TEST PASSED — two domains (VMID 1/2) time-sliced in distinct Stage-2, each faulted on the peer's memory, no cross-corruption, no tlbi on switch" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
