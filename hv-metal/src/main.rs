@@ -37,6 +37,7 @@
 mod blk;
 mod el2;
 mod exceptions;
+mod gic;
 mod guest;
 mod heap;
 mod pl011;

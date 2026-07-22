@@ -103,6 +103,7 @@ use hv_core::{HvCall, HvError, HvOutcome, Hypercall, Hypervisor, RawHypercall};
 
 use hv_hal::GuestMemory;
 
+use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, GuestMem};
 
@@ -346,6 +347,28 @@ const NR_BLK_NEGOTIATED: u64 = 0xe1;
 const NR_BLK_READ_REPORT: u64 = 0xe2;
 /// The block phase's terminal report — the backend asserts the matrix and finishes (boot's last act).
 const NR_BLK_FINAL: u64 = 0xe3;
+
+// ─── M5 Arc 5a: vGIC interrupt injection ────────────────────────────────────────────────────────────
+//
+// A synthetic guest enables the GICv3 CPU interface, signals the hypervisor to inject a virtual
+// interrupt (via the list registers, see `crate::gic`), then acknowledges it through `ICC_IAR1_EL1` and
+// reports the INTID. Proves the vGIC injection path end to end before any of it drives real Linux.
+
+/// The domain running the vGIC test guest (a fresh `Hypervisor` for this phase).
+const GIC_DOM: DomId = 1;
+/// The guest's page-table root (the only frame it needs — it touches no guest data memory).
+const F_GIC_ROOT: Mfn = 1;
+/// The virtual INTID the hypervisor injects and the guest must acknowledge (an arbitrary SPI).
+const GIC_TEST_INTID: u32 = 42;
+
+/// The guest signals it has enabled its CPU interface and is ready for an injection (the hypervisor
+/// injects [`GIC_TEST_INTID`] while servicing this HVC). A checkpoint.
+const NR_GIC_READY: u64 = 0xd0;
+/// The guest reports the INTID it acknowledged via `ICC_IAR1_EL1` (`x1`); the hypervisor asserts it
+/// equals the injected INTID. A checkpoint.
+const NR_GIC_REPORT: u64 = 0xd1;
+/// The vGIC phase's terminal report.
+const NR_GIC_FINAL: u64 = 0xd2;
 
 // ---------------------------------------------------------------------------------------------
 // The guest program.
@@ -971,6 +994,48 @@ __guest_blk_write_tpl_end:
     NR_BLK_FINAL = const NR_BLK_FINAL,
 );
 
+// The vGIC test guest program (M5 Arc 5a). It enables the GICv3 CPU interface (system-register access,
+// priority mask, Group 1), signals the hypervisor to inject a virtual interrupt, then ACKNOWLEDGES the
+// pending interrupt via `ICC_IAR1_EL1` and reports the INTID. This first step POLLS the acknowledge
+// register with interrupts still masked (proving the injection reaches the CPU interface); async
+// vectored delivery is the next step. Straight-line / stack-free, position-independent as the others.
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest_gic_poll_tpl_start
+__guest_gic_poll_tpl_start:
+    // ── enable the GICv3 CPU system-register interface at EL1 ──
+    mrs     x0, ICC_SRE_EL1
+    orr     x0, x0, #1                     // SRE = 1 (use the system-register interface)
+    msr     ICC_SRE_EL1, x0
+    isb
+    mov     x0, #0xff
+    msr     ICC_PMR_EL1, x0                // priority mask = allow every priority
+    mov     x0, #1
+    msr     ICC_IGRPEN1_EL1, x0            // enable Group 1 interrupts
+    isb
+    // ── ready: the hypervisor injects GIC_TEST_INTID while servicing this HVC ──
+    mov     x0, #{NR_GIC_READY}
+    hvc     #0
+    // ── acknowledge the injected virtual interrupt and report its INTID ──
+    mrs     x1, ICC_IAR1_EL1               // → the pending INTID (1023 if none/spurious)
+    msr     ICC_EOIR1_EL1, x1              // end of interrupt (priority drop + deactivate)
+    mov     x0, #{NR_GIC_REPORT}
+    hvc     #0                             // report x1 = the acknowledged INTID
+    // ── terminal ──
+    mov     x0, #{NR_GIC_FINAL}
+    hvc     #0
+0:  wfe
+    b       0b
+    .global __guest_gic_poll_tpl_end
+__guest_gic_poll_tpl_end:
+    "#,
+    NR_GIC_READY = const NR_GIC_READY,
+    NR_GIC_REPORT = const NR_GIC_REPORT,
+    NR_GIC_FINAL = const NR_GIC_FINAL,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -1142,6 +1207,10 @@ static BLK_WRITE_ISOLATED_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 4: the backend REFUSED an un-granted descriptor in the chain (the grant regression negative).
 static BLK_UNGRANTED_REFUSED: AtomicBool = AtomicBool::new(false);
 
+/// M5 Arc 5a: the guest acknowledged the injected virtual interrupt with the correct INTID (the vGIC
+/// injection path reached the guest's CPU interface).
+static GIC_INJECT_OK: AtomicBool = AtomicBool::new(false);
+
 extern "C" {
     static __guest_tpl_start: u8;
     static __guest_tpl_end: u8;
@@ -1157,6 +1226,8 @@ extern "C" {
     static __guest_blk_read_tpl_end: u8;
     static __guest_blk_write_tpl_start: u8;
     static __guest_blk_write_tpl_end: u8;
+    static __guest_gic_poll_tpl_start: u8;
+    static __guest_gic_poll_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -1457,6 +1528,21 @@ fn load_guest_blk_read() -> u64 {
 fn load_guest_blk_write() -> u64 {
     let tpl_start = core::ptr::addr_of!(__guest_blk_write_tpl_start) as usize;
     let tpl_end = core::ptr::addr_of!(__guest_blk_write_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
+/// Copy the **vGIC test** guest template into guest RAM and return its `entry` guest-physical address
+/// (M5 Arc 5a).
+fn load_guest_gic_poll() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_gic_poll_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_gic_poll_tpl_end) as usize;
     let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
     let len = tpl_end - tpl_start;
     // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
@@ -1835,7 +1921,10 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_BLK_ID => virtio_blk_report_id(frame, uart), // M5 Arc 4: assert the virtio-blk identity
         NR_BLK_NEGOTIATED => virtio_blk_report_negotiated(frame, uart), // assert VERSION_1 + FEATURES_OK
         NR_BLK_READ_REPORT => virtio_blk_report_read(frame, uart), // assert the read round-tripped
-        NR_BLK_FINAL => finish_virtio_blk_test(uart),              // -> ! (block phase terminal)
+        NR_BLK_FINAL => finish_virtio_blk_test(uart), // -> ! (block phase → vGIC phase)
+        NR_GIC_READY => gic::inject(GIC_TEST_INTID),  // M5 Arc 5a: inject a virtual interrupt now
+        NR_GIC_REPORT => gic_report(frame, uart), // assert the guest acknowledged the right INTID
+        NR_GIC_FINAL => finish_gic_test(uart),    // -> ! (vGIC phase terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -3739,6 +3828,9 @@ fn finish_virtio_blk_test(uart: &mut Pl011) -> ! {
             uart,
             "baleen: VIRTIO-BLK TEST PASSED — writes hit the CoW overlay, template immutable, peer overlay isolated, un-granted access refused"
         );
+        // M5 Arc 5a: with the device arcs proven, drive the vGIC phase — give a guest interrupts (the
+        // first step toward a real Linux guest). Never returns (it ends the boot at the vGIC terminal).
+        begin_gic_phase(uart);
     } else {
         let _ = writeln!(
             uart,
@@ -3747,6 +3839,104 @@ fn finish_virtio_blk_test(uart: &mut Pl011) -> ! {
     }
     selftest_brk(uart);
     crate::park();
+}
+
+/// **M5 Arc 5a** — the guest reported the INTID it acknowledged (`x1`); assert it equals the injected
+/// [`GIC_TEST_INTID`]. A checkpoint (resumes the guest).
+fn gic_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let intid = frame.x[1] as u32;
+    let ok = intid == GIC_TEST_INTID;
+    GIC_INJECT_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC injection OK: guest acknowledged the injected virtual interrupt (INTID {intid}) via ICC_IAR1_EL1"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC injection MISMATCH: guest acknowledged INTID {intid} (expected {GIC_TEST_INTID})"
+        );
+    }
+}
+
+/// **M5 Arc 5a, vGIC phase terminal.** Assert the injection round-trip and finish the boot.
+fn finish_gic_test(uart: &mut Pl011) -> ! {
+    if GIC_INJECT_OK.load(Ordering::Relaxed) {
+        let _ = writeln!(
+            uart,
+            "baleen: VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: VGIC TEST FAILED — injected interrupt not acknowledged"
+        );
+    }
+    selftest_brk(uart);
+    crate::park();
+}
+
+/// **M5 Arc 5a, vGIC phase — give a guest interrupts.** Build a fresh `Hypervisor`, create a minimal
+/// guest (it touches no guest data memory — only its own code + the GIC system registers), emit its
+/// Stage-2, enable the hardware virtual CPU interface at EL2, and enter. The guest enables its CPU
+/// interface and signals ready; the hypervisor injects a virtual interrupt (`NR_GIC_READY` →
+/// [`gic::inject`]); the guest acknowledges it and reports the INTID. Never returns.
+fn begin_gic_phase(uart: &mut Pl011) -> ! {
+    // SAFETY: single-CPU, one-time rebuild before the vGIC guest runs.
+    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+
+    // The guest needs only a pinned page-table root — its code is the identity RO+X image block; it
+    // touches no guest data frames, so there are no leaves to grant.
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: GIC_DOM,
+            may_create: false,
+        },
+        "create vGIC guest",
+        uart,
+    );
+    expect(
+        hv,
+        GIC_DOM,
+        HvCall::P2mAllocate { mfn: F_GIC_ROOT },
+        "vGIC alloc root",
+        uart,
+    );
+    expect(
+        hv,
+        GIC_DOM,
+        HvCall::P2mPin {
+            mfn: F_GIC_ROOT,
+            level: PtLevel::L1,
+        },
+        "vGIC pin root",
+        uart,
+    );
+
+    let vttbr = stage2::build_stage2_from_p2m(hv, GIC_DOM, STAGE2_SET_SINGLE);
+    let entry = load_guest_gic_poll();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    gic::enable_el2(); // ICC_SRE_EL2 + ICH_HCR_EL2.En + HCR_EL2.IMO — after enable_stage2
+    init_guest_el1(ram_end);
+    {
+        use hv_hal::VcpuOps;
+        ArmVcpu.set_entry(entry);
+    }
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    let _ = writeln!(
+        uart,
+        "baleen: vGIC phase — a guest enables its GICv3 CPU interface and receives an injected virtual interrupt"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    enter_guest(exc_stack_top);
 }
 
 /// **M5 Arc 4, block phase 6 — the virtio-blk run-loop (tenant 0).** Build a fresh `Hypervisor`, seed
