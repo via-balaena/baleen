@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # `hv-metal` — the bare-metal layer (M4 Arc 4)
+//! # `hv-metal` — the bare-metal layer (M5 Arc 0)
 //!
 //! The southbound metal layer beneath the proven `hv-core` brain. Arc 0 stood up the dev + CI
 //! boot-test loop; Arc 1 turned the raw UART poke into a *proper* [`pl011`] console; Arc 2 confirmed
@@ -206,10 +206,12 @@ pub extern "C" fn rust_main() -> ! {
     #[cfg(feature = "selftest")]
     selftest_hvcall_accounting(&mut uart);
 
-    // (7) The Arc-4 headline: enter a real EL1 guest that issues `HVC`, trap it to EL2, decode +
-    //     route through the ACTUAL Hypervisor::dispatch, hand the result back, and let the guest
-    //     observe it — the first time the proof touches a guest. Terminal: the guest-report handler
-    //     parks (and, under `selftest`, chains the Arc-2 fault-catch first), so this never returns.
+    // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven
+    //     `p2m`, run the Arc-5 authorize/deny isolation matrix (the proof touches reality), then the
+    //     M5 Arc 0 LIFECYCLE phase — destroy the guest and reborn a fresh domain in the same slot,
+    //     witnessing that it inherits nothing (the confused-deputy defense, live). Terminal: the
+    //     reborn guest's report handler parks (and, under `selftest`, chains the Arc-2 fault-catch
+    //     first), so this never returns.
     guest::run(&mut uart);
 }
 
