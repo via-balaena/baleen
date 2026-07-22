@@ -1,7 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # The negative-isolation test — the proof touches reality (M4 Arc 5)
+//! # The negative-isolation test + the lifecycle, live (M4 Arc 5 → M5 Arc 0)
+//!
+//! **M5 Arc 0 — the lifecycle, live.** After the Arc-5 matrix (below) passes, [`run`]'s terminal
+//! handler does not park: it drives the proven *lifecycle* through the real [`Hypervisor::dispatch`]
+//! ([`begin_lifecycle_phase2`]). dom0 **destroys** the guest — the proven teardown releases its
+//! frames and sweeps the peer's grant to it ([`hv_core`]'s `revoke_grants_to`, design-lesson #15) —
+//! then **reborns** a fresh domain in the *same slot*. The reborn `G′` gets a fresh isolated address
+//! space (positive) but provably inherits **nothing**: it cannot even *link* the frame the peer had
+//! granted to the dead `G` (refused at the p2m↔grant seam, no grant), so Stage-2(G′) has no
+//! descriptor for it and `G′`'s probe of it is **faulted by the hardware** — the confused-deputy
+//! defense (`DeadDomainNotClean` + `DeadDomainReferenced` + ID-reuse), on the metal. This adds the
+//! genuinely-new metal capability the milestone needs: a **re-enterable run loop + `DomainDestroy` +
+//! Stage-2 re-emit for a reborn slot**. Honest scope: the proof guarantees no inherited *authority*;
+//! frame-content scrubbing on reuse is a metal allocator obligation, named-and-deferred (see
+//! `docs/ARC-0-M5-LIFECYCLE.md`; `G′` here overwrites its frame before reading, so its own content is
+//! fresh regardless).
 //!
 //! Arc 4 stood up trap-and-service: a guest issues `HVC`, traps to EL2, and the proven brain serves
 //! it. It ran behind a *single 2 MiB identity block* — **no isolation content**. Arc 5 (see
@@ -132,6 +147,26 @@ const EXPECTED_BALANCE: u64 = 70;
 /// Sentinel returned to the guest in `x0` when a routed hypercall is rejected.
 const HVCALL_REJECTED: u64 = u64::MAX;
 
+// ─── M5 Arc 0: the lifecycle matrix (a second incarnation in the same slot) ───────────────────
+//
+// After the Arc-5 matrix passes, dom0 DESTROYS the guest (`DomainDestroy` — the proven teardown,
+// including `revoke_grants_to` clearing the peer's grant to it) and REBORNS a fresh domain in the
+// SAME slot (`DomainCreate`). The reborn `G′` gets a fresh, isolated address space (positive) but
+// provably inherits NOTHING from the dead `G`: the peer's grant was swept, so `G′` cannot even
+// *link* the ex-granted frame (refused at the p2m↔grant seam), and Stage-2(G′) therefore has no
+// descriptor for it — so a `G′` probe of that frame is FAULTED by the hardware. The confused-deputy
+// defense (design-lesson #15's inbound-reference sweep), live on the metal.
+
+/// Phase-2 positive report: the value `G′` read back from its own fresh writable frame.
+const NR_POS_RW2: u64 = 0xf3;
+/// Phase-2 terminal report — the mirror of [`NR_FINAL`] for the reborn guest.
+const NR_FINAL2: u64 = 0xfe;
+/// Sentinel `G′` writes to (then reads back from) its fresh writable frame. Distinct from every
+/// phase-1 sentinel and from any hypercall input, so a read-back proves `G′`'s own store landed —
+/// and, written-before-read, it is fresh content (the reused machine frame's stale bytes are
+/// overwritten; see the audit's content-scrub scope note).
+const SENTINEL_RW2: u64 = 0xCAFE;
+
 // ---------------------------------------------------------------------------------------------
 // The guest program.
 //
@@ -232,6 +267,54 @@ __guest_tpl_end:
     SENTINEL_BAD = const SENTINEL_BAD,
 );
 
+// ---------------------------------------------------------------------------------------------
+// The phase-2 (reborn `G′`) guest program (M5 Arc 0).
+//
+// Same position-independent style as phase 1, but a *different* configuration exercises it: `G′`
+// owns a fresh writable frame (`F_RW`, re-allocated after the dead `G` released it) and holds NO
+// grant to the peer's `F_FGRANT` (it was revoked at teardown). So:
+//   1. positive: write a fresh sentinel to its own writable frame and read it back — must SUCCEED.
+//   2. the ID-reuse negative: read the frame the peer had granted to the *dead* `G` — must FAULT
+//      (translation), because `G′` inherited no grant and Stage-2(G′) has no descriptor for it.
+//   3. terminal report.
+// ---------------------------------------------------------------------------------------------
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 4
+    .global __guest2_tpl_start
+__guest2_tpl_start:
+    // ── positive: own (fresh) writable frame — write a sentinel, read it back ──
+    movz    x2, #{DATA_HI}, lsl #16
+    movk    x2, #{OFF_RW}
+    movz    x3, #{SENTINEL_RW2}
+    str     x3, [x2]
+    ldr     x4, [x2]                        // x4 = readback (expect SENTINEL_RW2)
+    mov     x0, #{NR_POS_RW2}
+    mov     x1, x4
+    hvc     #0
+
+    // ── ID-reuse negative: read the peer frame granted to the DEAD G -> translation fault ──
+    movz    x2, #{DATA_HI}, lsl #16
+    movk    x2, #{OFF_FGRANT}
+    ldr     x5, [x2]                        // faults to EL2; handler records + resumes past
+
+    // ── terminal report ──
+    mov     x0, #{NR_FINAL2}
+    hvc     #0
+0:  wfe                                     // the reborn final report handler is terminal
+    b       0b
+    .global __guest2_tpl_end
+__guest2_tpl_end:
+    "#,
+    NR_POS_RW2 = const NR_POS_RW2,
+    NR_FINAL2 = const NR_FINAL2,
+    DATA_HI = const DATA_IPA_HI,
+    OFF_RW = const OFF_RW,
+    OFF_FGRANT = const OFF_FGRANT,
+    SENTINEL_RW2 = const SENTINEL_RW2,
+);
+
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -283,9 +366,15 @@ static POS_RO: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The credit balance the guest echoed, reported at [`NR_CREDIT_ECHO`].
 static CREDIT_ECHO: AtomicU64 = AtomicU64::new(u64::MAX);
 
+/// The value the reborn `G′` read back from its fresh writable frame, reported at [`NR_POS_RW2`]
+/// (M5 Arc 0, phase 2).
+static POS_RW2: AtomicU64 = AtomicU64::new(u64::MAX);
+
 extern "C" {
     static __guest_tpl_start: u8;
     static __guest_tpl_end: u8;
+    static __guest2_tpl_start: u8;
+    static __guest2_tpl_end: u8;
     static __exc_stack_top: u8;
     static __guest_ram_start: u8;
     static __guest_ram_end: u8;
@@ -386,6 +475,21 @@ fn load_guest() -> (u64, u64) {
         core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
     }
     (ram_start as u64, ram_end as u64)
+}
+
+/// Copy the **phase-2** (reborn `G′`) guest template over the same guest RAM window (the dead `G`'s
+/// code is gone) and return its `entry` guest-physical address (M5 Arc 0).
+fn load_guest2() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest2_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest2_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger
+    // than the template, non-overlapping.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
 }
 
 /// Program Stage-2 and enable it: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM`, then invalidate
@@ -606,7 +710,9 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         }
         NR_POS_RW => POS_RW.store(arg0, Ordering::Relaxed),
         NR_POS_RO => POS_RO.store(arg0, Ordering::Relaxed),
-        NR_FINAL => finish_isolation_test(uart), // -> !
+        NR_FINAL => finish_isolation_test(uart), // -> ! (phase 1 terminal → drives phase 2)
+        NR_POS_RW2 => POS_RW2.store(arg0, Ordering::Relaxed),
+        NR_FINAL2 => finish_lifecycle_test(uart), // -> ! (phase 2 terminal)
         other => {
             let _ = writeln!(uart, "baleen: guest HVC unknown nr={other}; halting");
             crate::park();
@@ -759,12 +865,228 @@ fn finish_isolation_test(uart: &mut Pl011) -> ! {
     }
 
     #[cfg(feature = "selftest")]
-    {
-        if positive_ok && negative_ok {
-            let _ = writeln!(uart, "baleen: selftest: isolation matrix OK");
-        } else {
-            let _ = writeln!(uart, "baleen: selftest: isolation matrix FAIL");
+    if positive_ok && negative_ok {
+        let _ = writeln!(uart, "baleen: selftest: isolation matrix OK");
+    } else {
+        let _ = writeln!(uart, "baleen: selftest: isolation matrix FAIL");
+    }
+
+    // M5 Arc 0: with the Arc-5 baseline confirmed, drive the lifecycle — destroy the guest and reborn
+    // a fresh domain in the same slot, then witness that it inherits nothing (never returns). If the
+    // baseline itself failed, do NOT proceed on a broken foundation: park after reporting.
+    if positive_ok && negative_ok {
+        begin_lifecycle_phase2(uart);
+    }
+    crate::park();
+}
+
+/// **M5 Arc 0, phase 2 — the lifecycle, live.** Driven entirely through the real
+/// [`Hypervisor::dispatch`] on the guest `Hypervisor` built in [`run`]:
+///
+/// 1. **Destroy** the guest (`DomainDestroy`) — the proven teardown releases its frames and, the
+///    crux, `revoke_grants_to` clears the peer's grant to it (design-lesson #15's inbound sweep).
+/// 2. **Clean-shell witness (model):** the slot is now `Dead` and owns none of its former frames.
+/// 3. **Reborn** a fresh domain in the *same slot* (`DomainCreate`); it allocates a fresh root +
+///    writable frame, pins, and links its own frame — a fresh, isolated address space.
+/// 4. **ID-reuse witness (seam):** the reborn `G′` *cannot even link* the frame the peer had granted
+///    to the dead `G` — `p2m_link` refuses it (no grant), so Stage-2(G′) has no descriptor for it.
+/// 5. Re-emit Stage-2(G′) and re-enter the phase-2 guest, whose probe of that ex-granted frame is
+///    then FAULTED by the hardware — the confused-deputy defense, live.
+///
+/// Never returns: it re-enters `G′`, whose terminal report ([`finish_lifecycle_test`]) parks.
+fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
+    // SAFETY: single-CPU, non-nested; the global `Hypervisor` was built in `run` and this is the only
+    // (straight-line) accessor now running — the guest is trapped at EL2, nothing else touches it.
+    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
+        Some(hv) => hv,
+        None => {
+            let _ = writeln!(uart, "baleen: lifecycle: no Hypervisor built; halting");
+            crate::park();
         }
+    };
+
+    // (1) Destroy the guest. `now` is a real generic-timer tick (the teardown uses it for runtime
+    // accounting; any monotonic value is sound for the isolation witness).
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainDestroy {
+            target: GUEST_DOM,
+            now,
+        },
+        "destroy guest",
+        uart,
+    );
+
+    // (2) Clean-shell witness: the dead slot is Dead and owns none of its former frames. Printed ONLY
+    // when it actually holds — a witness produced by reading the proven model back, not a bare line.
+    let dead = !hv.is_live(GUEST_DOM);
+    let unowned = hv.p2m().owner_of(F_ROOT) != Some(GUEST_DOM)
+        && hv.p2m().owner_of(F_RW) != Some(GUEST_DOM)
+        && hv.p2m().owner_of(F_RO) != Some(GUEST_DOM);
+    if dead && unowned {
+        let _ = writeln!(
+            uart,
+            "baleen: lifecycle: guest destroyed — dead slot is a clean shell (Dead, owns no frames)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: lifecycle: teardown INCOMPLETE (dead={dead} unowned={unowned}); halting"
+        );
+        crate::park();
+    }
+
+    // (3) Reborn a fresh domain in the SAME slot, and give it a fresh isolated address space.
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: GUEST_DOM,
+            may_create: false,
+        },
+        "reborn guest",
+        uart,
+    );
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mAllocate { mfn: F_ROOT },
+        "reborn alloc root",
+        uart,
+    );
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mAllocate { mfn: F_RW },
+        "reborn alloc rw",
+        uart,
+    );
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mPin {
+            mfn: F_ROOT,
+            level: PtLevel::L1,
+        },
+        "reborn pin root",
+        uart,
+    );
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mLink {
+            parent: F_ROOT,
+            slot: 0,
+            child: F_RW,
+            writable: true,
+            leaf: true,
+        },
+        "reborn link rw",
+        uart,
+    );
+
+    // (4) The ID-reuse witness at the seam: `G′` must NOT be able to link the frame the peer granted
+    // to the DEAD `G` — the grant was swept at teardown, so `p2m_link` refuses it. Printed ONLY when
+    // the link is actually refused; a *success* here would be the confused-deputy bug, so halt loudly.
+    match hv.dispatch(
+        GUEST_DOM,
+        HvCall::P2mLink {
+            parent: F_ROOT,
+            slot: 1,
+            child: F_FGRANT,
+            writable: true,
+            leaf: true,
+        },
+    ) {
+        Err(_) => {
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle: reborn slot could NOT link the destroyed grant \
+                 (ID-reuse: no inherited authority)"
+            );
+        }
+        Ok(_) => {
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle: BUG — reborn slot linked the peer's revoked grant (confused deputy); halting"
+            );
+            crate::park();
+        }
+    }
+
+    // (5) Re-emit Stage-2 from `G′`'s p2m (maps its fresh writable frame; the ex-granted frame has no
+    // leaf edge → no descriptor → a hole), and re-enter the phase-2 guest. The re-entry guard is
+    // cleared here because we diverge into `eret` rather than returning through the trampoline.
+    let vttbr = stage2::build_stage2_from_p2m(hv, GUEST_DOM);
+    let entry = load_guest2();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    init_guest_el1(ram_end);
+    {
+        use hv_hal::VcpuOps;
+        ArmVcpu.set_entry(entry);
+    }
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    let _ = writeln!(
+        uart,
+        "baleen: re-entering reborn EL1 guest (entry=0x{entry:016x}, fresh Stage-2) — lifecycle isolation test"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    enter_guest(exc_stack_top);
+}
+
+/// **M5 Arc 0, phase 2 terminal.** Assert the lifecycle matrix: the reborn `G′` reached its own
+/// fresh frame (positive) and was FAULTED probing the frame its dead predecessor was granted (the
+/// ID-reuse negative). Prints the headline only when both hold. Under `--features selftest` it chains
+/// the Arc-2 deliberate-fault self-test (moved here from phase 1 so it stays the boot's last act).
+fn finish_lifecycle_test(uart: &mut Pl011) -> ! {
+    // ── positive: `G′` reached its own fresh writable frame ──
+    let rw2_readback = POS_RW2.load(Ordering::Relaxed);
+    let rw2_mem = read_frame(F_RW); // the HV reads it back through the fence
+    let pos_ok = rw2_readback == SENTINEL_RW2 && rw2_mem == SENTINEL_RW2;
+    if pos_ok {
+        let _ = writeln!(
+            uart,
+            "baleen: lifecycle positive OK: reborn guest reached its own fresh frame (rw=0x{rw2_mem:x})"
+        );
+    }
+
+    // ── the ID-reuse negative: `G′` faulted probing the ex-granted frame ──
+    let fgrant_dfsc = FAULT_DFSC[F_FGRANT as usize].load(Ordering::Relaxed);
+    let inherit_denied = is_translation(fgrant_dfsc);
+    // The fresh frame must NOT have faulted for `G′`.
+    let rw2_faulted = FAULT_DFSC[F_RW as usize].load(Ordering::Relaxed) != 0;
+    if inherit_denied {
+        let _ = writeln!(
+            uart,
+            "baleen: lifecycle negative OK: reborn probe of the destroyed grant -> translation fault \
+             (DFSC=0x{fgrant_dfsc:02x}) at IPA=0x{:08x} (no inherited reference reaches the peer frame)",
+            stage2::frame_ipa(F_FGRANT)
+        );
+    }
+
+    if pos_ok && inherit_denied && !rw2_faulted {
+        // Printed ONLY when the whole lifecycle matrix holds: a reborn slot gets a fresh isolated
+        // address space and inherits NO authority from the domain that died in it.
+        let _ = writeln!(
+            uart,
+            "baleen: LIFECYCLE ISOLATION TEST PASSED — a reborn slot inherits nothing (destroyed grant not re-reachable)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: LIFECYCLE ISOLATION TEST FAILED (pos_ok={pos_ok} inherit_denied={inherit_denied} \
+             rw2_faulted={rw2_faulted} fgrant_dfsc=0x{fgrant_dfsc:02x})"
+        );
+    }
+
+    #[cfg(feature = "selftest")]
+    {
         // Chain the Arc-2 fault-catch: a deliberate BRK at EL2 (SPSel=1) vectors to slot 4, which the
         // diagnostic handler catches and decodes (EC=0x3c) — keeps that witness alive in the same boot.
         let _ = writeln!(uart, "baleen: exception self-test — executing BRK #0");

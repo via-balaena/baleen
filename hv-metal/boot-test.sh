@@ -6,16 +6,22 @@
 # `virt` machine at EL2, and assert the expected serial markers appear. This is the metal side of
 # the "diamond -> CI-green -> merge" loop; CI runs it (see .github/workflows/ci.yml) and so can you.
 #
-# The boot runs TWICE (through M4 Arc 5):
+# The boot runs TWICE (through M5 Arc 0):
 #   - the DEFAULT build: at EL2, vectors installed, HCR_EL2.RW=1, the generic-timer TimeSource live
 #     and monotonic, a synthetic HvCall dispatched directly into the linked hv-core brain (Arc 3),
 #     the Arc-4 trap-and-service round trip (nr=0 arg=100 -> 100, nr=1 arg=30 -> 70, guest echoes 70),
-#     and then the Arc-5 headline — the NEGATIVE-ISOLATION TEST: the guest runs behind REAL AArch64
-#     Stage-2 tables generated from the proven p2m, its authorized accesses SUCCEED (rw=0xbeef,
-#     ro=0x5eed seeded by the HV through GuestMemory, fgrant=0xf00d) and its unauthorized accesses are
-#     FAULTED by the hardware — a write to a read-only frame -> permission fault, a read of an
-#     un-granted peer frame and of an unmapped IPA -> translation faults — each decoded (EC=0x24) and
-#     confirmed against the model. The matrix PASSED marker prints only when every dimension holds;
+#     then the Arc-5 NEGATIVE-ISOLATION TEST: the guest runs behind REAL AArch64 Stage-2 tables
+#     generated from the proven p2m, its authorized accesses SUCCEED (rw=0xbeef, ro=0x5eed seeded by
+#     the HV through GuestMemory, fgrant=0xf00d) and its unauthorized accesses are FAULTED by the
+#     hardware — a write to a read-only frame -> permission fault, a read of an un-granted peer frame
+#     and of an unmapped IPA -> translation faults — each decoded (EC=0x24) and confirmed against the
+#     model. The matrix PASSED marker prints only when every dimension holds. THEN the M5 Arc 0
+#     LIFECYCLE phase: dom0 DESTROYS the guest (the proven teardown — the dead slot is Dead and owns
+#     no frames), REBORNS a fresh domain in the SAME slot, and witnesses that it inherits nothing —
+#     the reborn slot cannot even LINK the frame the peer had granted to the dead guest (the grant was
+#     swept), so its probe of that frame is FAULTED by the hardware (translation, DFSC=0x07). The
+#     LIFECYCLE PASSED marker prints only when the reborn guest reaches its own fresh frame AND is
+#     denied the inherited one — the confused-deputy defense (design-lesson #15), live on the metal;
 #   - the `--features selftest` build: additionally asserts the Arc-3 accounting witness
 #     (grant 100 / spend 30 -> balance 70), hard-asserts the isolation matrix, then — chained at the
 #     end of the final report — deliberately executes `BRK #0` so the installed exception vectors must
@@ -142,7 +148,12 @@ boot_and_check "default" "" \
     "isolation negative OK: foreign-ungranted read -> translation fault" \
     "isolation negative OK: unmapped read -> translation fault" \
     "isolation negative OK: own-page-table read -> translation fault" \
-    "NEGATIVE-ISOLATION TEST PASSED"
+    "NEGATIVE-ISOLATION TEST PASSED" \
+    "lifecycle: guest destroyed — dead slot is a clean shell" \
+    "lifecycle: reborn slot could NOT link the destroyed grant" \
+    "lifecycle positive OK: reborn guest reached its own fresh frame (rw=0xcafe)" \
+    "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
+    "LIFECYCLE ISOLATION TEST PASSED"
 
 # Self-test path: additionally, the HvCall accounting witness (printed ONLY when grant 100 / spend 30
 # both returned the exact expected balances — a witness produced by the dispatch itself), then the
@@ -168,6 +179,11 @@ boot_and_check "selftest" "--features selftest" \
     "isolation negative OK: own-page-table read -> translation fault" \
     "NEGATIVE-ISOLATION TEST PASSED" \
     "selftest: isolation matrix OK" \
+    "lifecycle: guest destroyed — dead slot is a clean shell" \
+    "lifecycle: reborn slot could NOT link the destroyed grant" \
+    "lifecycle positive OK: reborn guest reached its own fresh frame (rw=0xcafe)" \
+    "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
+    "LIFECYCLE ISOLATION TEST PASSED" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
 
