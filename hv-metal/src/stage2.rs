@@ -236,6 +236,18 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         frame_size: FRAME_SIZE,
     };
 
+    // Structural preconditions the encoder silently assumes: the guest-image and data regions must
+    // occupy DISTINCT `L1` entries (else one write clobbers the other and a whole region vanishes),
+    // and their windows must not overlap (else a domain's private data frames alias the SHARED,
+    // read-only code image). Both were argued from the address layout + linker script (Audit #2's
+    // composition finding); checked here, so a future layout change cannot reintroduce either
+    // silently. Cheap — a handful of comparisons, once per Stage-2 build.
+    if let Err(e) = layout.validate() {
+        let mut uart = crate::uart();
+        let _ = writeln!(uart, "baleen: Stage-2 layout invalid: {e:?}; halting");
+        crate::park();
+    }
+
     // (3) THE PUBLISH — the only `unsafe` left in Stage-2 emission: hand the encoder `&mut` views of
     //     the interior-mutable table storage. Everything about *what values* go in the tables is
     //     decided above, in safe code.
@@ -260,6 +272,45 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
                 l3_data: &mut *tables.l3_data.0.get(),
             },
         );
+    }
+
+    // (4) Under `selftest`, read the emitted tables BACK and assert they decode to exactly the leaf
+    //     map — the ENCODER's half of the refinement, witnessed on the real hardware tables on every
+    //     CI boot rather than only on unit-test fixtures. Also pins the shared guest-image block:
+    //     read-only (never a cross-domain write channel) and executable (the guest runs from it),
+    //     which until now rested on a comment. A witness produced BY the mechanism (design #24(f)).
+    #[cfg(feature = "selftest")]
+    {
+        // SAFETY: the same table storage, borrowed read-only this time; single-CPU and no walker
+        // observes it (see the publish block above), so these shared refs alias nothing live.
+        let verdict = unsafe {
+            hv_s2::arm64::verify_encoding(
+                &leaves,
+                &layout,
+                hv_s2::arm64::TablesRef {
+                    l1: &*tables.l1.0.get(),
+                    l2_code: &*tables.l2_code.0.get(),
+                    l2_data: &*tables.l2_data.0.get(),
+                    l3_data: &*tables.l3_data.0.get(),
+                },
+            )
+        };
+        let mut uart = crate::uart();
+        match verdict {
+            Ok(()) => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block RO+X)"
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: selftest: Stage-2 ENCODING VIOLATION: {e:?}; halting"
+                );
+                crate::park();
+            }
+        }
     }
 
     hv_s2::arm64::vttbr(layout.l1_pa, set_vmid(set))

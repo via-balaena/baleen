@@ -33,6 +33,55 @@
 //! crate is to make it a *checkable* — and then provable — property of a function. See
 //! `docs/AUDIT-2-P2M-STAGE2.md` for the argument this replaces, and the module docs below.
 //!
+//! ## What is verified, arrow by arrow — and what is NOT
+//!
+//! The metal's isolation rests on a chain, and the honest thing is to say how strong each link is
+//! *separately*, because a claim about the whole chain is only as good as its weakest arrow:
+//!
+//! ```text
+//!     p2m model  --(1)-->  leaf map  --(2)-->  descriptor words  --(3)-->  hardware
+//! ```
+//!
+//! 1. **model → leaf map** ([`leafmap`]). Checked by `hv-sim`'s enumerator at **every reachable
+//!    state** of its configs (828,325 states on the deep grant↔p2m sweep) and by `hv-fuzz` after
+//!    every dispatch, via [`check`]. The properties are stated there, including which of them is a
+//!    genuine theorem and which is only a consistency check. **Not yet proven ∀-N** — that is the
+//!    follow-on arc.
+//! 2. **leaf map → descriptor words** ([`arm64`]). [`arm64::verify_encoding`] reads the emitted
+//!    tables back and asserts they mean exactly the leaf map and *nothing else* (no spurious live
+//!    slot anywhere in any table); the metal runs it on the real tables under `--features selftest`
+//!    on every CI boot. The bit-level encoding itself is **proven** by Kani over all 2⁶⁴ output
+//!    addresses (`hv-verify::stage2_encoding`): round-trip, always-execute-never data leaves, no
+//!    RO→RW escalation, and the guest image always read-only + executable.
+//! 3. **descriptors → hardware** — QEMU/TCG, exercised by the boot-test's isolation matrix
+//!    (including the exact `DFSC=0x07` translation vs `0x0F` permission fault-class
+//!    discriminators). Faithful for CPU-initiated Stage-2 accesses; blind to timing, weak-memory
+//!    ordering, and DMA/SMMU (`docs/QEMU-AND-METAL.md`).
+//!
+//! ### Scope boundaries the claim does NOT cover (state these before proving anything)
+//!
+//! - **Interior-node sharing.** The model permits a domain to share a whole page-table *subtree*
+//!   (a foreign `L(k-1)` node). The emitter maps only **leaves of tables the domain owns**, so a
+//!   domain holding a legitimately shared subtree gets **no** mapping for the leaves beneath it.
+//!   That is an *under*-map: it fails **closed** (the guest faults where the model would allow),
+//!   never open. The refinement claim is therefore about **leaf-level frame reachability**, not
+//!   full model reachability — and any theorem must say so or it is simply false.
+//! - **Superpage size.** A model leaf pins exactly one `Mfn` (contiguity of a 2 MiB/1 GiB
+//!   superpage's sub-frames is abstracted out as an hv-metal concern), and the emitter maps it as
+//!   one 4 KiB page. Expanding a real superpage is unmodelled here.
+//! - **The guest-image block is infrastructure, not model-driven.** It is identity-mapped from the
+//!   linker window and is the **one mapping two domains hold in common** (M5 Arc 2 maps the same
+//!   host frames into both). [`leaf_map`] says nothing about it. Its safety is instead pinned
+//!   structurally: read-only so it cannot be a cross-domain *write* channel, executable so the
+//!   guest can fetch, and its window disjoint from the data window
+//!   ([`arm64::Layout::validate`]) — all checked, and the RO+X part proven by Kani. It remains a
+//!   shared *read* surface by construction; that is a deliberate design choice, not an oversight.
+//! - **`GuestMem` is the trusted path.** The hypervisor's own reads/writes of guest memory are
+//!   deliberately unconditional on `S2AP` — permission enforcement is Stage-2's job for the
+//!   *guest*, not for the core's own accesses.
+//! - **VMID / table-set binding.** That domain → table set → `VMID` is injective lives in
+//!   `hv-metal`, not here, and is not covered by these properties.
+//!
 //! ## Zero unsafe
 //!
 //! Inherits the workspace `unsafe_code = "forbid"` fence. Every function here is total and pure:
