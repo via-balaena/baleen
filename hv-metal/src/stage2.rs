@@ -114,8 +114,18 @@ pub fn frame_ipa(m: Mfn) -> u64 {
 // handed — `hv_s2::arm64::frame_pa`. hv-metal no longer needs its own copy: the one derivation lives
 // under the fence, where it is unit-tested.)
 
+/// Guest IPA base of the super-span frame window (M5 Arc 6a). Its own `L1` entry — `0xC000_0000 >> 30
+/// = 3`, distinct from the guest image (1) and the base data region (2) — which is what makes
+/// "no two emitted leaves overlap" structural rather than a per-leaf check.
+pub const SUP_IPA_BASE: u64 = 0xC000_0000;
+
+/// How many super-span frames the linker actually backs (`__guest_sup_*` is 2 MiB = one 2 MiB
+/// frame). Must match the reserved region: `Layout::validate` checks the BACKED span.
+pub const NUM_SUP_FRAMES: u64 = 1;
+
 extern "C" {
     static __guest_ram_start: u8;
+    static __guest_sup_start: u8;
     static __guest_data_start: u8;
     static __guest_data_end: u8;
 }
@@ -128,6 +138,9 @@ fn data_ram_start() -> u64 {
 }
 fn data_ram_end() -> u64 {
     core::ptr::addr_of!(__guest_data_end) as u64
+}
+fn sup_ram_start() -> u64 {
+    core::ptr::addr_of!(__guest_sup_start) as u64
 }
 
 /// Number of independent per-domain Stage-2 table sets the metal can hold live at once. Two, for the
@@ -180,6 +193,8 @@ struct Stage2Set {
     l2_code: Table,
     l2_data: Table,
     l3_data: Table,
+    /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
+    l2_sup: Table,
 }
 
 /// The [`NUM_STAGE2_SETS`] independent per-domain table sets. Set 0 is the sole set the single-domain
@@ -203,6 +218,7 @@ static STAGE2_SETS: BootCell<[Stage2Set; NUM_STAGE2_SETS]> = BootCell::new(
             l2_code: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l2_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l3_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+            l2_sup: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
         }
     }; NUM_STAGE2_SETS],
 );
@@ -252,18 +268,6 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         );
         crate::park();
     }
-    // A super-span leaf is a 2 MiB block this emitter does not yet write. Halt rather than emit a
-    // 4 KiB descriptor for it — the model authorizes 2 MiB and a base descriptor would map 1/512th
-    // of it. (The encoder half lands next; see `docs/ARC6A-SPAN-REFINEMENT.md`.)
-    if let Some(m) = supers.iter().position(|s| s.is_some()) {
-        let mut uart = crate::uart();
-        let _ = writeln!(
-            uart,
-            "baleen: Stage-2 emission: frame {m} is a SUPER-span leaf, which this emitter does not yet encode; halting"
-        );
-        crate::park();
-    }
-
     // (1b) THE CONTENT CHECK (M5 Arc 5) — the second, independent derivation (#36). The scrub runs
     //      at `P2mAllocate`, when a frame becomes OWNED, inside `crate::teardown`'s dispatch funnel.
     //      This is the other end: the moment a frame becomes REACHABLE. A dispatch that bypassed the
@@ -292,10 +296,14 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         l2_code_pa: tables.l2_code.0.as_ptr() as u64,
         l2_data_pa: tables.l2_data.0.as_ptr() as u64,
         l3_data_pa: tables.l3_data.0.as_ptr() as u64,
+        l2_sup_pa: tables.l2_sup.0.as_ptr() as u64,
         guest_image_pa: guest_ram_start(),
         data_ipa_base: DATA_IPA_BASE,
         data_pa_base: data_ram_start(),
         frame_size: FRAME_SIZE,
+        sup_ipa_base: SUP_IPA_BASE,
+        sup_pa_base: sup_ram_start(),
+        sup_frames: NUM_SUP_FRAMES,
     };
 
     // Structural preconditions the encoder silently assumes: the guest-image and data regions must
@@ -326,12 +334,14 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
     // code's, and it lives with the barriers in `enable_stage2` — see `crate::cell`'s class 2.
     hv_s2::arm64::encode(
         &leaves,
+        &supers,
         &layout,
         hv_s2::arm64::Tables {
             l1: &mut tables.l1.0,
             l2_code: &mut tables.l2_code.0,
             l2_data: &mut tables.l2_data.0,
             l3_data: &mut tables.l3_data.0,
+            l2_sup: &mut tables.l2_sup.0,
         },
     );
 
@@ -346,12 +356,14 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         // these shared refs are checked (not argued) to alias nothing. Also no `unsafe`.
         let verdict = hv_s2::arm64::verify_encoding(
             &leaves,
+            &supers,
             &layout,
             hv_s2::arm64::TablesRef {
                 l1: &tables.l1.0,
                 l2_code: &tables.l2_code.0,
                 l2_data: &tables.l2_data.0,
                 l3_data: &tables.l3_data.0,
+                l2_sup: &tables.l2_sup.0,
             },
         );
         let mut uart = crate::uart();

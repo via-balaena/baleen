@@ -337,7 +337,7 @@ mod stage2_encoding {
 #[cfg(kani)]
 mod stage2_refinement {
     use hv_core::p2m::{DomId, Mfn};
-    use hv_s2::{check_authorized_with, leaf_map_from_edges, Edge, Perm, Violation};
+    use hv_s2::{check_authorized_with, leaf_map_from_edges, Edge, Maps, Perm, Violation};
 
     /// Distinct domains the symbolic model may name. Three is the smallest world that can express
     /// the confused deputy: an owner, a mapper, and a *third* party whose grant must not count.
@@ -365,12 +365,18 @@ mod stage2_refinement {
         owners: [Option<DomId>; FRAMES],
         auth: u128,
         edges: [Edge; EDGES],
+        /// Per-frame: is a leaf out of this table a SUPER span? Symbolic (M5 Arc 6a).
+        spans: [bool; FRAMES],
     }
 
     impl World {
         /// Every field symbolic, constrained only to be *well-formed* (ids in range) — not to be
         /// reachable. Reachability enters solely as the two named premises.
         fn any() -> Self {
+            let mut spans = [false; FRAMES];
+            for slot in spans.iter_mut() {
+                *slot = kani::any();
+            }
             let mut owners = [None; FRAMES];
             for slot in owners.iter_mut() {
                 let owned: bool = kani::any();
@@ -392,6 +398,19 @@ mod stage2_refinement {
                 owners,
                 auth: kani::any(),
                 edges,
+                spans,
+            }
+        }
+
+        /// The SPAN of a table, chosen symbolically per frame (M5 Arc 6a). Kani explores every
+        /// assignment, so the refinement theorem is proven for every mix of base and super leaves —
+        /// including the ones that put the same child under tables of both spans, which
+        /// `leaf_map_from_edges` must then reject rather than emit two backings for.
+        fn span_of(&self, m: Mfn) -> hv_s2::Span {
+            if (m as usize) < FRAMES && self.spans[m as usize] {
+                hv_s2::Span::Super
+            } else {
+                hv_s2::Span::Base
             }
         }
 
@@ -457,19 +476,35 @@ mod stage2_refinement {
         let cap: usize = kani::any();
         kani::assume(cap <= FRAMES);
         let mut buf = [None; FRAMES];
-        let out = &mut buf[..cap];
-
-        if leaf_map_from_edges(&w.edges, |m| w.owner_of(m), dom, out).is_ok() {
-            assert!(
-                check_authorized_with(
-                    dom,
-                    out,
-                    |m| w.owner_of(m),
-                    |g, d, f, wr| w.authorizes(g, d, f, wr),
-                )
-                .is_ok(),
-                "an emitted Stage-2 leaf map reached a frame no ownership or grant authorizes"
-            );
+        // The span of each table is SYMBOLIC (M5 Arc 6a): the theorem must hold for every
+        // assignment of base/super spans to parents, not just the all-base one. BOTH maps are then
+        // checked, because authorization is span-independent — a mapped frame must be owned or
+        // granted whatever the size of the mapping.
+        let mut sup_buf = [None; FRAMES];
+        if leaf_map_from_edges(
+            &w.edges,
+            |m| w.owner_of(m),
+            |p| Some(w.span_of(p)),
+            dom,
+            Maps {
+                base: &mut buf[..cap],
+                sup: &mut sup_buf[..cap],
+            },
+        )
+        .is_ok()
+        {
+            for out in [&buf[..cap], &sup_buf[..cap]] {
+                assert!(
+                    check_authorized_with(
+                        dom,
+                        out,
+                        |m| w.owner_of(m),
+                        |g, d, f, wr| w.authorizes(g, d, f, wr),
+                    )
+                    .is_ok(),
+                    "an emitted Stage-2 leaf map reached a frame no ownership or grant authorizes"
+                );
+            }
         }
     }
 
@@ -497,7 +532,19 @@ mod stage2_refinement {
         }
 
         let mut out = [None; FRAMES];
-        if leaf_map_from_edges(&w.edges, |m| w.owner_of(m), dom, &mut out).is_ok() {
+        let mut sup_out = [None; FRAMES];
+        if leaf_map_from_edges(
+            &w.edges,
+            |m| w.owner_of(m),
+            |p| Some(w.span_of(p)),
+            dom,
+            Maps {
+                base: &mut out,
+                sup: &mut sup_out,
+            },
+        )
+        .is_ok()
+        {
             assert!(
                 out[m as usize].is_none(),
                 "an unowned, ungranted frame must be a hole in the guest's Stage-2 table"
@@ -519,7 +566,19 @@ mod stage2_refinement {
         w.assume_edge_children_allocated();
 
         let mut out = [None; FRAMES];
-        if leaf_map_from_edges(&w.edges, |m| w.owner_of(m), dom, &mut out).is_ok() {
+        let mut sup_out = [None; FRAMES];
+        if leaf_map_from_edges(
+            &w.edges,
+            |m| w.owner_of(m),
+            |p| Some(w.span_of(p)),
+            dom,
+            Maps {
+                base: &mut out,
+                sup: &mut sup_out,
+            },
+        )
+        .is_ok()
+        {
             let m: Mfn = kani::any();
             kani::assume((m as usize) < FRAMES);
             if out[m as usize] == Some(Perm::Rw) {
@@ -554,10 +613,22 @@ mod stage2_refinement {
                 (1, 0, 2, true, true),
                 (1, 0, 2, true, true),
             ],
+            spans: [false; FRAMES],
         };
         // P2 holds; P1 deliberately does NOT (the edge is foreign and ungranted).
         let mut out = [None; FRAMES];
-        assert!(leaf_map_from_edges(&w.edges, |m| w.owner_of(m), 0, &mut out).is_ok());
+        let mut sup_out = [None; FRAMES];
+        assert!(leaf_map_from_edges(
+            &w.edges,
+            |m| w.owner_of(m),
+            |p| Some(w.span_of(p)),
+            0,
+            Maps {
+                base: &mut out,
+                sup: &mut sup_out,
+            },
+        )
+        .is_ok());
         assert!(
             check_authorized_with(
                 0,
