@@ -45,7 +45,7 @@ use hv_core::p2m::Mfn;
 use hv_core::Hypervisor;
 
 use crate::arm64::TABLE_ENTRIES;
-use crate::leafmap::{leaf_map, Perm};
+use crate::leafmap::{leaf_map, MapError, Maps, Perm, Span};
 
 /// A way the emitted Stage-2 leaf map can betray the model.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,6 +90,47 @@ pub enum Violation {
         /// The frame that did not fit.
         mfn: Mfn,
     },
+}
+
+/// A model state the refinement **does not claim to cover** — *not* a violation of anything.
+///
+/// The distinction is load-bearing and was forced by evidence: the exhaustive enumerator reaches
+/// both of these within a handful of hypercalls, so folding them into [`Violation`] would report
+/// perfectly legal model states as isolation failures. That is the mislabelling this project keeps
+/// correcting (#36: call a consistency check a consistency check). A [`Violation`] says *the
+/// emitted table would be wrong*; an `OutOfDomain` says *this model state is outside the
+/// refinement's stated domain*, which is a coverage fact to be measured and reported, not a bug.
+///
+/// The **emitter** on the metal still fails loudly on these — it cannot emit a faithful table — but
+/// the **checker** must not call them violations.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutOfDomain {
+    /// One frame is a leaf at two different spans, so it would need two machine-frame backings
+    /// (each span has its own window). `hv-core` permits this — `MislevelledLink` constrains only
+    /// *interior* children — and the enumerator reaches it in 6 hypercalls.
+    SpanConflict {
+        /// The domain whose map claims it twice.
+        dom: DomId,
+        /// The frame claimed at two spans.
+        mfn: Mfn,
+    },
+    /// A leaf hangs off a table at a level this refinement does not emit (e.g. an `L3` leaf — a
+    /// 1 GiB block). Reached by the enumerator in 3 hypercalls.
+    UnsupportedSpan {
+        /// The domain whose map contains it.
+        dom: DomId,
+        /// The parent table whose level is out of range.
+        parent: Mfn,
+    },
+}
+
+/// What [`check_all`] concluded about a model state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// A guarantee of the refinement is broken — a real finding.
+    Violated(Violation),
+    /// The state is outside the refinement's domain. **Not** a finding; see [`OutOfDomain`].
+    OutOfDomain(OutOfDomain),
 }
 
 /// **P-SOUND + P-PERM — no reachability without authorization.**
@@ -175,7 +216,12 @@ where
 /// A *consistency* check (see the module docs): it re-derives from the same `link_edges` relation
 /// the emitter reads, so it catches mis-application — a missed clear, a surviving stale leaf, a
 /// wrong permission, an ordering bug — but not a misunderstanding of the relation itself.
-pub fn check_exact(hv: &Hypervisor, dom: DomId, leaves: &[Option<Perm>]) -> Result<(), Violation> {
+pub fn check_exact(
+    hv: &Hypervisor,
+    dom: DomId,
+    leaves: &[Option<Perm>],
+    span: Span,
+) -> Result<(), Violation> {
     let edges = hv.p2m().link_edges();
     for (m, mapped) in leaves.iter().enumerate() {
         let mfn = m as Mfn;
@@ -183,7 +229,13 @@ pub fn check_exact(hv: &Hypervisor, dom: DomId, leaves: &[Option<Perm>]) -> Resu
         // (later edges overwrite earlier ones, exactly as the emitter applies them).
         let mut expected: Option<Perm> = None;
         for (parent, _slot, child, writable, leaf) in edges.iter().copied() {
-            if leaf && child == mfn && hv.p2m().owner_of(parent) == Some(dom) {
+            // Filter to THIS span's map: an edge only belongs to the map whose span its parent's
+            // level implies (the same translation `leaf_map` uses, re-derived here from the model).
+            if leaf
+                && child == mfn
+                && hv.p2m().owner_of(parent) == Some(dom)
+                && crate::leafmap::span_of_table(hv.p2m(), parent) == Some(span)
+            {
                 expected = Some(if writable { Perm::Rw } else { Perm::Ro });
             }
         }
@@ -209,17 +261,41 @@ pub fn check_exact(hv: &Hypervisor, dom: DomId, leaves: &[Option<Perm>]) -> Resu
 /// work is then `O(domains × (frames × edges))` over the tiny configs the enumerator uses, instead
 /// of a 512-slot sweep per call. Frames beyond the model's count cannot be mapped — the model has
 /// no such frame to link — so the prefix is the whole truth.
-pub fn check_all(hv: &Hypervisor) -> Result<(), Violation> {
+pub fn check_all(hv: &Hypervisor) -> Result<(), Verdict> {
     let frames = hv.p2m().frame_count().min(TABLE_ENTRIES);
-    let mut buf = [None; TABLE_ENTRIES];
-    let leaves = &mut buf[..frames];
+    let mut base_buf = [None; TABLE_ENTRIES];
+    let mut sup_buf = [None; TABLE_ENTRIES];
     for dom in 0..hv.domain_count() {
         let dom = dom as DomId;
-        if let Err(e) = leaf_map(hv.p2m(), dom, leaves) {
-            return Err(Violation::Overflow { dom, mfn: e.mfn });
+        {
+            let maps = Maps {
+                base: &mut base_buf[..frames],
+                sup: &mut sup_buf[..frames],
+            };
+            if let Err(e) = leaf_map(hv.p2m(), dom, maps) {
+                return Err(match e {
+                    MapError::OutOfRange(r) => {
+                        Verdict::Violated(Violation::Overflow { dom, mfn: r.mfn })
+                    }
+                    MapError::SpanConflict { mfn } => {
+                        Verdict::OutOfDomain(OutOfDomain::SpanConflict { dom, mfn })
+                    }
+                    MapError::UnsupportedSpan { parent } => {
+                        Verdict::OutOfDomain(OutOfDomain::UnsupportedSpan { dom, parent })
+                    }
+                });
+            }
         }
-        check_authorized(hv, dom, leaves)?;
-        check_exact(hv, dom, leaves)?;
+        // Authorization is span-INDEPENDENT — a mapped frame must be owned or granted whatever the
+        // size of the mapping — so both maps go through the same predicate. Exactness is not: each
+        // map is checked against the edges of its own span.
+        for (leaves, span) in [
+            (&base_buf[..frames], Span::Base),
+            (&sup_buf[..frames], Span::Super),
+        ] {
+            check_authorized(hv, dom, leaves).map_err(Verdict::Violated)?;
+            check_exact(hv, dom, leaves, span).map_err(Verdict::Violated)?;
+        }
     }
     Ok(())
 }
@@ -282,7 +358,15 @@ mod tests {
     fn dead_domain_maps_nothing() {
         let h = hv();
         let mut leaves = [None; TABLE_ENTRIES];
-        assert!(leaf_map(h.p2m(), DOM1, &mut leaves).is_ok());
+        assert!(leaf_map(
+            h.p2m(),
+            DOM1,
+            Maps {
+                base: &mut leaves,
+                sup: &mut []
+            }
+        )
+        .is_ok());
         assert!(leaves.iter().all(|l| l.is_none()));
         assert_eq!(check_all(&h), Ok(()));
     }
@@ -446,14 +530,14 @@ mod tests {
         stale[2] = Some(Perm::Rw);
         stale[3] = Some(Perm::Rw);
         assert!(matches!(
-            check_exact(&h, DOM0, &stale),
+            check_exact(&h, DOM0, &stale, Span::Base),
             Err(Violation::Inexact { mfn: 3, .. })
         ));
 
         // Over-restriction: an authorized leaf dropped.
         let empty = [None; TABLE_ENTRIES];
         assert!(matches!(
-            check_exact(&h, DOM0, &empty),
+            check_exact(&h, DOM0, &empty, Span::Base),
             Err(Violation::Inexact {
                 mfn: 2,
                 mapped: None,

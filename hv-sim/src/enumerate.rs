@@ -138,6 +138,15 @@ pub struct EnumOutcome {
     /// [`hv_s2::check_all`] asks "does the page table we would *emit* from this model authorize
     /// exactly what the model permits?" — over the same reachable states.
     pub refinement: Option<hv_s2::Violation>,
+    /// How many reachable states fell **outside** the Stage-2 refinement's domain
+    /// ([`hv_s2::OutOfDomain`]) — a frame that is a leaf at two spans, or a leaf level the
+    /// refinement does not emit.
+    ///
+    /// **Not violations.** This is the refinement's *coverage*, measured rather than asserted: a
+    /// nonzero count says the model routinely reaches states the emitted table cannot faithfully
+    /// represent, which the metal must (and does) fail loudly on. Surfaced because the alternative
+    /// — discarding it — is how a scope limit turns into an unstated assumption.
+    pub out_of_domain: usize,
 }
 
 /// A canonical state fingerprint (see [`state_key`]).
@@ -941,6 +950,10 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
     came_from.insert(root_key.clone(), None);
     frontier.push((root_key, init));
     let mut truncated = false;
+    // How many reachable states fell OUTSIDE the Stage-2 refinement's domain (see
+    // `hv_s2::OutOfDomain`). Not violations — a measurement of how much of the reachable set the
+    // refinement actually claims.
+    let mut out_of_domain: usize = 0;
     // Set once the frontier goes empty *without* truncation — the config's whole reachable
     // set is exhausted at every depth (an all-depths theorem). A run that instead exhausts
     // its depth budget leaves this false: it is complete only up to `cfg.depth`.
@@ -957,7 +970,19 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                 // exactly what the model permits (no reachability without ownership or a grant).
                 // The second is what turns Architecture Audit #2's three hand-written mutations
                 // into a property checked over the whole reachable set.
-                let refinement = hv_s2::check_all(&h).err();
+                // A refinement VERDICT is not automatically a counterexample: `OutOfDomain` says
+                // the model reached a state the refinement does not claim to cover (one frame at two
+                // spans; a leaf level we do not emit), which is a COVERAGE fact, not a defect. Only
+                // `Violated` is a finding. Counting the rest is how the refinement's domain becomes a
+                // measured number instead of a sentence in a doc.
+                let refinement = match hv_s2::check_all(&h) {
+                    Ok(()) => None,
+                    Err(hv_s2::Verdict::Violated(v)) => Some(v),
+                    Err(hv_s2::Verdict::OutOfDomain(_)) => {
+                        out_of_domain += 1;
+                        None
+                    }
+                };
                 if !h.invariants_hold() || refinement.is_some() {
                     let key = keyfn(&h);
                     came_from.insert(key.clone(), Some((keyfn(hv), caller, call)));
@@ -967,6 +992,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                         saturated: false,
                         violation: Some(trace(&came_from, &key)),
                         refinement,
+                        out_of_domain,
                     };
                 }
                 let key = keyfn(&h);
@@ -996,6 +1022,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
         saturated,
         violation: None,
         refinement: None,
+        out_of_domain: 0,
     }
 }
 

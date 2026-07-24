@@ -229,15 +229,37 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
     //     host-testable and (next arc) provable rather than merely argued. Every slot of `leaves`
     //     is written by the call, so no previous tenant's leaf can survive into this rebuild.
     let mut leaves = [None; hv_s2::arm64::TABLE_ENTRIES];
-    if let Err(e) = hv_s2::leaf_map(hv.p2m(), guest_dom, &mut leaves) {
+    // M5 Arc 6a: the refinement is now SPAN-aware. This emitter still only encodes base-span leaves,
+    // so a super-span leaf is collected separately and rejected loudly below rather than being
+    // silently flattened into a base-page descriptor (which is what happened before this arc — an
+    // under-map that fails closed, but a map of the wrong SIZE).
+    let mut supers = [None; hv_s2::arm64::TABLE_ENTRIES];
+    if let Err(e) = hv_s2::leaf_map(
+        hv.p2m(),
+        guest_dom,
+        hv_s2::Maps {
+            base: &mut leaves,
+            sup: &mut supers,
+        },
+    ) {
         // A frame the model authorized does not fit the table. Unreachable while the model stays far
         // below `TABLE_ENTRIES`, but the previous emitter dropped such a frame with a bare
         // `continue` — a SILENT under-map (the guest loses memory it is entitled to). Fail loudly.
         let mut uart = crate::uart();
         let _ = writeln!(
             uart,
-            "baleen: Stage-2 emission: authorized frame {} exceeds table capacity {}; halting",
-            e.mfn, e.capacity
+            "baleen: Stage-2 emission: cannot represent this model state faithfully: {e:?}; halting"
+        );
+        crate::park();
+    }
+    // A super-span leaf is a 2 MiB block this emitter does not yet write. Halt rather than emit a
+    // 4 KiB descriptor for it — the model authorizes 2 MiB and a base descriptor would map 1/512th
+    // of it. (The encoder half lands next; see `docs/ARC6A-SPAN-REFINEMENT.md`.)
+    if let Some(m) = supers.iter().position(|s| s.is_some()) {
+        let mut uart = crate::uart();
+        let _ = writeln!(
+            uart,
+            "baleen: Stage-2 emission: frame {m} is a SUPER-span leaf, which this emitter does not yet encode; halting"
         );
         crate::park();
     }
