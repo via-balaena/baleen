@@ -77,13 +77,14 @@
 //! MMU-off/identity, so a host PA is directly addressable). Each carries its justification; the
 //! tables live behind `UnsafeCell` (never `static mut`), the same discipline as `guest.rs`/`heap.rs`.
 
-use core::cell::UnsafeCell;
 use core::fmt::Write;
 
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::Mfn;
 use hv_core::Hypervisor;
 use hv_hal::{Gpa, GuestMemory, MemError};
+
+use crate::cell::BootCell;
 
 // ---------------------------------------------------------------------------------------------
 // Address layout — the single map the Stage-2 builder AND `GuestMem` both derive from.
@@ -149,22 +150,30 @@ pub const fn set_vmid(set: usize) -> u64 {
 // (VMSAv8-64 Stage-2 descriptor formats), converged three ways per `docs/AUDIT-2-P2M-STAGE2.md`.
 // ---------------------------------------------------------------------------------------------
 
-/// A 4 KiB Stage-2 translation table (512 × 8-byte descriptors), interior-mutable so it is built at
-/// runtime without a `static mut`. `#[repr(C, align(4096))]`: the walk hardware requires a 4 KiB
-/// aligned base.
+/// A 4 KiB Stage-2 translation table (512 × 8-byte descriptors). `#[repr(C, align(4096))]`: the walk
+/// hardware requires a 4 KiB aligned base.
+///
+/// Plain storage — the interior mutability moved up to the [`STAGE2_SETS`] cell (M5 Arc 4), which is
+/// what lets the four tables of a set be borrowed **as disjoint fields** by ordinary safe code
+/// instead of four `unsafe` derefs the compiler cannot check for aliasing.
 #[repr(C, align(4096))]
-struct Table(UnsafeCell<[u64; 512]>);
+struct Table([u64; hv_s2::arm64::TABLE_ENTRIES]);
 
-// SAFETY: single-CPU bring-up (only the boot CPU runs; secondaries stay PSCI-parked in `_start`).
-// Each table is written once, before Stage-2 is enabled, then read only by the walk hardware. No two
-// accesses race. Same discipline as `guest.rs`'s and `heap.rs`'s interior-mutable statics.
-unsafe impl Sync for Table {}
+// The walk hardware takes the table base from `VTTBR_EL2`/a table descriptor, both of which carry
+// only bits [47:12] — a mis-aligned base would silently truncate to a different address. Bound to
+// the type so a future `repr` change cannot desync it (the `const _` discipline, design-lesson #14c).
+const _: () = assert!(core::mem::align_of::<Table>() == 4096);
+const _: () = assert!(core::mem::size_of::<Table>() == 4096);
 
 /// One complete per-domain Stage-2 table set: an `L1` (one entry → the guest-image `1 GiB` region's
 /// `L2`, one → the data `1 GiB` region's `L2`), an `L2` for the guest image (a single 2 MiB RO+X
 /// block), an `L2` for the data region (→ `L3`), and an `L3` for the data region (one 4 KiB page
 /// descriptor per authorized model frame; the rest stay zero → translation-fault holes). Each domain
 /// under concurrent isolation (M5 Arc 2) gets its own set, reached via a distinct VMID-tagged VTTBR.
+///
+/// `#[repr(C)]` so the four 4 KiB-aligned, 4 KiB-sized tables stay laid out end to end (each one's
+/// own alignment then guarantees a valid walk base).
+#[repr(C)]
 struct Stage2Set {
     l1: Table,
     l2_code: Table,
@@ -175,17 +184,27 @@ struct Stage2Set {
 /// The [`NUM_STAGE2_SETS`] independent per-domain table sets. Set 0 is the sole set the single-domain
 /// phases use (byte-identical to Arc 1's single table set); set 1 is the second domain's, used only by
 /// the Arc-2 concurrent-isolation phase. Distinct storage per set, so building one domain's Stage-2
-/// never touches another's. Each set is built via an inline `const` block (an all-zero, interior-mutable
-/// `Table` per level) — the same idiom as `guest.rs`'s `FAULT_DFSC` array, so no named
-/// interior-mutable const is declared.
-static STAGE2_SETS: [Stage2Set; NUM_STAGE2_SETS] = [const {
-    Stage2Set {
-        l1: Table(UnsafeCell::new([0; 512])),
-        l2_code: Table(UnsafeCell::new([0; 512])),
-        l2_data: Table(UnsafeCell::new([0; 512])),
-        l3_data: Table(UnsafeCell::new([0; 512])),
-    }
-}; NUM_STAGE2_SETS];
+/// never touches another's. Each set is built via an inline `const` block (an all-zero `Table` per
+/// level) — the same idiom as `guest.rs`'s `FAULT_DFSC` array, so no named const is declared.
+///
+/// **One [`BootCell`] over ALL the sets, not one per table** (M5 Arc 4). This is the *publication*
+/// class of the concurrency audit (`crate::cell`): the second agent is the Stage-2 walker + TLB, not
+/// another CPU, and that obligation is a barrier one — discharged by `enable_stage2`'s
+/// `dsb`+`tlbi`+`isb` and the rebirth flush (design-lesson #28f), not by this cell. What the cell
+/// adds is the *aliasing* half: a single claim covers a whole rebuild, and the four tables of a set
+/// then come out as **disjoint field borrows** that the compiler checks — which is what let this
+/// module's Stage-2 emission drop to **zero `unsafe`**.
+static STAGE2_SETS: BootCell<[Stage2Set; NUM_STAGE2_SETS]> = BootCell::new(
+    "STAGE2_SETS",
+    [const {
+        Stage2Set {
+            l1: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+            l2_code: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+            l2_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+            l3_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+        }
+    }; NUM_STAGE2_SETS],
+);
 
 /// Build the Stage-2 tables for `guest_dom` from the proven `p2m` into table `set`, and return the
 /// `VTTBR_EL2` value (the set's `L1` table PA | its VMID = [`set_vmid`]`(set)`). Idempotent: every used
@@ -224,12 +243,16 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
 
     // (2) THE ENCODING — descriptor values for that decision. Also pure, also under the fence; the
     //     Arm-ARM field layout and its golden values live in `hv_s2::arm64::desc`.
-    let tables = &STAGE2_SETS[set];
+    // The claim covers the whole rebuild: taken here, released when `sets` drops at the end of this
+    // function — so a re-entrant or second-CPU rebuild halts instead of interleaving descriptor
+    // writes with this one (M5 Arc 4).
+    let mut sets = STAGE2_SETS.borrow_mut();
+    let tables = &mut sets[set];
     let layout = hv_s2::arm64::Layout {
-        l1_pa: tables.l1.0.get() as *const u8 as u64,
-        l2_code_pa: tables.l2_code.0.get() as *const u8 as u64,
-        l2_data_pa: tables.l2_data.0.get() as *const u8 as u64,
-        l3_data_pa: tables.l3_data.0.get() as *const u8 as u64,
+        l1_pa: tables.l1.0.as_ptr() as u64,
+        l2_code_pa: tables.l2_code.0.as_ptr() as u64,
+        l2_data_pa: tables.l2_data.0.as_ptr() as u64,
+        l3_data_pa: tables.l3_data.0.as_ptr() as u64,
         guest_image_pa: guest_ram_start(),
         data_ipa_base: DATA_IPA_BASE,
         data_pa_base: data_ram_start(),
@@ -248,31 +271,30 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         crate::park();
     }
 
-    // (3) THE PUBLISH — the only `unsafe` left in Stage-2 emission: hand the encoder `&mut` views of
-    //     the interior-mutable table storage. Everything about *what values* go in the tables is
-    //     decided above, in safe code.
+    // (3) THE PUBLISH — hand the encoder `&mut` views of the table storage. Everything about *what
+    //     values* go in the tables is decided above, in safe code.
     //
-    // SAFETY: single-CPU. The tables are rewritten while executing at EL2, where the EL1&0 Stage-2
-    // regime performs no walks (no walker observes these stores mid-rebuild), so even though a *prior*
-    // phase may have Stage-2 enabled (this fn is called once per phase, not only before the first
-    // enable), the rewrite races no translation. `enable_stage2`'s subsequent `dsb`+`tlbi`+`isb`
-    // fences the rewrite (and makes these Non-cacheable EL2 stores globally observable) before the
-    // next `eret`, so a switched-in domain's walker reads correct, published descriptors. Each table
-    // is 4 KiB aligned (`#[repr(align(4096))]`) with exactly `TABLE_ENTRIES` entries, matching the
-    // `&mut [u64; TABLE_ENTRIES]` the encoder takes; the four `UnsafeCell`s are distinct storage, so
-    // the four `&mut`s never alias.
-    unsafe {
-        hv_s2::arm64::encode(
-            &leaves,
-            &layout,
-            hv_s2::arm64::Tables {
-                l1: &mut *tables.l1.0.get(),
-                l2_code: &mut *tables.l2_code.0.get(),
-                l2_data: &mut *tables.l2_data.0.get(),
-                l3_data: &mut *tables.l3_data.0.get(),
-            },
-        );
-    }
+    // **No `unsafe` (M5 Arc 4).** The four `&mut`s are disjoint *fields* of one `Stage2Set` behind
+    // one claimed `BootCell`, so their non-aliasing is checked by the compiler rather than argued in
+    // a comment — the aliasing half of the old SAFETY block is now a type-system fact. What remains
+    // is the PUBLICATION obligation, which is not an aliasing property and does not live here: the
+    // tables are rewritten while executing at EL2, where the EL1&0 Stage-2 regime performs no walks
+    // (no walker observes these stores mid-rebuild), so even though a *prior* phase may have Stage-2
+    // enabled (this fn is called once per phase, not only before the first enable), the rewrite races
+    // no translation; and `enable_stage2`'s subsequent `dsb`+`tlbi`+`isb` fences the rewrite (and
+    // makes these Non-cacheable EL2 stores globally observable) before the next `eret`, so a
+    // switched-in domain's walker reads correct, published descriptors. That argument is `unsafe`
+    // code's, and it lives with the barriers in `enable_stage2` — see `crate::cell`'s class 2.
+    hv_s2::arm64::encode(
+        &leaves,
+        &layout,
+        hv_s2::arm64::Tables {
+            l1: &mut tables.l1.0,
+            l2_code: &mut tables.l2_code.0,
+            l2_data: &mut tables.l2_data.0,
+            l3_data: &mut tables.l3_data.0,
+        },
+    );
 
     // (4) Under `selftest`, read the emitted tables BACK and assert they decode to exactly the leaf
     //     map — the ENCODER's half of the refinement, witnessed on the real hardware tables on every
@@ -281,20 +303,18 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
     //     which until now rested on a comment. A witness produced BY the mechanism (design #24(f)).
     #[cfg(feature = "selftest")]
     {
-        // SAFETY: the same table storage, borrowed read-only this time; single-CPU and no walker
-        // observes it (see the publish block above), so these shared refs alias nothing live.
-        let verdict = unsafe {
-            hv_s2::arm64::verify_encoding(
-                &leaves,
-                &layout,
-                hv_s2::arm64::TablesRef {
-                    l1: &*tables.l1.0.get(),
-                    l2_code: &*tables.l2_code.0.get(),
-                    l2_data: &*tables.l2_data.0.get(),
-                    l3_data: &*tables.l3_data.0.get(),
-                },
-            )
-        };
+        // The same table storage, borrowed read-only this time — still under the one live claim, so
+        // these shared refs are checked (not argued) to alias nothing. Also no `unsafe`.
+        let verdict = hv_s2::arm64::verify_encoding(
+            &leaves,
+            &layout,
+            hv_s2::arm64::TablesRef {
+                l1: &tables.l1.0,
+                l2_code: &tables.l2_code.0,
+                l2_data: &tables.l2_data.0,
+                l3_data: &tables.l3_data.0,
+            },
+        );
         let mut uart = crate::uart();
         match verdict {
             Ok(()) => {

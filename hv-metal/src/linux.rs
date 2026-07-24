@@ -33,15 +33,16 @@
 //!
 //! ## Unsafe
 //!
-//! As the rest of the metal: Stage-2 table writes (into linker-free interior-mutable storage),
-//! EL2 system-register setup, the vector-table `global_asm!`, and the `eret` handoff. Every block
-//! carries its justification; the tables live behind `UnsafeCell` (never `static mut`), the same
-//! discipline as `stage2.rs`/`guest.rs`.
+//! As the rest of the metal: EL2 system-register setup, the vector-table `global_asm!`, and the
+//! `eret` handoff. Every block carries its justification. The Stage-2 table **writes** are no longer
+//! among them — since M5 Arc 4 the tables live in a [`crate::cell::BootCell`] (never `static mut`,
+//! and no longer a bare `UnsafeCell` either), so building them is ordinary safe code and their
+//! exclusivity is checked rather than commented; the same discipline as `stage2.rs`/`guest.rs`.
 
 use core::arch::{asm, global_asm};
-use core::cell::UnsafeCell;
 use core::fmt::Write;
 
+use crate::cell::BootCell;
 use crate::pl011::Pl011;
 
 // ─── the memory contract (must match xtask's `-device loader` addresses) ─────────────────────────
@@ -101,55 +102,70 @@ const SCTLR_EL1_ENABLES: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 <<
 
 // ─── Stage-2 tables ──────────────────────────────────────────────────────────────────────────────
 
-/// A 4 KiB Stage-2 translation table (512 × 8-byte descriptors), interior-mutable so it is built at
-/// runtime without a `static mut`; 4 KiB-aligned for the walk hardware.
+/// A 4 KiB Stage-2 translation table (512 × 8-byte descriptors); 4 KiB-aligned for the walk hardware.
+/// Plain storage — the interior mutability lives on the [`TABLES`] cell (M5 Arc 4), as in `stage2.rs`.
 #[repr(C, align(4096))]
-struct Table(UnsafeCell<[u64; 512]>);
-// SAFETY: single-CPU bring-up (secondaries stay PSCI-parked in `_start`); each table is written once,
-// before Stage-2 is enabled, then read only by the walk hardware. Same discipline as `stage2.rs`.
-unsafe impl Sync for Table {}
+struct Table([u64; 512]);
+
+const _: () = assert!(core::mem::align_of::<Table>() == 4096);
+const _: () = assert!(core::mem::size_of::<Table>() == 4096);
 
 /// The single guest's Stage-2 tables: an `L1` (entry 0 → the device region's `L2`, entry 1 → the
 /// guest-RAM region's `L2`), an `L2` covering `0x0..0x4000_0000` (device blocks), and an `L2`
 /// covering `0x4000_0000..0x8000_0000` (RAM blocks).
-static L1: Table = Table(UnsafeCell::new([0; 512]));
-static L2_DEV: Table = Table(UnsafeCell::new([0; 512]));
-static L2_RAM: Table = Table(UnsafeCell::new([0; 512]));
+///
+/// One [`BootCell`] over all three (M5 Arc 4) — the *publication* class of `crate::cell`'s audit,
+/// and the strictest member of it: unlike `stage2.rs`'s sets these are written **once**, before
+/// `enable_stage2`, and thereafter read only by the walk hardware. The cell buys the disjoint field
+/// borrows that make [`build_stage2`] `unsafe`-free; the barriers in [`enable_stage2`] remain the
+/// publication argument.
+#[repr(C)]
+struct LinuxTables {
+    l1: Table,
+    l2_dev: Table,
+    l2_ram: Table,
+}
+
+static TABLES: BootCell<LinuxTables> = BootCell::new(
+    "linux::TABLES",
+    LinuxTables {
+        l1: Table([0; 512]),
+        l2_dev: Table([0; 512]),
+        l2_ram: Table([0; 512]),
+    },
+);
 
 /// Build the big identity Stage-2 (guest RAM Normal WB RWX + the GIC/PL011 device window) and return
 /// the `VTTBR_EL2` value (`L1` PA | VMID). Identity IPA==PA throughout — this is infrastructure that
 /// gives the single guest the machine, NOT the model-driven isolation refinement (`stage2.rs`).
 fn build_stage2() -> u64 {
-    let l1 = L1.0.get();
-    let l2_dev = L2_DEV.0.get();
-    let l2_ram = L2_RAM.0.get();
-    let l1_pa = l1 as *const u8 as u64;
-    let l2_dev_pa = l2_dev as *const u8 as u64;
-    let l2_ram_pa = l2_ram as *const u8 as u64;
+    let mut tables = TABLES.borrow_mut();
+    let l1_pa = tables.l1.0.as_ptr() as u64;
+    let l2_dev_pa = tables.l2_dev.0.as_ptr() as u64;
+    let l2_ram_pa = tables.l2_ram.0.as_ptr() as u64;
 
-    // SAFETY: single-CPU, built before `enable_stage2` publishes it; EL2 runs MMU-off/identity so no
-    // walker observes these stores mid-build. Every table is 4 KiB-aligned with 512 entries, so all
-    // indices below (masked to 9 bits) are in range. The device region lives in L1[0], guest RAM in
-    // L1[1], so the two L1 writes never collide.
-    unsafe {
-        (*l1)[0] = (l2_dev_pa & ADDR_4K) | DESC_TABLE; // 0x0..0x4000_0000
-        (*l1)[1] = (l2_ram_pa & ADDR_4K) | DESC_TABLE; // 0x4000_0000..0x8000_0000
+    // No `unsafe` (M5 Arc 4): the three tables are disjoint fields of one claimed cell, so the
+    // compiler checks what the old SAFETY block argued. Every table is 4 KiB-aligned with 512
+    // entries, so all indices below (masked to 9 bits) are in range. The device region lives in
+    // L1[0], guest RAM in L1[1], so the two L1 writes never collide. Publication is `enable_stage2`'s
+    // (EL2 runs MMU-off/identity, so no walker observes these stores mid-build).
+    tables.l1.0[0] = (l2_dev_pa & ADDR_4K) | DESC_TABLE; // 0x0..0x4000_0000
+    tables.l1.0[1] = (l2_ram_pa & ADDR_4K) | DESC_TABLE; // 0x4000_0000..0x8000_0000
 
-        // Device pass-through: GICv3 + PL011, 2 MiB device blocks.
-        let mut a = DEV_BASE;
-        while a < DEV_END {
-            let idx = ((a >> 21) & 0x1ff) as usize;
-            (*l2_dev)[idx] = (a & ADDR_2M) | BLOCK_DEVICE;
-            a += 0x20_0000;
-        }
+    // Device pass-through: GICv3 + PL011, 2 MiB device blocks.
+    let mut a = DEV_BASE;
+    while a < DEV_END {
+        let idx = ((a >> 21) & 0x1ff) as usize;
+        tables.l2_dev.0[idx] = (a & ADDR_2M) | BLOCK_DEVICE;
+        a += 0x20_0000;
+    }
 
-        // Guest RAM: Normal WB RWX, 2 MiB blocks over the whole window.
-        let mut a = GUEST_RAM_BASE;
-        while a < GUEST_RAM_END {
-            let idx = ((a >> 21) & 0x1ff) as usize;
-            (*l2_ram)[idx] = (a & ADDR_2M) | BLOCK_NORMAL_RWX;
-            a += 0x20_0000;
-        }
+    // Guest RAM: Normal WB RWX, 2 MiB blocks over the whole window.
+    let mut a = GUEST_RAM_BASE;
+    while a < GUEST_RAM_END {
+        let idx = ((a >> 21) & 0x1ff) as usize;
+        tables.l2_ram.0[idx] = (a & ADDR_2M) | BLOCK_NORMAL_RWX;
+        a += 0x20_0000;
     }
 
     l1_pa | (GUEST_VMID << 48)

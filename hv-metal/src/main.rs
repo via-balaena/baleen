@@ -39,6 +39,7 @@
 #![cfg_attr(feature = "real-linux", allow(dead_code))]
 
 mod blk;
+mod cell;
 mod el2;
 mod exceptions;
 mod gic;
@@ -214,6 +215,14 @@ pub extern "C" fn rust_main() -> ! {
     //     `selftest`), so every prior witness still fires in the same boot.
     #[cfg(feature = "selftest")]
     selftest_hvcall_accounting(&mut uart);
+
+    // (6b) M5 Arc 4 — the concurrency predicate's non-vacuity witness. The nine `unsafe impl Sync`
+    //      that used to rest on a commented "single boot CPU" are now one checked cell type; this
+    //      asserts the check actually excludes (a second borrow refused while one is live, accepted
+    //      once it drops) on both a probe cell and the live `GUEST_HV`. Runs before any guest, so no
+    //      cell is claimed. A degenerate flag — always-set or never-set — fails one half or the other.
+    #[cfg(feature = "selftest")]
+    cell::selftest_exclusion(&mut uart);
 
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven
     //     `p2m`, run the Arc-5 authorize/deny isolation matrix (the proof touches reality), then the

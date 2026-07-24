@@ -51,10 +51,14 @@ const HEAP_SIZE: usize = 256 * 1024;
 #[repr(align(16))]
 struct Arena(UnsafeCell<[u8; HEAP_SIZE]>);
 
-// SAFETY: the metal is uniprocessor during bring-up (only the boot CPU runs `rust_main`;
-// secondaries stay PSCI-parked in `_start`), and all synchronization of the bump offset goes
-// through the `AtomicUsize` in `BumpAlloc`. The `UnsafeCell`'s bytes are only ever reached via the
-// atomically-reserved, non-overlapping ranges `alloc` returns, so no two accesses alias.
+// SAFETY: all synchronization of the bump offset goes through the `AtomicUsize` in `BumpAlloc`, and
+// the `UnsafeCell`'s bytes are only ever reached via the atomically-reserved, non-overlapping ranges
+// `alloc` returns — so no two accesses alias, *whatever* the CPU count. This argument deliberately
+// does NOT cite the single-boot-CPU predicate the rest of the metal's interior-mutable statics used
+// to: M5 Arc 4's classification pass deleted that hypothesis and the argument still stands (the
+// compare-exchange on a strictly-increasing offset carries all of it), which is exactly why this is
+// the ONE site that does not belong in `crate::cell::BootCell` — the arena is deliberately *shared*,
+// not exclusive. See design-lesson #39 and `docs/ARC4-CONCURRENCY-PREDICATE.md`.
 unsafe impl Sync for Arena {}
 
 static ARENA: Arena = Arena(UnsafeCell::new([0; HEAP_SIZE]));
