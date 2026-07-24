@@ -182,6 +182,12 @@ const NR_FINAL2: u64 = 0xfe;
 /// overwritten; see the audit's content-scrub scope note).
 const SENTINEL_RW2: u64 = 0xCAFE;
 
+/// **M5 Arc 5** — a recognizable secret the dying tenant leaves in its writable frame, so the
+/// content-non-inheritance witness has something legible to look for after the rebirth. The literal
+/// is also `boot-test.sh`'s FORBIDDEN marker: if a reborn tenant ever reads it back, the string
+/// reaches the serial log and the boot test fails. Distinct from every other marker in the boot.
+const DEAD_TENANT_SECRET: &[u8] = b"D3ADTENANT-must-not-survive-rebirth";
+
 // ─── M5 Arc 1: the vCPU context switch + concurrent scheduler run-loop ─────────────────────────
 //
 // Two vCPUs (of one domain) time-slice on the single physical CPU, switched by hv-core's REAL
@@ -1447,6 +1453,28 @@ fn blk_disk() -> BootRef<crate::blk::BlkDisk> {
     BLK_DISK.borrow_mut()
 }
 
+/// Discard a CoW tenant's overlay — the disk half of content non-inheritance (M5 Arc 5).
+///
+/// `discard_overlay` has existed since Arc 4 but was reachable from exactly one place, the thesis
+/// terminal, as an explicit test step; nothing wired it to teardown, so an ordinary `DomainDestroy`
+/// left the dead tenant's disk writes intact for whoever took the slot next. `crate::teardown` now
+/// calls this on every destroy.
+pub(crate) fn discard_tenant_overlay(tenant: usize) {
+    blk_disk().discard_overlay(tenant);
+}
+
+/// Reset the virtio device register files to their power-on state (M5 Arc 5).
+///
+/// `VIRTIO_DEV`/`BLK_DEV` were constructed once at boot and never reset, so a new tenant read the
+/// previous one's `status`, `queue_ready` and `interrupt_status` straight back, and the previous
+/// one's queue addresses stayed live in the backend. The address reuse failed closed —
+/// `backend_authorize` re-checks every access against the *current* guest's grant — but the defense
+/// was one layer deep, and the readable status bits were a channel with no defense at all.
+pub(crate) fn reset_device_state() {
+    *VIRTIO_DEV.borrow_mut() = crate::virtio::VirtioConsole::new();
+    *BLK_DEV.borrow_mut() = crate::blk::VirtioBlk::new();
+}
+
 /// Which virtio device the mmio window ([`crate::virtio::VIRTIO_MMIO_BASE`]) currently emulates — set at
 /// each device phase's entry so [`handle_mmio`] routes a trapped register access to the right device.
 /// The console (Arc 3) and block (Arc 4) phases run sequentially; only one device is live at a time.
@@ -2340,7 +2368,7 @@ fn service_hypercall(hv: &mut Hypervisor, nr: u64, arg0: u64) -> u64 {
         Ok(Hypercall::Spend { amount }) => HvCall::CreditSpend { amount },
         Err(_) => return HVCALL_REJECTED,
     };
-    match hv.dispatch(GUEST_DOM, call) {
+    match crate::teardown::dispatch(hv, GUEST_DOM, call) {
         Ok(HvOutcome::Balance(b)) => b,
         _ => HVCALL_REJECTED,
     }
@@ -3115,6 +3143,25 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
     let mut cell = GUEST_HV.borrow_mut();
     let hv = hv_or_halt(&mut cell, uart, "lifecycle");
 
+    // (0) M5 Arc 5 — seed a RECOGNIZABLE secret into the dying tenant's writable frame, so the
+    //     content-inheritance question has a legible answer after the rebirth. Written through
+    //     `GuestMem` (the trusted hypervisor path) into the frame `G` owns right now; the reborn
+    //     `G'` re-allocates this same `Mfn`, and therefore the same machine frame.
+    {
+        use hv_hal::GuestMemory;
+        let mut mem = GuestMem;
+        if mem
+            .write(stage2::frame_ipa(F_RW), DEAD_TENANT_SECRET)
+            .is_err()
+        {
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle: could not seed the dead-tenant secret; halting"
+            );
+            crate::park();
+        }
+    }
+
     // (1) Destroy the guest. `now` is a real generic-timer tick (the teardown uses it for runtime
     // accounting; any monotonic value is sound for the isolation witness).
     let now = {
@@ -3176,6 +3223,37 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
         "reborn alloc rw",
         uart,
     );
+
+    // (3b) **M5 Arc 5 — the CONTENT witness.** `G'` has just re-allocated the very machine frame the
+    //      dead `G` held. Read it back through the trusted path BEFORE `G'` writes anything: the
+    //      dead tenant's secret must be gone. Read-before-write is the whole point — the pre-arc
+    //      fixture had the reborn guest write its sentinel first, which is exactly why this leak
+    //      could sit in the ledger with every boot green. On failure the recovered bytes are PRINTED,
+    //      so `boot-test.sh`'s forbidden marker catches a regression even if this branch were ever
+    //      mis-worded.
+    {
+        use hv_hal::GuestMemory;
+        let mut probe = [0u8; DEAD_TENANT_SECRET.len()];
+        if GuestMem.read(stage2::frame_ipa(F_RW), &mut probe).is_err() {
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle: content probe read failed; halting"
+            );
+            crate::park();
+        }
+        if probe.iter().all(|&b| b == 0) {
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle content OK: the reborn slot's re-allocated frame reads as ZERO before it writes (the dead tenant's bytes were scrubbed, not merely its authority revoked)"
+            );
+        } else {
+            let recovered = core::str::from_utf8(&probe).unwrap_or("<non-utf8>");
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle content LEAK: the reborn slot read the dead tenant's bytes: {recovered}"
+            );
+        }
+    }
     expect(
         hv,
         GUEST_DOM,
@@ -3203,7 +3281,8 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
     // (4) The ID-reuse witness at the seam: `G′` must NOT be able to link the frame the peer granted
     // to the DEAD `G` — the grant was swept at teardown, so `p2m_link` refuses it. Printed ONLY when
     // the link is actually refused; a *success* here would be the confused-deputy bug, so halt loudly.
-    match hv.dispatch(
+    match crate::teardown::dispatch(
+        hv,
         GUEST_DOM,
         HvCall::P2mLink {
             parent: F_ROOT,
@@ -3509,7 +3588,8 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
     );
 
     // ── sched-pillar witness 1: pCPU exclusivity ── SchedRun B onto the pCPU A occupies → PcpuBusy.
-    match hv.dispatch(
+    match crate::teardown::dispatch(
+        hv,
         SCHED_DOM,
         HvCall::SchedRun {
             vcpu: SCHED_VCPU_B,
@@ -3546,7 +3626,8 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
         "set B affinity (exclude pCPU1)",
         uart,
     );
-    match hv.dispatch(
+    match crate::teardown::dispatch(
+        hv,
         SCHED_DOM,
         HvCall::SchedRun {
             vcpu: SCHED_VCPU_B,
@@ -3840,7 +3921,8 @@ fn begin_concurrent_iso_phase4(uart: &mut Pl011) -> ! {
     // ── cross-domain exclusivity witness ── dom B's SchedRun onto the pCPU dom A occupies → PcpuBusy.
     // Now genuinely CROSS-domain (two distinct domains contend for one physical CPU), a stronger form
     // of Arc 1's same-domain exclusivity probe.
-    match hv.dispatch(
+    match crate::teardown::dispatch(
+        hv,
         ISO_DOM_B,
         HvCall::SchedRun {
             vcpu: 0,
@@ -4842,6 +4924,11 @@ fn setup_thesis_model(hv: &mut Hypervisor, uart: &mut Pl011) {
     let mut disk = blk_disk();
     disk.seed_template(0, THESIS_TEMPLATE_MARKER);
     disk.write(DISP_TENANT, 0, DISP_DISK_MARKER);
+    drop(disk);
+    // The disposable's disk IS tenant `DISP_TENANT`; binding it here is what makes the thesis's
+    // `DomainDestroy` discard the overlay as a TEARDOWN obligation rather than an explicit test step
+    // (M5 Arc 5 — before this arc, `discard_overlay` was reachable from the terminal only).
+    crate::teardown::bind_tenant(DISP_DOM, DISP_TENANT);
 }
 
 /// **M5 Arc 6, the thesis phase.** Build a fresh `Hypervisor`, create the disposable + vault, emit the
@@ -4988,7 +5075,8 @@ fn finish_thesis_test(uart: &mut Pl011) -> ! {
         uart,
     );
     let reborn_denied = matches!(
-        hv.dispatch(
+        crate::teardown::dispatch(
+            hv,
             DISP_DOM,
             HvCall::P2mLink {
                 parent: F_DISP_ROOT,
@@ -5146,6 +5234,8 @@ fn begin_virtio_blk_phase6(uart: &mut Pl011) -> ! {
     // read falls through to; it is written here and never again (template-immutability).
     blk_disk().seed_template(0, BLK_TEMPLATE_MARKER);
     BLK_TENANT.store(0, Ordering::Relaxed);
+    // Bind this phase's guest to its CoW tenant, so destroying it discards that overlay (M5 Arc 5).
+    crate::teardown::bind_tenant(BLK_DOM, 0);
 
     // A fresh Hypervisor: the console phase mutated the previous one. SAFETY: single-CPU, one-time
     // rebuild before the block guest runs; no handler is touching the cell.
@@ -5187,6 +5277,7 @@ fn begin_virtio_blk_phase7(uart: &mut Pl011) -> ! {
     // Do NOT re-seed the template: it must survive tenant 0's phase untouched (that survival IS the
     // template-immutability property). Just switch tenant.
     BLK_TENANT.store(1, Ordering::Relaxed);
+    crate::teardown::bind_tenant(BLK_DOM, 1);
 
     // SAFETY: single-CPU, one-time rebuild before the phase-7 guest runs.
     *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
@@ -5452,7 +5543,7 @@ fn setup_model(hv: &mut Hypervisor, uart: &mut Pl011) {
 
 /// Dispatch one setup hypercall and require it to succeed; halt loudly on any rejection.
 fn expect(hv: &mut Hypervisor, caller: DomId, call: HvCall, what: &str, uart: &mut Pl011) {
-    if let Err(e) = hv.dispatch(caller, call) {
+    if let Err(e) = crate::teardown::dispatch(hv, caller, call) {
         let _ = writeln!(uart, "baleen: model setup '{what}' failed: {e:?}; halting");
         crate::park();
     }

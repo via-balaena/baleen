@@ -49,6 +49,7 @@ mod heap;
 mod linux;
 mod pl011;
 mod stage2;
+mod teardown;
 mod time;
 mod virtio;
 
@@ -282,7 +283,7 @@ pub(crate) fn build_hypervisor() -> Hypervisor {
 /// (`grant 100 → Balance(100)`).
 fn dispatch_synthetic_hvcall(uart: &mut Pl011) {
     let mut hv = build_hypervisor();
-    match hv.dispatch(DOM0, HvCall::CreditGrant { amount: 100 }) {
+    match crate::teardown::dispatch(&mut hv, DOM0, HvCall::CreditGrant { amount: 100 }) {
         Ok(HvOutcome::Balance(100)) => {
             let _ = writeln!(
                 uart,
@@ -305,8 +306,8 @@ fn dispatch_synthetic_hvcall(uart: &mut Pl011) {
 #[cfg(feature = "selftest")]
 fn selftest_hvcall_accounting(uart: &mut Pl011) {
     let mut hv = build_hypervisor();
-    let granted = hv.dispatch(DOM0, HvCall::CreditGrant { amount: 100 });
-    let spent = hv.dispatch(DOM0, HvCall::CreditSpend { amount: 30 });
+    let granted = crate::teardown::dispatch(&mut hv, DOM0, HvCall::CreditGrant { amount: 100 });
+    let spent = crate::teardown::dispatch(&mut hv, DOM0, HvCall::CreditSpend { amount: 30 });
     if granted == Ok(HvOutcome::Balance(100)) && spent == Ok(HvOutcome::Balance(70)) {
         let _ = writeln!(
             uart,
