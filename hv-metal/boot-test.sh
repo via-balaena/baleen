@@ -172,6 +172,7 @@ boot_and_check "default" "" \
     "guest HVC serviced: nr=1 arg=30 -> result=70" \
     "guest observed HvCall result=70 via HVC round-trip" \
     "isolation positive OK: rw=0xbeef ro=0x5eed fgrant=0xf00d" \
+    "superpage OK: the guest round-tripped 0x5079 through a 2 MiB BLOCK descriptor" \
     "isolation negative OK: RO write -> permission fault" \
     "isolation negative OK: foreign-ungranted read -> translation fault" \
     "isolation negative OK: unmapped read -> translation fault" \
@@ -239,10 +240,12 @@ boot_and_check "selftest" "--features selftest" \
     "selftest: HvCall accounting OK" \
     "selftest: BootCell exclusion OK (second borrow refused while live, accepted after drop" \
     "selftest: Stage-2 encoding verified" \
+    "1 super-span 2 MiB block(s) emitted and decoded" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \
     "guest HVC serviced: nr=1 arg=30 -> result=70" \
     "guest observed HvCall result=70 via HVC round-trip" \
     "isolation positive OK: rw=0xbeef ro=0x5eed fgrant=0xf00d" \
+    "superpage OK: the guest round-tripped 0x5079 through a 2 MiB BLOCK descriptor" \
     "isolation negative OK: RO write -> permission fault" \
     "isolation negative OK: foreign-ungranted read -> translation fault" \
     "isolation negative OK: unmapped read -> translation fault" \

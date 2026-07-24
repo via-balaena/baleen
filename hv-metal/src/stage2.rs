@@ -255,7 +255,9 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         guest_dom,
         hv_s2::Maps {
             base: &mut leaves,
-            sup: &mut supers,
+            // Sized to the BACKING, not the table: a super frame beyond `NUM_SUP_FRAMES` names
+            // memory the linker never reserved, so it must be rejected loudly rather than mapped.
+            sup: &mut supers[..NUM_SUP_FRAMES as usize],
         },
     ) {
         // A frame the model authorized does not fit the table. Unreachable while the model stays far
@@ -369,9 +371,13 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         let mut uart = crate::uart();
         match verdict {
             Ok(()) => {
+                let n_sup = supers[..NUM_SUP_FRAMES as usize]
+                    .iter()
+                    .filter(|s| s.is_some())
+                    .count();
                 let _ = writeln!(
                     uart,
-                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block RO+X)"
+                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block RO+X; {n_sup} super-span 2 MiB block(s) emitted and decoded)"
                 );
             }
             Err(e) => {

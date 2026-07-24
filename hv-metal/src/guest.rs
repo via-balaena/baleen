@@ -126,6 +126,19 @@ const F_RO: Mfn = 3; // G owns — mapped read-only (positive: read; negative: w
 const F_FGRANT: Mfn = 4; // P owns, granted RW to G — mapped (positive: authorized foreign write)
 const F_FUNGRANT: Mfn = 5; // P owns, NOT granted — unmapped in G (negative: translation fault)
 const F_HOLE: Mfn = 6; // never mapped — an unmapped IPA (negative: translation fault)
+/// **M5 Arc 6a — the SUPER-span witness.** `F_SUP_ROOT` is pinned at `PtLevel::L2`, which in the
+/// model's convention is ONE LEVEL UP from the bottom, so a leaf hanging off it is a superpage
+/// (2 MiB on ARM). `F_SUP` is the frame it maps.
+///
+/// `F_SUP` must be **`Mfn` 0**: the linker backs exactly one super frame (`stage2::NUM_SUP_FRAMES`),
+/// and a super frame's host PA is `sup_pa_base + m * 2 MiB`, so any other index would name memory
+/// that is not reserved. The refinement rejects an unbacked index loudly rather than mapping it —
+/// the `supers` slice handed to `leaf_map` is sized to the backing.
+const F_SUP: Mfn = 0;
+/// The `L2`-pinned table whose leaf makes `F_SUP` a superpage. Deliberately NOT linked under
+/// `F_ROOT`: the refinement is about LEAF-LEVEL reachability (Audit #2's scope note), so an edge
+/// out of a table the domain owns counts whether or not that table is itself reachable from a root.
+const F_SUP_ROOT: Mfn = 7;
 
 /// The high half of `stage2::DATA_IPA_BASE` (`0x8000`), for the guest's `movz #hi, lsl #16`.
 const DATA_IPA_HI: u64 = stage2::DATA_IPA_BASE >> 16;
@@ -138,6 +151,10 @@ const OFF_ROOT: u64 = F_ROOT as u64 * stage2::FRAME_SIZE;
 
 /// Sentinel the guest writes to its own writable frame (positive control; not any hypercall input).
 const SENTINEL_RW: u64 = 0xBEEF;
+/// **M5 Arc 6a** — the sentinel the guest writes into (and reads back from) its 2 MiB SUPERPAGE.
+/// Distinct from every other sentinel, so a readback proves the store landed *through the block
+/// descriptor* and not through some other mapping.
+const SENTINEL_SUP: u64 = 0x5079;
 /// Sentinel the guest writes to the granted foreign frame (positive control for cross-domain share).
 const SENTINEL_FGRANT: u64 = 0xF00D;
 /// The value the guest *attempts* to write to its read-only frame (must be denied — never lands).
@@ -154,6 +171,13 @@ const NR_SPEND: u64 = 1;
 const NR_CREDIT_ECHO: u64 = 0xf0;
 const NR_POS_RW: u64 = 0xf1;
 const NR_POS_RO: u64 = 0xf2;
+/// The high 16 bits of the super-span window's IPA, for the guest's `movz ..., lsl #16`. Bound to
+/// [`stage2::SUP_IPA_BASE`] at compile time so the probe and the emitted block can never drift.
+const SUP_IPA_HI: u64 = stage2::SUP_IPA_BASE >> 16;
+const _: () = assert!(SUP_IPA_HI << 16 == stage2::SUP_IPA_BASE);
+
+/// **M5 Arc 6a** — the guest reports what it read back from its SUPERPAGE (`x1`).
+const NR_POS_SUP: u64 = 0xa8;
 const NR_FINAL: u64 = 0xff;
 
 /// Balance the guest observes and echoes (`grant 100`, `spend 30` → `70`) — the Arc-4 witness value.
@@ -530,6 +554,16 @@ __guest_tpl_start:
     mov     x0, #{NR_POS_RO}
     mov     x1, x5
     hvc     #0
+    // M5 Arc 6a: the SUPERPAGE. A store+load through a 2 MiB BLOCK descriptor — the hardware must
+    // translate an L2 block, not an L3 page. A readback of SENTINEL_SUP proves the MMU walked the
+    // block the emitter wrote.
+    movz    x2, #{SUP_HI}, lsl #16
+    movz    x3, #{SENTINEL_SUP}
+    str     x3, [x2]
+    ldr     x7, [x2]
+    mov     x0, #{NR_POS_SUP}
+    mov     x1, x7
+    hvc     #0
 
     // ── Act 3: negatives — each faults to EL2; the handler records + resumes past ──
     // write to the read-only frame -> permission fault
@@ -562,6 +596,9 @@ __guest_tpl_end:
     NR_CREDIT_ECHO = const NR_CREDIT_ECHO,
     NR_POS_RW = const NR_POS_RW,
     NR_POS_RO = const NR_POS_RO,
+    NR_POS_SUP = const NR_POS_SUP,
+    SUP_HI = const SUP_IPA_HI,
+    SENTINEL_SUP = const SENTINEL_SUP,
     NR_FINAL = const NR_FINAL,
     DATA_HI = const DATA_IPA_HI,
     OFF_RW = const OFF_RW,
@@ -1525,6 +1562,9 @@ static FAULT_WNR: [AtomicBool; NFRAMES] = [const { AtomicBool::new(false) }; NFR
 static POS_RW: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The value the guest read back from its read-only frame, reported at [`NR_POS_RO`].
 static POS_RO: AtomicU64 = AtomicU64::new(u64::MAX);
+/// **M5 Arc 6a** — the value the guest read back from its 2 MiB SUPERPAGE, reported at
+/// [`NR_POS_SUP`]. `u64::MAX` until the guest reports, so a phase that never probed cannot pass.
+static POS_SUP: AtomicU64 = AtomicU64::new(u64::MAX);
 /// The credit balance the guest echoed, reported at [`NR_CREDIT_ECHO`].
 static CREDIT_ECHO: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -2460,6 +2500,7 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         }
         NR_POS_RW => POS_RW.store(arg0, Ordering::Relaxed),
         NR_POS_RO => POS_RO.store(arg0, Ordering::Relaxed),
+        NR_POS_SUP => POS_SUP.store(arg0, Ordering::Relaxed),
         NR_FINAL => finish_isolation_test(uart), // -> ! (phase 1 terminal → drives phase 2)
         NR_POS_RW2 => POS_RW2.store(arg0, Ordering::Relaxed),
         NR_FINAL2 => finish_lifecycle_test(uart), // -> ! (phase 2 terminal → drives phase 3)
@@ -3017,7 +3058,24 @@ fn finish_isolation_test(uart: &mut Pl011) -> ! {
     let rw_ok = rw_readback == SENTINEL_RW && rw_mem == SENTINEL_RW;
     let ro_ok = ro_readback == RO_SEED;
     let fgrant_ok = fgrant_mem == SENTINEL_FGRANT;
-    let positive_ok = credit_ok && rw_ok && ro_ok && fgrant_ok;
+    // M5 Arc 6a — the SUPERPAGE witness: the guest stored to and read back from an IPA translated
+    // by a 2 MiB BLOCK descriptor, so the hardware walked an L2 block rather than an L3 page. The
+    // model has had superpages since design-lesson #14; this is the first time one is TRANSLATED on
+    // the metal rather than flattened into a page by the emitter.
+    let sup_readback = POS_SUP.load(Ordering::Relaxed);
+    let sup_ok = sup_readback == SENTINEL_SUP;
+    if sup_ok {
+        let _ = writeln!(
+            uart,
+            "baleen: superpage OK: the guest round-tripped 0x{sup_readback:x} through a 2 MiB BLOCK descriptor (the hardware translated a superpage emitted from the model)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: superpage FAIL: readback=0x{sup_readback:x} expected=0x{SENTINEL_SUP:x}"
+        );
+    }
+    let positive_ok = credit_ok && rw_ok && ro_ok && fgrant_ok && sup_ok;
 
     if positive_ok {
         let _ = writeln!(
@@ -5550,6 +5608,47 @@ fn setup_model(hv: &mut Hypervisor, uart: &mut Pl011) {
             leaf: true,
         },
         "link fgrant",
+        uart,
+    );
+
+    // M5 Arc 6a — the SUPER-span leaf. `F_SUP_ROOT` is pinned one level UP from the bottom
+    // (`PtLevel::L2` in the model's convention), so this leaf is a 2 MiB superpage, not a page.
+    // The model has supported this since design-lesson #14; the emitter used to flatten it.
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mAllocate { mfn: F_SUP_ROOT },
+        "alloc super root",
+        uart,
+    );
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mPin {
+            mfn: F_SUP_ROOT,
+            level: PtLevel::L2,
+        },
+        "pin super root at L2",
+        uart,
+    );
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mAllocate { mfn: F_SUP },
+        "alloc super frame",
+        uart,
+    );
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mLink {
+            parent: F_SUP_ROOT,
+            slot: 0,
+            child: F_SUP,
+            writable: true,
+            leaf: true,
+        },
+        "link super leaf",
         uart,
     );
 }
