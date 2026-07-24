@@ -87,6 +87,16 @@ hardware; platform tension).
   `p2m`*. Ideally a checked property (the generated table denies exactly what the model says it
   should); at minimum the negative-isolation test as the bridge. Audit the model→hardware
   translation for every access class (read/write/execute, foreign, superpage).
+- **✅ EXCEEDED (2026-07-24, PRs #46–#56 — the Stage-2 refinement program).** This bar asked for
+  "ideally a checked property". It is now a **∀-N theorem with an ∀-N premise**: `check_authorized`
+  proven for all configurations (Verus + Kani over the shipped functions), `UnauthorizedForeignLink`
+  proven preserved by every transition class, the descriptor encoding proven over all 2^64 addresses,
+  and every emitted table read back and decoded at runtime. Superpages carried (`Span`), the
+  concurrency predicate beneath it machine-checked, content non-inheritance closed — and the real
+  Linux guest moved onto the proven emitter, deleting the unproven one. See
+  `docs/STAGE2-REFINEMENT-FORALL-N.md`, `docs/ARC6A-SPAN-REFINEMENT.md`,
+  `docs/ARC6B-LINUX-ON-THE-PROVEN-EMITTER.md`, `docs/ARC4-CONCURRENCY-PREDICATE.md`,
+  `docs/ARC5-CONTENT-NON-INHERITANCE.md`.
 - **Flags:** *refines* the proof (this is the model→metal bridge for CPU-access isolation).
   QEMU-sound for the functional fault behavior.
 
