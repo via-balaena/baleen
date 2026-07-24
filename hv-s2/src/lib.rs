@@ -45,8 +45,15 @@
 //! 1. **model → leaf map** ([`leafmap`]). Checked by `hv-sim`'s enumerator at **every reachable
 //!    state** of its configs (828,325 states on the deep grant↔p2m sweep) and by `hv-fuzz` after
 //!    every dispatch, via [`check`]. The properties are stated there, including which of them is a
-//!    genuine theorem and which is only a consistency check. **Not yet proven ∀-N** — that is the
-//!    follow-on arc.
+//!    genuine theorem and which is only a consistency check. The theorem —
+//!    [`check::check_authorized`], *no reachability without authorization* — is now **proven ∀-N**:
+//!    over an arbitrary edge population in Verus
+//!    (`hv-verify/verus/stage2_leaf_authorized.rs`), and on the **shipped**
+//!    [`leafmap::leaf_map_from_edges`] by Kani over every ownership assignment, grant table,
+//!    permission and capacity at bounded edge count (`hv-verify::stage2_refinement`). It is
+//!    **conditional** on hv-core's `UnauthorizedForeignLink` (enumerator-checked, not itself a
+//!    ∀-N theorem) plus the allocated-child premise — see `docs/STAGE2-REFINEMENT-FORALL-N.md`.
+//!    Note this is **soundness, not completeness**: see the interior-node bullet below.
 //! 2. **leaf map → descriptor words** ([`arm64`]). [`arm64::verify_encoding`] reads the emitted
 //!    tables back and asserts they mean exactly the leaf map and *nothing else* (no spurious live
 //!    slot anywhere in any table); the metal runs it on the real tables under `--features selftest`
@@ -92,5 +99,5 @@ pub mod arm64;
 pub mod check;
 pub mod leafmap;
 
-pub use check::{check_all, Violation};
-pub use leafmap::{leaf_map, FrameOutOfRange, Perm};
+pub use check::{check_all, check_authorized, check_authorized_with, Violation};
+pub use leafmap::{leaf_map, leaf_map_from_edges, Edge, FrameOutOfRange, Perm};

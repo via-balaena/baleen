@@ -282,3 +282,295 @@ mod stage2_encoding {
         assert!(decode_table(d) == Some(pa & desc::ADDR_4K));
     }
 }
+
+/// # The Stage-2 **refinement**, proven on the shipped emitter (the first arrow)
+///
+/// Arrow (1) of the chain — `p2m model → leaf map` — is the isolation content of the whole metal
+/// build: *which machine frames does a domain's hardware page table reach, and at what
+/// permission?* `hv-sim`'s enumerator checks it over every reachable state of its configs (828,325
+/// on the deep grant↔p2m sweep) and `hv-fuzz` after every dispatch. Those are **bounded**: Tier B
+/// proved the grant+p2m config is the one config that can *never* saturate (`grant::map` bumps a
+/// `u32` with no cap, so its reachable set is genuinely infinite), so the saturation route that
+/// closed the depth axis elsewhere is unavailable here by construction.
+///
+/// ## The theorem
+///
+/// > **T.** For every model state satisfying **(P1)** `UnauthorizedForeignLink` and **(P2)** every
+/// > active edge's child is allocated, and every domain `G`: the leaf map
+/// > [`hv_s2::leaf_map_from_edges`] emits for `G` contains no frame that `G` neither **owns** nor
+/// > holds an **active grant** for at (at least) the mapped permission — i.e.
+/// > [`hv_s2::check_authorized_with`] returns `Ok`.
+///
+/// **T is conditional, and P1 is the load-bearing premise.** `UnauthorizedForeignLink` is what
+/// makes a foreign leaf *imply* a grant; it is checked by the enumerator over every reachable state
+/// and carries a Tier-B locality cutoff, but it is **not** itself a machine-checked ∀-N theorem
+/// (no Verus proof discharges it — that is Arc 3b). T composes with it; T does not prove it.
+/// **P2 is a separate premise P1 does not give you**: `UnauthorizedForeignLink` *skips* an edge
+/// whose child is unallocated, while `check_authorized` *rejects* such a frame — so without P2, T
+/// is false at `owner == None`. P2 holds because `p2m::link` requires `is_allocated(child)` and the
+/// edge's own reference blocks a later free; the harnesses assume it explicitly rather than let it
+/// hide.
+///
+/// ## What these harnesses close, and what they do not
+///
+/// Kani cannot construct a symbolic [`Hypervisor`] — it is heap `Vec`s, and worse, an *arbitrary
+/// reachable* one. So the emitter and the checker each expose an oracle-parameterised seam
+/// ([`hv_s2::leaf_map_from_edges`], [`hv_s2::check_authorized_with`]) that production calls through
+/// a two-line wrapper (design-lesson #14c): these harnesses drive the **same shipped functions**
+/// the metal calls, over *every* edge set, ownership assignment, grant table, permission and
+/// capacity — bounded only in **edge count** and frame count. The arbitrary-*length* step is the
+/// Verus mirror `hv-verify/verus/stage2_leaf_authorized.rs`.
+///
+/// Three complementary axes over one obligation, no one of which is the theorem alone: the
+/// enumerator (real code, real reachable states, small size), Kani (real code, all values, bounded
+/// length), Verus (mirror, all lengths).
+///
+/// ## Scope (carried verbatim from `hv_s2`'s scope boundaries — T is false without it)
+///
+/// The claim is **leaf-level frame reachability**, not full model reachability: the emitter maps
+/// only leaves of tables the domain owns, so a legitimately shared interior node yields *no*
+/// mapping beneath it — an **under**-map that fails **closed**. Superpage size, the guest-image
+/// block (infrastructure, proven RO+X by `stage2_encoding`), `GuestMem` (the trusted path), and
+/// VMID/table-set binding (hv-metal) are all outside T.
+///
+/// [`Hypervisor`]: hv_core::Hypervisor
+#[cfg(kani)]
+mod stage2_refinement {
+    use hv_core::p2m::{DomId, Mfn};
+    use hv_s2::{check_authorized_with, leaf_map_from_edges, Edge, Perm, Violation};
+
+    /// Distinct domains the symbolic model may name. Three is the smallest world that can express
+    /// the confused deputy: an owner, a mapper, and a *third* party whose grant must not count.
+    const DOMS: usize = 3;
+    /// Frames in the symbolic model.
+    const FRAMES: usize = 4;
+    /// Live page-table edges. Bounded — this is the axis the Verus mirror lifts to arbitrary N.
+    const EDGES: usize = 3;
+
+    /// Bit index into the symbolic grant *permit* table, standing in for
+    /// `hv_core::grant::System::authorizes(grantor, grantee, frame, writable)`. The table is a
+    /// single symbolic `u128` bitmask (`DOMS·DOMS·FRAMES·2 = 72` bits), which keeps it fully
+    /// symbolic over every possible grant table while costing the solver no loop at all — an
+    /// array-of-`bool` would make `kani::any` unwind 72 times before the proof even starts.
+    ///
+    /// Left completely free: no monotonicity between the `writable` and read-only entries is
+    /// assumed, so the proof covers strictly more tables than the grant subsystem can realise.
+    fn auth_idx(grantor: DomId, grantee: DomId, frame: Mfn, writable: bool) -> u32 {
+        (((grantor as u32 * DOMS as u32 + grantee as u32) * FRAMES as u32 + frame) * 2)
+            + u32::from(writable)
+    }
+
+    /// The symbolic world: an ownership assignment, a grant permit table, and an edge set.
+    struct World {
+        owners: [Option<DomId>; FRAMES],
+        auth: u128,
+        edges: [Edge; EDGES],
+    }
+
+    impl World {
+        /// Every field symbolic, constrained only to be *well-formed* (ids in range) — not to be
+        /// reachable. Reachability enters solely as the two named premises.
+        fn any() -> Self {
+            let mut owners = [None; FRAMES];
+            for slot in owners.iter_mut() {
+                let owned: bool = kani::any();
+                if owned {
+                    let d: DomId = kani::any();
+                    kani::assume((d as usize) < DOMS);
+                    *slot = Some(d);
+                }
+            }
+            let mut edges = [(0u32, 0u32, 0u32, false, false); EDGES];
+            for e in edges.iter_mut() {
+                let parent: Mfn = kani::any();
+                let child: Mfn = kani::any();
+                kani::assume((parent as usize) < FRAMES);
+                kani::assume((child as usize) < FRAMES);
+                *e = (parent, kani::any(), child, kani::any(), kani::any());
+            }
+            World {
+                owners,
+                auth: kani::any(),
+                edges,
+            }
+        }
+
+        fn owner_of(&self, m: Mfn) -> Option<DomId> {
+            if (m as usize) < FRAMES {
+                self.owners[m as usize]
+            } else {
+                None
+            }
+        }
+
+        fn authorizes(&self, grantor: DomId, grantee: DomId, frame: Mfn, writable: bool) -> bool {
+            self.auth & (1u128 << auth_idx(grantor, grantee, frame, writable)) != 0
+        }
+
+        /// **(P1) `UnauthorizedForeignLink`** — transcribed from the shape hv-core checks
+        /// (`hypervisor.rs`, the page-table↔grant seam): every *cross-domain* live edge is backed
+        /// by a grant from the child's owner to the domain whose table maps it, at the entry's
+        /// permission. Note it *skips* an edge either end of which is unowned — which is precisely
+        /// why P2 is needed separately.
+        fn assume_no_unauthorized_foreign_link(&self) {
+            for (parent, _slot, child, writable, _leaf) in self.edges.iter().copied() {
+                let (Some(child_owner), Some(parent_owner)) =
+                    (self.owner_of(child), self.owner_of(parent))
+                else {
+                    continue;
+                };
+                if child_owner != parent_owner {
+                    kani::assume(self.authorizes(child_owner, parent_owner, child, writable));
+                }
+            }
+        }
+
+        /// **(P2) every active edge's child is allocated** — `p2m::link` refuses an unallocated
+        /// child, and the reference the edge takes blocks a later free.
+        fn assume_edge_children_allocated(&self) {
+            for (_parent, _slot, child, _writable, _leaf) in self.edges.iter().copied() {
+                kani::assume(self.owner_of(child).is_some());
+            }
+        }
+    }
+
+    /// **THEOREM T, on the shipped emitter.** Over every ownership assignment, grant table, edge
+    /// set, target domain and table capacity: if the model state satisfies P1 and P2, then the map
+    /// the emitter actually produces is authorized frame by frame — the real
+    /// [`hv_s2::check_authorized_with`] finds no violation.
+    ///
+    /// The overflow case is *included*, not assumed away: an authorized frame that does not fit is
+    /// returned as an error the metal halts on, never a silent omission. So the harness proves the
+    /// disjunction "**fails loudly, or is authorized**" — there is no third outcome in which the
+    /// hardware maps something the model forbids.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn emitted_leaf_map_is_always_authorized() {
+        let w = World::any();
+        let dom: DomId = kani::any();
+        kani::assume((dom as usize) < DOMS);
+
+        w.assume_no_unauthorized_foreign_link();
+        w.assume_edge_children_allocated();
+
+        // An arbitrary table capacity, including capacities too small to hold every frame.
+        let cap: usize = kani::any();
+        kani::assume(cap <= FRAMES);
+        let mut buf = [None; FRAMES];
+        let out = &mut buf[..cap];
+
+        if leaf_map_from_edges(&w.edges, |m| w.owner_of(m), dom, out).is_ok() {
+            assert!(
+                check_authorized_with(
+                    dom,
+                    out,
+                    |m| w.owner_of(m),
+                    |g, d, f, wr| w.authorizes(g, d, f, wr),
+                )
+                .is_ok(),
+                "an emitted Stage-2 leaf map reached a frame no ownership or grant authorizes"
+            );
+        }
+    }
+
+    /// The same theorem stated as the **isolation corollary**, because that is the sentence the
+    /// project actually claims: a frame that `dom` does not own and holds no grant for is **not in
+    /// the table at all** — the guest takes a translation fault rather than reaching it. Implied by
+    /// T, but asserted directly so the negative form is machine-checked and not left to a reader's
+    /// contraposition.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn an_unauthorized_frame_is_never_mapped() {
+        let w = World::any();
+        let dom: DomId = kani::any();
+        kani::assume((dom as usize) < DOMS);
+        w.assume_no_unauthorized_foreign_link();
+        w.assume_edge_children_allocated();
+
+        // The frame under scrutiny: foreign, and ungranted at either permission.
+        let m: Mfn = kani::any();
+        kani::assume((m as usize) < FRAMES);
+        kani::assume(w.owner_of(m) != Some(dom));
+        if let Some(owner) = w.owner_of(m) {
+            kani::assume(!w.authorizes(owner, dom, m, false));
+            kani::assume(!w.authorizes(owner, dom, m, true));
+        }
+
+        let mut out = [None; FRAMES];
+        if leaf_map_from_edges(&w.edges, |m| w.owner_of(m), dom, &mut out).is_ok() {
+            assert!(
+                out[m as usize].is_none(),
+                "an unowned, ungranted frame must be a hole in the guest's Stage-2 table"
+            );
+        }
+    }
+
+    /// **No silent write escalation.** A frame mapped `Rw` is always backed by ownership or a
+    /// *read-write* grant — a read-only grant can never produce a writable leaf. Stated separately
+    /// from T because permission escalation, not mere reachability, is the sharper half of the
+    /// isolation claim (and the mutation class Audit #2 called "RW for an RO leaf").
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn a_writable_leaf_is_never_backed_by_a_readonly_grant() {
+        let w = World::any();
+        let dom: DomId = kani::any();
+        kani::assume((dom as usize) < DOMS);
+        w.assume_no_unauthorized_foreign_link();
+        w.assume_edge_children_allocated();
+
+        let mut out = [None; FRAMES];
+        if leaf_map_from_edges(&w.edges, |m| w.owner_of(m), dom, &mut out).is_ok() {
+            let m: Mfn = kani::any();
+            kani::assume((m as usize) < FRAMES);
+            if out[m as usize] == Some(Perm::Rw) {
+                if let Some(owner) = w.owner_of(m) {
+                    assert!(
+                        owner == dom || w.authorizes(owner, dom, m, true),
+                        "a writable leaf must be owned or backed by a read-write grant"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Non-vacuity, kept in-tree rather than only in the arc doc: the harnesses above must be able
+    /// to **fail**. Dropping P1 — the one premise the whole composition rests on — makes an
+    /// unauthorized mapping reachable, so this harness asserts the violation *is* constructible:
+    /// a peer's frame linked from `dom`'s table with no grant yields exactly
+    /// [`Violation::UnauthorizedMapping`]. If the checker were vacuously satisfiable this would
+    /// not hold.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn without_the_foreign_link_premise_the_checker_fires() {
+        let mut owners = [None; FRAMES];
+        owners[1] = Some(0); // dom0's table
+        owners[2] = Some(1); // dom1's frame — never granted to dom0
+        let w = World {
+            owners,
+            // An empty grant table: dom1 has granted dom0 nothing.
+            auth: 0,
+            edges: [
+                (1, 0, 2, true, true),
+                (1, 0, 2, true, true),
+                (1, 0, 2, true, true),
+            ],
+        };
+        // P2 holds; P1 deliberately does NOT (the edge is foreign and ungranted).
+        let mut out = [None; FRAMES];
+        assert!(leaf_map_from_edges(&w.edges, |m| w.owner_of(m), 0, &mut out).is_ok());
+        assert!(
+            check_authorized_with(
+                0,
+                &out,
+                |m| w.owner_of(m),
+                |g, d, f, wr| w.authorizes(g, d, f, wr)
+            ) == Err(Violation::UnauthorizedMapping {
+                dom: 0,
+                mfn: 2,
+                owner: Some(1),
+                perm: Perm::Rw,
+            }),
+            "with P1 dropped the confused deputy must be caught — the checker is not vacuous"
+        );
+    }
+}

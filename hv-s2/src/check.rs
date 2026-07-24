@@ -14,8 +14,16 @@
 //! through a route the emitter never touches: [`hv_core::p2m::System::owner_of`] plus the **grant
 //! subsystem** ([`hv_core::grant::System::authorizes`]). The emitter walks `link_edges`; this walks
 //! ownership and grants. Two independent derivations agreeing over every reachable state is
-//! evidence; it also *composes* with hv-core's already-proven `UnauthorizedForeignLink` invariant,
-//! which is what makes a foreign leaf imply a grant in the first place.
+//! evidence; it also *composes* with hv-core's `UnauthorizedForeignLink` invariant, which is what
+//! makes a foreign leaf imply a grant in the first place. It is now proven ∀-N — over an arbitrary
+//! edge population in Verus, and on this shipped predicate by Kani over every ownership assignment
+//! and grant table at bounded edge count (`docs/STAGE2-REFINEMENT-FORALL-N.md`).
+//!
+//! **That theorem is CONDITIONAL, and the premise is the weaker link.**
+//! `UnauthorizedForeignLink` is checked by the enumerator over every reachable state and carries a
+//! Tier-B locality cutoff — but no Verus proof discharges it, so it is **not** itself a
+//! machine-checked ∀-N theorem. (An earlier revision of this comment called it "already-proven";
+//! it was not, and the correction is the point of design-lesson #37.) Lifting it is Arc 3b.
 //!
 //! **[`check_exact`] is a consistency check, not a theorem.** It re-derives the expected map from
 //! the same `link_edges` relation the emitter reads, so it cannot fail for a *reason the emitter got
@@ -90,10 +98,38 @@ pub fn check_authorized(
     dom: DomId,
     leaves: &[Option<Perm>],
 ) -> Result<(), Violation> {
+    check_authorized_with(
+        dom,
+        leaves,
+        |m| hv.p2m().owner_of(m),
+        |grantor, grantee, frame, writable| {
+            hv.grant().authorizes(grantor, grantee, frame, writable)
+        },
+    )
+}
+
+/// [`check_authorized`], with the two model reads it makes lifted into parameters: frame
+/// ownership and the grant *permit* relation.
+///
+/// The same #14c seam as [`crate::leafmap::leaf_map_from_edges`], for the same reason —
+/// `hv-verify`'s Kani harnesses cannot build a whole [`Hypervisor`] symbolically, but they *can*
+/// drive this function against a symbolic ownership assignment and a symbolic grant table, which
+/// makes the proof one about the shipped predicate rather than a re-modelled copy.
+/// [`check_authorized`] is the two-line wrapper production uses.
+pub fn check_authorized_with<O, A>(
+    dom: DomId,
+    leaves: &[Option<Perm>],
+    owner_of: O,
+    authorizes: A,
+) -> Result<(), Violation>
+where
+    O: Fn(Mfn) -> Option<DomId>,
+    A: Fn(DomId, DomId, Mfn, bool) -> bool,
+{
     for (m, leaf) in leaves.iter().enumerate() {
         let Some(perm) = *leaf else { continue };
         let mfn = m as Mfn;
-        let owner = hv.p2m().owner_of(mfn);
+        let owner = owner_of(mfn);
         // Its own frame: ownership is the authorization.
         if owner == Some(dom) {
             continue;
@@ -108,25 +144,23 @@ pub fn check_authorized(
             });
         };
         let writable = perm == Perm::Rw;
-        if !hv.grant().authorizes(grantor, dom, mfn, writable) {
+        if !authorizes(grantor, dom, mfn, writable) {
             // Distinguish "no grant at all" from "a read-only grant mapped writable" — the second
             // is the sharper diagnosis, and the mutation class Audit #2 called RW-for-an-RO-leaf.
-            return Err(
-                if writable && hv.grant().authorizes(grantor, dom, mfn, false) {
-                    Violation::WriteEscalation {
-                        dom,
-                        mfn,
-                        owner: grantor,
-                    }
-                } else {
-                    Violation::UnauthorizedMapping {
-                        dom,
-                        mfn,
-                        owner,
-                        perm,
-                    }
-                },
-            );
+            return Err(if writable && authorizes(grantor, dom, mfn, false) {
+                Violation::WriteEscalation {
+                    dom,
+                    mfn,
+                    owner: grantor,
+                }
+            } else {
+                Violation::UnauthorizedMapping {
+                    dom,
+                    mfn,
+                    owner,
+                    perm,
+                }
+            });
         }
     }
     Ok(())
