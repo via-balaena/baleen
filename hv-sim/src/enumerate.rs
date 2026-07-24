@@ -130,6 +130,14 @@ pub struct EnumOutcome {
     /// A shortest counterexample: the hypercall path from `new()` to a state that
     /// violates the integrated invariant, or `None` if none exists within `depth`.
     pub violation: Option<Vec<(u16, HvCall)>>,
+    /// If the counterexample is a **Stage-2 refinement** failure rather than (or as well as) a
+    /// model-invariant failure, the specific way the emitted page table betrayed the model. `None`
+    /// when the run was clean, or when the counterexample was a pure `invariants_hold` violation.
+    ///
+    /// This is the metal's half of the check: `invariants_hold` asks "is the *model* consistent?",
+    /// [`hv_s2::check_all`] asks "does the page table we would *emit* from this model authorize
+    /// exactly what the model permits?" — over the same reachable states.
+    pub refinement: Option<hv_s2::Violation>,
 }
 
 /// A canonical state fingerprint (see [`state_key`]).
@@ -944,7 +952,13 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
             for &(caller, call) in &universe {
                 let mut h = hv.clone();
                 let _: Result<HvOutcome, _> = h.dispatch(caller, call);
-                if !h.invariants_hold() {
+                // Two predicates at every reachable state: hv-core's own invariants, and the
+                // Stage-2 REFINEMENT — that the page table emitted from this state authorizes
+                // exactly what the model permits (no reachability without ownership or a grant).
+                // The second is what turns Architecture Audit #2's three hand-written mutations
+                // into a property checked over the whole reachable set.
+                let refinement = hv_s2::check_all(&h).err();
+                if !h.invariants_hold() || refinement.is_some() {
                     let key = keyfn(&h);
                     came_from.insert(key.clone(), Some((keyfn(hv), caller, call)));
                     return EnumOutcome {
@@ -952,6 +966,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                         truncated,
                         saturated: false,
                         violation: Some(trace(&came_from, &key)),
+                        refinement,
                     };
                 }
                 let key = keyfn(&h);
@@ -980,6 +995,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
         truncated,
         saturated,
         violation: None,
+        refinement: None,
     }
 }
 
@@ -1005,8 +1021,14 @@ mod tests {
         let out = enumerate(cfg);
         assert!(
             out.violation.is_none(),
-            "invariant violated after: {:?}",
-            out.violation.unwrap()
+            "violated after: {:?}{}",
+            out.violation.as_ref().unwrap(),
+            // Name WHICH predicate failed: a bare trace cannot distinguish a model-invariant
+            // break from a Stage-2 refinement break, and they have very different diagnoses.
+            match &out.refinement {
+                Some(v) => format!(" [Stage-2 REFINEMENT: {v:?}]"),
+                None => " [hv-core invariant]".to_string(),
+            }
         );
         assert!(
             !out.truncated,

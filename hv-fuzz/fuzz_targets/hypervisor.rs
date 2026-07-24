@@ -33,6 +33,12 @@
 //! `run_ptab` tree-building, `run_foreign` cross-domain, `run_destroy` lifecycle-cycling)
 //! make the properties deterministic.
 //!
+//! Since the Stage-2 refinement arc, every dispatch also checks the **metal's** half: that the
+//! AArch64 page table `hv-s2` would emit from this state authorizes exactly what the model permits
+//! — no frame reachable without ownership or an authorizing grant, and no read-only grant mapped
+//! writable (see [`check`]). The enumerator proves that over every reachable state of tiny configs;
+//! the fuzzer reaches the wide interleavings those configs cannot.
+//!
 //! Run it (needs nightly + `cargo install cargo-fuzz`):
 //!
 //! ```sh
@@ -52,6 +58,18 @@ fn pt_level(n: u8) -> PtLevel {
         1 => PtLevel::L2,
         2 => PtLevel::L3,
         _ => PtLevel::L4,
+    }
+}
+
+/// The two predicates asserted after every dispatch: hv-core's own combined invariant, and the
+/// **Stage-2 refinement** — that the page table `hv-s2` would emit from this state authorizes
+/// exactly what the model permits (nothing reachable without ownership or an authorizing grant).
+/// The fuzzer drives `P2mLink`/`GrantAccess`/`DomainDestroy` interleavings the enumerator's tiny
+/// configs cannot reach, so this is the refinement's coverage beyond the exhaustive-but-small sweeps.
+fn check(hv: &Hypervisor) {
+    assert!(hv.invariants_hold(), "integrated invariant violated");
+    if let Err(v) = hv_s2::check_all(hv) {
+        panic!("Stage-2 refinement violated: {v:?}");
     }
 }
 
@@ -134,7 +152,7 @@ fuzz_target!(|data: &[u8]| {
                 ) {
                     handles.push((caller, h));
                 }
-                assert!(hv.invariants_hold(), "integrated invariant violated");
+                check(&hv);
                 continue;
             }
             13 => {
@@ -142,7 +160,7 @@ fuzz_target!(|data: &[u8]| {
                     let (owner, handle) = handles.swap_remove(usize::from(a) % handles.len());
                     let _ = hv.dispatch(owner, HvCall::GrantUnmap { handle });
                 }
-                assert!(hv.invariants_hold(), "integrated invariant violated");
+                check(&hv);
                 continue;
             }
             14 => HvCall::GrantCopy {

@@ -20,6 +20,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 hv-core = { path = "../hv-core" }
+# The Stage-2 emission + its refinement properties: the integrated target checks them after every
+# dispatch, alongside hv-core's own invariants.
+hv-s2 = { path = "../hv-s2" }
 
 [[bin]]
 name = "decode"

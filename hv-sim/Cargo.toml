@@ -15,6 +15,9 @@ repository.workspace = true
 [dependencies]
 hv-hal = { path = "../hv-hal" }
 hv-core = { path = "../hv-core" }
+# The Stage-2 emission + its refinement properties: the enumerator checks them at every reachable
+# state, alongside hv-core's own invariants (see `enumerate`).
+hv-s2 = { path = "../hv-s2" }
 
 [lints]
 workspace = true
