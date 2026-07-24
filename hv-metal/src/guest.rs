@@ -5034,9 +5034,21 @@ fn finish_thesis_test(uart: &mut Pl011) -> ! {
         && hv.p2m().owner_of(F_DISP_ROOT) != Some(DISP_DOM)
         && hv.p2m().owner_of(F_DISP_DATA) != Some(DISP_DOM);
 
-    // Discard the disposable's disk (its CoW overlay) — a disposable's storage is thrown away on teardown.
-    blk_disk().discard_overlay(DISP_TENANT);
+    // The disposable's disk (its CoW overlay) is thrown away on teardown — and since M5 Arc 5 that is
+    // the TEARDOWN's job, not this terminal's. The explicit `discard_overlay` call that used to sit
+    // here was the ONLY caller in the crate, which is exactly why an ordinary `DomainDestroy` left a
+    // dead tenant's disk writes intact for the next occupant. `crate::teardown::on_destroy` now does
+    // it, so this assertion has become the WITNESS for that obligation rather than a check on a
+    // test step performed two lines above it.
     let overlay_gone = !blk_disk().is_dirty(DISP_TENANT, 0);
+
+    // Same shape for the device register files: the destroy above must have reset them, so a next
+    // tenant cannot read the disposable's negotiated `status`/`queue_ready` back out (M5 Arc 5).
+    let device_state_reset = {
+        let console = virtio_dev();
+        let blk = blk_dev();
+        console.status == 0 && console.queue_ready == 0 && blk.status == 0 && blk.queue_ready == 0
+    };
 
     // (4) The vault's secret is UNTOUCHED (read the real backing HV-side). And the CoW template is
     // pristine — a model-level re-assertion of the Arc-4 immutability property (here the disposable's
@@ -5100,6 +5112,7 @@ fn finish_thesis_test(uart: &mut Pl011) -> ! {
         && no_channel
         && destroy_clean
         && overlay_gone
+        && device_state_reset
         && vault_untouched
         && template_pristine
         && reborn_denied;
@@ -5111,7 +5124,7 @@ fn finish_thesis_test(uart: &mut Pl011) -> ! {
     } else {
         let _ = writeln!(
             uart,
-            "baleen: THESIS TEST FAILED (pos_ok={pos_ok} faulted={faulted} no_channel={no_channel} destroy_clean={destroy_clean} overlay_gone={overlay_gone} vault_untouched={vault_untouched} template_pristine={template_pristine} reborn_denied={reborn_denied})"
+            "baleen: THESIS TEST FAILED (pos_ok={pos_ok} faulted={faulted} no_channel={no_channel} destroy_clean={destroy_clean} overlay_gone={overlay_gone} device_state_reset={device_state_reset} vault_untouched={vault_untouched} template_pristine={template_pristine} reborn_denied={reborn_denied})"
         );
     }
     selftest_brk(uart);
