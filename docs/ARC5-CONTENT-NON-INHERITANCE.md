@@ -2,6 +2,12 @@
 
 **Status:** done. `hv-core` / `hv-hal` / `hv-s2` untouched.
 
+> **Two later corrections, recorded here so this page is not read as the final word.**
+> 1. **Arc 6a** exposed that `scrub_frame` was **span-blind** — it always addressed the base window
+>    and zeroed 4 KiB, so this arc's claim was **false for superpages**. Fixed in PR #54; see
+>    `docs/ARC6A-SPAN-REFINEMENT.md` and the seam note below.
+> 2. **Arc 6b-pre** moved the scrub from the *allocate* to the *free*. See §2.
+
 `hv-core` proves a reborn slot inherits no **authority** — no grant, no port, no owned frame
 (design-lesson #15's inbound-reference sweep, live on the metal since M5 Arc 0). It says nothing
 about **bytes**, and it never can: `Mfn` is an opaque token by design, the same fence that abstracts
@@ -50,12 +56,20 @@ slot under the *same* `DomId`.
 So the honest statement is not "owner-diff is wrong" but **"an owner-diff is only sound at a sampling
 rate that already costs more than the alternative."**
 
-**What this arc does instead** is key on the transition that *creates* ownership. `p2m::allocate` is
-the sole place a frame becomes `Frame::Allocated` from `Free` — the only `*frame = Frame::Allocated`
-assignment in `hv-core/src/p2m.rs` — so **scrub on a successful `P2mAllocate`** is complete by
-construction, whoever held the frame before, with **no ownership history kept at all**. It is also
-correctly ordered: a frame becomes guest-reachable only through a Stage-2 leaf, which requires a
-link, which requires the allocate.
+**What this arc did** was key on the transition that *creates* ownership — `p2m::allocate`, the sole
+place a frame becomes `Frame::Allocated` from `Free`, so complete by construction with no ownership
+history kept.
+
+> **Superseded by Arc 6b-pre: the scrub now hooks the FREE, not the allocate.** A frame must pass
+> through `Free` between owners, so the two are equally complete hooks — but free is better on every
+> axis that later came up. It leaves nothing at rest (discharging residual 1 below rather than
+> carrying it); it does not erase a real guest's pre-loaded payload, which is deposited into guest
+> RAM *before* the hypervisor runs and which scrub-at-allocate would have zeroed the moment the model
+> config was built; and it costs nothing at boot. The hook is also transition-agnostic now — the
+> funnel diffs allocation state against its own shadow and scrubs whatever went allocated → free, so
+> bulk `free_all`, explicit frees, and any future freeing transition are covered without a new arm.
+> See `hv-metal/src/teardown.rs`. **Choosing allocate was the wrong side of the pair, and it took the
+> requirements of the *next* arc to show it (design-lesson #43).**
 
 ---
 
@@ -90,7 +104,7 @@ the VMID-tagging argument (#23).
 | 1 | **Remove the scrub** (the pre-arc state) | **LEAK REPRODUCED** — `lifecycle content LEAK: the reborn slot read the dead tenant's bytes: D3ADTENANT-must-not-survive-rebirth`; forbidden marker fired |
 | 2a | Owner-diff sampled **at reachability time** | **LEAK REPRODUCED** — the DomId-reuse trap, exactly as §2 predicts |
 | 2b | Owner-diff sampled **after every transition** | **STILL GREEN** — works; this is what corrected the claim from "owner-diff is wrong" to "only at a costlier sampling rate" |
-| 3 | **Bypass the funnel** (`expect` dispatches directly) | **CAUGHT** — the independent Stage-2-time check halts |
+| 3 | **Bypass the funnel** (`expect` dispatches directly) | **CAUGHT** — the independent Stage-2-time check halts. *(Under 6b-pre the check compares the model's allocation state against the funnel's shadow rather than a per-frame scrubbed flag; same #36 shape, same catch.)* |
 | 4 | Remove the `dc civac` cache maintenance | **STILL GREEN — does not fire.** Predicted: TCG models no cache. This row *is* the evidence for the reasoned-not-witnessed label |
 | 5 | Remove the `scrubbed` shadow re-sync | **STILL GREEN — does not fire** |
 | 5b | Funnel bypass **and** no re-sync (the combination it should defend) | **CAUGHT anyway** — so the re-sync is not load-bearing on any path this fixture builds, either |
@@ -116,9 +130,9 @@ this leak sat in the ledger with every boot green. The new witness reads first. 
 
 ## 5. Residual
 
-1. **The scrub is eager at allocate, not at free.** Between a free and the next allocate the bytes
-   are still in DRAM. That is exposure to **EL2 only**, which is the trusted layer, so the
-   cross-tenant property holds — but "scrubbed at rest" is *not* what this arc delivers.
+1. ~~**The scrub is eager at allocate, not at free.**~~ **DISCHARGED by Arc 6b-pre** — the scrub
+   moved to the free, so the bytes are gone at the tenant boundary rather than sitting in DRAM until
+   the next allocate. Scrubbed-at-rest is now what is delivered.
 2. **The cache-maintenance half is reasoned, not witnessed**, and cannot be witnessed under TCG
    (§4 row 4). It rides on the standing crate-wide EL2-MMU real-hardware gap.
 3. **The bump heap is not scrubbed and never reclaims.** Not guest-reachable, so not a channel —
