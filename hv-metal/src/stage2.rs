@@ -491,13 +491,19 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         let mut uart = crate::uart();
         match verdict {
             Ok(()) => {
+                let image = if layout.guest_image_pa.is_some() {
+                    "RO+X"
+                } else {
+                    "absent (tables asserted dead)"
+                };
+                let dev = layout.device_len / (1024 * 1024);
                 let n_sup = supers[..NUM_SUP_FRAMES as usize]
                     .iter()
                     .filter(|s| s.is_some())
                     .count();
                 let _ = writeln!(
                     uart,
-                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block RO+X; {n_sup} super-span 2 MiB block(s) emitted and decoded)"
+                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block {image}; {n_sup} super-span 2 MiB block(s) emitted and decoded; device window {dev} MiB)"
                 );
             }
             Err(e) => {
