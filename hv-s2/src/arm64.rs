@@ -74,6 +74,12 @@ pub mod desc {
     pub const BLOCK_RW: u64 = BLOCK | LEAF_COMMON | S2AP_RW | XN;
     /// A **data** 2 MiB block, read-only, execute-never (M5 Arc 6a).
     pub const BLOCK_RO: u64 = BLOCK | LEAF_COMMON | S2AP_RO | XN;
+    /// A 2 MiB block a guest may **execute** from — read/write and read-only forms (M5 Arc 6b).
+    /// Only ever emitted when [`super::Layout::sup_executable`] asks for it.
+    pub const BLOCK_RW_X: u64 = BLOCK | LEAF_COMMON | S2AP_RW;
+    /// Read-only and executable — the same shape as the guest-image block, for a guest whose code
+    /// lives in its own RAM.
+    pub const BLOCK_RO_X: u64 = BLOCK | LEAF_COMMON | S2AP_RO;
     /// A **device** 2 MiB block (M5 Arc 6b): `MemAttr = 0b0000` (Device-nGnRnE — no gathering, no
     /// reordering, no early write acknowledgement), read/write, **execute-never**. Note the absent
     /// `0b1111 << 2`: that is the whole difference from a Normal-memory block, and getting it wrong
@@ -131,6 +137,17 @@ pub struct Layout {
     pub device_base: u64,
     /// Length of the device window in bytes; `0` = absent. Must be a multiple of 2 MiB.
     pub device_len: u64,
+    /// Whether super-span leaves are **executable** (M5 Arc 6b).
+    ///
+    /// **A named weakening, not an oversight.** Arc 6a made every data leaf execute-never, and that
+    /// is right for a guest whose code lives in a separate read-only image: an executable data
+    /// superpage is a 512-page execute surface. But a *real kernel* runs from its own RAM, so it
+    /// cannot be hosted at all under a blanket XN. Making it a declared flag rather than a constant
+    /// keeps the property **checked** — `verify_encoding` asserts the emitted blocks match this
+    /// exactly, so a config that did not ask for execute cannot silently get it, and one that did
+    /// cannot silently lose it. Base-span (4 KiB) leaves stay XN unconditionally; only the super
+    /// window, which is what a real guest's RAM is made of, is affected.
+    pub sup_executable: bool,
     /// How many super-span frames are actually **backed** by reserved memory.
     ///
     /// Not `TABLE_ENTRIES`: a full super table would span 1 GiB, and the window is only as large as
@@ -254,9 +271,11 @@ pub fn encode(
     }
     for (m, leaf) in supers.iter().enumerate().take(TABLE_ENTRIES) {
         if let Some(perm) = leaf {
-            let attrs = match perm {
-                Perm::Rw => desc::BLOCK_RW,
-                Perm::Ro => desc::BLOCK_RO,
+            let attrs = match (perm, layout.sup_executable) {
+                (Perm::Rw, false) => desc::BLOCK_RW,
+                (Perm::Ro, false) => desc::BLOCK_RO,
+                (Perm::Rw, true) => desc::BLOCK_RW_X,
+                (Perm::Ro, true) => desc::BLOCK_RO_X,
             };
             // Indexed by the block's own L2 slot, derived from its IPA — NOT by `m` directly, so the
             // window's base offset cannot silently shift the mapping.
@@ -648,7 +667,8 @@ pub fn verify_encoding(
         let want = supers.get(m).copied().flatten().map(|perm| Decoded {
             pa: super_pa(layout, m as u32) & desc::ADDR_2M,
             perm,
-            xn: true,
+            // Exactly what the layout declared — so execute cannot be gained or lost silently.
+            xn: !layout.sup_executable,
         });
         let idx = ((super_ipa(layout, m as u32) >> 21) & 0x1ff) as usize;
         let found = decode_block(t.l2_sup[idx]);
@@ -775,6 +795,7 @@ mod tests {
             // Device pass-through window: its own L1 entry (0x0800_0000 >> 30 = 0), 32 MiB.
             device_base: 0x0800_0000,
             device_len: 0x0200_0000,
+            sup_executable: false,
             sup_ipa_base: 0xC000_0000,
             sup_pa_base: 0x8000_0000,
             sup_frames: 8,
