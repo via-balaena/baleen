@@ -33,6 +33,10 @@
 
 #![no_std]
 #![no_main]
+// Under `real-linux` (M5 Arc 5e) the synthetic `guest` phases are replaced wholesale by `linux::run`,
+// so its functions are legitimately unused in that build; the default/`selftest` builds (the ones CI
+// lints) still exercise every one, so this narrows the allow to exactly the capstone config.
+#![cfg_attr(feature = "real-linux", allow(dead_code))]
 
 mod blk;
 mod el2;
@@ -40,6 +44,8 @@ mod exceptions;
 mod gic;
 mod guest;
 mod heap;
+#[cfg(feature = "real-linux")]
+mod linux;
 mod pl011;
 mod stage2;
 mod time;
@@ -217,6 +223,14 @@ pub extern "C" fn rust_main() -> ! {
     //     preserved across the switch, exclusivity + affinity enforced. Terminal: the last phase's
     //     report handler parks (and, under `selftest`, chains the Arc-2 fault-catch first), so this
     //     never returns.
+    //
+    //     Under `--features real-linux` (M5 Arc 5e), the synthetic phases are replaced by the
+    //     real-Linux capstone: `linux::run` boots an actual aarch64 Linux kernel as a single EL1
+    //     guest that owns the machine (device pass-through, `IMO=0`). Feature-gated, so the default
+    //     build — the one the CI boot-test asserts on — is unchanged.
+    #[cfg(feature = "real-linux")]
+    linux::run(&mut uart);
+    #[cfg(not(feature = "real-linux"))]
     guest::run(&mut uart);
 }
 

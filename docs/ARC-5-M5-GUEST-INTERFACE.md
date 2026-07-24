@@ -38,14 +38,32 @@ interface deliver it — exactly how KVM and Xen do it. `hv-metal/src/gic.rs` ho
   required real physical GICv3 init (distributor + this CPU's redistributor wake + enable PPI 27) and the
   EL2 physical CPU interface. This receive→inject path is what virtio used-buffer interrupts reuse.
 
-## What remains — the real Linux capstone (5e), kernel-gated
+## 5e — the real Linux capstone (DONE)
 
-With the interface proven, the capstone is booting a real Linux guest: a large guest-RAM Stage-2 map,
-device pass-through (PL011 + GICv3 for a single guest that owns the machine, with `IMO=0` — the vGIC
-injection path above is the *multi-guest* mechanism), a DTB (dtc / the QEMU-generated blob), a minimal
-kernel `Image` + initramfs loaded per the arm64 boot protocol (`x0` = DTB), and virtio interrupts pended
-into the real distributor. The one input this environment cannot itself produce is the **kernel `Image`**
-(no aarch64 Linux cross-toolchain here); it is a documented drop-in seam for a focused follow-up.
+The capstone is landed (`hv-metal/src/linux.rs`, feature `real-linux`; run via `cargo xtask qemu-linux`).
+A **real Alpine Linux 6.18 aarch64 kernel** boots end-to-end as a single EL1 guest that owns the machine,
+reaches userspace (runs `/init`), and powers off via PSCI `SYSTEM_OFF` — serviced by hv-metal's HVC
+handler — exactly as the interface above predicted. Everything built for the synthetic guests carries an
+unmodified kernel unchanged:
+
+- **Large guest-RAM Stage-2 map + device pass-through.** A big identity Stage-2 maps guest RAM
+  (`0x4800_0000..0x8000_0000`, Normal WB) plus the GICv3 + PL011 device pages, with `HCR_EL2.IMO=0`
+  so the kernel drives the real GIC / arch-timer / PL011 directly (the vGIC injection path is the
+  *multi-guest* mechanism, unused here). hv-metal owns the low 128 MiB; the guest never maps it.
+- **DTB.** A minimal device tree (`hv-metal/linux/guest.dts`) — only the nodes the guest drives (psci
+  `method="hvc"`, memory, GICv3, PL011, timer, cpu, chosen), so Linux probes only what is passed
+  through. `x0` = the DTB per the arm64 boot protocol; the kernel `Image` + initramfs are placed in
+  guest RAM by QEMU `-device loader`.
+- **PSCI over HVC.** `PSCI_VERSION` / `FEATURES` / `SYSTEM_OFF` serviced; unknown FIDs (e.g. the
+  kernel's `MIGRATE_INFO_TYPE` probe) return `NOT_SUPPORTED` and the kernel continues.
+
+The one input this environment cannot produce is the **kernel `Image`** (no aarch64 Linux
+cross-toolchain here), so the target is kernel-gated on a user-supplied/approved `Image` in
+`$BALEEN_LINUX_DIR` — an official signed Alpine `virt` kernel, decompressed from its EFI-zboot wrapper.
+**No isolation content** (the thesis is proven on the un-forgeable synthetic guests); this demonstrates
+the proven interface carries an unmodified kernel. The guest CPU is a stable `cortex-a72` baseline, not
+`-cpu max` — `max` advertises features (S1PIE, SME, GCS, pauth) whose EL1 use traps to EL2 for a
+hypervisor to enable, which this minimal EL2 deliberately does not.
 
 ## Scope and honesty
 

@@ -19,6 +19,14 @@ publish = false
 # `src/exceptions.rs` and `rust_main`.
 selftest = []
 
+# `real-linux` (M5 Arc 5e) replaces the synthetic guest phases with the real-Linux capstone: boot an
+# actual aarch64 Linux kernel as a single EL1 guest that owns the machine (device pass-through,
+# `HCR_EL2.IMO=0`). Off by default — the default build (what the CI boot-test asserts on) runs the
+# synthetic Arc 0–5 guests unchanged. Driven by `cargo xtask qemu-linux`, which loads a kernel
+# `Image` + initramfs + DTB via QEMU `-device loader`. NO isolation content (the thesis is proven on
+# the synthetic guests); this only demonstrates the proven interface carries an unmodified kernel.
+real-linux = []
+
 # The proven brain and the fence it speaks to, linked across the workspace boundary as path deps
 # (both are members of the parent workspace; hv-metal is its own excluded workspace). They build
 # under their own manifests — i.e. still `unsafe_code = "forbid"`, still proven — so linking them

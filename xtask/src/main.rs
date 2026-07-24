@@ -39,6 +39,10 @@ fn main() {
                 )
         }
         "qemu-test" => run("bash", &["hv-metal/boot-test.sh"]),
+        // Metal (M5 Arc 5e): boot a REAL aarch64 Linux kernel as a single EL1 guest under hv-metal.
+        // Kernel-gated — needs a kernel `Image` + initramfs in `$BALEEN_LINUX_DIR` (see the fn). Never
+        // part of CI (the synthetic `qemu-test` is the CI check); this is the capstone demo.
+        "qemu-linux" => qemu_linux(),
         "metal-lint" => metal_lint(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
@@ -81,6 +85,140 @@ fn main() {
 /// The bare-metal target `hv-metal` builds for, and the resulting binary path.
 const METAL_TARGET: &str = "aarch64-unknown-none-softfloat";
 const METAL_BIN: &str = "hv-metal/target/aarch64-unknown-none-softfloat/release/hv-metal";
+
+// ─── M5 Arc 5e: the real-Linux capstone runner ──────────────────────────────────────────────────
+// The guest-RAM load layout — MUST match `hv-metal/src/linux.rs`'s constants and `hv-metal/linux/
+// guest.dts`. QEMU `-device loader` deposits the three blobs at these PAs before hv-metal boots.
+const LINUX_KERNEL_ADDR: u64 = 0x4800_0000; // Image (also DTB /memory base)
+const LINUX_DTB_ADDR: u64 = 0x4b00_0000; // DTB (hv-metal points guest x0 here)
+const LINUX_INITRD_ADDR: u64 = 0x4c00_0000; // initramfs (DTB /chosen linux,initrd-*)
+
+/// Boot a real aarch64 Linux kernel under hv-metal (M5 Arc 5e). Builds hv-metal `--features
+/// real-linux`, compiles the guest DTB (patching `initrd-end` to the initramfs size), and launches
+/// QEMU with the kernel `Image` + initramfs + DTB loaded into guest RAM via `-device loader`.
+///
+/// Kernel-gated: the `Image` and `initramfs` come from `$BALEEN_LINUX_DIR` (default
+/// `~/forge/baleen-metal-linux/alpine`), holding `Image` (raw arm64 kernel) and `custom-initramfs.gz`.
+fn qemu_linux() -> bool {
+    use std::path::PathBuf;
+
+    let dir = std::env::var("BALEEN_LINUX_DIR").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/forge/baleen-metal-linux/alpine")
+    });
+    let dir = PathBuf::from(dir);
+    let image = dir.join("Image");
+    let initrd = dir.join("custom-initramfs.gz");
+
+    for (what, p) in [("kernel Image", &image), ("initramfs", &initrd)] {
+        if !p.exists() {
+            eprintln!(
+                "xtask qemu-linux: missing {what} at {}\n  \
+                 This target is kernel-gated: set $BALEEN_LINUX_DIR to a dir containing a raw arm64 \
+                 `Image` and `custom-initramfs.gz` (see docs/ARC-5-M5-GUEST-INTERFACE.md).",
+                p.display()
+            );
+            return false;
+        }
+    }
+
+    // Compile the DTB, patching linux,initrd-end = initrd-start + initramfs size.
+    let dts = match std::fs::read_to_string("hv-metal/linux/guest.dts") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("xtask qemu-linux: cannot read hv-metal/linux/guest.dts: {e}");
+            return false;
+        }
+    };
+    let initrd_size = std::fs::metadata(&initrd).map(|m| m.len()).unwrap_or(0);
+    let initrd_end = LINUX_INITRD_ADDR + initrd_size;
+    let patched = dts.replace(
+        &format!("linux,initrd-end = <0x{LINUX_INITRD_ADDR:x}>;"),
+        &format!("linux,initrd-end = <0x{initrd_end:x}>;"),
+    );
+    let dts_out = dir.join("guest.patched.dts");
+    let dtb_out = dir.join("guest.dtb");
+    if let Err(e) = std::fs::write(&dts_out, patched) {
+        eprintln!("xtask qemu-linux: cannot write {}: {e}", dts_out.display());
+        return false;
+    }
+    if !run(
+        "dtc",
+        &[
+            "-I",
+            "dts",
+            "-O",
+            "dtb",
+            dts_out.to_str().unwrap(),
+            "-o",
+            dtb_out.to_str().unwrap(),
+        ],
+    ) {
+        eprintln!("xtask qemu-linux: dtc failed to compile the guest DTB");
+        return false;
+    }
+
+    if !metal_build_linux() {
+        return false;
+    }
+
+    // `-device loader,file=…,addr=…,force-raw=on` deposits each blob at its guest PA before the
+    // `-kernel` (hv-metal) boots at EL2; hv-metal then erets into the kernel with x0 = the DTB.
+    let loader = |file: &std::path::Path, addr: u64| {
+        format!(
+            "loader,file={},addr=0x{addr:x},force-raw=on",
+            file.display()
+        )
+    };
+    let args: Vec<String> = vec![
+        "-M".into(),
+        "virt,virtualization=on,gic-version=3".into(),
+        // A stable ARMv8.0 baseline for the guest — NOT `-cpu max`. `max` advertises bleeding-edge
+        // features (S1PIE, SME, GCS, pointer-auth) whose EL1 use traps to EL2 for the hypervisor to
+        // enable (HCRX_EL2 …); our minimal EL2 doesn't, so the kernel traps on `PIRE0_EL1` early.
+        // `cortex-a72` exposes only what hv-metal actually virtualizes (GICv3, arch timer, PSCI,
+        // Stage-2), so an unmodified kernel boots without needing exotic-feature enablement at EL2.
+        "-cpu".into(),
+        "cortex-a72".into(),
+        "-smp".into(),
+        "1".into(),
+        "-m".into(),
+        "1024".into(),
+        "-nographic".into(),
+        "-net".into(),
+        "none".into(),
+        // Semihosting: hv-metal's SYSTEM_OFF handler issues a semihosting SYS_EXIT so QEMU exits
+        // cleanly when the guest powers off (instead of parking until a timeout).
+        "-semihosting".into(),
+        "-kernel".into(),
+        METAL_BIN.into(),
+        "-device".into(),
+        loader(&image, LINUX_KERNEL_ADDR),
+        "-device".into(),
+        loader(&dtb_out, LINUX_DTB_ADDR),
+        "-device".into(),
+        loader(&initrd, LINUX_INITRD_ADDR),
+    ];
+    let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run("qemu-system-aarch64", &argv)
+}
+
+/// Build `hv-metal` for the bare-metal target with the `real-linux` feature (M5 Arc 5e).
+fn metal_build_linux() -> bool {
+    run(
+        "cargo",
+        &[
+            "build",
+            "--release",
+            "--target",
+            METAL_TARGET,
+            "--manifest-path",
+            "hv-metal/Cargo.toml",
+            "--features",
+            "real-linux",
+        ],
+    )
+}
 
 /// Lint `hv-metal` — fmt `--check` + clippy `-D warnings` on the bare-metal target, for BOTH
 /// feature configs (default and `selftest`). `hv-metal` is excluded from the workspace, so
