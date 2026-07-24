@@ -39,6 +39,13 @@
 
 use hv_core::p2m::{DomId, Mfn, System};
 
+/// A live page-table edge, exactly as [`System::link_edges`] yields it:
+/// `(parent, slot, child, writable, leaf)`.
+///
+/// Named so the proof harnesses can build one symbolically without re-modelling the tuple
+/// (design-lesson #14c: one derivation, consumed by production and proof alike).
+pub type Edge = (Mfn, u32, Mfn, bool, bool);
+
 /// The permission a Stage-2 leaf carries. The model's `writable` bit, named at the layer that
 /// consumes it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,13 +77,42 @@ pub struct FrameOutOfRange {
 /// so a reused buffer never retains a previous domain's leaf. Returns [`FrameOutOfRange`] if an
 /// authorized frame does not fit — never a silent omission.
 pub fn leaf_map(p2m: &System, dom: DomId, out: &mut [Option<Perm>]) -> Result<(), FrameOutOfRange> {
+    leaf_map_from_edges(&p2m.link_edges(), |m| p2m.owner_of(m), dom, out)
+}
+
+/// [`leaf_map`], with the model reads it makes lifted into parameters: the live edge set and
+/// the frame-ownership function.
+///
+/// **This is the function the refinement theorem is about.** [`leaf_map`] is a two-line wrapper
+/// that supplies `p2m.link_edges()` and `p2m.owner_of` — so the emitter has exactly one
+/// derivation (design-lesson #14c) while the decision itself becomes reachable to a prover that
+/// cannot construct a whole `System` symbolically. `hv-verify`'s Kani harnesses drive *this*
+/// function over arbitrary edge sets, ownership assignments and capacities; the Verus mirror
+/// lifts the same loop to an arbitrary edge *count*. Neither proves a re-modelled copy.
+///
+/// The loop's guarantee, stated as the proof uses it:
+///
+/// > every `out[m] == Some(π)` is **witnessed** by an edge in `edges` with `leaf == true`,
+/// > `owner_of(parent) == Some(dom)`, `child == m`, and `π = writable ? Rw : Ro`.
+///
+/// That witness plus hv-core's `UnauthorizedForeignLink` is the whole authorization argument —
+/// see [`crate::check::check_authorized`].
+pub fn leaf_map_from_edges<O>(
+    edges: &[Edge],
+    owner_of: O,
+    dom: DomId,
+    out: &mut [Option<Perm>],
+) -> Result<(), FrameOutOfRange>
+where
+    O: Fn(Mfn) -> Option<DomId>,
+{
     // Clear the FULL capacity first — the no-stale-leaf property (module docs).
     for slot in out.iter_mut() {
         *slot = None;
     }
-    for (parent, _slot, child, writable, leaf) in p2m.link_edges() {
+    for (parent, _slot, child, writable, leaf) in edges.iter().copied() {
         // Only leaves map a frame; only tables this domain owns are its reachability.
-        if !leaf || p2m.owner_of(parent) != Some(dom) {
+        if !leaf || owner_of(parent) != Some(dom) {
             continue;
         }
         let idx = child as usize;
