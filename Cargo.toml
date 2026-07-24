@@ -3,7 +3,7 @@
 
 [workspace]
 resolver = "2"
-members = ["hv-hal", "hv-core", "hv-sim", "hv-verify", "xtask"]
+members = ["hv-hal", "hv-core", "hv-s2", "hv-sim", "hv-verify", "xtask"]
 # hv-verify (Tier C) IS a member: its Kani preservation proofs are `#[cfg(kani)]`-gated, so
 # under a normal build it is a trivially-empty crate with only an internal path dep — stable
 # `cargo test --workspace`, MSRV, and cargo-deny stay green. The proofs run out-of-band with

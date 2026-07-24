@@ -57,14 +57,28 @@
 //! ([`crate::guest`]'s `enable_stage2`) is load-bearing on silicon and invisible-but-correct under
 //! TCG, as in Arc 4.
 //!
+//! ## Where the refinement now lives (the factoring)
+//!
+//! The refinement itself — *which* frames a domain reaches and at what permission, and the
+//! descriptor words that expresses — has moved OUT of this crate into [`hv_s2`], a pure `no_std`
+//! library under the workspace `unsafe_code = "forbid"` fence: [`hv_s2::leaf_map`] (neutral: the
+//! `p2m` relation → a per-frame leaf map) and [`hv_s2::arm64::encode`] (AArch64 descriptor words).
+//! It is therefore host-testable, fuzzable, enumerable, and provable, where before it could only be
+//! argued (Audit #2) and mutation-tested. What stays here is the **publish**: handing the encoder
+//! `&mut` views of the table storage, then the barriers + TLB maintenance + `VTTBR_EL2`
+//! ([`crate::guest`]'s `enable_stage2`). The refinement *relation* this module documents above is
+//! unchanged — only its implementation site moved, and the boot-test's full isolation matrix is the
+//! byte-identity witness that it did.
+//!
 //! ## Unsafe
 //!
-//! Building the Stage-2 tables (raw writes into linker-reserved, 4 KiB-aligned table storage) and the
-//! `GuestMem` volatile copies into/out of the reserved data-frame window (EL2 runs MMU-off/identity,
-//! so a host PA is directly addressable). Each block carries its justification; the tables live
-//! behind `UnsafeCell` (never `static mut`), the same discipline as `guest.rs`/`heap.rs`.
+//! Two blocks: deriving `&mut` views of the interior-mutable table storage for the encoder (the
+//! publish), and the `GuestMem` volatile copies into/out of the reserved data-frame window (EL2 runs
+//! MMU-off/identity, so a host PA is directly addressable). Each carries its justification; the
+//! tables live behind `UnsafeCell` (never `static mut`), the same discipline as `guest.rs`/`heap.rs`.
 
 use core::cell::UnsafeCell;
+use core::fmt::Write;
 
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::Mfn;
@@ -87,14 +101,16 @@ pub const FRAME_SIZE: u64 = 0x1000;
 
 /// The guest IPA a model frame `m` is mapped at (whether or not it is authorized — the guest probes
 /// this address; a hole faults). `m` also indexes the `L3` data table, so `m` must be `< 512`.
+///
+/// Delegates to [`hv_s2::arm64::frame_addr`], the single derivation of frame addressing shared with
+/// the emitter — so this window can never drift from the one the descriptors are built against.
 pub fn frame_ipa(m: Mfn) -> u64 {
-    DATA_IPA_BASE + m as u64 * FRAME_SIZE
+    hv_s2::arm64::frame_addr(DATA_IPA_BASE, FRAME_SIZE, m)
 }
 
-/// The host PA a model frame `m` is backed at, inside the linker's reserved data window.
-pub fn frame_pa(m: Mfn) -> u64 {
-    data_ram_start() + m as u64 * FRAME_SIZE
-}
+// (The host PA a model frame is backed at is now derived inside the emitter, from the `Layout` it is
+// handed — `hv_s2::arm64::frame_pa`. hv-metal no longer needs its own copy: the one derivation lives
+// under the fence, where it is unit-tested.)
 
 extern "C" {
     static __guest_ram_start: u8;
@@ -127,58 +143,11 @@ pub const fn set_vmid(set: usize) -> u64 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// AArch64 Stage-2 descriptor encodings (4 KiB granule). Re-derived independently from the Arm ARM
-// (VMSAv8-64 Stage-2 descriptor formats + the S2AP/MemAttr/SH/AF/XN fields) by a spec-blind auditor
-// and converged (see `docs/AUDIT-2-P2M-STAGE2.md`); QEMU is the third oracle (a wrong permission =
-// the guest either faults where it should not, or reaches what it should not).
+// The descriptor encodings moved to `hv_s2::arm64::desc` (M5 — the refinement arc): they are pure
+// data, so they now live under the workspace `unsafe_code = "forbid"` fence where they are pinned by
+// golden tests, instead of inside this crate's `unsafe`. Provenance is unchanged — the Arm ARM
+// (VMSAv8-64 Stage-2 descriptor formats), converged three ways per `docs/AUDIT-2-P2M-STAGE2.md`.
 // ---------------------------------------------------------------------------------------------
-mod desc {
-    /// Table descriptor low bits (`0b11`) — an `L1`/`L2` entry pointing at the next table. Rest is
-    /// the next-table PA in bits [47:12].
-    pub const TABLE: u64 = 0b11;
-    /// A **page** descriptor's low bits (`0b11`) — a valid `L3` (4 KiB) leaf. (At `L3` the `0b01`
-    /// "block" encoding is reserved/invalid; a leaf is `0b11`.)
-    pub const PAGE: u64 = 0b11;
-    /// A **block** descriptor's low bits (`0b01`) — a valid `L2` (2 MiB) leaf / superpage.
-    pub const BLOCK: u64 = 0b01;
-
-    /// Next-table / 4 KiB-page output-address mask (bits [47:12]).
-    pub const ADDR_4K: u64 = 0x0000_ffff_ffff_f000;
-    /// 2 MiB-block output-address mask (bits [47:21]).
-    pub const ADDR_2M: u64 = 0x0000_ffff_ffe0_0000;
-
-    /// Leaf lower attributes shared by every mapping we emit: `MemAttr=0b1111` (Stage-2 Normal
-    /// Inner+Outer Write-Back cacheable, bits [5:2]), `SH=0b11` (Inner Shareable, bits [9:8]),
-    /// `AF=1` (bit 10, else the first access faults). S2AP and the descriptor type are OR'd on per
-    /// mapping.
-    pub const LEAF_COMMON: u64 = (0b1111 << 2) | (0b11 << 8) | (1 << 10);
-
-    /// `S2AP=0b11` (bits [7:6]) — read/write.
-    pub const S2AP_RW: u64 = 0b11 << 6;
-    /// `S2AP=0b01` (bits [7:6]) — read-only (a guest *write* to it faults with a permission fault).
-    pub const S2AP_RO: u64 = 0b01 << 6;
-
-    /// Execute-never for a Stage-2 leaf. Bit 54 is `XN` (the `XN[1]` of the `XN[1:0]` field when
-    /// `FEAT_XNX` is present); setting it makes the page execute-never at EL1&0. Data frames get it
-    /// (they are not code); the guest-image block does not (the guest fetches from it).
-    pub const XN: u64 = 1 << 54;
-
-    /// The guest-image block: 2 MiB, **read-only + executable**, Normal WB IS — identity-mapping the
-    /// guest's own code. Read-only (`S2AP=RO`, not `RW`) so the shared code image cannot be a
-    /// cross-domain *write* channel under concurrent isolation (M5 Arc 2): the two domains identity-map
-    /// the SAME host frames here, and making them read-only hardware-enforces "the guest never writes
-    /// its code image" rather than asserting it by inspection — a future guest that stores into this
-    /// region (or uses it as a stack) faults **loudly** (an abort outside the data window halts in
-    /// `record_data_abort`) instead of silently cross-corrupting. Executable (no `XN`) so the guest
-    /// still fetches from it. The register-only test guests never write it, so RO is behaviour-neutral
-    /// for them; a private RW code+stack image per domain is the real-Linux capstone (deferred).
-    pub const BLOCK_ROX: u64 = BLOCK | LEAF_COMMON | S2AP_RO;
-
-    /// A 4 KiB data leaf, read/write, execute-never.
-    pub const PAGE_RW: u64 = PAGE | LEAF_COMMON | S2AP_RW | XN;
-    /// A 4 KiB data leaf, read-only, execute-never.
-    pub const PAGE_RO: u64 = PAGE | LEAF_COMMON | S2AP_RO | XN;
-}
 
 /// A 4 KiB Stage-2 translation table (512 × 8-byte descriptors), interior-mutable so it is built at
 /// runtime without a `static mut`. `#[repr(C, align(4096))]`: the walk hardware requires a 4 KiB
@@ -235,73 +204,65 @@ static STAGE2_SETS: [Stage2Set; NUM_STAGE2_SETS] = [const {
 /// `p2m_link` already required a grant, so the grant dimension is covered transitively; a frame
 /// `guest_dom` may not reach has no leaf edge and so no descriptor — the hardware faults it.
 pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u64 {
+    // (1) THE REFINEMENT — which frames this domain reaches, at what permission. A pure decision,
+    //     made under the workspace `unsafe_code = "forbid"` fence (`hv_s2::leaf_map`), so it is
+    //     host-testable and (next arc) provable rather than merely argued. Every slot of `leaves`
+    //     is written by the call, so no previous tenant's leaf can survive into this rebuild.
+    let mut leaves = [None; hv_s2::arm64::TABLE_ENTRIES];
+    if let Err(e) = hv_s2::leaf_map(hv.p2m(), guest_dom, &mut leaves) {
+        // A frame the model authorized does not fit the table. Unreachable while the model stays far
+        // below `TABLE_ENTRIES`, but the previous emitter dropped such a frame with a bare
+        // `continue` — a SILENT under-map (the guest loses memory it is entitled to). Fail loudly.
+        let mut uart = crate::uart();
+        let _ = writeln!(
+            uart,
+            "baleen: Stage-2 emission: authorized frame {} exceeds table capacity {}; halting",
+            e.mfn, e.capacity
+        );
+        crate::park();
+    }
+
+    // (2) THE ENCODING — descriptor values for that decision. Also pure, also under the fence; the
+    //     Arm-ARM field layout and its golden values live in `hv_s2::arm64::desc`.
     let tables = &STAGE2_SETS[set];
-    let l1 = tables.l1.0.get();
-    let l2_code = tables.l2_code.0.get();
-    let l2_data = tables.l2_data.0.get();
-    let l3_data = tables.l3_data.0.get();
+    let layout = hv_s2::arm64::Layout {
+        l1_pa: tables.l1.0.get() as *const u8 as u64,
+        l2_code_pa: tables.l2_code.0.get() as *const u8 as u64,
+        l2_data_pa: tables.l2_data.0.get() as *const u8 as u64,
+        l3_data_pa: tables.l3_data.0.get() as *const u8 as u64,
+        guest_image_pa: guest_ram_start(),
+        data_ipa_base: DATA_IPA_BASE,
+        data_pa_base: data_ram_start(),
+        frame_size: FRAME_SIZE,
+    };
 
-    let l1_pa = l1 as *const u8 as u64;
-    let l2_code_pa = l2_code as *const u8 as u64;
-    let l2_data_pa = l2_data as *const u8 as u64;
-    let l3_data_pa = l3_data as *const u8 as u64;
-
-    // The guest image sits at its linker address (identity IPA==PA); the data region at DATA_IPA_BASE.
-    let ram = guest_ram_start();
-    let code_l1 = ((ram >> 30) & 0x1ff) as usize;
-    let code_l2 = ((ram >> 21) & 0x1ff) as usize;
-    let data_l1 = ((DATA_IPA_BASE >> 30) & 0x1ff) as usize;
-    let data_l2 = ((DATA_IPA_BASE >> 21) & 0x1ff) as usize;
-
+    // (3) THE PUBLISH — the only `unsafe` left in Stage-2 emission: hand the encoder `&mut` views of
+    //     the interior-mutable table storage. Everything about *what values* go in the tables is
+    //     decided above, in safe code.
+    //
     // SAFETY: single-CPU. The tables are rewritten while executing at EL2, where the EL1&0 Stage-2
-    // regime performs no walks (no walker observes this store mid-rebuild), so even though a *prior*
+    // regime performs no walks (no walker observes these stores mid-rebuild), so even though a *prior*
     // phase may have Stage-2 enabled (this fn is called once per phase, not only before the first
     // enable), the rewrite races no translation. `enable_stage2`'s subsequent `dsb`+`tlbi`+`isb`
     // fences the rewrite (and makes these Non-cacheable EL2 stores globally observable) before the
-    // next `eret`, so a switched-in domain's walker reads correct, published descriptors. Every table
-    // is 4 KiB aligned (`#[repr(align(4096))]`) with 512 entries, so all indices below are in range;
-    // the two regions occupy distinct `L1` entries (guest image → index 1, data → index 2), so the
-    // two `L1` writes never collide.
+    // next `eret`, so a switched-in domain's walker reads correct, published descriptors. Each table
+    // is 4 KiB aligned (`#[repr(align(4096))]`) with exactly `TABLE_ENTRIES` entries, matching the
+    // `&mut [u64; TABLE_ENTRIES]` the encoder takes; the four `UnsafeCell`s are distinct storage, so
+    // the four `&mut`s never alias.
     unsafe {
-        // Guest image: identity 2 MiB RO+X block (infrastructure — the guest's code; read-only so a
-        // shared image can't be a cross-domain write channel, see `desc::BLOCK_ROX`).
-        (*l1)[code_l1] = (l2_code_pa & desc::ADDR_4K) | desc::TABLE;
-        (*l2_code)[code_l2] = (ram & desc::ADDR_2M) | desc::BLOCK_ROX;
-
-        // Data region: L1 → L2 → L3, with the L3 leaves emitted from the model below.
-        (*l1)[data_l1] = (l2_data_pa & desc::ADDR_4K) | desc::TABLE;
-        (*l2_data)[data_l2] = (l3_data_pa & desc::ADDR_4K) | desc::TABLE;
-
-        // Clear EVERY L3 data slot the model could ever have written, so a rebuild for a new tenant
-        // (a reborn slot, or — under concurrent isolation, where the no-`tlbi` switch relies on set 0
-        // holding ONLY the current domain's leaves — dom A's set) retains no stale leaf. This is
-        // load-bearing for the no-flush isolation: it MUST cover the full model capacity, so it keys
-        // on `frame_count()` (the fixed table capacity `NUM_FRAMES`), NOT a live allocated count —
-        // were it a live count, a freed-then-reused Mfn could leave a stale leaf a peer's Stage-2
-        // still reaches. `min(512)` bounds it to this single L3 table.
-        for slot in 0..hv.p2m().frame_count().min(512) {
-            (*l3_data)[slot] = 0;
-        }
-
-        // The refinement: one 4 KiB leaf per model leaf-edge owned by the guest, at model permission.
-        for (parent, _slot, child, writable, leaf) in hv.p2m().link_edges() {
-            if !leaf || hv.p2m().owner_of(parent) != Some(guest_dom) {
-                continue;
-            }
-            let idx = child as usize;
-            if idx >= 512 {
-                continue; // unrepresentable in this single L3 table; the model stays far below it.
-            }
-            let attrs = if writable {
-                desc::PAGE_RW
-            } else {
-                desc::PAGE_RO
-            };
-            (*l3_data)[idx] = (frame_pa(child) & desc::ADDR_4K) | attrs;
-        }
+        hv_s2::arm64::encode(
+            &leaves,
+            &layout,
+            hv_s2::arm64::Tables {
+                l1: &mut *tables.l1.0.get(),
+                l2_code: &mut *tables.l2_code.0.get(),
+                l2_data: &mut *tables.l2_data.0.get(),
+                l3_data: &mut *tables.l3_data.0.get(),
+            },
+        );
     }
 
-    l1_pa | (set_vmid(set) << 48)
+    hv_s2::arm64::vttbr(layout.l1_pa, set_vmid(set))
 }
 
 // ---------------------------------------------------------------------------------------------
