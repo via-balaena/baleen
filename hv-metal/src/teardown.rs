@@ -27,34 +27,48 @@
 //! **not guest-reachable** (it is mapped into no Stage-2), so it is secrets-at-rest inside the
 //! trusted layer, not a cross-tenant channel. Recorded rather than discovered later.
 //!
-//! ## The seam — and why the intuitive one depends on a detail nobody would think to state
+//! ## The seam — allocate versus free, and why the first choice was the wrong one
 //!
-//! The obvious design is *"scrub when a frame's owner changes"* — and whether that works turns
-//! entirely on **when you sample the owner**, which is not obvious at all. Both variants were built
-//! and booted; they disagree.
+//! A frame must pass through `Frame::Free` between owners (`p2m::allocate` requires it), so the
+//! transition pair *allocate* / *free* are **equally complete** hooks: neither can be skipped on a
+//! path from one tenant to the next. M5 Arc 5 picked **allocate**. Arc 6b-pre moved it to **free**,
+//! and the move is not a wash — free is better on every axis that came up:
 //!
-//! `hv-core` deliberately has no generation counter (an unbounded incarnation would break the
-//! enumerator's finite-state BFS, design-lesson #15b), so **domain IDs are reused** and a reborn
-//! tenant occupies the slot under the *same* `DomId`.
+//! - **Nothing is left at rest.** Scrubbing at allocate leaves a dead tenant's bytes sitting in DRAM
+//!   from the free until the next allocate. Scrubbing at free closes that window — this was Arc 5's
+//!   own residual #1, now discharged rather than carried.
+//! - **It does not erase pre-loaded content.** A real guest's payload (kernel, DTB, initramfs) is
+//!   deposited into guest RAM *before* the hypervisor runs; scrubbing at allocate would zero it the
+//!   moment the model config was built. A never-freed frame is never scrubbed, so free is the only
+//!   hook compatible with hosting a real guest at all.
+//! - **It costs nothing at boot.** Nothing is freed during setup, so building a large model config
+//!   is free; scrubbing at allocate would have zeroed the whole guest RAM window up front.
 //!
-//! - Sampling ownership **at reachability time** — the natural, cheap place, since Stage-2 emission
-//!   is already walking every frame — is **defeated**: across a destroy/rebirth it compares
-//!   `Some(1)` with `Some(1)`, never observes the `None` the free passed through, and scrubs
-//!   nothing. *Measured:* the dead tenant's secret came back verbatim.
-//! - Sampling ownership **after every transition** does work, because it catches that intermediate
-//!   `None`. *Measured:* no leak. So the honest statement is not "owner-diff is wrong" but **"an
-//!   owner-diff is only sound at a sampling rate that already costs more than the alternative"** —
-//!   it must observe every dispatch, and at that point it is strictly more state and more work than
-//!   keying on the allocate directly, for no gain.
+//! **The seam is transition-agnostic.** Rather than matching on `P2mFree` and `DomainDestroy`, the
+//! funnel diffs the model's allocation state against its own shadow after every dispatch and scrubs
+//! whatever went allocated → free. So bulk `free_all`, explicit frees, and any freeing transition a
+//! later arc adds are covered without a new arm — the seam cannot be forgotten for a new call.
 //!
-//! What this arc does instead is key on the transition that **creates** ownership. `p2m::allocate`
-//! is the sole place a frame becomes `Frame::Allocated` from `Free` (the only
-//! `*frame = Frame::Allocated` assignment in `hv-core/src/p2m.rs`), so **scrub on a successful
-//! `P2mAllocate`** is complete by construction — whoever held the frame before, and whatever their
-//! `DomId` was — with no ownership history to keep at all.
+//! ### The intuitive design, and why its soundness turns on a detail nobody would state
 //!
-//! It is also correctly *ordered*: a frame becomes guest-reachable only through a Stage-2 leaf,
-//! which requires a link, which requires the allocate — so the scrub always precedes reachability.
+//! *"Scrub when a frame's owner changes"* looks equivalent, and whether it works depends entirely on
+//! **when you sample the owner**. Both variants were built and booted; they disagree. `hv-core`
+//! deliberately has no generation counter (an unbounded incarnation would break the enumerator's
+//! finite-state BFS, #15b), so **domain IDs are reused** and a reborn tenant holds the slot under
+//! the *same* `DomId`.
+//!
+//! - Sampled **at reachability time** — the natural, cheap place, since Stage-2 emission already
+//!   walks every frame — it is **defeated**: it compares `Some(1)` with `Some(1)` across a
+//!   destroy/rebirth, never sees the `None` the free passed through, and scrubs nothing.
+//!   *Measured:* the dead tenant's secret came back verbatim.
+//! - Sampled **after every transition** it works, because it catches that intermediate `None`.
+//!   *Measured:* no leak.
+//!
+//! So the honest statement is not "owner-diff is wrong" but **"an owner-diff is only sound at a
+//! sampling rate that already costs more than the alternative"** — and note that the allocated/free
+//! diff this module now uses *is* that sampling rate, arrived at from the other direction: it needs
+//! one bit per frame rather than an owner, and it asks the question the property actually cares
+//! about (did this frame stop being owned?) rather than a proxy for it.
 //!
 //! ## Why a funnel is not enough, and what checks it
 //!
@@ -62,9 +76,9 @@
 //! remembered to use the funnel" is a prose claim across N sites, which is the exact shape M5 Arc 4
 //! spent an arc removing. So the scrub is **checked by a second, independent derivation** (#36):
 //! [`stage2::build_stage2_from_p2m`] — a different code path, reached at the moment a frame becomes
-//! *reachable* rather than *owned* — asserts via [`is_scrubbed`] that every frame it is about to map
-//! was scrubbed since it became allocated, and halts loudly otherwise. A dispatch that bypasses the
-//! funnel does not silently leak; it stops the machine at the next Stage-2 emission.
+//! *reachable* rather than *owned* — re-derives allocation state from the model and asserts it
+//! agrees with the funnel's shadow ([`shadow_says_allocated`]), halting loudly otherwise. A dispatch
+//! that bypasses the funnel does not silently leak; it stops the machine at the next emission.
 
 use core::fmt::Write;
 
@@ -75,11 +89,15 @@ use hv_core::{HvCall, HvError, HvOutcome, Hypervisor};
 use crate::cell::BootCell;
 use crate::stage2;
 
-/// Per-frame "scrubbed since it became allocated". Set by the scrub at `P2mAllocate`; cleared for any
-/// frame the model reports is no longer allocated (so a free→allocate cycle cannot reuse a stale
-/// `true`). Over-clearing is harmless — it can only cause an extra scrub, never a missed one.
-static SCRUBBED: BootCell<[bool; crate::NUM_FRAMES]> =
-    BootCell::new("SCRUBBED", [false; crate::NUM_FRAMES]);
+/// The metal's shadow of which frames the model reports allocated, refreshed after **every**
+/// dispatch through the funnel.
+///
+/// Two jobs. It is how a **free** is detected (a frame that was allocated and now is not), which is
+/// the transition the scrub hangs off; and it is the **independent check** on the funnel itself —
+/// the emitter re-derives allocation straight from the model at Stage-2 time and asserts agreement,
+/// so a bypassed dispatch is caught rather than silently leaking (#36).
+static ALLOCATED: BootCell<[bool; crate::NUM_FRAMES]> =
+    BootCell::new("ALLOCATED", [false; crate::NUM_FRAMES]);
 
 /// Which CoW disk tenant a domain's storage lives in, so [`on_destroy`] knows whose overlay to
 /// discard. `None` for a domain with no disk bound (most phases). Set by [`bind_tenant`].
@@ -94,13 +112,14 @@ pub(crate) fn bind_tenant(dom: DomId, tenant: usize) {
     }
 }
 
-/// Has model frame `mfn` been scrubbed since it became allocated?
+/// The funnel's shadow of whether frame `mfn` is allocated — for the emitter's agreement check.
 ///
-/// The *checker* side of the obligation, deliberately derived from a different place than the scrub
-/// itself (#36): this is read at Stage-2 emission — when a frame becomes **reachable** — while the
-/// scrub happens at allocate, when it becomes **owned**.
-pub(crate) fn is_scrubbed(mfn: Mfn) -> bool {
-    SCRUBBED
+/// The *checker* side, deliberately read from a different place than the scrub is written (#36):
+/// Stage-2 emission re-derives allocation straight from the model and compares against this. Equal
+/// ⇒ every free reached the funnel and was scrubbed. Unequal ⇒ a dispatch bypassed the funnel, and
+/// a frame may be carrying a dead tenant's bytes into a live mapping.
+pub(crate) fn shadow_says_allocated(mfn: Mfn) -> bool {
+    ALLOCATED
         .borrow_mut()
         .get(mfn as usize)
         .copied()
@@ -122,26 +141,20 @@ pub(crate) fn dispatch(
 
     // A refused call mutates nothing (design-lesson #9), so it can create no content obligation.
     if outcome.is_ok() {
-        match call {
-            // The sole owner-creating transition — see the module docs on why this, and not an
-            // owner-diff, is the complete seam.
-            HvCall::P2mAllocate { mfn } => {
-                stage2::scrub_frame(mfn);
-                if let Some(slot) = SCRUBBED.borrow_mut().get_mut(mfn as usize) {
-                    *slot = true;
-                }
-            }
-            HvCall::DomainDestroy { target, .. } => on_destroy(target),
-            _ => {}
+        if let HvCall::DomainDestroy { target, .. } = call {
+            on_destroy(target);
         }
-        // Re-sync the shadow against the model: any frame that is no longer allocated must lose its
-        // `scrubbed` mark, or a later re-allocation could inherit it. Cheap (`NUM_FRAMES` reads) and
-        // transition-agnostic, so a future call that frees a frame needs no new arm here.
-        let mut scrubbed = SCRUBBED.borrow_mut();
-        for (mfn, slot) in scrubbed.iter_mut().enumerate() {
-            if !hv.p2m().is_allocated(mfn as Mfn) {
-                *slot = false;
+        // **Scrub every frame that just became FREE.** Computed as a diff against the shadow rather
+        // than per-transition, so `P2mFree`, `DomainDestroy`'s bulk `free_all`, and any freeing
+        // transition a later arc adds all need no arm here — the seam cannot be forgotten for a new
+        // call. Cheap: `NUM_FRAMES` reads per dispatch.
+        let mut shadow = ALLOCATED.borrow_mut();
+        for (mfn, was) in shadow.iter_mut().enumerate() {
+            let now = hv.p2m().is_allocated(mfn as Mfn);
+            if *was && !now {
+                stage2::scrub_frame(mfn as Mfn);
             }
+            *was = now;
         }
     }
 

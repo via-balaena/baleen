@@ -287,17 +287,19 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         }
     }
 
-    // (1b) THE CONTENT CHECK (M5 Arc 5) — the second, independent derivation (#36). The scrub runs
-    //      at `P2mAllocate`, when a frame becomes OWNED, inside `crate::teardown`'s dispatch funnel.
-    //      This is the other end: the moment a frame becomes REACHABLE. A dispatch that bypassed the
-    //      funnel leaves a mapped frame unscrubbed, and that must stop the machine rather than hand a
-    //      tenant the previous one's bytes.
-    for (mfn, leaf) in leaves.iter().enumerate() {
-        if leaf.is_some() && !crate::teardown::is_scrubbed(mfn as Mfn) {
+    // (1b) THE CONTENT CHECK (M5 Arc 5, seam moved in 6b-pre) — the second, independent derivation
+    //      (#36). The scrub runs when a frame becomes FREE, inside `crate::teardown`'s funnel. This
+    //      is the other end: at emission we re-derive allocation straight from the model and assert
+    //      it agrees with the funnel's shadow. They can only disagree if a dispatch bypassed the
+    //      funnel — in which case a free may have gone unscrubbed, and that must stop the machine
+    //      rather than hand a tenant the previous one's bytes.
+    for mfn in 0..leaves.len() {
+        let model = hv.p2m().is_allocated(mfn as Mfn);
+        if model != crate::teardown::shadow_says_allocated(mfn as Mfn) {
             let mut uart = crate::uart();
             let _ = writeln!(
                 uart,
-                "baleen: Stage-2 emission: frame {mfn} would be mapped for domain {guest_dom} but was never scrubbed since it was allocated; halting"
+                "baleen: Stage-2 emission: frame {mfn}'s allocation disagrees with the teardown funnel's shadow (model={model}); a dispatch bypassed the funnel, so a free may have gone unscrubbed; halting"
             );
             crate::park();
         }
