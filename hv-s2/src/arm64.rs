@@ -74,6 +74,11 @@ pub mod desc {
     pub const BLOCK_RW: u64 = BLOCK | LEAF_COMMON | S2AP_RW | XN;
     /// A **data** 2 MiB block, read-only, execute-never (M5 Arc 6a).
     pub const BLOCK_RO: u64 = BLOCK | LEAF_COMMON | S2AP_RO | XN;
+    /// A **device** 2 MiB block (M5 Arc 6b): `MemAttr = 0b0000` (Device-nGnRnE — no gathering, no
+    /// reordering, no early write acknowledgement), read/write, **execute-never**. Note the absent
+    /// `0b1111 << 2`: that is the whole difference from a Normal-memory block, and getting it wrong
+    /// turns MMIO into speculatively-accessible cacheable memory.
+    pub const BLOCK_DEVICE: u64 = BLOCK | (0b11 << 6) | (1 << 10) | XN;
 }
 
 /// Where the tables live and what they map — the physical facts the encoder cannot know.
@@ -89,8 +94,16 @@ pub struct Layout {
     pub l3_data_pa: u64,
     /// PA of the `L2` holding the **super-span** leaves (2 MiB blocks) — M5 Arc 6a.
     pub l2_sup_pa: u64,
-    /// Host PA (== IPA, identity) of the 2 MiB guest-image block.
-    pub guest_image_pa: u64,
+    /// PA of the `L2` covering the device pass-through region — M5 Arc 6b.
+    pub l2_dev_pa: u64,
+    /// Host PA (== IPA, identity) of the 2 MiB guest-image block, or `None`.
+    ///
+    /// `None` for a guest whose code lives inside the mapped RAM rather than in a separate
+    /// hypervisor-owned image — a real kernel, for instance, is deposited into guest RAM before the
+    /// hypervisor runs and is therefore covered by the ordinary leaf mapping. Absent means the
+    /// image `L1` entry must be **dead**, which `verify_encoding` checks; it does not mean
+    /// "unchecked".
+    pub guest_image_pa: Option<u64>,
     /// Guest IPA base of the model-data-frame region.
     pub data_ipa_base: u64,
     /// Host PA backing model frame 0.
@@ -106,6 +119,18 @@ pub struct Layout {
     pub sup_ipa_base: u64,
     /// Host PA backing super-span frame 0.
     pub sup_pa_base: u64,
+    /// Base of the **device pass-through** window (identity, IPA == PA), and its length in bytes;
+    /// `device_len == 0` means no device region — M5 Arc 6b.
+    ///
+    /// **Infrastructure, not model-driven** — the same standing as the guest-image block. A guest
+    /// that drives real hardware (a GIC, a UART) needs those MMIO pages mapped, and no `p2m` edge
+    /// describes them. Being infrastructure is exactly why it needs its own checked invariant
+    /// rather than an argument: device memory is mapped **Device-nGnRnE and execute-never**, and
+    /// its window must not overlap any RAM window — a device page that decoded as Normal memory or
+    /// as executable would be a far worse surface than a mis-permissioned data page.
+    pub device_base: u64,
+    /// Length of the device window in bytes; `0` = absent. Must be a multiple of 2 MiB.
+    pub device_len: u64,
     /// How many super-span frames are actually **backed** by reserved memory.
     ///
     /// Not `TABLE_ENTRIES`: a full super table would span 1 GiB, and the window is only as large as
@@ -143,6 +168,8 @@ pub struct Tables<'a> {
     pub l3_data: &'a mut [u64; TABLE_ENTRIES],
     /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
     pub l2_sup: &'a mut [u64; TABLE_ENTRIES],
+    /// The `L2` covering the device pass-through region (M5 Arc 6b).
+    pub l2_dev: &'a mut [u64; TABLE_ENTRIES],
 }
 
 /// The address of model frame `m` in a linear frame window based at `base`. The single derivation
@@ -184,13 +211,17 @@ pub fn encode(
         l2_data,
         l3_data,
         l2_sup,
+        l2_dev,
     } = tables;
 
-    // Guest image: identity 2 MiB RO+X block (infrastructure — the guest's own code).
-    let code_l1 = ((layout.guest_image_pa >> 30) & 0x1ff) as usize;
-    let code_l2 = ((layout.guest_image_pa >> 21) & 0x1ff) as usize;
-    l1[code_l1] = (layout.l2_code_pa & desc::ADDR_4K) | desc::TABLE;
-    l2_code[code_l2] = (layout.guest_image_pa & desc::ADDR_2M) | desc::BLOCK_ROX;
+    // Guest image: identity 2 MiB RO+X block (infrastructure — the guest's own code). Absent for a
+    // guest whose code lives in the mapped RAM instead, in which case the entry stays dead.
+    if let Some(image_pa) = layout.guest_image_pa {
+        let code_l1 = ((image_pa >> 30) & 0x1ff) as usize;
+        let code_l2 = ((image_pa >> 21) & 0x1ff) as usize;
+        l1[code_l1] = (layout.l2_code_pa & desc::ADDR_4K) | desc::TABLE;
+        l2_code[code_l2] = (image_pa & desc::ADDR_2M) | desc::BLOCK_ROX;
+    }
 
     // Data region: L1 -> L2 -> L3.
     let data_l1 = ((layout.data_ipa_base >> 30) & 0x1ff) as usize;
@@ -233,7 +264,27 @@ pub fn encode(
             l2_sup[idx] = (super_pa(layout, m as u32) & desc::ADDR_2M) | attrs;
         }
     }
+
+    // Device pass-through region (M5 Arc 6b): identity 2 MiB Device-nGnRnE, execute-never blocks.
+    // Infrastructure, like the image block — no `p2m` edge describes MMIO.
+    for slot in l2_dev.iter_mut() {
+        *slot = 0;
+    }
+    if layout.device_len > 0 {
+        let dev_l1 = ((layout.device_base >> 30) & 0x1ff) as usize;
+        l1[dev_l1] = (layout.l2_dev_pa & desc::ADDR_4K) | desc::TABLE;
+        let mut a = layout.device_base;
+        while a < layout.device_base + layout.device_len {
+            let idx = ((a >> 21) & 0x1ff) as usize;
+            l2_dev[idx] = (a & desc::ADDR_2M) | desc::BLOCK_DEVICE;
+            a += BLOCK_SIZE;
+        }
+    }
 }
+
+/// Bytes one 2 MiB block covers — the granule the image, super and device regions are all built
+/// from. Derived from the table geometry so it cannot drift (design-lesson #14c).
+pub const BLOCK_SIZE: u64 = 0x20_0000;
 
 // ─── the inverse: decoding, so the emitted table can be read back and checked ────────────────────
 //
@@ -315,6 +366,8 @@ pub struct TablesRef<'a> {
     pub l3_data: &'a [u64; TABLE_ENTRIES],
     /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
     pub l2_sup: &'a [u64; TABLE_ENTRIES],
+    /// The `L2` covering the device pass-through region (M5 Arc 6b).
+    pub l2_dev: &'a [u64; TABLE_ENTRIES],
 }
 
 /// A way the emitted tables can fail to mean what the leaf map said.
@@ -332,6 +385,21 @@ pub enum EncodingViolation {
     WindowsOverlap {
         /// Which address space overlapped (`"ipa"` or `"pa"`).
         space: &'static str,
+    },
+    /// The device window's length is not a whole number of 2 MiB blocks, so the loop that emits it
+    /// would either under-map the tail or run past the window's end.
+    DeviceWindowUnaligned {
+        /// The window base.
+        base: u64,
+        /// The offending length.
+        len: u64,
+    },
+    /// A device block is missing, or is not a Device-nGnRnE execute-never identity block.
+    BadDeviceBlock {
+        /// The `L2(dev)` slot.
+        index: usize,
+        /// The descriptor found there.
+        desc: u64,
     },
     /// A table descriptor does not point at the table it should.
     BadTableEntry {
@@ -373,17 +441,17 @@ pub enum EncodingViolation {
 }
 
 impl Layout {
-    /// The `L1` index of the guest-image region.
-    fn code_l1(&self) -> usize {
-        ((self.guest_image_pa >> 30) & 0x1ff) as usize
+    /// The `L1` index of the guest-image region, if present.
+    fn code_l1(&self) -> Option<usize> {
+        self.guest_image_pa.map(|pa| ((pa >> 30) & 0x1ff) as usize)
+    }
+    /// The `L2` index of the guest-image block, if present.
+    fn code_l2(&self) -> Option<usize> {
+        self.guest_image_pa.map(|pa| ((pa >> 21) & 0x1ff) as usize)
     }
     /// The `L1` index of the data region.
     fn data_l1(&self) -> usize {
         ((self.data_ipa_base >> 30) & 0x1ff) as usize
-    }
-    /// The `L2` index of the guest-image block.
-    fn code_l2(&self) -> usize {
-        ((self.guest_image_pa >> 21) & 0x1ff) as usize
     }
     /// The `L2` index of the data region's `L3` table.
     fn data_l2(&self) -> usize {
@@ -393,85 +461,75 @@ impl Layout {
     fn sup_l1(&self) -> usize {
         ((self.sup_ipa_base >> 30) & 0x1ff) as usize
     }
+    /// The `L1` index of the device region, if present.
+    fn dev_l1(&self) -> Option<usize> {
+        (self.device_len > 0).then_some(((self.device_base >> 30) & 0x1ff) as usize)
+    }
+
+    /// Every region actually present, as `(L1 index, IPA base, PA base, span)`.
+    ///
+    /// Building the list once and checking it pairwise is what keeps [`validate`](Self::validate)
+    /// from being N² hand-written comparisons that a later region silently escapes — the failure
+    /// mode when this was three open-coded pairs and a fourth region arrived (M5 Arc 6b).
+    fn regions(&self) -> [Option<(usize, u64, u64, u64)>; 4] {
+        let data_span = TABLE_ENTRIES as u64 * self.frame_size;
+        [
+            self.guest_image_pa
+                .map(|pa| (((pa >> 30) & 0x1ff) as usize, pa, pa, BLOCK_SIZE)),
+            Some((
+                self.data_l1(),
+                self.data_ipa_base,
+                self.data_pa_base,
+                data_span,
+            )),
+            Some((
+                self.sup_l1(),
+                self.sup_ipa_base,
+                self.sup_pa_base,
+                self.sup_frames * super_size(self),
+            )),
+            self.dev_l1()
+                .map(|l1| (l1, self.device_base, self.device_base, self.device_len)),
+        ]
+    }
 
     /// Structural preconditions [`encode`] silently assumes.
     ///
-    /// Both were **argued** from the address layout and the linker script (Audit #2's composition
-    /// finding: the data frames sit outside the guest's only identity mapping). A layout change
-    /// could reintroduce either silently — a collided `L1` entry makes a whole region vanish, an
-    /// overlapping window makes private data alias the *shared* code image — so they are checked.
+    /// Argued from the address layout and the linker script in Audit #2, and checked ever since,
+    /// because a layout change could reintroduce either failure silently: a **collided `L1` entry**
+    /// makes a whole region vanish (the second write clobbers the first), and an **overlapping
+    /// window** makes one region alias another — private data over the shared code image, or RAM
+    /// over MMIO.
+    ///
+    /// Non-overlap here is also what carries the property that uniform 4 KiB addressing used to make
+    /// unrepresentable (M5 Arc 6a): within one span a leaf map is a total function over an
+    /// `Mfn`-indexed space, so two leaves cannot overlap — but *across* spans, and across the
+    /// infrastructure regions, only disjoint windows guarantee it.
     pub fn validate(&self) -> Result<(), EncodingViolation> {
-        // THREE regions now, so the collision check is pairwise (M5 Arc 6a). A collision is not a
-        // cosmetic clash: two regions in one `L1` entry means the second write clobbers the first
-        // and a whole region silently vanishes.
-        for (a, b) in [
-            (self.code_l1(), self.data_l1()),
-            (self.code_l1(), self.sup_l1()),
-            (self.data_l1(), self.sup_l1()),
-        ] {
-            if a == b {
-                return Err(EncodingViolation::RegionsCollide { l1_index: a });
-            }
+        if !self.device_len.is_multiple_of(BLOCK_SIZE) {
+            return Err(EncodingViolation::DeviceWindowUnaligned {
+                base: self.device_base,
+                len: self.device_len,
+            });
         }
-        // The image block is 2 MiB; the data region spans at most one full L3 table.
-        const IMAGE_SPAN: u64 = 0x20_0000;
-        let data_span = TABLE_ENTRIES as u64 * self.frame_size;
-        let overlaps = |a: u64, alen: u64, b: u64, blen: u64| a < b + blen && b < a + alen;
-        if overlaps(
-            self.guest_image_pa,
-            IMAGE_SPAN,
-            self.data_ipa_base,
-            data_span,
-        ) {
-            return Err(EncodingViolation::WindowsOverlap { space: "ipa" });
-        }
-        if overlaps(
-            self.guest_image_pa,
-            IMAGE_SPAN,
-            self.data_pa_base,
-            data_span,
-        ) {
-            return Err(EncodingViolation::WindowsOverlap { space: "pa" });
-        }
-        // The super window versus both others, in BOTH address spaces (M5 Arc 6a). **This is the
-        // property that replaces what uniform 4 KiB addressing used to make unrepresentable**: with
-        // one span, two leaves could not overlap because the map was a total function over an
-        // `Mfn`-indexed space. With two spans that is only true *within* a map, so non-overlap
-        // ACROSS maps has to be pinned here — and it is pinned structurally (disjoint windows),
-        // not re-checked per leaf.
-        let sup_span = self.sup_frames * super_size(self);
-        for (a, alen, b, blen, space) in [
-            (
-                self.sup_ipa_base,
-                sup_span,
-                self.data_ipa_base,
-                data_span,
-                "ipa",
-            ),
-            (
-                self.sup_ipa_base,
-                sup_span,
-                self.guest_image_pa,
-                IMAGE_SPAN,
-                "ipa",
-            ),
-            (
-                self.sup_pa_base,
-                sup_span,
-                self.data_pa_base,
-                data_span,
-                "pa",
-            ),
-            (
-                self.sup_pa_base,
-                sup_span,
-                self.guest_image_pa,
-                IMAGE_SPAN,
-                "pa",
-            ),
-        ] {
-            if overlaps(a, alen, b, blen) {
-                return Err(EncodingViolation::WindowsOverlap { space });
+        let regions = self.regions();
+        for i in 0..regions.len() {
+            for j in (i + 1)..regions.len() {
+                let (Some((l1a, ipa_a, pa_a, span_a)), Some((l1b, ipa_b, pa_b, span_b))) =
+                    (regions[i], regions[j])
+                else {
+                    continue;
+                };
+                if l1a == l1b {
+                    return Err(EncodingViolation::RegionsCollide { l1_index: l1a });
+                }
+                let overlaps = |a: u64, alen: u64, b: u64, blen: u64| a < b + blen && b < a + alen;
+                if overlaps(ipa_a, span_a, ipa_b, span_b) {
+                    return Err(EncodingViolation::WindowsOverlap { space: "ipa" });
+                }
+                if overlaps(pa_a, span_a, pa_b, span_b) {
+                    return Err(EncodingViolation::WindowsOverlap { space: "pa" });
+                }
             }
         }
         Ok(())
@@ -494,15 +552,24 @@ pub fn verify_encoding(
     t: TablesRef<'_>,
 ) -> Result<(), EncodingViolation> {
     layout.validate()?;
-    let (code_l1, data_l1, sup_l1) = (layout.code_l1(), layout.data_l1(), layout.sup_l1());
-    let (code_l2, data_l2) = (layout.code_l2(), layout.data_l2());
+    let (data_l1, sup_l1, data_l2) = (layout.data_l1(), layout.sup_l1(), layout.data_l2());
 
-    // L1: exactly THREE live entries now, pointing at the three L2s.
+    // L1: exactly one live entry per PRESENT region, each pointing at that region's L2.
+    let mut live_l1 = [0usize; 4];
+    let mut n_live = 0;
     for (idx, expected) in [
-        (code_l1, layout.l2_code_pa & desc::ADDR_4K),
-        (data_l1, layout.l2_data_pa & desc::ADDR_4K),
-        (sup_l1, layout.l2_sup_pa & desc::ADDR_4K),
-    ] {
+        Some((data_l1, layout.l2_data_pa & desc::ADDR_4K)),
+        Some((sup_l1, layout.l2_sup_pa & desc::ADDR_4K)),
+        layout
+            .code_l1()
+            .map(|i| (i, layout.l2_code_pa & desc::ADDR_4K)),
+        layout
+            .dev_l1()
+            .map(|i| (i, layout.l2_dev_pa & desc::ADDR_4K)),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if decode_table(t.l1[idx]) != Some(expected) {
             return Err(EncodingViolation::BadTableEntry {
                 table: "l1",
@@ -511,22 +578,31 @@ pub fn verify_encoding(
                 expected,
             });
         }
+        live_l1[n_live] = idx;
+        n_live += 1;
     }
-    dead_except(t.l1, &[code_l1, data_l1, sup_l1], "l1")?;
+    dead_except(t.l1, &live_l1[..n_live], "l1")?;
 
-    // L2(code): the guest image, read-only and EXECUTABLE (it is the guest's code).
-    let want_image = Decoded {
-        pa: layout.guest_image_pa & desc::ADDR_2M,
-        perm: Perm::Ro,
-        xn: false,
-    };
-    if decode_block(t.l2_code[code_l2]) != Some(want_image) {
-        return Err(EncodingViolation::BadImageBlock {
-            found: decode_block(t.l2_code[code_l2]),
-            expected_pa: want_image.pa,
-        });
+    // L2(code): the guest image, read-only and EXECUTABLE (it is the guest's code). Absent for a
+    // guest whose code lives in the mapped RAM — then the whole table must be DEAD, which is a
+    // stronger statement than "we did not write it".
+    match (layout.guest_image_pa, layout.code_l2()) {
+        (Some(image_pa), Some(code_l2)) => {
+            let want_image = Decoded {
+                pa: image_pa & desc::ADDR_2M,
+                perm: Perm::Ro,
+                xn: false,
+            };
+            if decode_block(t.l2_code[code_l2]) != Some(want_image) {
+                return Err(EncodingViolation::BadImageBlock {
+                    found: decode_block(t.l2_code[code_l2]),
+                    expected_pa: want_image.pa,
+                });
+            }
+            dead_except(t.l2_code, &[code_l2], "l2_code")?;
+        }
+        _ => dead_except(t.l2_code, &[], "l2_code")?,
     }
-    dead_except(t.l2_code, &[code_l2], "l2_code")?;
 
     // L2(data): one entry, to the L3.
     let want_l3 = layout.l3_data_pa & desc::ADDR_4K;
@@ -550,7 +626,6 @@ pub fn verify_encoding(
         });
         let found = decode_page(t.l3_data[m]);
         if found != want {
-            // A dead slot must be *fully* dead, not merely an undecodable non-zero word.
             if want.is_none() && t.l3_data[m] != 0 {
                 return Err(EncodingViolation::SpuriousDescriptor {
                     table: "l3_data",
@@ -566,11 +641,9 @@ pub fn verify_encoding(
         }
     }
 
-    // L2(sup): one 2 MiB BLOCK per mapped super-span frame, at its PA and permission, execute-never;
-    // every other slot dead (M5 Arc 6a). The `xn: true` is load-bearing and is the reason data
-    // blocks get their own descriptor constants: the ONLY executable mapping this emitter writes is
-    // the shared guest image, and a data superpage that decoded as executable would hand a guest an
-    // execute surface 512× the size of a page.
+    // L2(sup): one 2 MiB BLOCK per mapped super-span frame, execute-never; every other slot dead
+    // (M5 Arc 6a). `xn: true` is load-bearing — the only executable mapping this emitter writes is
+    // the shared guest image, and an executable data superpage is a 512-page execute surface.
     for m in 0..TABLE_ENTRIES {
         let want = supers.get(m).copied().flatten().map(|perm| Decoded {
             pa: super_pa(layout, m as u32) & desc::ADDR_2M,
@@ -594,7 +667,66 @@ pub fn verify_encoding(
             });
         }
     }
+
+    // L2(dev): identity Device-nGnRnE execute-never blocks over the window; every other slot dead
+    // (M5 Arc 6b). Checked by DECODING rather than by re-deriving the word — a device block that
+    // decoded as Normal memory, or as executable, is precisely the failure this exists to catch.
+    for idx in 0..TABLE_ENTRIES {
+        // The address this slot covers: an L2 spans 1 GiB, so slot `idx` is
+        // `(the L1-aligned base of the window) + idx * 2 MiB`.
+        let want = if layout.device_len > 0 {
+            let l1_base = layout.device_base & !(BLOCK_SIZE * TABLE_ENTRIES as u64 - 1);
+            let a = l1_base + idx as u64 * BLOCK_SIZE;
+            (a >= layout.device_base && a < layout.device_base + layout.device_len).then_some(
+                DecodedDevice {
+                    pa: a & desc::ADDR_2M,
+                    xn: true,
+                },
+            )
+        } else {
+            None
+        };
+        let found = decode_device_block(t.l2_dev[idx]);
+        if found != want {
+            if want.is_none() && t.l2_dev[idx] != 0 {
+                return Err(EncodingViolation::SpuriousDescriptor {
+                    table: "l2_dev",
+                    index: idx,
+                    desc: t.l2_dev[idx],
+                });
+            }
+            return Err(EncodingViolation::BadDeviceBlock {
+                index: idx,
+                desc: t.l2_dev[idx],
+            });
+        }
+    }
     Ok(())
+}
+
+/// What a **device** block descriptor means, recovered from its bits (M5 Arc 6b).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecodedDevice {
+    /// The MMIO output address.
+    pub pa: u64,
+    /// Execute-never. Must always be true — device memory is never an instruction source.
+    pub xn: bool,
+}
+
+/// Decode a device block, or `None` if it is not one — including a Normal-memory block, which is
+/// exactly the confusion worth catching.
+pub fn decode_device_block(d: u64) -> Option<DecodedDevice> {
+    if d & 0b11 != desc::BLOCK {
+        return None;
+    }
+    // `MemAttr` (bits [5:2]) must be 0b0000 = Device-nGnRnE. A Normal-memory block has 0b1111.
+    if (d >> 2) & 0b1111 != 0 {
+        return None;
+    }
+    Some(DecodedDevice {
+        pa: d & desc::ADDR_2M,
+        xn: d & desc::XN != 0,
+    })
 }
 
 /// Every slot of `table` except `live` must be zero — no descriptor the emitter did not intend.
@@ -631,7 +763,7 @@ mod tests {
             l2_code_pa: 0x4010_1000,
             l2_data_pa: 0x4010_2000,
             l3_data_pa: 0x4010_3000,
-            guest_image_pa: 0x4040_0000,
+            guest_image_pa: Some(0x4040_0000),
             data_ipa_base: 0x8000_0000,
             data_pa_base: 0x4060_0000,
             frame_size: 0x1000,
@@ -639,6 +771,10 @@ mod tests {
             // image at 1 and the data region at 2) and its own PA window, clear of both. One L2 of
             // 512 x 2 MiB blocks covers exactly 1 GiB — exactly one L1 slot, by construction.
             l2_sup_pa: 0x4010_4000,
+            l2_dev_pa: 0x4010_5000,
+            // Device pass-through window: its own L1 entry (0x0800_0000 >> 30 = 0), 32 MiB.
+            device_base: 0x0800_0000,
+            device_len: 0x0200_0000,
             sup_ipa_base: 0xC000_0000,
             sup_pa_base: 0x8000_0000,
             sup_frames: 8,
@@ -653,10 +789,12 @@ mod tests {
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
+        [u64; TABLE_ENTRIES],
     );
 
     fn tables() -> Blank {
         (
+            [0; TABLE_ENTRIES],
             [0; TABLE_ENTRIES],
             [0; TABLE_ENTRIES],
             [0; TABLE_ENTRIES],
@@ -689,7 +827,7 @@ mod tests {
     #[test]
     fn skeleton_indices_and_descriptors() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         encode(
             &[None; 8],
             &[None; 0],
@@ -700,11 +838,15 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
         // guest image 0x4040_0000 -> L1 index 1, L2 index 2
         assert_eq!(l1[1], (l.l2_code_pa & desc::ADDR_4K) | desc::TABLE);
-        assert_eq!(l2c[2], (l.guest_image_pa & desc::ADDR_2M) | desc::BLOCK_ROX);
+        assert_eq!(
+            l2c[2],
+            (l.guest_image_pa.unwrap() & desc::ADDR_2M) | desc::BLOCK_ROX
+        );
         // data base 0x8000_0000 -> L1 index 2, L2 index 0
         assert_eq!(l1[2], (l.l2_data_pa & desc::ADDR_4K) | desc::TABLE);
         assert_eq!(l2d[0], (l.l3_data_pa & desc::ADDR_4K) | desc::TABLE);
@@ -714,7 +856,7 @@ mod tests {
     #[test]
     fn leaves_encode_at_their_permission_and_pa() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
         leaves[5] = Some(Perm::Ro);
@@ -728,6 +870,7 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
         assert_eq!(l3[2], (0x4060_2000 & desc::ADDR_4K) | desc::PAGE_RW);
@@ -743,7 +886,7 @@ mod tests {
     #[test]
     fn re_encode_clears_stale_leaves() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut first = [None; 8];
         first[2] = Some(Perm::Rw);
         encode(
@@ -756,6 +899,7 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
         assert_ne!(l3[2], 0);
@@ -772,6 +916,7 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
         assert_eq!(l3[2], 0, "the previous tenant's leaf survived");
@@ -784,7 +929,7 @@ mod tests {
     #[test]
     fn golden_descriptor_words_are_literal() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
         leaves[5] = Some(Perm::Ro);
@@ -798,6 +943,7 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
         // table descriptors: next-table PA | 0b11
@@ -826,12 +972,13 @@ mod tests {
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
+        [u64; TABLE_ENTRIES],
     );
 
     /// Encode a representative map and hand back the tables, for the verifier tests below.
     fn encoded() -> Fixture {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
         leaves[5] = Some(Perm::Ro);
@@ -845,9 +992,10 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
-        (leaves, l, l1, l2c, l2d, l3, l2s)
+        (leaves, l, l1, l2c, l2d, l3, l2s, l2dv)
     }
 
     fn refs<'a>(
@@ -856,6 +1004,7 @@ mod tests {
         l2d: &'a [u64; TABLE_ENTRIES],
         l3: &'a [u64; TABLE_ENTRIES],
         l2s: &'a [u64; TABLE_ENTRIES],
+        l2dv: &'a [u64; TABLE_ENTRIES],
     ) -> TablesRef<'a> {
         TablesRef {
             l1,
@@ -863,6 +1012,7 @@ mod tests {
             l2_data: l2d,
             l3_data: l3,
             l2_sup: l2s,
+            l2_dev: l2dv,
         }
     }
 
@@ -872,7 +1022,7 @@ mod tests {
     #[test]
     fn super_leaf_encodes_as_a_block_and_verifies() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut sup = [None; 8];
         sup[1] = Some(Perm::Rw);
         sup[3] = Some(Perm::Ro);
@@ -886,6 +1036,7 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
         // It is a BLOCK (2 MiB), not a page — and execute-never, unlike the shared image block.
@@ -903,7 +1054,12 @@ mod tests {
             "a block must not decode as a page"
         );
         assert_eq!(
-            verify_encoding(&[None; 8], &sup, &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+            verify_encoding(
+                &[None; 8],
+                &sup,
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+            ),
             Ok(())
         );
     }
@@ -913,7 +1069,7 @@ mod tests {
     #[test]
     fn verify_catches_a_tampered_or_spurious_super_block() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut sup = [None; 8];
         sup[1] = Some(Perm::Ro);
         encode(
@@ -926,6 +1082,7 @@ mod tests {
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
                 l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
             },
         );
 
@@ -933,7 +1090,12 @@ mod tests {
         tampered[1] = (tampered[1] & !desc::S2AP_RO) | desc::S2AP_RW; // RO block escalated to RW
         assert!(
             matches!(
-                verify_encoding(&[None; 8], &sup, &l, refs(&l1, &l2c, &l2d, &l3, &tampered)),
+                verify_encoding(
+                    &[None; 8],
+                    &sup,
+                    &l,
+                    refs(&l1, &l2c, &l2d, &l3, &tampered, &l2dv)
+                ),
                 Err(EncodingViolation::BadLeaf { .. })
             ),
             "a read-only superpage escalated to writable must be caught"
@@ -943,7 +1105,12 @@ mod tests {
         spurious[7] = (0x8000_0000 & desc::ADDR_2M) | desc::BLOCK_RW; // an unauthorized 2 MiB block
         assert!(
             matches!(
-                verify_encoding(&[None; 8], &sup, &l, refs(&l1, &l2c, &l2d, &l3, &spurious)),
+                verify_encoding(
+                    &[None; 8],
+                    &sup,
+                    &l,
+                    refs(&l1, &l2c, &l2d, &l3, &spurious, &l2dv)
+                ),
                 Err(EncodingViolation::SpuriousDescriptor {
                     table: "l2_sup",
                     ..
@@ -970,6 +1137,171 @@ mod tests {
         assert!(matches!(
             l.validate(),
             Err(EncodingViolation::WindowsOverlap { space: "pa" })
+        ));
+    }
+
+    /// **M5 Arc 6b — the device region.** Identity Device-nGnRnE, execute-never blocks over the
+    /// window; `verify_encoding` accepts, and the decoder confirms the attribute rather than
+    /// re-deriving the word we just wrote.
+    #[test]
+    fn device_region_encodes_and_verifies() {
+        let l = layout();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
+        encode(
+            &[None; 8],
+            &[None; 8],
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
+            },
+        );
+        // 32 MiB of window = 16 blocks, starting at slot (0x0800_0000 >> 21) & 0x1ff = 64.
+        let first = ((l.device_base >> 21) & 0x1ff) as usize;
+        assert_eq!(
+            decode_device_block(l2dv[first]),
+            Some(DecodedDevice {
+                pa: l.device_base,
+                xn: true
+            })
+        );
+        assert_eq!(
+            decode_device_block(l2dv[first + 15]),
+            Some(DecodedDevice {
+                pa: l.device_base + 15 * BLOCK_SIZE,
+                xn: true
+            })
+        );
+        assert_eq!(l2dv[first + 16], 0, "one past the window must be dead");
+        assert_eq!(
+            verify_encoding(
+                &[None; 8],
+                &[None; 8],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+            ),
+            Ok(())
+        );
+    }
+
+    /// A device block that is **Normal memory**, or that is **executable**, is caught. These are the
+    /// two ways MMIO turns into something far worse than a mis-permissioned data page: cacheable and
+    /// speculatively accessible, or an instruction source.
+    #[test]
+    fn verify_catches_a_normal_or_executable_device_block() {
+        let l = layout();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
+        encode(
+            &[None; 8],
+            &[None; 8],
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
+            },
+        );
+        let first = ((l.device_base >> 21) & 0x1ff) as usize;
+
+        let mut normal = l2dv;
+        normal[first] |= 0b1111 << 2; // MemAttr = Normal WB — no longer device memory
+        assert_eq!(decode_device_block(normal[first]), None);
+        assert!(matches!(
+            verify_encoding(
+                &[None; 8],
+                &[None; 8],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &normal)
+            ),
+            Err(EncodingViolation::BadDeviceBlock { .. })
+        ));
+
+        let mut exec = l2dv;
+        exec[first] &= !desc::XN; // MMIO made executable
+        assert!(matches!(
+            verify_encoding(
+                &[None; 8],
+                &[None; 8],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &exec)
+            ),
+            Err(EncodingViolation::BadDeviceBlock { .. })
+        ));
+    }
+
+    /// **An absent guest image means the image tables are DEAD, not merely unwritten.** A real
+    /// kernel lives inside the mapped RAM, so there is no separate image block — and `None` must be
+    /// a checked statement about the emitted tables, not a silent skip.
+    #[test]
+    fn absent_guest_image_leaves_its_tables_dead() {
+        let mut l = layout();
+        l.guest_image_pa = None;
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
+        encode(
+            &[None; 8],
+            &[None; 8],
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
+            },
+        );
+        assert!(l2c.iter().all(|&d| d == 0), "no image => image L2 is dead");
+        assert_eq!(l1[1], 0, "and its L1 entry is dead too");
+        assert_eq!(
+            verify_encoding(
+                &[None; 8],
+                &[None; 8],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+            ),
+            Ok(())
+        );
+
+        // And a stray image block with no image declared is CAUGHT, not ignored.
+        let mut stray = l2c;
+        stray[2] = (0x4040_0000 & desc::ADDR_2M) | desc::BLOCK_ROX;
+        assert!(matches!(
+            verify_encoding(
+                &[None; 8],
+                &[None; 8],
+                &l,
+                refs(&l1, &stray, &l2d, &l3, &l2s, &l2dv)
+            ),
+            Err(EncodingViolation::SpuriousDescriptor {
+                table: "l2_code",
+                ..
+            })
+        ));
+    }
+
+    /// The device window is checked like every other region: distinct `L1` entry, disjoint window,
+    /// and a length that is a whole number of blocks (else the emit loop under-maps the tail).
+    #[test]
+    fn device_window_must_be_aligned_and_disjoint() {
+        let mut l = layout();
+        l.device_len = BLOCK_SIZE + 1;
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::DeviceWindowUnaligned { .. })
+        ));
+
+        let mut l = layout();
+        l.device_base = l.sup_ipa_base; // same L1 entry as the super window
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::RegionsCollide { .. })
         ));
     }
 
@@ -1008,9 +1340,14 @@ mod tests {
     /// THE ROUND TRIP: what `encode` wrote means exactly what the leaf map said, and nothing else.
     #[test]
     fn encode_then_verify_round_trips() {
-        let (leaves, l, l1, l2c, l2d, l3, l2s) = encoded();
+        let (leaves, l, l1, l2c, l2d, l3, l2s, l2dv) = encoded();
         assert_eq!(
-            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+            verify_encoding(
+                &leaves,
+                &[None; 0],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+            ),
             Ok(())
         );
     }
@@ -1018,10 +1355,15 @@ mod tests {
     /// NON-VACUITY: a tampered leaf is caught.
     #[test]
     fn verify_catches_a_tampered_leaf() {
-        let (leaves, l, l1, l2c, l2d, mut l3, l2s) = encoded();
+        let (leaves, l, l1, l2c, l2d, mut l3, l2s, l2dv) = encoded();
         l3[2] = (l3[2] & !desc::S2AP_RW) | desc::S2AP_RO; // silently downgrade RW -> RO
         assert!(matches!(
-            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+            verify_encoding(
+                &leaves,
+                &[None; 0],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+            ),
             Err(EncodingViolation::BadLeaf { mfn: 2, .. })
         ));
     }
@@ -1030,10 +1372,15 @@ mod tests {
     /// not reach anything extra.
     #[test]
     fn verify_catches_a_spurious_descriptor() {
-        let (leaves, l, l1, l2c, l2d, mut l3, l2s) = encoded();
+        let (leaves, l, l1, l2c, l2d, mut l3, l2s, l2dv) = encoded();
         l3[7] = (0x4060_7000 & desc::ADDR_4K) | desc::PAGE_RW; // a frame nobody authorized
         assert!(matches!(
-            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+            verify_encoding(
+                &leaves,
+                &[None; 0],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+            ),
             Err(EncodingViolation::BadLeaf { mfn: 7, .. })
                 | Err(EncodingViolation::SpuriousDescriptor { .. })
         ));
@@ -1042,10 +1389,15 @@ mod tests {
     /// NON-VACUITY: a broken skeleton (an `L1` entry pointing at the wrong table) is caught.
     #[test]
     fn verify_catches_a_broken_skeleton() {
-        let (leaves, l, mut l1, l2c, l2d, l3, l2s) = encoded();
+        let (leaves, l, mut l1, l2c, l2d, l3, l2s, l2dv) = encoded();
         l1[2] = (0xdead_0000u64 & desc::ADDR_4K) | desc::TABLE;
         assert!(matches!(
-            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+            verify_encoding(
+                &leaves,
+                &[None; 0],
+                &l,
+                refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+            ),
             Err(EncodingViolation::BadTableEntry { table: "l1", .. })
         ));
     }
@@ -1055,13 +1407,18 @@ mod tests {
     /// from it). Both directions are caught — this used to rest on a comment.
     #[test]
     fn verify_catches_a_writable_or_non_executable_image() {
-        let (leaves, l, l1, l2c_ok, l2d, l3, l2s) = encoded();
+        let (leaves, l, l1, l2c_ok, l2d, l3, l2s, l2dv) = encoded();
 
         let mut l2c = l2c_ok;
         l2c[2] = (l2c[2] & !desc::S2AP_RO) | desc::S2AP_RW; // shared image made WRITABLE
         assert!(
             matches!(
-                verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+                verify_encoding(
+                    &leaves,
+                    &[None; 0],
+                    &l,
+                    refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+                ),
                 Err(EncodingViolation::BadImageBlock { .. })
             ),
             "a writable shared image is a cross-domain write channel"
@@ -1071,7 +1428,12 @@ mod tests {
         l2c[2] |= desc::XN; // image made non-executable
         assert!(
             matches!(
-                verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+                verify_encoding(
+                    &leaves,
+                    &[None; 0],
+                    &l,
+                    refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+                ),
                 Err(EncodingViolation::BadImageBlock { .. })
             ),
             "the guest must still be able to fetch from its image"
@@ -1093,7 +1455,7 @@ mod tests {
 
         // Data frames backed INSIDE the 2 MiB image block -> private data aliases the shared image.
         let mut overlap = layout();
-        overlap.data_pa_base = overlap.guest_image_pa + 0x1000;
+        overlap.data_pa_base = overlap.guest_image_pa.unwrap() + 0x1000;
         assert!(matches!(
             overlap.validate(),
             Err(EncodingViolation::WindowsOverlap { space: "pa" })

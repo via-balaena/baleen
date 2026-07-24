@@ -195,6 +195,8 @@ struct Stage2Set {
     l3_data: Table,
     /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
     l2_sup: Table,
+    /// The `L2` covering the device pass-through region (M5 Arc 6b); unused by the synthetic path.
+    l2_dev: Table,
 }
 
 /// The [`NUM_STAGE2_SETS`] independent per-domain table sets. Set 0 is the sole set the single-domain
@@ -219,6 +221,7 @@ static STAGE2_SETS: BootCell<[Stage2Set; NUM_STAGE2_SETS]> = BootCell::new(
             l2_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l3_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l2_sup: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+            l2_dev: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
         }
     }; NUM_STAGE2_SETS],
 );
@@ -318,13 +321,18 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         l2_data_pa: tables.l2_data.0.as_ptr() as u64,
         l3_data_pa: tables.l3_data.0.as_ptr() as u64,
         l2_sup_pa: tables.l2_sup.0.as_ptr() as u64,
-        guest_image_pa: guest_ram_start(),
+        l2_dev_pa: tables.l2_dev.0.as_ptr() as u64,
+        guest_image_pa: Some(guest_ram_start()),
         data_ipa_base: DATA_IPA_BASE,
         data_pa_base: data_ram_start(),
         frame_size: FRAME_SIZE,
         sup_ipa_base: SUP_IPA_BASE,
         sup_pa_base: sup_ram_start(),
         sup_frames: NUM_SUP_FRAMES,
+        // No device pass-through for the synthetic guests: their virtio-mmio window is TRAPPED and
+        // emulated, not mapped, and the PL011 is EL2-only. The real-Linux path is what needs it.
+        device_base: 0,
+        device_len: 0,
     };
 
     // Structural preconditions the encoder silently assumes: the guest-image and data regions must
@@ -363,6 +371,7 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
             l2_data: &mut tables.l2_data.0,
             l3_data: &mut tables.l3_data.0,
             l2_sup: &mut tables.l2_sup.0,
+            l2_dev: &mut tables.l2_dev.0,
         },
     );
 
@@ -385,6 +394,7 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
                 l2_data: &tables.l2_data.0,
                 l3_data: &tables.l3_data.0,
                 l2_sup: &tables.l2_sup.0,
+                l2_dev: &tables.l2_dev.0,
             },
         );
         let mut uart = crate::uart();
