@@ -91,7 +91,6 @@
 //! `static mut`), as in `stage2.rs`/`heap.rs`.
 
 use core::arch::{asm, global_asm};
-use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
@@ -104,6 +103,7 @@ use hv_core::{HvCall, HvError, HvOutcome, Hypercall, Hypervisor, RawHypercall};
 
 use hv_hal::GuestMemory;
 
+use crate::cell::{BootCell, BootRef};
 use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, GuestMem};
@@ -1385,54 +1385,66 @@ const HCR_EL2_VM: u64 = 1 << 0;
 
 // ─── global guest state ───────────────────────────────────────────────────────────────────────
 
-struct HvCell(UnsafeCell<Option<Hypervisor>>);
-// SAFETY: single boot CPU; the only writer is `run` (before any guest runs) plus the straight-line,
-// interrupt-masked, non-nested trap handler. No concurrent access exists.
-unsafe impl Sync for HvCell {}
-static GUEST_HV: HvCell = HvCell(UnsafeCell::new(None));
+/// The guest `Hypervisor` — the whole `hv-core` model state, rebuilt once per boot phase.
+///
+/// The **class-3** (exclusive-borrow) member of `crate::cell`'s concurrency audit, and the one that
+/// motivated the arc: it is written by phase setup *and* mutated by the trap handler, and its old
+/// accessors minted unbounded `&'static mut`. `pub(crate)` so `crate::cell::selftest_exclusion` can
+/// witness the flag on a **production** cell rather than only on a probe.
+pub(crate) static GUEST_HV: BootCell<Option<Hypervisor>> = BootCell::new("GUEST_HV", None);
+
+/// Resolve a claimed [`GUEST_HV`] guard to the built `Hypervisor`, or halt.
+///
+/// The one-line replacement for the six-line `match` on a raw-pointer deref this file repeated at
+/// fourteen sites. The returned `&mut` borrows the **guard**, so the borrow checker now enforces what
+/// the old `&'static mut` left to a comment: a reference to the model cannot outlive the claim that
+/// makes it exclusive.
+fn hv_or_halt<'a>(
+    cell: &'a mut BootRef<Option<Hypervisor>>,
+    uart: &mut Pl011,
+    what: &str,
+) -> &'a mut Hypervisor {
+    match cell.as_mut() {
+        Some(hv) => hv,
+        None => {
+            let _ = writeln!(uart, "baleen: {what}: no Hypervisor built; halting");
+            crate::park();
+        }
+    }
+}
 
 /// The virtio-mmio console device state (M5 Arc 3) — the trap-and-emulate register file.
-struct VirtioCell(UnsafeCell<crate::virtio::VirtioConsole>);
-// SAFETY: single boot CPU; touched only by the straight-line, non-nested guest trap handler (the MMIO
-// emulation) and the phase-5 setup before that guest runs. No concurrent access. Same discipline as
-// `GUEST_HV`.
-unsafe impl Sync for VirtioCell {}
-static VIRTIO_DEV: VirtioCell = VirtioCell(UnsafeCell::new(crate::virtio::VirtioConsole::new()));
+static VIRTIO_DEV: BootCell<crate::virtio::VirtioConsole> =
+    BootCell::new("VIRTIO_DEV", crate::virtio::VirtioConsole::new());
 
 /// Borrow the virtio-mmio console device state (M5 Arc 3).
-fn virtio_dev() -> &'static mut crate::virtio::VirtioConsole {
-    // SAFETY: single-CPU, non-nested handler; exclusive access.
-    unsafe { &mut *VIRTIO_DEV.0.get() }
+///
+/// Returns a *guard*, not the `&'static mut` this used to hand out: the borrow is now bounded by the
+/// returned value's lifetime, so an overlapping use is a compile error and a re-entrant one halts.
+fn virtio_dev() -> BootRef<crate::virtio::VirtioConsole> {
+    VIRTIO_DEV.borrow_mut()
 }
 
 /// The virtio-blk device state (M5 Arc 4) — a second trap-and-emulate register file, active only during
-/// the block phases. Same single-CPU discipline as [`VIRTIO_DEV`].
-struct BlkCell(UnsafeCell<crate::blk::VirtioBlk>);
-// SAFETY: single boot CPU; touched only by the straight-line, non-nested guest trap handler and the
-// block-phase setup before that guest runs. No concurrent access.
-unsafe impl Sync for BlkCell {}
-static BLK_DEV: BlkCell = BlkCell(UnsafeCell::new(crate::blk::VirtioBlk::new()));
+/// the block phases. Same discipline as [`VIRTIO_DEV`].
+static BLK_DEV: BootCell<crate::blk::VirtioBlk> =
+    BootCell::new("BLK_DEV", crate::blk::VirtioBlk::new());
 
 /// Borrow the virtio-blk device register state (M5 Arc 4).
-fn blk_dev() -> &'static mut crate::blk::VirtioBlk {
-    // SAFETY: single-CPU, non-nested handler; exclusive access.
-    unsafe { &mut *BLK_DEV.0.get() }
+fn blk_dev() -> BootRef<crate::blk::VirtioBlk> {
+    BLK_DEV.borrow_mut()
 }
 
 /// The copy-on-write disk (M5 Arc 4) — the shared read-only template + per-tenant overlays. **Persists
 /// across the two block-phase `Hypervisor` rebuilds** (it is backend/device-model storage, not part of
 /// the model), which is exactly what lets tenant 1 read the template tenant 0 left pristine. Seeded once
 /// before the first block phase; never mapped into any guest's Stage-2 (unreachable by construction).
-struct BlkDiskCell(UnsafeCell<crate::blk::BlkDisk>);
-// SAFETY: single boot CPU; touched only by the non-nested backend (via the trap handler) and the
-// one-time seed before the first block guest runs. No concurrent access.
-unsafe impl Sync for BlkDiskCell {}
-static BLK_DISK: BlkDiskCell = BlkDiskCell(UnsafeCell::new(crate::blk::BlkDisk::new()));
+static BLK_DISK: BootCell<crate::blk::BlkDisk> =
+    BootCell::new("BLK_DISK", crate::blk::BlkDisk::new());
 
 /// Borrow the copy-on-write disk (M5 Arc 4).
-fn blk_disk() -> &'static mut crate::blk::BlkDisk {
-    // SAFETY: single-CPU, non-nested handler; exclusive access.
-    unsafe { &mut *BLK_DISK.0.get() }
+fn blk_disk() -> BootRef<crate::blk::BlkDisk> {
+    BLK_DISK.borrow_mut()
 }
 
 /// Which virtio device the mmio window ([`crate::virtio::VIRTIO_MMIO_BASE`]) currently emulates — set at
@@ -1655,12 +1667,8 @@ const _: () = {
     assert!(core::mem::offset_of!(GuestContext, sctlr_el1) == 272);
 };
 
-struct CtxCell(UnsafeCell<[GuestContext; NUM_VCPUS_METAL]>);
-// SAFETY: single boot CPU; written/read only by the straight-line, non-nested guest trap handler
-// (and phase-3 setup before any scheduler guest runs). No concurrent access. Same discipline as
-// `GUEST_HV` and the `stage2` tables.
-unsafe impl Sync for CtxCell {}
-static VCPU_CTX: CtxCell = CtxCell(UnsafeCell::new([GuestContext::ZERO; NUM_VCPUS_METAL]));
+static VCPU_CTX: BootCell<[GuestContext; NUM_VCPUS_METAL]> =
+    BootCell::new("VCPU_CTX", [GuestContext::ZERO; NUM_VCPUS_METAL]);
 
 /// Per-metal-vCPU-slot scheduling identity + address space (M5 Arc 1 unified for Arc 2). The register
 /// state lives in [`GuestContext`] (asm-bound offsets); this is the state the *metal switch* needs but
@@ -1689,17 +1697,15 @@ impl VcpuMeta {
     };
 }
 
-struct MetaCell(UnsafeCell<[VcpuMeta; NUM_VCPUS_METAL]>);
-// SAFETY: single boot CPU; written only at phase setup (before any scheduler guest runs) and read by
-// the straight-line, non-nested trap handler. No concurrent access. Same discipline as `VCPU_CTX`.
-unsafe impl Sync for MetaCell {}
-static VCPU_META: MetaCell = MetaCell(UnsafeCell::new([VcpuMeta::ZERO; NUM_VCPUS_METAL]));
+/// Per-slot scheduling metadata. The mildest member of `crate::cell`'s class 3: written at phase
+/// setup and read by the handler, and — already the right shape before this arc — read out **by
+/// value**, so no reference into it ever escaped.
+static VCPU_META: BootCell<[VcpuMeta; NUM_VCPUS_METAL]> =
+    BootCell::new("VCPU_META", [VcpuMeta::ZERO; NUM_VCPUS_METAL]);
 
-/// Read a metal vCPU slot's scheduling metadata (M5 Arc 1/2).
+/// Read a metal vCPU slot's scheduling metadata (M5 Arc 1/2). By value — the guard drops here.
 fn vcpu_meta(slot: usize) -> VcpuMeta {
-    // SAFETY: single-CPU, non-nested handler; the metadata was written at phase setup before any guest
-    // ran. Exclusive read.
-    unsafe { (*VCPU_META.0.get())[slot] }
+    VCPU_META.borrow_mut()[slot]
 }
 
 /// Install a VMID-tagged `VTTBR_EL2` with **no TLB flush** (M5 Arc 2 — the headline property). Switching
@@ -2212,8 +2218,8 @@ fn write_sysctx(sp_el1: u64, elr: u64, spsr: u64, sctlr: u64) {
 /// into `VCPU_CTX[vcpu]` (M5 Arc 1).
 fn save_context(vcpu: usize, frame: &GuestFrame) {
     let (sp_el1, elr, spsr, sctlr) = read_sysctx();
-    // SAFETY: single-CPU, non-nested handler → exclusive access to the context store.
-    let ctx = unsafe { &mut (*VCPU_CTX.0.get())[vcpu] };
+    let mut ctxs = VCPU_CTX.borrow_mut();
+    let ctx = &mut ctxs[vcpu];
     ctx.x = frame.x;
     ctx.sp_el1 = sp_el1;
     ctx.elr_el2 = elr;
@@ -2227,8 +2233,8 @@ fn save_context(vcpu: usize, frame: &GuestFrame) {
 /// Stage-2 install is an identity write; for the concurrent-isolation phase it swaps to the peer
 /// domain's address space.
 fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
-    // SAFETY: as [`save_context`] — exclusive single-CPU access.
-    let ctx = unsafe { (*VCPU_CTX.0.get())[vcpu] };
+    // Copied out, so the claim is released before `vcpu_meta` (below) takes its own.
+    let ctx = VCPU_CTX.borrow_mut()[vcpu];
     frame.x = ctx.x;
     write_sysctx(ctx.sp_el1, ctx.elr_el2, ctx.spsr_el2, ctx.sctlr_el1);
     set_vttbr_no_flush(vcpu_meta(vcpu).vttbr);
@@ -2395,15 +2401,10 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
 
     match nr {
         NR_GRANT | NR_SPEND => {
-            // SAFETY: the global `Hypervisor` was built in `run` before the guest ran; single-CPU,
-            // non-nested access.
-            let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-                Some(hv) => hv,
-                None => {
-                    let _ = writeln!(uart, "baleen: guest trap but no Hypervisor built; halting");
-                    crate::park();
-                }
-            };
+            // The global `Hypervisor` was built in `run` before the guest ran. The claim is held for
+            // exactly this dispatch and released at the end of the arm.
+            let mut cell = GUEST_HV.borrow_mut();
+            let hv = hv_or_halt(&mut cell, uart, "guest trap");
             let result = service_hypercall(hv, nr, arg0);
             LAST_RESULT.store(result, Ordering::Relaxed);
             frame.x[0] = result;
@@ -2644,12 +2645,11 @@ fn handle_virtio_notify(uart: &mut Pl011) {
         VIRTQ_AVAIL_IDX_OFF, VIRTQ_AVAIL_RING_OFF, VIRTQ_DESC_SIZE, VIRTQ_USED_ELEM_SIZE,
         VIRTQ_USED_IDX_OFF, VIRTQ_USED_RING_OFF,
     };
-    // SAFETY: single-CPU, non-nested handler; the Hypervisor was built before the guest ran.
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_ref() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
-    let dev = virtio_dev();
+    // Two distinct cells, so both claims can be live at once — and the compiler now checks that the
+    // model reference does not outlive its claim.
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "virtio notify");
+    let mut dev = virtio_dev();
     if !dev.queue_live() {
         let _ = writeln!(
             uart,
@@ -2772,12 +2772,9 @@ fn handle_virtio_blk_notify(uart: &mut Pl011) {
         VIRTQ_AVAIL_IDX_OFF, VIRTQ_AVAIL_RING_OFF, VIRTQ_USED_ELEM_SIZE, VIRTQ_USED_IDX_OFF,
         VIRTQ_USED_RING_OFF,
     };
-    // SAFETY: single-CPU, non-nested handler; the Hypervisor was built before the guest ran.
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_ref() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
-    let dev = blk_dev();
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "virtio-blk notify");
+    let mut dev = blk_dev();
     if !dev.queue_live() {
         let _ = writeln!(
             uart,
@@ -2831,7 +2828,7 @@ fn process_blk_request(hv: &Hypervisor, desc_table: u64, num: u16, head: u16, ua
         VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
     };
     let tenant = BLK_TENANT.load(Ordering::Relaxed) as usize;
-    let disk = blk_disk();
+    let mut disk = blk_disk();
 
     // desc0: the request header (device-readable), chained to the data descriptor.
     let Some(d0) = backend_read_desc(hv, desc_table, head, num, uart) else {
@@ -3115,13 +3112,8 @@ fn finish_isolation_test(uart: &mut Pl011) -> ! {
 fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
     // SAFETY: single-CPU, non-nested; the global `Hypervisor` was built in `run` and this is the only
     // (straight-line) accessor now running — the guest is trapped at EL2, nothing else touches it.
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => {
-            let _ = writeln!(uart, "baleen: lifecycle: no Hypervisor built; halting");
-            crate::park();
-        }
-    };
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "lifecycle");
 
     // (1) Destroy the guest. `now` is a real generic-timer tick (the teardown uses it for runtime
     // accounting; any monotonic value is sound for the isolation witness).
@@ -3277,6 +3269,11 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
         "baleen: re-entering reborn EL1 guest (entry=0x{entry:016x}, fresh Stage-2) — lifecycle isolation test"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2. Entering the guest is where EL2 relinquishes
+    // its state, and a claim taken here could never be released — the next trap's borrow would
+    // be refused. Under the pre-Arc-4 code this reference simply stayed nominally live across
+    // the `eret`, sound only because nothing used it afterwards; that is now structural.
+    drop(cell);
     enter_guest(exc_stack_top);
 }
 
@@ -3341,16 +3338,13 @@ fn sched_now() -> u64 {
     crate::time::GenericTimer.now()
 }
 
-/// Borrow the global scheduler `Hypervisor` (built in [`begin_scheduler_phase3`]); halts if unbuilt.
-fn sched_hv(uart: &mut Pl011) -> &'static mut Hypervisor {
-    // SAFETY: single-CPU, non-nested handler; the Hypervisor was built before any scheduler guest ran.
-    match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => {
-            let _ = writeln!(uart, "baleen: scheduler: no Hypervisor built; halting");
-            crate::park();
-        }
-    }
+/// Claim the global scheduler `Hypervisor` cell (built in [`begin_scheduler_phase3`]).
+///
+/// Returns the **guard**, not a `&'static mut Hypervisor` — that old signature was the sharpest
+/// instance of the hazard M5 Arc 4 closed: two calls minted two live `&'static mut` aliases to one
+/// cell with nothing, at any level, forbidding it. Callers pair this with [`hv_or_halt`].
+fn sched_hv() -> BootRef<Option<Hypervisor>> {
+    GUEST_HV.borrow_mut()
 }
 
 /// **M5 Arc 1 — the vCPU yield handler.** Save the running vCPU's context, drive hv-core's REAL
@@ -3364,7 +3358,8 @@ fn handle_yield(frame: &mut GuestFrame, uart: &mut Pl011) {
     let next = 1 - cur;
     let (cur_m, next_m) = (vcpu_meta(cur), vcpu_meta(next));
     let now = sched_now();
-    let hv = sched_hv(uart);
+    let mut cell = sched_hv();
+    let hv = hv_or_halt(&mut cell, uart, "scheduler");
     // Preempt the running vCPU (as its owning domain) and dispatch the peer (as ITS owning domain — the
     // same domain when they share it [Arc 1], distinct domains under concurrent isolation [Arc 2]). The
     // pCPU-exclusivity invariant is maintained across the preempt→run pair; the peer's Stage-2 (its
@@ -3433,7 +3428,8 @@ fn retire_and_switch_to_peer(cur: usize, frame: &mut GuestFrame, uart: &mut Pl01
     let next = 1 - cur;
     let (cur_m, next_m) = (vcpu_meta(cur), vcpu_meta(next));
     let now = sched_now();
-    let hv = sched_hv(uart);
+    let mut cell = sched_hv();
+    let hv = hv_or_halt(&mut cell, uart, "scheduler");
     expect(
         hv,
         cur_m.dom,
@@ -3467,11 +3463,9 @@ fn retire_and_switch_to_peer(cur: usize, frame: &mut GuestFrame, uart: &mut Pl01
 fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
     // A fresh Hypervisor: the lifecycle phase mutated the previous one. SAFETY: single-CPU, one-time
     // rebuild before any scheduler guest runs; no handler is touching the cell.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     // Both vCPUs belong to ONE domain (a single address space — concurrent isolation between two
     // DOMAINS is step 2b). Register-only guests → no data frames; Stage-2 is just the image block.
@@ -3600,10 +3594,11 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
     // belong to ONE domain and share ONE address space, so both slots carry the SAME (dom, vttbr) — the
     // per-slot VTTBR restore on every switch is therefore an identity write here (the concurrent-
     // isolation phase is where the two slots' VTTBRs differ).
-    // SAFETY: single-CPU, before any scheduler guest runs → exclusive access to the context + meta store.
-    unsafe {
-        let ctxs = &mut *VCPU_CTX.0.get();
-        let metas = &mut *VCPU_META.0.get();
+    // Two claims, two distinct cells; both released at the end of this block, before the guest is
+    // entered below (M5 Arc 4 — a claim must not survive the `eret` out of EL2).
+    {
+        let mut ctxs = VCPU_CTX.borrow_mut();
+        let mut metas = VCPU_META.borrow_mut();
         for (i, base) in [SCHED_BASE_A, SCHED_BASE_B].into_iter().enumerate() {
             let c = &mut ctxs[i];
             *c = GuestContext::ZERO;
@@ -3631,8 +3626,22 @@ fn begin_scheduler_phase3(uart: &mut Pl011) -> ! {
         "baleen: scheduler phase — two vCPUs time-slice ({SCHED_YIELDS} yields each), hv-core sched drives the switch"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2 (see the other phase entries): a claim taken here
+    // could never be released, and the next trap's borrow would be refused.
+    drop(cell);
     // SAFETY: VCPU_CTX[A] is a valid, seeded GuestContext; exc_stack_top is the dedicated EL2 stack.
-    unsafe { __enter_guest_ctx(&(*VCPU_CTX.0.get())[SCHED_VCPU_A as usize], exc_stack_top) }
+    // `as_ptr` deliberately does NOT claim the cell (see `crate::cell`): this is the hand-off to the
+    // trampoline, after which EL2 `eret`s out and holds no borrow — a claim taken here could never be
+    // released, and would halt the next trap.
+    unsafe {
+        __enter_guest_ctx(
+            VCPU_CTX
+                .as_ptr()
+                .cast::<GuestContext>()
+                .add(SCHED_VCPU_A as usize),
+            exc_stack_top,
+        )
+    }
 }
 
 /// **M5 Arc 1, phase 3 terminal.** Assert the concurrent scheduler matrix: each vCPU's counter ended
@@ -3785,11 +3794,9 @@ fn setup_concurrent_model(hv: &mut Hypervisor, uart: &mut Pl011) {
 fn begin_concurrent_iso_phase4(uart: &mut Pl011) -> ! {
     // A fresh Hypervisor: the scheduler phase mutated the previous one. SAFETY: single-CPU, one-time
     // rebuild before any phase-4 guest runs; no handler is touching the cell.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     setup_concurrent_model(hv, uart);
 
@@ -3874,10 +3881,11 @@ fn begin_concurrent_iso_phase4(uart: &mut Pl011) -> ! {
     // `mov`, `b`; no stack use, no self-modification). The isolation surface under test is the per-domain
     // DATA frames (distinct Mfn → distinct PA → distinct per-VMID Stage-2 leaf). A production control
     // domain would give each domain a private code image (the real-Linux capstone arc); deferred.
-    // SAFETY: single-CPU, before any phase-4 guest runs → exclusive access to the context + meta store.
-    unsafe {
-        let ctxs = &mut *VCPU_CTX.0.get();
-        let metas = &mut *VCPU_META.0.get();
+    // Two claims, two distinct cells; both released at the end of this block, before the guest is
+    // entered below (M5 Arc 4).
+    {
+        let mut ctxs = VCPU_CTX.borrow_mut();
+        let mut metas = VCPU_META.borrow_mut();
         let seeds = [
             (
                 ISO_DOM_A,
@@ -3929,8 +3937,12 @@ fn begin_concurrent_iso_phase4(uart: &mut Pl011) -> ! {
         "baleen: concurrent-isolation phase — two domains (VMID 1/2) time-slice, each in its own Stage-2 (no tlbi on switch)"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2 (see the other phase entries): a claim taken here
+    // could never be released, and the next trap's borrow would be refused.
+    drop(cell);
     // SAFETY: VCPU_CTX[0] is a valid, seeded GuestContext for dom A; exc_stack_top is the EL2 stack.
-    unsafe { __enter_guest_ctx(&(*VCPU_CTX.0.get())[0], exc_stack_top) }
+    // `as_ptr`, not a claim — the hand-off to the trampoline; see the phase-3 entry above.
+    unsafe { __enter_guest_ctx(VCPU_CTX.as_ptr().cast::<GuestContext>(), exc_stack_top) }
 }
 
 /// **M5 Arc 2, phase 4 terminal.** Assert the concurrent inter-domain isolation matrix: (1) no
@@ -4108,11 +4120,9 @@ fn virtio_report_negotiated(frame: &mut GuestFrame, uart: &mut Pl011) {
 fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
     // A fresh Hypervisor: the isolation phase mutated the previous one. SAFETY: single-CPU, one-time
     // rebuild before the phase-5 guest runs; no handler is touching the cell.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     // dom0 creates the guest that runs the virtio-console driver.
     expect(
@@ -4212,6 +4222,11 @@ fn begin_virtio_console_phase5(uart: &mut Pl011) -> ! {
         "baleen: virtio-console phase — guest drives a virtio-mmio v2 console device (MMIO trap-and-emulate)"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2. Entering the guest is where EL2 relinquishes
+    // its state, and a claim taken here could never be released — the next trap's borrow would
+    // be refused. Under the pre-Arc-4 code this reference simply stayed nominally live across
+    // the `eret`, sound only because nothing used it afterwards; that is now structural.
+    drop(cell);
     enter_guest(exc_stack_top);
 }
 
@@ -4342,8 +4357,13 @@ fn finish_virtio_blk_test(uart: &mut Pl011) -> ! {
     // `POISON` forbidden-marker. `overlays_distinct` below is a by-construction *structural* assertion
     // (the overlays are distinct rows of a fixed array — it cannot fail without rewriting the struct); it
     // documents the "distinct storage" clause of the property but does not by itself discriminate a leak.
-    let disk = blk_disk();
-    let overlays_distinct = !core::ptr::eq(disk.overlay_ptr(0, 0), disk.overlay_ptr(1, 0));
+    // Scoped: this function's success tail diverges into `begin_gic_phase` and never returns, so a
+    // claim taken at function scope would still be held when the thesis phase re-seeds the disk —
+    // which is precisely the overlap `BootCell` caught on this arc's first boot (M5 Arc 4).
+    let overlays_distinct = {
+        let disk = blk_disk();
+        !core::ptr::eq(disk.overlay_ptr(0, 0), disk.overlay_ptr(1, 0))
+    };
 
     if id_ok
         && negotiated_ok
@@ -4819,7 +4839,7 @@ fn setup_thesis_model(hv: &mut Hypervisor, uart: &mut Pl011) {
     }
     // The disposable's CoW disk: seed the shared template, then write the disposable's overlay so its
     // disk has diverged (the overlay is discarded on teardown, the template staying pristine).
-    let disk = blk_disk();
+    let mut disk = blk_disk();
     disk.seed_template(0, THESIS_TEMPLATE_MARKER);
     disk.write(DISP_TENANT, 0, DISP_DISK_MARKER);
 }
@@ -4835,11 +4855,9 @@ fn begin_thesis_phase(uart: &mut Pl011) -> ! {
         FAULT_WNR[f].store(false, Ordering::Relaxed);
     }
     // SAFETY: single-CPU, one-time rebuild before the disposable runs.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     setup_thesis_model(hv, uart);
 
@@ -4858,6 +4876,11 @@ fn begin_thesis_phase(uart: &mut Pl011) -> ! {
         "baleen: thesis phase — dom0 runs a disposable; a live no-net vault domain holds an un-forgeable secret the disposable must not reach (the vault is modeled + owns its secret; only the disposable executes)"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2. Entering the guest is where EL2 relinquishes
+    // its state, and a claim taken here could never be released — the next trap's borrow would
+    // be refused. Under the pre-Arc-4 code this reference simply stayed nominally live across
+    // the `eret`, sound only because nothing used it afterwards; that is now structural.
+    drop(cell);
     enter_guest(exc_stack_top);
 }
 
@@ -4868,10 +4891,8 @@ fn begin_thesis_phase(uart: &mut Pl011) -> ! {
 /// and the vault's secret + the CoW template both pristine (Arc 4), plus a reborn disposable that inherits
 /// no reach to the secret. Then finish the boot.
 fn finish_thesis_test(uart: &mut Pl011) -> ! {
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     let pos_ok = THESIS_POS_OK.load(Ordering::Relaxed);
 
@@ -5035,11 +5056,9 @@ fn begin_timer_phase(uart: &mut Pl011) -> ! {
 /// (5a) and async (5b) phases.
 fn gic_fresh_guest(uart: &mut Pl011) {
     // SAFETY: single-CPU, one-time rebuild before the vGIC guest runs.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
     expect(
         hv,
         DOM0,
@@ -5072,10 +5091,8 @@ fn gic_fresh_guest(uart: &mut Pl011) {
 /// Emit the vGIC guest's Stage-2, enable the hardware virtual CPU interface at EL2, and enter the guest
 /// at `entry`. Shared by the poll (5a) and async (5b) phases. Never returns.
 fn run_gic_guest(uart: &mut Pl011, entry: u64, msg: &str) -> ! {
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
     let vttbr = stage2::build_stage2_from_p2m(hv, GIC_DOM, STAGE2_SET_SINGLE);
     let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
     enable_stage2(vttbr);
@@ -5088,6 +5105,11 @@ fn run_gic_guest(uart: &mut Pl011, entry: u64, msg: &str) -> ! {
     IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
     let _ = writeln!(uart, "{msg}");
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2. Entering the guest is where EL2 relinquishes
+    // its state, and a claim taken here could never be released — the next trap's borrow would
+    // be refused. Under the pre-Arc-4 code this reference simply stayed nominally live across
+    // the `eret`, sound only because nothing used it afterwards; that is now structural.
+    drop(cell);
     enter_guest(exc_stack_top);
 }
 
@@ -5127,11 +5149,9 @@ fn begin_virtio_blk_phase6(uart: &mut Pl011) -> ! {
 
     // A fresh Hypervisor: the console phase mutated the previous one. SAFETY: single-CPU, one-time
     // rebuild before the block guest runs; no handler is touching the cell.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     setup_blk_guest(hv, uart);
 
@@ -5151,6 +5171,11 @@ fn begin_virtio_blk_phase6(uart: &mut Pl011) -> ! {
         "baleen: virtio-blk phase (tenant 0) — guest drives a virtio-blk v2 device over a CoW template"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2. Entering the guest is where EL2 relinquishes
+    // its state, and a claim taken here could never be released — the next trap's borrow would
+    // be refused. Under the pre-Arc-4 code this reference simply stayed nominally live across
+    // the `eret`, sound only because nothing used it afterwards; that is now structural.
+    drop(cell);
     enter_guest(exc_stack_top);
 }
 
@@ -5164,11 +5189,9 @@ fn begin_virtio_blk_phase7(uart: &mut Pl011) -> ! {
     BLK_TENANT.store(1, Ordering::Relaxed);
 
     // SAFETY: single-CPU, one-time rebuild before the phase-7 guest runs.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     setup_blk_guest(hv, uart);
 
@@ -5188,6 +5211,11 @@ fn begin_virtio_blk_phase7(uart: &mut Pl011) -> ! {
         "baleen: virtio-blk phase (tenant 1) — a second tenant reads the shared template (must see it pristine)"
     );
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2. Entering the guest is where EL2 relinquishes
+    // its state, and a claim taken here could never be released — the next trap's borrow would
+    // be refused. Under the pre-Arc-4 code this reference simply stayed nominally live across
+    // the `eret`, sound only because nothing used it afterwards; that is now structural.
+    drop(cell);
     enter_guest(exc_stack_top);
 }
 
@@ -5436,12 +5464,10 @@ fn expect(hv: &mut Hypervisor, caller: DomId, call: HvCall, what: &str, uart: &m
 /// returns.
 pub(crate) fn run(uart: &mut Pl011) -> ! {
     // SAFETY: single-CPU, one-time; no guest has run yet, so no handler is touching the cell.
-    unsafe { *GUEST_HV.0.get() = Some(crate::build_hypervisor()) };
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
     // SAFETY: as above — exclusive access to build the model configuration before any guest runs.
-    let hv = match unsafe { (*GUEST_HV.0.get()).as_mut() } {
-        Some(hv) => hv,
-        None => crate::park(),
-    };
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
 
     setup_model(hv, uart);
 
@@ -5481,5 +5507,10 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     );
 
     let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2. Entering the guest is where EL2 relinquishes
+    // its state, and a claim taken here could never be released — the next trap's borrow would
+    // be refused. Under the pre-Arc-4 code this reference simply stayed nominally live across
+    // the `eret`, sound only because nothing used it afterwards; that is now structural.
+    drop(cell);
     enter_guest(exc_stack_top);
 }

@@ -235,6 +235,7 @@ boot_and_check "selftest" "--features selftest" \
     "generic timer live" \
     "HvCall CreditGrant(100) -> balance=100" \
     "selftest: HvCall accounting OK" \
+    "selftest: BootCell exclusion OK (second borrow refused while live, accepted after drop" \
     "selftest: Stage-2 encoding verified" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \
     "guest HVC serviced: nr=1 arg=30 -> result=70" \
