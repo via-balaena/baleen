@@ -40,6 +40,8 @@
 //! nothing here can fault.
 
 pub mod arm64;
+pub mod check;
 pub mod leafmap;
 
+pub use check::{check_all, Violation};
 pub use leafmap::{leaf_map, FrameOutOfRange, Perm};
