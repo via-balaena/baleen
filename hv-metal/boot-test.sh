@@ -242,7 +242,7 @@ boot_and_check "selftest" "--features selftest" \
     "selftest: HvCall accounting OK" \
     "selftest: BootCell exclusion OK (second borrow refused while live, accepted after drop" \
     "selftest: Stage-2 encoding verified" \
-    "1 super-span 2 MiB block(s) emitted and decoded" \
+    "1 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \
     "guest HVC serviced: nr=1 arg=30 -> result=70" \
     "guest observed HvCall result=70 via HVC round-trip" \

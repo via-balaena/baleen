@@ -121,7 +121,74 @@ pub const SUP_IPA_BASE: u64 = 0xC000_0000;
 
 /// How many super-span frames the linker actually backs (`__guest_sup_*` is 2 MiB = one 2 MiB
 /// frame). Must match the reserved region: `Layout::validate` checks the BACKED span.
-pub const NUM_SUP_FRAMES: u64 = 1;
+pub const NUM_SUP_FRAMES: u64 = windows().sup_frames;
+
+/// The address windows one Stage-2 emission is shaped by.
+///
+/// **One emitter, two configurations.** The synthetic guests and the real-Linux guest need different
+/// windows — different RAM base, a device region for one and not the other, a hypervisor-owned code
+/// image for one and not the other — but they must not get different *emitters*, which is the
+/// two-emitters problem this whole arc exists to end. So the windows are data and the emission path
+/// is shared, proofs and all.
+pub struct Windows {
+    /// Guest IPA base of the base-span (4 KiB) frame window.
+    pub data_ipa_base: u64,
+    /// Guest IPA base of the super-span (2 MiB) frame window.
+    pub sup_ipa_base: u64,
+    /// How many super-span frames are backed. Also the metal's span PARTITION: model frames
+    /// `[0, sup_frames)` are super, the rest base (see [`scrub_frame`]).
+    pub sup_frames: u64,
+    /// Device pass-through window (identity), or `len == 0` for none.
+    pub device_base: u64,
+    /// Length of the device window in bytes.
+    pub device_len: u64,
+}
+
+/// The windows this build emits with — the synthetic layout by default, the real-Linux layout under
+/// `--features real-linux`. A `const fn` so `NUM_SUP_FRAMES` and the scrub partition are compile-time
+/// facts rather than something to thread through every call.
+pub const fn windows() -> Windows {
+    #[cfg(not(feature = "real-linux"))]
+    {
+        Windows {
+            data_ipa_base: DATA_IPA_BASE,
+            sup_ipa_base: SUP_IPA_BASE,
+            sup_frames: 1,
+            device_base: 0,
+            device_len: 0,
+        }
+    }
+    #[cfg(feature = "real-linux")]
+    {
+        Windows {
+            // The synthetic base-frame window is unused by this build (the Linux guest's memory is
+            // all super-span), but it must still be a valid, disjoint window for `validate`.
+            data_ipa_base: DATA_IPA_BASE,
+            // IDENTITY: IPA == PA over guest RAM, which the arm64 boot protocol and the DTB's
+            // `/memory` node both assume. The emitter needs no new mechanism for this — it maps
+            // `base + m*size` in both spaces, so equal bases give identity for free.
+            sup_ipa_base: LINUX_RAM_BASE,
+            // 896 MiB of guest RAM in 2 MiB blocks — under `TABLE_ENTRIES`, so ONE L2 covers it.
+            sup_frames: (LINUX_RAM_END - LINUX_RAM_BASE)
+                / (hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE),
+            // GICv3 distributor + redistributor + PL011, as pass-through MMIO.
+            device_base: 0x0800_0000,
+            device_len: 0x0200_0000,
+        }
+    }
+}
+
+/// How many `L2`-pinned model tables the real-Linux guest needs to hold its leaves, at
+/// `hv_core::TABLE_SLOTS` (8) leaves each. See `crate::NUM_FRAMES` on why this is not one.
+#[cfg(feature = "real-linux")]
+pub const NUM_LINUX_TABLES: u64 = NUM_SUP_FRAMES.div_ceil(hv_core::p2m::TABLE_SLOTS as u64);
+
+/// Guest RAM for the real-Linux guest — must match `xtask`'s `-device loader` addresses and the DTB.
+#[cfg(feature = "real-linux")]
+pub const LINUX_RAM_BASE: u64 = 0x4800_0000;
+/// Exclusive end of guest RAM (QEMU `-m 1024` puts the top of DRAM at `0x8000_0000`).
+#[cfg(feature = "real-linux")]
+pub const LINUX_RAM_END: u64 = 0x8000_0000;
 
 extern "C" {
     static __guest_ram_start: u8;
@@ -139,8 +206,20 @@ fn data_ram_start() -> u64 {
 fn data_ram_end() -> u64 {
     core::ptr::addr_of!(__guest_data_end) as u64
 }
+/// Host PA backing super-span frame 0.
+///
+/// The synthetic build reserves its own small window in the linker script; the real-Linux build uses
+/// **guest RAM itself**, so that `sup_ipa_base == sup_pa_base` and the mapping is identity — which
+/// the arm64 boot protocol and the DTB's `/memory` node both require.
 fn sup_ram_start() -> u64 {
-    core::ptr::addr_of!(__guest_sup_start) as u64
+    #[cfg(not(feature = "real-linux"))]
+    {
+        core::ptr::addr_of!(__guest_sup_start) as u64
+    }
+    #[cfg(feature = "real-linux")]
+    {
+        LINUX_RAM_BASE
+    }
 }
 
 /// Number of independent per-domain Stage-2 table sets the metal can hold live at once. Two, for the
@@ -195,6 +274,8 @@ struct Stage2Set {
     l3_data: Table,
     /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
     l2_sup: Table,
+    /// The `L2` covering the device pass-through region (M5 Arc 6b); unused by the synthetic path.
+    l2_dev: Table,
 }
 
 /// The [`NUM_STAGE2_SETS`] independent per-domain table sets. Set 0 is the sole set the single-domain
@@ -219,6 +300,7 @@ static STAGE2_SETS: BootCell<[Stage2Set; NUM_STAGE2_SETS]> = BootCell::new(
             l2_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l3_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l2_sup: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+            l2_dev: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
         }
     }; NUM_STAGE2_SETS],
 );
@@ -318,13 +400,28 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         l2_data_pa: tables.l2_data.0.as_ptr() as u64,
         l3_data_pa: tables.l3_data.0.as_ptr() as u64,
         l2_sup_pa: tables.l2_sup.0.as_ptr() as u64,
-        guest_image_pa: guest_ram_start(),
-        data_ipa_base: DATA_IPA_BASE,
+        l2_dev_pa: tables.l2_dev.0.as_ptr() as u64,
+        // The synthetic build's guest image is the hypervisor-owned blob at `__guest_ram_start`;
+        // the real-Linux build has none (its kernel is inside the mapped RAM).
+        guest_image_pa: if cfg!(feature = "real-linux") {
+            None
+        } else {
+            Some(guest_ram_start())
+        },
+        data_ipa_base: windows().data_ipa_base,
         data_pa_base: data_ram_start(),
         frame_size: FRAME_SIZE,
-        sup_ipa_base: SUP_IPA_BASE,
+        sup_ipa_base: windows().sup_ipa_base,
         sup_pa_base: sup_ram_start(),
         sup_frames: NUM_SUP_FRAMES,
+        // The synthetic guests need no device pass-through: their virtio-mmio window is TRAPPED and
+        // emulated, and the PL011 is EL2-only. The real-Linux guest drives real hardware.
+        device_base: windows().device_base,
+        device_len: windows().device_len,
+        // A real kernel executes from its own RAM; the synthetic guests run from a separate
+        // read-only image and keep every data leaf execute-never. Declared, and checked by
+        // `verify_encoding` — see `Layout::sup_executable`.
+        sup_executable: cfg!(feature = "real-linux"),
     };
 
     // Structural preconditions the encoder silently assumes: the guest-image and data regions must
@@ -363,6 +460,7 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
             l2_data: &mut tables.l2_data.0,
             l3_data: &mut tables.l3_data.0,
             l2_sup: &mut tables.l2_sup.0,
+            l2_dev: &mut tables.l2_dev.0,
         },
     );
 
@@ -385,18 +483,25 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
                 l2_data: &tables.l2_data.0,
                 l3_data: &tables.l3_data.0,
                 l2_sup: &tables.l2_sup.0,
+                l2_dev: &tables.l2_dev.0,
             },
         );
         let mut uart = crate::uart();
         match verdict {
             Ok(()) => {
+                let image = if layout.guest_image_pa.is_some() {
+                    "RO+X"
+                } else {
+                    "absent (tables asserted dead)"
+                };
+                let dev = layout.device_len / (1024 * 1024);
                 let n_sup = supers[..NUM_SUP_FRAMES as usize]
                     .iter()
                     .filter(|s| s.is_some())
                     .count();
                 let _ = writeln!(
                     uart,
-                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block RO+X; {n_sup} super-span 2 MiB block(s) emitted and decoded)"
+                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block {image}; {n_sup} super-span 2 MiB block(s) emitted and decoded; device window {dev} MiB)"
                 );
             }
             Err(e) => {

@@ -131,9 +131,10 @@ distinct state keys. Recording it because a metric that cannot exceed 100% would
 
 ## 6. Residual
 
-1. **`linux.rs::build_stage2` still exists.** Arc 6a makes the proven emitter *capable* of hosting a
-   real guest; it does not rehost it. Until 6b, the only real Linux guest still runs behind an
-   emitter no proof touches — the gap that motivated this arc is narrowed, **not closed**.
+1. ~~**`linux.rs::build_stage2` still exists.**~~ **CLOSED by Arc 6b** — a real Alpine kernel now
+   boots behind the proven emitter from a 448-leaf `hv-core` model, and `linux.rs::build_stage2` is
+   deleted along with that file's own table storage and descriptor encodings. See
+   `docs/ARC6B-LINUX-ON-THE-PROVEN-EMITTER.md`.
 2. **One backed super frame.** The metal reserves 2 MiB, so the super path is exercised but not at
    scale; a real guest needs the window sized up (NOLOAD, so it costs image nothing).
 3. **1 GiB spans (a model `L3` leaf) are `UnsupportedSpan`** — rejected loudly, not emitted.

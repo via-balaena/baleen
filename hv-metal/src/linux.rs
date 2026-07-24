@@ -42,8 +42,15 @@
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
 
-use crate::cell::BootCell;
+use hv_core::hypervisor::DomId;
+use hv_core::p2m::{Mfn, PtLevel};
+use hv_core::{HvCall, Hypervisor};
+
 use crate::pl011::Pl011;
+use crate::stage2::{self, LINUX_RAM_BASE, LINUX_RAM_END};
+
+/// The control domain.
+const DOM0: DomId = 0;
 
 // ─── the memory contract (must match xtask's `-device loader` addresses) ─────────────────────────
 
@@ -102,73 +109,102 @@ const SCTLR_EL1_ENABLES: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 <<
 
 // ─── Stage-2 tables ──────────────────────────────────────────────────────────────────────────────
 
-/// A 4 KiB Stage-2 translation table (512 × 8-byte descriptors); 4 KiB-aligned for the walk hardware.
-/// Plain storage — the interior mutability lives on the [`TABLES`] cell (M5 Arc 4), as in `stage2.rs`.
-#[repr(C, align(4096))]
-struct Table([u64; 512]);
+// The Stage-2 tables live in `crate::stage2` now — the same storage the proven emitter uses for the
+// synthetic guests. This file used to declare its own, alongside its own descriptor encodings and
+// its own 40-line identity mapper; all three are gone (M5 Arc 6b). That duplication WAS the gap:
+// the only real guest ran behind an emitter no proof touched.
 
-const _: () = assert!(core::mem::align_of::<Table>() == 4096);
-const _: () = assert!(core::mem::size_of::<Table>() == 4096);
-
-/// The single guest's Stage-2 tables: an `L1` (entry 0 → the device region's `L2`, entry 1 → the
-/// guest-RAM region's `L2`), an `L2` covering `0x0..0x4000_0000` (device blocks), and an `L2`
-/// covering `0x4000_0000..0x8000_0000` (RAM blocks).
+/// Build this guest's model in `hv-core`, then emit its Stage-2 through the **proven emitter**.
 ///
-/// One [`BootCell`] over all three (M5 Arc 4) — the *publication* class of `crate::cell`'s audit,
-/// and the strictest member of it: unlike `stage2.rs`'s sets these are written **once**, before
-/// `enable_stage2`, and thereafter read only by the walk hardware. The cell buys the disjoint field
-/// borrows that make [`build_stage2`] `unsafe`-free; the barriers in [`enable_stage2`] remain the
-/// publication argument.
-#[repr(C)]
-struct LinuxTables {
-    l1: Table,
-    l2_dev: Table,
-    l2_ram: Table,
-}
+/// **This is what M5 Arc 6b is for.** Until now the only real guest ran behind `build_stage2` — forty
+/// lines of hand-rolled identity mapping in this file that no proof touched — while the emitter with
+/// the ∀-N refinement theorem behind it could only address 2 MiB and so could not host a kernel. Arc
+/// 6a gave that emitter superpages; this makes the kernel use it.
+///
+/// The model: one domain owning an `L2`-pinned page table, with one **leaf edge per 2 MiB of guest
+/// RAM**. A leaf out of an `L2` table is a superpage (`hv_s2::Span::Super`), so the emitter writes
+/// 2 MiB blocks — and because the super window's IPA and PA bases are both `LINUX_RAM_BASE`, the
+/// mapping is identity, as the arm64 boot protocol and the DTB's `/memory` node require.
+///
+/// The device pass-through window is **infrastructure**, not model-driven — no `p2m` edge describes
+/// MMIO — and the emitter maps it Device-nGnRnE + execute-never under its own checked invariant.
+fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
+    /// The domain the Linux guest runs as. `0` is the control domain.
+    const GUEST: DomId = 1;
+    /// The first model frame holding an `L2` page table — just above the super partition, in the
+    /// base partition, and never mapped (a page table is model state, not a leaf).
+    const FIRST_TABLE: Mfn = stage2::NUM_SUP_FRAMES as Mfn;
 
-static TABLES: BootCell<LinuxTables> = BootCell::new(
-    "linux::TABLES",
-    LinuxTables {
-        l1: Table([0; 512]),
-        l2_dev: Table([0; 512]),
-        l2_ram: Table([0; 512]),
-    },
-);
+    let mut go = |caller: DomId, call: HvCall, what: &str| {
+        if let Err(e) = crate::teardown::dispatch(hv, caller, call) {
+            let _ = writeln!(
+                uart,
+                "baleen: linux model setup '{what}' failed: {e:?}; halting"
+            );
+            crate::park();
+        }
+    };
 
-/// Build the big identity Stage-2 (guest RAM Normal WB RWX + the GIC/PL011 device window) and return
-/// the `VTTBR_EL2` value (`L1` PA | VMID). Identity IPA==PA throughout — this is infrastructure that
-/// gives the single guest the machine, NOT the model-driven isolation refinement (`stage2.rs`).
-fn build_stage2() -> u64 {
-    let mut tables = TABLES.borrow_mut();
-    let l1_pa = tables.l1.0.as_ptr() as u64;
-    let l2_dev_pa = tables.l2_dev.0.as_ptr() as u64;
-    let l2_ram_pa = tables.l2_ram.0.as_ptr() as u64;
+    go(
+        DOM0,
+        HvCall::DomainCreate {
+            target: GUEST,
+            may_create: false,
+        },
+        "create the linux domain",
+    );
 
-    // No `unsafe` (M5 Arc 4): the three tables are disjoint fields of one claimed cell, so the
-    // compiler checks what the old SAFETY block argued. Every table is 4 KiB-aligned with 512
-    // entries, so all indices below (masked to 9 bits) are in range. The device region lives in
-    // L1[0], guest RAM in L1[1], so the two L1 writes never collide. Publication is `enable_stage2`'s
-    // (EL2 runs MMU-off/identity, so no walker observes these stores mid-build).
-    tables.l1.0[0] = (l2_dev_pa & ADDR_4K) | DESC_TABLE; // 0x0..0x4000_0000
-    tables.l1.0[1] = (l2_ram_pa & ADDR_4K) | DESC_TABLE; // 0x4000_0000..0x8000_0000
-
-    // Device pass-through: GICv3 + PL011, 2 MiB device blocks.
-    let mut a = DEV_BASE;
-    while a < DEV_END {
-        let idx = ((a >> 21) & 0x1ff) as usize;
-        tables.l2_dev.0[idx] = (a & ADDR_2M) | BLOCK_DEVICE;
-        a += 0x20_0000;
+    // One super-span leaf per 2 MiB of guest RAM, spread across `NUM_LINUX_TABLES` `L2`-pinned
+    // tables because `hv_core::TABLE_SLOTS` is 8 (see `crate::NUM_FRAMES`). Each table is allocated
+    // and pinned before its leaves are linked.
+    for t in 0..stage2::NUM_LINUX_TABLES {
+        let table = FIRST_TABLE + t as Mfn;
+        go(
+            GUEST,
+            HvCall::P2mAllocate { mfn: table },
+            "allocate a table",
+        );
+        go(
+            GUEST,
+            HvCall::P2mPin {
+                mfn: table,
+                level: PtLevel::L2,
+            },
+            "pin a table at L2",
+        );
+        for slot in 0..hv_core::p2m::TABLE_SLOTS {
+            let m = (t * hv_core::p2m::TABLE_SLOTS as u64 + slot as u64) as Mfn;
+            if m >= stage2::NUM_SUP_FRAMES as Mfn {
+                break;
+            }
+            go(
+                GUEST,
+                HvCall::P2mAllocate { mfn: m },
+                "allocate a RAM frame",
+            );
+            go(
+                GUEST,
+                HvCall::P2mLink {
+                    parent: table,
+                    slot,
+                    child: m,
+                    writable: true,
+                    leaf: true,
+                },
+                "link a RAM superpage",
+            );
+        }
     }
 
-    // Guest RAM: Normal WB RWX, 2 MiB blocks over the whole window.
-    let mut a = GUEST_RAM_BASE;
-    while a < GUEST_RAM_END {
-        let idx = ((a >> 21) & 0x1ff) as usize;
-        tables.l2_ram.0[idx] = (a & ADDR_2M) | BLOCK_NORMAL_RWX;
-        a += 0x20_0000;
-    }
+    let _ = writeln!(
+        uart,
+        "baleen: linux model built — {} super-span leaves ({} MiB of guest RAM) across {} L2-pinned tables",
+        stage2::NUM_SUP_FRAMES,
+        (LINUX_RAM_END - LINUX_RAM_BASE) / (1024 * 1024),
+        stage2::NUM_LINUX_TABLES
+    );
 
-    l1_pa | (GUEST_VMID << 48)
+    stage2::build_stage2_from_p2m(hv, GUEST, 0)
 }
 
 /// Program + enable Stage-2: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM` (leaving `IMO=0`), then
@@ -481,7 +517,15 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
          (Image@0x{KERNEL_ENTRY:08x}, DTB@0x{DTB_ADDR:08x}, RAM 0x{GUEST_RAM_BASE:08x}..0x{GUEST_RAM_END:08x})"
     );
 
-    let vttbr = build_stage2();
+    // Build the guest's model and emit its Stage-2 through the PROVEN emitter (M5 Arc 6b).
+    *crate::guest::GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = crate::guest::GUEST_HV.borrow_mut();
+    let hv = match cell.as_mut() {
+        Some(hv) => hv,
+        None => crate::park(),
+    };
+    let vttbr = build_model_and_stage2(hv, uart);
+    drop(cell);
     enable_stage2(vttbr);
     enable_guest_hw_access();
     init_guest_el1();

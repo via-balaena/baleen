@@ -254,7 +254,26 @@ const VCPUS_PER_DOMAIN: usize = 2;
 const NUM_PCPUS: usize = 2;
 /// Machine frames in the model. `pub(crate)` so [`guest`]'s per-frame fault-record array can
 /// compile-time-assert it covers every model frame (see `guest::NFRAMES`).
+#[cfg(not(feature = "real-linux"))]
 pub(crate) const NUM_FRAMES: usize = 8;
+
+/// The real-Linux guest's model: one frame per 2 MiB of its RAM, plus the `L2` page-table frames
+/// those leaves hang off.
+///
+/// **Why more than one table.** `hv_core::TABLE_SLOTS` is **8** — a deliberate model abstraction
+/// ("small enough that the `links` table stays bounded"), not a hardware fact. So one model table
+/// holds at most 8 leaves and a real address space needs many of them; the metal composes them,
+/// which is the refinement doing its job rather than a workaround. The emitted table does not
+/// reflect the model's table *structure* at all — the refinement is over the LEAF SET (Audit #2's
+/// leaf-level reachability scope), so 56 eight-leaf tables and one 448-leaf table would emit the
+/// same Stage-2.
+///
+/// Every frame below `stage2::NUM_SUP_FRAMES` is a super-span frame (the metal's span partition);
+/// the table frames sit just above it, in the base partition, and are never mapped — a page table is
+/// model state, not a leaf.
+#[cfg(feature = "real-linux")]
+pub(crate) const NUM_FRAMES: usize =
+    stage2::NUM_SUP_FRAMES as usize + stage2::NUM_LINUX_TABLES as usize;
 
 /// Domain 0 — the primordial control domain, `Live` from boot with a credit account. The acting
 /// domain for the synthetic call.

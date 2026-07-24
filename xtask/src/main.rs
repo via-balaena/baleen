@@ -203,7 +203,7 @@ fn qemu_linux() -> bool {
     run("qemu-system-aarch64", &argv)
 }
 
-/// Build `hv-metal` for the bare-metal target with the `real-linux` feature (M5 Arc 5e).
+/// Build `hv-metal` for the bare-metal target with `real-linux` + `selftest` (M5 Arc 5e/6b).
 fn metal_build_linux() -> bool {
     run(
         "cargo",
@@ -215,7 +215,11 @@ fn metal_build_linux() -> bool {
             "--manifest-path",
             "hv-metal/Cargo.toml",
             "--features",
-            "real-linux",
+            // `selftest` too, so the Linux path runs `verify_encoding` on its REAL emitted tables:
+            // 448 super-span blocks plus the device window read back and decoded, every other slot
+            // asserted dead. Without it the one real guest's emission would be the only one not
+            // verified at runtime (M5 Arc 6b).
+            "real-linux,selftest",
         ],
     )
 }

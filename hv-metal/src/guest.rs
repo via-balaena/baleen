@@ -1557,8 +1557,9 @@ static IN_GUEST_HANDLER: AtomicBool = AtomicBool::new(false);
 /// "guest data region" [`record_data_abort`] accepts, so it MUST cover every model frame — asserted
 /// at compile time against [`crate::NUM_FRAMES`] so a future arc that grows the model can't silently
 /// push a probeable frame past the fault array (which would halt-on-fault rather than record it).
-const NFRAMES: usize = 8;
-const _: () = assert!(NFRAMES >= crate::NUM_FRAMES);
+// Sized to the model's frame count directly, so a future arc that grows the model cannot push a
+// probeable frame past this array — the relation is now structural rather than asserted.
+const NFRAMES: usize = crate::NUM_FRAMES;
 static FAULT_DFSC: [AtomicU64; NFRAMES] = [const { AtomicU64::new(0) }; NFRAMES];
 /// The `WnR` bit (write-not-read) of that frame's fault — `true` for a store, meaningful with `DFSC`.
 static FAULT_WNR: [AtomicBool; NFRAMES] = [const { AtomicBool::new(false) }; NFRAMES];
