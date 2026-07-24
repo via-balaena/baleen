@@ -270,6 +270,23 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         );
         crate::park();
     }
+    // (1a) THE SPAN PARTITION (the Arc-6a scrub fix). Indices `[0, NUM_SUP_FRAMES)` are backed in
+    //      the SUPER window; everything else in the base window. A base leaf inside that partition
+    //      would be backed at `data_ram_start() + m*4KiB` by the emitter but scrubbed as a 2 MiB
+    //      super frame by `scrub_frame` — the two would address different memory, so the frame
+    //      would be mapped without ever being cleared. The model can express it; the metal cannot
+    //      represent it; so it halts rather than emitting a silently unscrubbed mapping.
+    for (mfn, leaf) in leaves.iter().enumerate() {
+        if leaf.is_some() && (mfn as u64) < NUM_SUP_FRAMES {
+            let mut uart = crate::uart();
+            let _ = writeln!(
+                uart,
+                "baleen: Stage-2 emission: frame {mfn} is a BASE leaf inside the super partition [0, {NUM_SUP_FRAMES}); its backing and its scrub would disagree; halting"
+            );
+            crate::park();
+        }
+    }
+
     // (1b) THE CONTENT CHECK (M5 Arc 5) — the second, independent derivation (#36). The scrub runs
     //      at `P2mAllocate`, when a frame becomes OWNED, inside `crate::teardown`'s dispatch funnel.
     //      This is the other end: the moment a frame becomes REACHABLE. A dispatch that bypassed the
@@ -398,6 +415,30 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
 // Frame-content scrubbing (M5 Arc 5) — the CONTENT half of "a reborn tenant inherits nothing".
 // ---------------------------------------------------------------------------------------------
 
+/// Read/write the first bytes of super-span frame `m`'s **backing**, for the content witness.
+///
+/// The super window is outside [`GuestMem`]'s data-window map (which is deliberately bounded to the
+/// base frames), so the witness needs its own accessor. Trusted-hypervisor access, unconditional on
+/// S2AP — exactly as `GuestMem` is.
+pub fn sup_frame_bytes(m: Mfn, buf: &mut [u8]) {
+    let pa = hv_s2::arm64::frame_addr(sup_ram_start(), SUPER_SIZE, m);
+    // SAFETY: `pa` is the base of super frame `m`'s backing inside the reserved `__guest_sup_*`
+    // window (`m < NUM_SUP_FRAMES` is the caller's obligation, checked at every emission), and EL2
+    // runs identity/MMU-off so it is directly addressable. `buf` is a distinct caller slice.
+    unsafe { core::ptr::copy_nonoverlapping(pa as *const u8, buf.as_mut_ptr(), buf.len()) };
+}
+
+/// Seed the first bytes of super-span frame `m`'s backing. Same contract as [`sup_frame_bytes`].
+pub fn seed_sup_frame(m: Mfn, buf: &[u8]) {
+    let pa = hv_s2::arm64::frame_addr(sup_ram_start(), SUPER_SIZE, m);
+    // SAFETY: as `sup_frame_bytes`, with the copy direction reversed.
+    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), pa as *mut u8, buf.len()) };
+}
+
+/// Bytes one super-span frame covers on this target — `TABLE_ENTRIES * FRAME_SIZE` (2 MiB at a
+/// 4 KiB granule). Derived, so it cannot drift from the base granule (design-lesson #14c).
+const SUPER_SIZE: u64 = hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE;
+
 /// The cache line size assumed for the scrub's maintenance loop. 64 bytes on every AArch64 core this
 /// targets; using a value **smaller** than the true line size is always safe (it merely repeats
 /// `dc civac` within a line), so this is a conservative constant rather than a `CTR_EL0` read.
@@ -426,18 +467,43 @@ const CACHE_LINE: u64 = 64;
 /// *wrong on silicon while passing every test we own* — the same standing of the VMID-tagging
 /// argument (design-lesson #23, `docs/AUDIT-4-CONCURRENT-STAGE2.md`).
 pub fn scrub_frame(mfn: Mfn) {
-    let pa = hv_s2::arm64::frame_addr(data_ram_start(), FRAME_SIZE, mfn);
+    // **The span partition.** A frame's SPAN is a property of the parent it is later LINKED under,
+    // so it does not exist at `P2mAllocate` — which is where the scrub must hook, because allocate
+    // is the sole OWNER-creating transition (M5 Arc 5) and a frame can be allocated, seeded through
+    // `GuestMem`, freed and re-allocated without ever being linked. Moving the scrub to the link
+    // would therefore leak; the span has to be knowable at allocate instead.
+    //
+    // It is, and not by convention: the super window backs exactly indices `[0, NUM_SUP_FRAMES)`
+    // (their PA is `sup_pa_base + m * 2 MiB`), so those are the ONLY indices that can be super
+    // frames. Making that the rule makes the addressing here total. `build_stage2_from_p2m` rejects
+    // a base leaf inside the super partition, so the two cannot disagree.
+    //
+    // Before this fix the scrub was span-BLIND — it always addressed the base window and always
+    // zeroed 4 KiB — so a super frame's 2 MiB backing was never scrubbed (Arc 5's content
+    // non-inheritance claim was false for superpages) and an unrelated base address was zeroed
+    // instead. Latent only because the fixture left base index 0 unused.
+    let (pa, size) = if (mfn as u64) < NUM_SUP_FRAMES {
+        (
+            hv_s2::arm64::frame_addr(sup_ram_start(), SUPER_SIZE, mfn),
+            SUPER_SIZE,
+        )
+    } else {
+        (
+            hv_s2::arm64::frame_addr(data_ram_start(), FRAME_SIZE, mfn),
+            FRAME_SIZE,
+        )
+    };
     // SAFETY: `pa` is the base of model frame `mfn`'s machine frame, inside the reserved in-DRAM data
     // window (`frame_addr` is the single shared derivation the emitter uses, and `mfn < NUM_FRAMES`
     // is a model invariant the caller is downstream of). EL2 runs identity/MMU-off, so the PA is
     // directly addressable. `FRAME_SIZE` bytes starting there are exactly this frame and no other.
     unsafe {
-        core::ptr::write_bytes(pa as *mut u8, 0, FRAME_SIZE as usize);
+        core::ptr::write_bytes(pa as *mut u8, 0, size as usize);
     }
     // Clean+invalidate the frame to the point of coherency, then fence. See the doc comment: this is
     // the half QEMU cannot witness and silicon requires.
     let mut addr = pa;
-    let end = pa + FRAME_SIZE;
+    let end = pa + size;
     while addr < end {
         // SAFETY: `dc civac` takes a VA in a mapped region; EL2 is identity-mapped so the PA is that
         // VA. Cache maintenance has no architectural memory effect beyond coherency.

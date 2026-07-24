@@ -124,6 +124,7 @@ FORBIDDEN_MARKERS=(
     "POISON-blk-guest0-write-must-not-cross"
     "V4ULTSEC"
     "D3ADTENANT-must-not-survive-rebirth"
+    "D3ADSUPER-must-not-survive-rebirth"
 )
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
@@ -183,6 +184,7 @@ boot_and_check "default" "" \
     "lifecycle positive OK: reborn guest reached its own fresh frame (rw=0xcafe)" \
     "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
     "lifecycle content OK: the reborn slot's re-allocated frame reads as ZERO before it writes" \
+    "lifecycle content OK (super): the reborn slot's re-allocated 2 MiB SUPERPAGE reads as ZERO" \
     "LIFECYCLE ISOLATION TEST PASSED" \
     "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
     "scheduler affinity OK: SchedRun onto a non-affine (free) pCPU refused (NotAffine)" \
@@ -257,6 +259,7 @@ boot_and_check "selftest" "--features selftest" \
     "lifecycle positive OK: reborn guest reached its own fresh frame (rw=0xcafe)" \
     "lifecycle negative OK: reborn probe of the destroyed grant -> translation fault" \
     "lifecycle content OK: the reborn slot's re-allocated frame reads as ZERO before it writes" \
+    "lifecycle content OK (super): the reborn slot's re-allocated 2 MiB SUPERPAGE reads as ZERO" \
     "LIFECYCLE ISOLATION TEST PASSED" \
     "scheduler exclusivity OK: SchedRun onto the occupied pCPU refused (PcpuBusy)" \
     "scheduler affinity OK: SchedRun onto a non-affine (free) pCPU refused (NotAffine)" \

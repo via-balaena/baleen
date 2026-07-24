@@ -212,6 +212,11 @@ const SENTINEL_RW2: u64 = 0xCAFE;
 /// reaches the serial log and the boot test fails. Distinct from every other marker in the boot.
 const DEAD_TENANT_SECRET: &[u8] = b"D3ADTENANT-must-not-survive-rebirth";
 
+/// The same idea for a **SUPER-span** frame — the case the scrub used to miss entirely, because
+/// `scrub_frame` addressed the base window and zeroed 4 KiB whatever the span. Also a FORBIDDEN
+/// marker in `boot-test.sh`.
+const DEAD_SUPER_SECRET: &[u8] = b"D3ADSUPER-must-not-survive-rebirth";
+
 // ─── M5 Arc 1: the vCPU context switch + concurrent scheduler run-loop ─────────────────────────
 //
 // Two vCPUs (of one domain) time-slice on the single physical CPU, switched by hv-core's REAL
@@ -3218,6 +3223,9 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
             );
             crate::park();
         }
+        // And the SUPER frame — the span the scrub used to miss entirely. Its backing lies outside
+        // the data window, so it needs the super accessor rather than `GuestMem`.
+        stage2::seed_sup_frame(F_SUP, DEAD_SUPER_SECRET);
     }
 
     // (1) Destroy the guest. `now` is a real generic-timer tick (the teardown uses it for runtime
@@ -3281,6 +3289,33 @@ fn begin_lifecycle_phase2(uart: &mut Pl011) -> ! {
         "reborn alloc rw",
         uart,
     );
+
+    // (3a) The SUPER-span content witness (the Arc-6a scrub fix). The reborn domain re-allocates
+    //      the very super frame the dead tenant held; `scrub_frame` must now zero its 2 MiB backing
+    //      in the SUPER window, not 4 KiB of an unrelated base address.
+    expect(
+        hv,
+        GUEST_DOM,
+        HvCall::P2mAllocate { mfn: F_SUP },
+        "reborn alloc super frame",
+        uart,
+    );
+    {
+        let mut probe = [0u8; DEAD_SUPER_SECRET.len()];
+        stage2::sup_frame_bytes(F_SUP, &mut probe);
+        if probe.iter().all(|&b| b == 0) {
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle content OK (super): the reborn slot's re-allocated 2 MiB SUPERPAGE reads as ZERO (the span-aware scrub cleared its own window, not a base-window address)"
+            );
+        } else {
+            let recovered = core::str::from_utf8(&probe).unwrap_or("<non-utf8>");
+            let _ = writeln!(
+                uart,
+                "baleen: lifecycle content LEAK (super): the reborn slot read the dead tenant's superpage bytes: {recovered}"
+            );
+        }
+    }
 
     // (3b) **M5 Arc 5 — the CONTENT witness.** `G'` has just re-allocated the very machine frame the
     //      dead `G` held. Read it back through the trusted path BEFORE `G'` writes anything: the
