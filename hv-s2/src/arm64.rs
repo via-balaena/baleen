@@ -165,6 +165,301 @@ pub fn encode(leaves: &[Option<Perm>], layout: &Layout, tables: Tables<'_>) {
     }
 }
 
+// ─── the inverse: decoding, so the emitted table can be read back and checked ────────────────────
+//
+// `encode` is the only thing that decides what the hardware walks. Until now it was exercised solely
+// by a handful of golden unit tests, while the *decision* feeding it (`leafmap`) was checked over
+// every reachable state — so the weakest link in the chain
+//
+//     model  ->  leaf map  ->  descriptor words  ->  hardware
+//
+// was the third arrow, not the first. These decoders close it: they recover a descriptor's meaning
+// from its bits, so [`verify_encoding`] can assert the emitted tables mean EXACTLY the leaf map they
+// were built from — and nothing else.
+
+/// What a Stage-2 leaf descriptor means, recovered from its bits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Decoded {
+    /// The output address it maps to.
+    pub pa: u64,
+    /// The access permission it grants the guest.
+    pub perm: Perm,
+    /// Whether it is execute-never.
+    pub xn: bool,
+}
+
+/// The `S2AP` field of a leaf, or `None` if it is a reserved encoding.
+fn decode_perm(d: u64) -> Option<Perm> {
+    match (d >> 6) & 0b11 {
+        0b11 => Some(Perm::Rw),
+        0b01 => Some(Perm::Ro),
+        _ => None,
+    }
+}
+
+/// Decode an `L3` 4 KiB **page** leaf. `None` if the slot is not a valid page (e.g. a zero hole).
+///
+/// Note the type bits `0b11` mean *page* at `L3` and *table* at `L1`/`L2` — the encoding is
+/// level-dependent, so the caller must know which level it is reading. That ambiguity is in the
+/// architecture, not this code.
+pub fn decode_page(d: u64) -> Option<Decoded> {
+    if d & 0b11 != desc::PAGE {
+        return None;
+    }
+    Some(Decoded {
+        pa: d & desc::ADDR_4K,
+        perm: decode_perm(d)?,
+        xn: d & desc::XN != 0,
+    })
+}
+
+/// Decode an `L2` 2 MiB **block** leaf. `None` if the slot is not a valid block.
+pub fn decode_block(d: u64) -> Option<Decoded> {
+    if d & 0b11 != desc::BLOCK {
+        return None;
+    }
+    Some(Decoded {
+        pa: d & desc::ADDR_2M,
+        perm: decode_perm(d)?,
+        xn: d & desc::XN != 0,
+    })
+}
+
+/// Decode an `L1`/`L2` **table** descriptor to the next-level table PA. `None` if not a table entry.
+pub fn decode_table(d: u64) -> Option<u64> {
+    if d & 0b11 != desc::TABLE {
+        return None;
+    }
+    Some(d & desc::ADDR_4K)
+}
+
+/// The four tables, read-only — for [`verify_encoding`].
+pub struct TablesRef<'a> {
+    /// The `L1` table.
+    pub l1: &'a [u64; TABLE_ENTRIES],
+    /// The `L2` for the guest-image region.
+    pub l2_code: &'a [u64; TABLE_ENTRIES],
+    /// The `L2` for the data region.
+    pub l2_data: &'a [u64; TABLE_ENTRIES],
+    /// The `L3` for the data region.
+    pub l3_data: &'a [u64; TABLE_ENTRIES],
+}
+
+/// A way the emitted tables can fail to mean what the leaf map said.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EncodingViolation {
+    /// The guest-image and data regions land in the **same `L1` entry** — the second write would
+    /// silently clobber the first and one whole region would vanish. Argued impossible by the
+    /// address layout; now checked, because a future layout change could reintroduce it silently.
+    RegionsCollide {
+        /// The `L1` index both regions claim.
+        l1_index: usize,
+    },
+    /// The guest-image window overlaps the data window, so a domain's private data frames would
+    /// alias the **shared** read-only code image.
+    WindowsOverlap {
+        /// Which address space overlapped (`"ipa"` or `"pa"`).
+        space: &'static str,
+    },
+    /// A table descriptor does not point at the table it should.
+    BadTableEntry {
+        /// Which table the bad entry is in.
+        table: &'static str,
+        /// The slot index.
+        index: usize,
+        /// What it decoded to.
+        found: Option<u64>,
+        /// What it should have been.
+        expected: u64,
+    },
+    /// The guest-image block is not a read-only, **executable** identity mapping of the image.
+    BadImageBlock {
+        /// What it decoded to.
+        found: Option<Decoded>,
+        /// The image PA it should map.
+        expected_pa: u64,
+    },
+    /// An `L3` slot does not decode to the leaf the map specified.
+    BadLeaf {
+        /// The frame whose slot is wrong.
+        mfn: u32,
+        /// What it decoded to.
+        found: Option<Decoded>,
+        /// What the leaf map called for.
+        expected: Option<(u64, Perm)>,
+    },
+    /// A slot outside the intended set holds a live descriptor — the table would reach something
+    /// the leaf map never authorized.
+    SpuriousDescriptor {
+        /// Which table.
+        table: &'static str,
+        /// The slot index.
+        index: usize,
+        /// The offending descriptor word.
+        desc: u64,
+    },
+}
+
+impl Layout {
+    /// The `L1` index of the guest-image region.
+    fn code_l1(&self) -> usize {
+        ((self.guest_image_pa >> 30) & 0x1ff) as usize
+    }
+    /// The `L1` index of the data region.
+    fn data_l1(&self) -> usize {
+        ((self.data_ipa_base >> 30) & 0x1ff) as usize
+    }
+    /// The `L2` index of the guest-image block.
+    fn code_l2(&self) -> usize {
+        ((self.guest_image_pa >> 21) & 0x1ff) as usize
+    }
+    /// The `L2` index of the data region's `L3` table.
+    fn data_l2(&self) -> usize {
+        ((self.data_ipa_base >> 21) & 0x1ff) as usize
+    }
+
+    /// Structural preconditions [`encode`] silently assumes.
+    ///
+    /// Both were **argued** from the address layout and the linker script (Audit #2's composition
+    /// finding: the data frames sit outside the guest's only identity mapping). A layout change
+    /// could reintroduce either silently — a collided `L1` entry makes a whole region vanish, an
+    /// overlapping window makes private data alias the *shared* code image — so they are checked.
+    pub fn validate(&self) -> Result<(), EncodingViolation> {
+        if self.code_l1() == self.data_l1() {
+            return Err(EncodingViolation::RegionsCollide {
+                l1_index: self.code_l1(),
+            });
+        }
+        // The image block is 2 MiB; the data region spans at most one full L3 table.
+        const IMAGE_SPAN: u64 = 0x20_0000;
+        let data_span = TABLE_ENTRIES as u64 * self.frame_size;
+        let overlaps = |a: u64, alen: u64, b: u64, blen: u64| a < b + blen && b < a + alen;
+        if overlaps(
+            self.guest_image_pa,
+            IMAGE_SPAN,
+            self.data_ipa_base,
+            data_span,
+        ) {
+            return Err(EncodingViolation::WindowsOverlap { space: "ipa" });
+        }
+        if overlaps(
+            self.guest_image_pa,
+            IMAGE_SPAN,
+            self.data_pa_base,
+            data_span,
+        ) {
+            return Err(EncodingViolation::WindowsOverlap { space: "pa" });
+        }
+        Ok(())
+    }
+}
+
+/// Read the emitted tables back and assert they mean **exactly** `leaves` under `layout` — and
+/// nothing more.
+///
+/// This is the encoder's half of the refinement. `hv_s2::check` verifies the *decision* (which
+/// frames, at what permission); this verifies the *expression* of that decision in the words the
+/// hardware actually walks: the table skeleton chains to the right tables, the guest-image block is
+/// a read-only executable identity map, each `L3` slot decodes to its leaf's PA and permission, and
+/// **every other slot in every table is dead** — so the table cannot reach anything the leaf map did
+/// not authorize.
+pub fn verify_encoding(
+    leaves: &[Option<Perm>],
+    layout: &Layout,
+    t: TablesRef<'_>,
+) -> Result<(), EncodingViolation> {
+    layout.validate()?;
+    let (code_l1, data_l1) = (layout.code_l1(), layout.data_l1());
+    let (code_l2, data_l2) = (layout.code_l2(), layout.data_l2());
+
+    // L1: exactly two live entries, pointing at the two L2s.
+    for (idx, expected) in [
+        (code_l1, layout.l2_code_pa & desc::ADDR_4K),
+        (data_l1, layout.l2_data_pa & desc::ADDR_4K),
+    ] {
+        if decode_table(t.l1[idx]) != Some(expected) {
+            return Err(EncodingViolation::BadTableEntry {
+                table: "l1",
+                index: idx,
+                found: decode_table(t.l1[idx]),
+                expected,
+            });
+        }
+    }
+    dead_except(t.l1, &[code_l1, data_l1], "l1")?;
+
+    // L2(code): the guest image, read-only and EXECUTABLE (it is the guest's code).
+    let want_image = Decoded {
+        pa: layout.guest_image_pa & desc::ADDR_2M,
+        perm: Perm::Ro,
+        xn: false,
+    };
+    if decode_block(t.l2_code[code_l2]) != Some(want_image) {
+        return Err(EncodingViolation::BadImageBlock {
+            found: decode_block(t.l2_code[code_l2]),
+            expected_pa: want_image.pa,
+        });
+    }
+    dead_except(t.l2_code, &[code_l2], "l2_code")?;
+
+    // L2(data): one entry, to the L3.
+    let want_l3 = layout.l3_data_pa & desc::ADDR_4K;
+    if decode_table(t.l2_data[data_l2]) != Some(want_l3) {
+        return Err(EncodingViolation::BadTableEntry {
+            table: "l2_data",
+            index: data_l2,
+            found: decode_table(t.l2_data[data_l2]),
+            expected: want_l3,
+        });
+    }
+    dead_except(t.l2_data, &[data_l2], "l2_data")?;
+
+    // L3: one page descriptor per mapped frame, at its PA and permission, execute-never; every
+    // other slot dead.
+    for m in 0..TABLE_ENTRIES {
+        let want = leaves.get(m).copied().flatten().map(|perm| Decoded {
+            pa: frame_pa(layout, m as u32) & desc::ADDR_4K,
+            perm,
+            xn: true,
+        });
+        let found = decode_page(t.l3_data[m]);
+        if found != want {
+            // A dead slot must be *fully* dead, not merely an undecodable non-zero word.
+            if want.is_none() && t.l3_data[m] != 0 {
+                return Err(EncodingViolation::SpuriousDescriptor {
+                    table: "l3_data",
+                    index: m,
+                    desc: t.l3_data[m],
+                });
+            }
+            return Err(EncodingViolation::BadLeaf {
+                mfn: m as u32,
+                found,
+                expected: want.map(|d| (d.pa, d.perm)),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Every slot of `table` except `live` must be zero — no descriptor the emitter did not intend.
+fn dead_except(
+    table: &[u64; TABLE_ENTRIES],
+    live: &[usize],
+    name: &'static str,
+) -> Result<(), EncodingViolation> {
+    for (i, d) in table.iter().enumerate() {
+        if *d != 0 && !live.contains(&i) {
+            return Err(EncodingViolation::SpuriousDescriptor {
+                table: name,
+                index: i,
+                desc: *d,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The `VTTBR_EL2` value for a table set: the `L1` PA with the set's `VMID` in bits `[55:48]`.
 pub fn vttbr(l1_pa: u64, vmid: u64) -> u64 {
     l1_pa | (vmid << 48)
@@ -342,6 +637,177 @@ mod tests {
     fn vttbr_carries_the_vmid() {
         assert_eq!(vttbr(0x4010_0000, 1), 0x0001_0000_4010_0000);
         assert_eq!(vttbr(0x4010_0000, 2), 0x0002_0000_4010_0000);
+    }
+
+    /// A representative encoded fixture: `(leaves, layout, l1, l2_code, l2_data, l3_data)`.
+    type Fixture = (
+        [Option<Perm>; 8],
+        Layout,
+        [u64; TABLE_ENTRIES],
+        [u64; TABLE_ENTRIES],
+        [u64; TABLE_ENTRIES],
+        [u64; TABLE_ENTRIES],
+    );
+
+    /// Encode a representative map and hand back the tables, for the verifier tests below.
+    fn encoded() -> Fixture {
+        let l = layout();
+        let (mut l1, mut l2c, mut l2d, mut l3) = tables();
+        let mut leaves = [None; 8];
+        leaves[2] = Some(Perm::Rw);
+        leaves[5] = Some(Perm::Ro);
+        encode(
+            &leaves,
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+            },
+        );
+        (leaves, l, l1, l2c, l2d, l3)
+    }
+
+    fn refs<'a>(
+        l1: &'a [u64; TABLE_ENTRIES],
+        l2c: &'a [u64; TABLE_ENTRIES],
+        l2d: &'a [u64; TABLE_ENTRIES],
+        l3: &'a [u64; TABLE_ENTRIES],
+    ) -> TablesRef<'a> {
+        TablesRef {
+            l1,
+            l2_code: l2c,
+            l2_data: l2d,
+            l3_data: l3,
+        }
+    }
+
+    /// The decoders invert the encoders, bit for bit.
+    #[test]
+    fn decoders_invert_the_encoders() {
+        for (perm, attrs) in [(Perm::Rw, desc::PAGE_RW), (Perm::Ro, desc::PAGE_RO)] {
+            let d = (0x4060_3000 & desc::ADDR_4K) | attrs;
+            assert_eq!(
+                decode_page(d),
+                Some(Decoded {
+                    pa: 0x4060_3000,
+                    perm,
+                    xn: true
+                })
+            );
+        }
+        let blk = (0x4040_0000 & desc::ADDR_2M) | desc::BLOCK_ROX;
+        assert_eq!(
+            decode_block(blk),
+            Some(Decoded {
+                pa: 0x4040_0000,
+                perm: Perm::Ro,
+                xn: false
+            })
+        );
+        assert_eq!(
+            decode_table((0x4010_1000 & desc::ADDR_4K) | desc::TABLE),
+            Some(0x4010_1000)
+        );
+        assert_eq!(decode_page(0), None, "a hole decodes to nothing");
+        assert_eq!(decode_block(0), None);
+        assert_eq!(decode_table(0), None);
+    }
+
+    /// THE ROUND TRIP: what `encode` wrote means exactly what the leaf map said, and nothing else.
+    #[test]
+    fn encode_then_verify_round_trips() {
+        let (leaves, l, l1, l2c, l2d, l3) = encoded();
+        assert_eq!(
+            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            Ok(())
+        );
+    }
+
+    /// NON-VACUITY: a tampered leaf is caught.
+    #[test]
+    fn verify_catches_a_tampered_leaf() {
+        let (leaves, l, l1, l2c, l2d, mut l3) = encoded();
+        l3[2] = (l3[2] & !desc::S2AP_RW) | desc::S2AP_RO; // silently downgrade RW -> RO
+        assert!(matches!(
+            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            Err(EncodingViolation::BadLeaf { mfn: 2, .. })
+        ));
+    }
+
+    /// NON-VACUITY: a live descriptor in a slot the map never authorized is caught — the table must
+    /// not reach anything extra.
+    #[test]
+    fn verify_catches_a_spurious_descriptor() {
+        let (leaves, l, l1, l2c, l2d, mut l3) = encoded();
+        l3[7] = (0x4060_7000 & desc::ADDR_4K) | desc::PAGE_RW; // a frame nobody authorized
+        assert!(matches!(
+            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            Err(EncodingViolation::BadLeaf { mfn: 7, .. })
+                | Err(EncodingViolation::SpuriousDescriptor { .. })
+        ));
+    }
+
+    /// NON-VACUITY: a broken skeleton (an `L1` entry pointing at the wrong table) is caught.
+    #[test]
+    fn verify_catches_a_broken_skeleton() {
+        let (leaves, l, mut l1, l2c, l2d, l3) = encoded();
+        l1[2] = (0xdead_0000u64 & desc::ADDR_4K) | desc::TABLE;
+        assert!(matches!(
+            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            Err(EncodingViolation::BadTableEntry { table: "l1", .. })
+        ));
+    }
+
+    /// THE SHARED-IMAGE INVARIANT: the guest image is the one mapping two domains hold in common,
+    /// so it must be READ-ONLY (never a cross-domain write channel) and EXECUTABLE (the guest runs
+    /// from it). Both directions are caught — this used to rest on a comment.
+    #[test]
+    fn verify_catches_a_writable_or_non_executable_image() {
+        let (leaves, l, l1, l2c_ok, l2d, l3) = encoded();
+
+        let mut l2c = l2c_ok;
+        l2c[2] = (l2c[2] & !desc::S2AP_RO) | desc::S2AP_RW; // shared image made WRITABLE
+        assert!(
+            matches!(
+                verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+                Err(EncodingViolation::BadImageBlock { .. })
+            ),
+            "a writable shared image is a cross-domain write channel"
+        );
+
+        let mut l2c = l2c_ok;
+        l2c[2] |= desc::XN; // image made non-executable
+        assert!(
+            matches!(
+                verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+                Err(EncodingViolation::BadImageBlock { .. })
+            ),
+            "the guest must still be able to fetch from its image"
+        );
+    }
+
+    /// The layout preconditions `encode` silently assumed are now checked.
+    #[test]
+    fn layout_validate_catches_collisions_and_overlap() {
+        assert_eq!(layout().validate(), Ok(()), "the real layout is sound");
+
+        // Data region moved into the SAME 1 GiB as the guest image -> one L1 entry for both.
+        let mut collide = layout();
+        collide.data_ipa_base = 0x4060_0000;
+        assert!(matches!(
+            collide.validate(),
+            Err(EncodingViolation::RegionsCollide { .. })
+        ));
+
+        // Data frames backed INSIDE the 2 MiB image block -> private data aliases the shared image.
+        let mut overlap = layout();
+        overlap.data_pa_base = overlap.guest_image_pa + 0x1000;
+        assert!(matches!(
+            overlap.validate(),
+            Err(EncodingViolation::WindowsOverlap { space: "pa" })
+        ));
     }
 
     #[test]

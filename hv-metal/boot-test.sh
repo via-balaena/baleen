@@ -235,6 +235,7 @@ boot_and_check "selftest" "--features selftest" \
     "generic timer live" \
     "HvCall CreditGrant(100) -> balance=100" \
     "selftest: HvCall accounting OK" \
+    "selftest: Stage-2 encoding verified" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \
     "guest HVC serviced: nr=1 arg=30 -> result=70" \
     "guest observed HvCall result=70 via HVC round-trip" \

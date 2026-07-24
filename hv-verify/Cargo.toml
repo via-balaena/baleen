@@ -19,6 +19,9 @@ repository.workspace = true
 # injected by the `cargo kani` driver, which is the only thing that compiles the harnesses.
 [dependencies]
 hv-core = { path = "../hv-core" }
+# The Stage-2 encoding: its descriptor round-trip is pure bit manipulation, so Kani proves it
+# bit-precisely over ALL output addresses and permissions (see `stage2_encoding`).
+hv-s2 = { path = "../hv-s2" }
 
 [lints]
 workspace = true

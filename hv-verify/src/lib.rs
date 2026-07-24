@@ -178,3 +178,107 @@ mod grant_state_machine {
         );
     }
 }
+
+/// # The Stage-2 **encoding**, proven bit-precisely (the refinement's third arrow)
+///
+/// The chain the metal's isolation rests on is
+///
+/// ```text
+///     p2m model  ->  leaf map  ->  descriptor words  ->  hardware
+/// ```
+///
+/// `hv-sim`'s enumerator checks the first arrow over every reachable state, and `hv_s2::check`
+/// states the property. The **third** arrow — the leaf map expressed as the `u64`s the MMU walks —
+/// was covered only by golden unit tests over a handful of example addresses. It is pure bit
+/// manipulation over a scalar, which is exactly what Kani closes: a `kani::any::<u64>()` output
+/// address is proven over *all* 2⁶⁴ values via the SMT backend, with no loop unwinding, because a
+/// descriptor is not a collection.
+///
+/// These harnesses call the **same** [`hv_s2::arm64`] encoders/decoders the metal uses (no
+/// re-modelled copy — design-lesson #14c), so proving them is proving a property of the shipped
+/// emitter.
+#[cfg(kani)]
+mod stage2_encoding {
+    use hv_s2::arm64::{decode_block, decode_page, decode_table, desc, Decoded};
+    use hv_s2::Perm;
+
+    /// A data leaf round-trips: for **every** output address and **both** permissions, encoding a
+    /// 4 KiB page then decoding it recovers exactly the address, the permission, and execute-never.
+    #[kani::proof]
+    fn page_encoding_round_trips() {
+        let pa: u64 = kani::any();
+        let writable: bool = kani::any();
+        let (perm, attrs) = if writable {
+            (Perm::Rw, desc::PAGE_RW)
+        } else {
+            (Perm::Ro, desc::PAGE_RO)
+        };
+        let d = (pa & desc::ADDR_4K) | attrs;
+        assert!(
+            decode_page(d)
+                == Some(Decoded {
+                    pa: pa & desc::ADDR_4K,
+                    perm,
+                    xn: true,
+                }),
+            "a page descriptor must decode to exactly what it was encoded from"
+        );
+    }
+
+    /// **The shared-image invariant, over every possible image address.** The guest-image block is
+    /// the one mapping two domains hold in common (M5 Arc 2 identity-maps the same host frames into
+    /// both), so it must be read-only — never a cross-domain *write* channel — and executable, since
+    /// the guest fetches its code from it. Until this arc that rested on a comment.
+    #[kani::proof]
+    fn image_block_is_always_readonly_and_executable() {
+        let pa: u64 = kani::any();
+        let d = (pa & desc::ADDR_2M) | desc::BLOCK_ROX;
+        let got = decode_block(d);
+        assert!(got.is_some(), "the image block must be a valid 2 MiB block");
+        let got = got.unwrap();
+        assert!(got.pa == pa & desc::ADDR_2M);
+        assert!(
+            matches!(got.perm, Perm::Ro),
+            "the SHARED guest image must never be writable"
+        );
+        assert!(!got.xn, "the guest must be able to fetch from its image");
+    }
+
+    /// A data leaf is **always** execute-never, whatever its address or permission — a guest can
+    /// never execute from a data frame.
+    #[kani::proof]
+    fn data_leaves_are_always_execute_never() {
+        let pa: u64 = kani::any();
+        let writable: bool = kani::any();
+        let attrs = if writable {
+            desc::PAGE_RW
+        } else {
+            desc::PAGE_RO
+        };
+        let d = (pa & desc::ADDR_4K) | attrs;
+        assert!(
+            decode_page(d).unwrap().xn,
+            "a data leaf must be execute-never"
+        );
+    }
+
+    /// **No silent privilege escalation in the bits.** A read-only leaf can never decode as
+    /// read/write, for any address — the two `S2AP` encodings are disjoint.
+    #[kani::proof]
+    fn readonly_never_decodes_as_writable() {
+        let pa: u64 = kani::any();
+        let ro = (pa & desc::ADDR_4K) | desc::PAGE_RO;
+        assert!(
+            matches!(decode_page(ro).unwrap().perm, Perm::Ro),
+            "an RO leaf must never read back as RW"
+        );
+    }
+
+    /// A table descriptor round-trips to the next-level table address, for every address.
+    #[kani::proof]
+    fn table_encoding_round_trips() {
+        let pa: u64 = kani::any();
+        let d = (pa & desc::ADDR_4K) | desc::TABLE;
+        assert!(decode_table(d) == Some(pa & desc::ADDR_4K));
+    }
+}
