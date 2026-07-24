@@ -27,21 +27,34 @@
 //! **not guest-reachable** (it is mapped into no Stage-2), so it is secrets-at-rest inside the
 //! trusted layer, not a cross-tenant channel. Recorded rather than discovered later.
 //!
-//! ## The seam — and the intuitive one that is WRONG
+//! ## The seam — and why the intuitive one depends on a detail nobody would think to state
 //!
-//! The obvious design is *"scrub when a frame's owner changes."* **It fails on exactly the case this
-//! arc exists for.** `hv-core` deliberately has no generation counter — an unbounded incarnation
-//! would break the enumerator's finite-state BFS, so domain **IDs are reused** and a reborn tenant
-//! occupies the slot under the *same* `DomId` (design-lesson #15b). An owner-diff therefore sees
-//! `Some(2) → Some(2)` across a destroy/rebirth and scrubs **nothing**. The very choice that makes
-//! the model checkable defeats the intuitive seam.
+//! The obvious design is *"scrub when a frame's owner changes"* — and whether that works turns
+//! entirely on **when you sample the owner**, which is not obvious at all. Both variants were built
+//! and booted; they disagree.
 //!
-//! What works instead is keying on the transition that **creates** ownership. `p2m::allocate` is the
-//! sole place a frame becomes `Frame::Allocated` from `Free` (the only `*frame = Frame::Allocated`
-//! assignment in `hv-core/src/p2m.rs`), so **scrub on a successful `P2mAllocate`** is complete by
-//! construction, whoever held the frame before and whatever their `DomId` was. It is also correctly
-//! *ordered*: a frame becomes guest-reachable only through a Stage-2 leaf, which requires a link,
-//! which requires the allocate — so the scrub always precedes reachability.
+//! `hv-core` deliberately has no generation counter (an unbounded incarnation would break the
+//! enumerator's finite-state BFS, design-lesson #15b), so **domain IDs are reused** and a reborn
+//! tenant occupies the slot under the *same* `DomId`.
+//!
+//! - Sampling ownership **at reachability time** — the natural, cheap place, since Stage-2 emission
+//!   is already walking every frame — is **defeated**: across a destroy/rebirth it compares
+//!   `Some(1)` with `Some(1)`, never observes the `None` the free passed through, and scrubs
+//!   nothing. *Measured:* the dead tenant's secret came back verbatim.
+//! - Sampling ownership **after every transition** does work, because it catches that intermediate
+//!   `None`. *Measured:* no leak. So the honest statement is not "owner-diff is wrong" but **"an
+//!   owner-diff is only sound at a sampling rate that already costs more than the alternative"** —
+//!   it must observe every dispatch, and at that point it is strictly more state and more work than
+//!   keying on the allocate directly, for no gain.
+//!
+//! What this arc does instead is key on the transition that **creates** ownership. `p2m::allocate`
+//! is the sole place a frame becomes `Frame::Allocated` from `Free` (the only
+//! `*frame = Frame::Allocated` assignment in `hv-core/src/p2m.rs`), so **scrub on a successful
+//! `P2mAllocate`** is complete by construction — whoever held the frame before, and whatever their
+//! `DomId` was — with no ownership history to keep at all.
+//!
+//! It is also correctly *ordered*: a frame becomes guest-reachable only through a Stage-2 leaf,
+//! which requires a link, which requires the allocate — so the scrub always precedes reachability.
 //!
 //! ## Why a funnel is not enough, and what checks it
 //!
