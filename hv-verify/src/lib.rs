@@ -574,3 +574,137 @@ mod stage2_refinement {
         );
     }
 }
+
+/// # `UnauthorizedForeignLink` on the **real** `Hypervisor` (Arc 3b's bounded anchor)
+///
+/// `hv-verify/verus/foreign_link_preservation.rs` proves the preservation step
+/// (`INV(s) ⇒ INV(t(s))`) for every transition class at **arbitrary** edge, grant and domain
+/// count — but in the Verus dialect, against a mirror. This module is its real-code companion: it
+/// builds an actual [`Hypervisor`], drives the actual `dispatch` seam with **symbolic**
+/// permissions, and asserts the actual `first_cross_violation()` finds nothing.
+///
+/// Bounded on model size (Kani unwinds `first_cross_violation`'s scans over frames, links, grants
+/// and domains), so this is the *faithfulness* anchor, not the ∀-N result — the same division of
+/// labour as `grant_state_machine` versus `refcount_mismatch.rs`. What it rules out is the failure
+/// mode a mirror cannot: that the transcribed guard is not the guard the shipped seam applies.
+///
+/// [`Hypervisor`]: hv_core::Hypervisor
+#[cfg(kani)]
+mod foreign_link_state_machine {
+    use hv_core::p2m::PtLevel;
+    use hv_core::{HvCall, Hypervisor};
+
+    /// A two-domain world: dom0 owns a pinned `L1` table (frame 1), dom1 owns a data frame
+    /// (frame 2). This is the smallest configuration in which a *cross-domain* edge — the only
+    /// kind `UnauthorizedForeignLink` constrains — can exist at all (design-lesson #13f: confirm
+    /// the tiny universe can build the feature's minimal witness).
+    fn two_domain_world() -> Hypervisor {
+        let mut hv = Hypervisor::new(2, 1, 2, 1, 1, 3);
+        assert!(hv
+            .dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: 1,
+                    may_create: false
+                }
+            )
+            .is_ok());
+        assert!(hv.dispatch(0, HvCall::P2mAllocate { mfn: 1 }).is_ok());
+        assert!(hv
+            .dispatch(
+                0,
+                HvCall::P2mPin {
+                    mfn: 1,
+                    level: PtLevel::L1
+                }
+            )
+            .is_ok());
+        assert!(hv.dispatch(1, HvCall::P2mAllocate { mfn: 2 }).is_ok());
+        hv
+    }
+
+    /// **`p2m_link` preserves it, on the real seam.** dom1 offers a grant of its frame at a
+    /// symbolic permission; dom0 attempts a link at an *independently* symbolic permission. Every
+    /// combination is covered, including the read-write-entry-over-a-read-only-grant escalation the
+    /// seam must refuse. Whether the link is accepted or rejected, the real cross-invariant must
+    /// stand — a rejected link is a no-op (design-lesson #9), an accepted one is authorized.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn real_link_preserves_the_seam_invariant() {
+        let mut hv = two_domain_world();
+
+        let readonly: bool = kani::any();
+        assert!(hv
+            .dispatch(
+                1,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 0,
+                    frame: 2,
+                    readonly,
+                }
+            )
+            .is_ok());
+
+        let writable: bool = kani::any();
+        let _ = hv.dispatch(
+            0,
+            HvCall::P2mLink {
+                parent: 1,
+                slot: 0,
+                child: 2,
+                writable,
+                leaf: true,
+            },
+        );
+
+        assert!(
+            hv.first_cross_violation().is_none(),
+            "a real cross-domain p2m_link left UnauthorizedForeignLink violated"
+        );
+    }
+
+    /// **`grant_end_access` preserves it, on the real seam** — the `is_foreign_linked_by` block,
+    /// exercised rather than assumed. dom1 grants read-write, dom0 links the frame, then dom1
+    /// attempts to revoke the grant its peer's page table is standing on. The seam must refuse
+    /// (`GrantError::InUse`); if it ever did not, the surviving edge would be unauthorized and the
+    /// assertion below would fire. The symbolic `writable` covers both entry shapes.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn real_revoke_under_a_live_foreign_link_preserves_the_seam_invariant() {
+        let mut hv = two_domain_world();
+        assert!(hv
+            .dispatch(
+                1,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 0,
+                    frame: 2,
+                    readonly: false,
+                }
+            )
+            .is_ok());
+
+        let writable: bool = kani::any();
+        assert!(hv
+            .dispatch(
+                0,
+                HvCall::P2mLink {
+                    parent: 1,
+                    slot: 0,
+                    child: 2,
+                    writable,
+                    leaf: true,
+                }
+            )
+            .is_ok());
+
+        // The revoke the block exists to refuse.
+        let _ = hv.dispatch(1, HvCall::GrantEndAccess { gref: 0 });
+
+        assert!(
+            hv.first_cross_violation().is_none(),
+            "revoking a grant a live foreign page-table entry relies on stranded it unauthorized"
+        );
+    }
+}

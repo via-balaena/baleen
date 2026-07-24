@@ -50,9 +50,11 @@
 //!    over an arbitrary edge population in Verus
 //!    (`hv-verify/verus/stage2_leaf_authorized.rs`), and on the **shipped**
 //!    [`leafmap::leaf_map_from_edges`] by Kani over every ownership assignment, grant table,
-//!    permission and capacity at bounded edge count (`hv-verify::stage2_refinement`). It is
-//!    **conditional** on hv-core's `UnauthorizedForeignLink` (enumerator-checked, not itself a
-//!    ∀-N theorem) plus the allocated-child premise — see `docs/STAGE2-REFINEMENT-FORALL-N.md`.
+//!    permission and capacity at bounded edge count (`hv-verify::stage2_refinement`). Its premise —
+//!    hv-core's `UnauthorizedForeignLink` — is **also** proven ∀-N (preservation over every
+//!    transition class, `hv-verify/verus/foreign_link_preservation.rs`), and the allocated-child
+//!    premise falls out of the standing `MislevelledLink` invariant. See
+//!    `docs/STAGE2-REFINEMENT-FORALL-N.md` for the theorem and the remaining ledger.
 //!    Note this is **soundness, not completeness**: see the interior-node bullet below.
 //! 2. **leaf map → descriptor words** ([`arm64`]). [`arm64::verify_encoding`] reads the emitted
 //!    tables back and asserts they mean exactly the leaf map and *nothing else* (no spurious live

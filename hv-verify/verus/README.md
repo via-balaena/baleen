@@ -23,6 +23,7 @@ cargo-deny never see it and the pure brain stays stable-buildable. It is verifie
 | `unwinding_destroy.rs` **(Tier D)** | **The `DomainDestroy` cascade** — the only *multi-domain* transition (intransitive reach). Its compound teardown (`close_all`/`clear_unbound_into`, `revoke_grants_to`/`drain_maps_of`) touches a *third* domain `a`'s ports, grant rows, and frame references — but every touch is conditioned on `a`→`c` grant or `a`→`c` port (the teardown-reach term). Proven: the port + grant-row sub-ops preserve `a`'s state when it has no reach to `c` (guard-shaped); the drain preserves `a`'s frame refs via the grant `map`-identity (`Seq`-induction, borrows-from-a-relational-invariant); and the intransitive-channel heart — `¬(b ⇝ a)` + authorized destroy of `c` ⟹ `a` has no reach to `c`. Over **arbitrary domain + partner count**. *The cascade composes **both** channel kinds in one transition.* | Tier D — non-interference |
 | `noninterference_theorem.rs` **(Tier D capstone)** | **The whole-system non-interference theorem** — the Rushby **unwinding theorem** assembling the per-transition lemmas over arbitrary executions. **Theorem A** (from **local respect**, which the five lemmas above discharge): a domain `a` sees a *constant* observation across any execution of actions by principals that do not interfere with it — unrelated activity is invisible. **Theorem B** (from local respect + **step consistency**): two executions that start `obs(a)`-equivalent and agree on each actor's observation stay `obs(a)`-equivalent — `a`'s view is determined *entirely* by the inputs authorized to flow to it. Proven generically over `obs`/`step`/`actor`/`interferes`. | Tier D — non-interference |
 | `step_consistency.rs` **(Tier D)** | **Closing the last mile** — discharges what is derivable of Theorem B's *step-consistency* premise and pins the residual. `step_consistency_off_channel`: from local respect alone, step consistency holds for every non-interfering actor (the premise reduces to the *interfering* case). `factored_step_is_consistent`: it holds for every **write** channel (a principal's authorized effect on `a` factors through `obs(a)` + the actor's observation). *Finding: the irreducible residual is the confidentiality **read** direction — `a` reading a partner's state it is authorized to see — the dual of local respect, needing an `obs` **read-closure**; the integrity property (Theorem A) stands complete without it.* | Tier D — non-interference |
+| `foreign_link_preservation.rs` **(the metal refinement)** | **`UnauthorizedForeignLink` preserved, ∀-N — discharging Arc 3's premise.** The page-table↔grant seam invariant (every live cross-domain edge is backed by a matching grant) is preserved by **every transition class that can move toward violating it**, at arbitrary edge, grant and domain count: `p2m_link` (the seam's grant check **establishes** it), `p2m_unlink` (monotone), `grant_access` (monotone), `grant_end_access` (the `is_foreign_linked_by` block refuses **exactly** the unsafe revoke), `p2m_free` (the freed frame's edges become **skipped**), `p2m_allocate` (**borrows** `MislevelledLink` — the third #20-shaped borrow), and `DomainDestroy`. With this, Arc 3's theorem **T is unconditional on P1**. Residual: this is the preservation *step* — initiation is trivial (no edges at boot) but the **completeness of the transition list** is an audit argument backed by the enumerator, not a machine-checked fact; and `MislevelledLink`, now load-bearing, is itself enumerator-checked. | the metal — `docs/STAGE2-REFINEMENT-FORALL-N.md` |
 | `stage2_leaf_authorized.rs` **(the metal refinement)** | **The Stage-2 refinement, ∀-N — no reachability without authorization.** Every frame the emitted Stage-2 leaf map reaches is one the domain **owns** or one an **active grant** authorizes it for at the mapped permission — over an **arbitrary edge population**, ownership assignment, grant relation and domain. The ∀-N content is one loop invariant (*every mapped frame is witnessed by a consumed edge*); the rest is the composition with hv-core's `UnauthorizedForeignLink`. Also proven: the isolation corollary (an unowned, ungranted frame is a **hole** — the guest faults), no write escalation over a read-only grant, and the no-stale-leaf base case. **Conditional** on P1 (`UnauthorizedForeignLink`, enumerator-checked, *not* ∀-N — Arc 3b) and P2 (every active edge's child is allocated — a separate premise P1 does not give you: it *skips* an unowned edge where the checker *rejects*). Kani proves the same statement on the **shipped** `hv_s2` functions at bounded edge count. | the metal — `docs/STAGE2-REFINEMENT-FORALL-N.md` |
 | `read_closure.rs` **(Tier D)** | **The confidentiality read-closure — finishing Theorem B.** Refines the observation to `obs⁺(a)` (= `obs(a)` + the read-capability tuple `(grantor, frame, active, owner)` for every grant naming `a` as grantee — exactly what `GrantMap`/`GrantCopy` reads). `read_outcome_factors`: `a`'s cross-domain read outcome is a function of `obs⁺(a)`, so step consistency's residual case **factors** once the observation is read-closed. `read_cap_stable`: `obs⁺(a)` is preserved by any principal that is neither the capability's grantor nor an owner-changer of its frame — the **extended channel relation** `⇝⁺` (the confidentiality dual of the write channels). With `obs := obs⁺`, `interferes := ⇝ ∪ ⇝⁺`, both unwinding conditions hold, so the generic assembly theorem yields **full non-interference — integrity *and* confidentiality**. | Tier D — non-interference |
 
@@ -68,6 +69,7 @@ $VERUS --crate-type=lib hv-verify/verus/noninterference_theorem.rs  # → 5 veri
 $VERUS --crate-type=lib hv-verify/verus/step_consistency.rs        # → 3 verified, 0 errors  (Tier D)
 $VERUS --crate-type=lib hv-verify/verus/read_closure.rs            # → 2 verified, 0 errors  (Tier D)
 $VERUS --crate-type=lib hv-verify/verus/stage2_leaf_authorized.rs  # → 7 verified, 0 errors  (the metal refinement)
+$VERUS --crate-type=lib hv-verify/verus/foreign_link_preservation.rs # → 9 verified, 0 errors  (Arc 3b — discharges T's premise)
 ```
 
 CI runs exactly this in the `verus preservation proofs` job of
@@ -119,12 +121,27 @@ hand; each reproduces in seconds):
 | `stage2_leaf_authorized.rs` | `Some(last.writable)` → `Some(true)` (map `Rw` regardless of the edge) | `postcondition not satisfied` |
 | `stage2_leaf_authorized.rs` | drop premise **P2** (`edge_children_allocated`) | `postcondition not satisfied` |
 | `stage2_leaf_authorized.rs` | **drop the `e.leaf` filter** | ⚠️ **still verifies — correctly** (see below) |
+| `foreign_link_preservation.rs` | drop the seam's grant check from `link_preserves` | `postcondition not satisfied` |
+| `foreign_link_preservation.rs` | drop the `is_foreign_linked_by` block from `end_access_preserves` | `postcondition not satisfied` |
+| `foreign_link_preservation.rs` | drop the `MislevelledLink` borrow from `allocate_preserves` | `postcondition not satisfied` |
+| `foreign_link_preservation.rs` | drop `domain_destroy`'s `has_foreign_link_into` **precondition** | ⚠️ **still verifies — correctly** (see below) |
+| `foreign_link_preservation.rs` | drop `domain_destroy`'s `unlink_all`-before-`revoke_grants_to` **ordering** | ⚠️ **still verifies — correctly** (see below) |
 
-The last row is recorded rather than buried: `UnauthorizedForeignLink` authorizes *every*
-cross-domain edge, interior ones included, so the leaf filter carries **no authorization content**.
-Its content is exactness, which is `hv_s2::check::check_exact`'s remit — and that is honestly
-labelled a *consistency check*, not a theorem. A mutation harness that "caught" it would have been
-catching it for the wrong reason. Full ledger: `docs/STAGE2-REFINEMENT-FORALL-N.md` §6.
+**The rows that do NOT fire are recorded rather than buried**, because each one localizes a property
+to the layer that actually owns it.
+
+* `stage2_leaf_authorized.rs`, **the `leaf` filter**: `UnauthorizedForeignLink` authorizes *every*
+  cross-domain edge, interior ones included, so the leaf filter carries **no authorization
+  content**. Its content is exactness, which is `hv_s2::check::check_exact`'s remit — and that is
+  honestly labelled a *consistency check*, not a theorem.
+* `foreign_link_preservation.rs`, **`domain_destroy`'s precondition and ordering**: both were
+  written as hypotheses on the expectation that they were load-bearing, and neither is — `free_all`
+  un-owns `target`'s frames, so every edge touching `target` is **skipped** regardless. They were
+  therefore removed from the lemma (it should require what it uses). They remain load-bearing for
+  `MislevelledLink` (no dangling edge) and `DeadDomainReferenced` (a reborn slot inherits nothing).
+
+A mutation harness that "caught" any of these would have been catching it for the wrong reason.
+Full ledger: `docs/STAGE2-REFINEMENT-FORALL-N.md` §6 and §9.
 
 ## What's next
 
