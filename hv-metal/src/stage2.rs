@@ -114,8 +114,18 @@ pub fn frame_ipa(m: Mfn) -> u64 {
 // handed — `hv_s2::arm64::frame_pa`. hv-metal no longer needs its own copy: the one derivation lives
 // under the fence, where it is unit-tested.)
 
+/// Guest IPA base of the super-span frame window (M5 Arc 6a). Its own `L1` entry — `0xC000_0000 >> 30
+/// = 3`, distinct from the guest image (1) and the base data region (2) — which is what makes
+/// "no two emitted leaves overlap" structural rather than a per-leaf check.
+pub const SUP_IPA_BASE: u64 = 0xC000_0000;
+
+/// How many super-span frames the linker actually backs (`__guest_sup_*` is 2 MiB = one 2 MiB
+/// frame). Must match the reserved region: `Layout::validate` checks the BACKED span.
+pub const NUM_SUP_FRAMES: u64 = 1;
+
 extern "C" {
     static __guest_ram_start: u8;
+    static __guest_sup_start: u8;
     static __guest_data_start: u8;
     static __guest_data_end: u8;
 }
@@ -128,6 +138,9 @@ fn data_ram_start() -> u64 {
 }
 fn data_ram_end() -> u64 {
     core::ptr::addr_of!(__guest_data_end) as u64
+}
+fn sup_ram_start() -> u64 {
+    core::ptr::addr_of!(__guest_sup_start) as u64
 }
 
 /// Number of independent per-domain Stage-2 table sets the metal can hold live at once. Two, for the
@@ -180,6 +193,8 @@ struct Stage2Set {
     l2_code: Table,
     l2_data: Table,
     l3_data: Table,
+    /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
+    l2_sup: Table,
 }
 
 /// The [`NUM_STAGE2_SETS`] independent per-domain table sets. Set 0 is the sole set the single-domain
@@ -203,6 +218,7 @@ static STAGE2_SETS: BootCell<[Stage2Set; NUM_STAGE2_SETS]> = BootCell::new(
             l2_code: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l2_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
             l3_data: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
+            l2_sup: Table([0; hv_s2::arm64::TABLE_ENTRIES]),
         }
     }; NUM_STAGE2_SETS],
 );
@@ -229,19 +245,31 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
     //     host-testable and (next arc) provable rather than merely argued. Every slot of `leaves`
     //     is written by the call, so no previous tenant's leaf can survive into this rebuild.
     let mut leaves = [None; hv_s2::arm64::TABLE_ENTRIES];
-    if let Err(e) = hv_s2::leaf_map(hv.p2m(), guest_dom, &mut leaves) {
+    // M5 Arc 6a: the refinement is now SPAN-aware. This emitter still only encodes base-span leaves,
+    // so a super-span leaf is collected separately and rejected loudly below rather than being
+    // silently flattened into a base-page descriptor (which is what happened before this arc — an
+    // under-map that fails closed, but a map of the wrong SIZE).
+    let mut supers = [None; hv_s2::arm64::TABLE_ENTRIES];
+    if let Err(e) = hv_s2::leaf_map(
+        hv.p2m(),
+        guest_dom,
+        hv_s2::Maps {
+            base: &mut leaves,
+            // Sized to the BACKING, not the table: a super frame beyond `NUM_SUP_FRAMES` names
+            // memory the linker never reserved, so it must be rejected loudly rather than mapped.
+            sup: &mut supers[..NUM_SUP_FRAMES as usize],
+        },
+    ) {
         // A frame the model authorized does not fit the table. Unreachable while the model stays far
         // below `TABLE_ENTRIES`, but the previous emitter dropped such a frame with a bare
         // `continue` — a SILENT under-map (the guest loses memory it is entitled to). Fail loudly.
         let mut uart = crate::uart();
         let _ = writeln!(
             uart,
-            "baleen: Stage-2 emission: authorized frame {} exceeds table capacity {}; halting",
-            e.mfn, e.capacity
+            "baleen: Stage-2 emission: cannot represent this model state faithfully: {e:?}; halting"
         );
         crate::park();
     }
-
     // (1b) THE CONTENT CHECK (M5 Arc 5) — the second, independent derivation (#36). The scrub runs
     //      at `P2mAllocate`, when a frame becomes OWNED, inside `crate::teardown`'s dispatch funnel.
     //      This is the other end: the moment a frame becomes REACHABLE. A dispatch that bypassed the
@@ -270,10 +298,14 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         l2_code_pa: tables.l2_code.0.as_ptr() as u64,
         l2_data_pa: tables.l2_data.0.as_ptr() as u64,
         l3_data_pa: tables.l3_data.0.as_ptr() as u64,
+        l2_sup_pa: tables.l2_sup.0.as_ptr() as u64,
         guest_image_pa: guest_ram_start(),
         data_ipa_base: DATA_IPA_BASE,
         data_pa_base: data_ram_start(),
         frame_size: FRAME_SIZE,
+        sup_ipa_base: SUP_IPA_BASE,
+        sup_pa_base: sup_ram_start(),
+        sup_frames: NUM_SUP_FRAMES,
     };
 
     // Structural preconditions the encoder silently assumes: the guest-image and data regions must
@@ -304,12 +336,14 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
     // code's, and it lives with the barriers in `enable_stage2` — see `crate::cell`'s class 2.
     hv_s2::arm64::encode(
         &leaves,
+        &supers,
         &layout,
         hv_s2::arm64::Tables {
             l1: &mut tables.l1.0,
             l2_code: &mut tables.l2_code.0,
             l2_data: &mut tables.l2_data.0,
             l3_data: &mut tables.l3_data.0,
+            l2_sup: &mut tables.l2_sup.0,
         },
     );
 
@@ -324,20 +358,26 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         // these shared refs are checked (not argued) to alias nothing. Also no `unsafe`.
         let verdict = hv_s2::arm64::verify_encoding(
             &leaves,
+            &supers,
             &layout,
             hv_s2::arm64::TablesRef {
                 l1: &tables.l1.0,
                 l2_code: &tables.l2_code.0,
                 l2_data: &tables.l2_data.0,
                 l3_data: &tables.l3_data.0,
+                l2_sup: &tables.l2_sup.0,
             },
         );
         let mut uart = crate::uart();
         match verdict {
             Ok(()) => {
+                let n_sup = supers[..NUM_SUP_FRAMES as usize]
+                    .iter()
+                    .filter(|s| s.is_some())
+                    .count();
                 let _ = writeln!(
                     uart,
-                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block RO+X)"
+                    "baleen: selftest: Stage-2 encoding verified (set {set}: tables decode to exactly the authorized leaf map; image block RO+X; {n_sup} super-span 2 MiB block(s) emitted and decoded)"
                 );
             }
             Err(e) => {

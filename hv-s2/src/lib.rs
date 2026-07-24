@@ -101,5 +101,9 @@ pub mod arm64;
 pub mod check;
 pub mod leafmap;
 
-pub use check::{check_all, check_authorized, check_authorized_with, Violation};
-pub use leafmap::{leaf_map, leaf_map_from_edges, Edge, FrameOutOfRange, Perm};
+pub use check::{
+    check_all, check_authorized, check_authorized_with, OutOfDomain, Verdict, Violation,
+};
+pub use leafmap::{
+    leaf_map, leaf_map_from_edges, span_of_table, Edge, FrameOutOfRange, MapError, Maps, Perm, Span,
+};

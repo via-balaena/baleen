@@ -56,9 +56,17 @@
 //! claim true — the emitter maps only leaves of tables the domain **owns**, so a legitimately
 //! shared interior node (the model permits sharing a whole subtree) yields **no** mapping beneath
 //! it. That is an **under**-map: it fails **closed**. A completeness claim here would simply be
-//! false. Also outside T: superpage size (a model leaf pins one `Mfn`), the guest-image block
-//! (infrastructure, not model-driven; proven RO+X by Kani), `GuestMem` (the trusted path), and
-//! VMID/table-set binding (hv-metal).
+//! false.
+//!
+//! **Superpage size is no longer outside T (M5 Arc 6a).** It used to be — the emitter flattened a
+//! model superpage into a base-page descriptor, so the size of a mapping was abstracted away. It is
+//! now carried: T is proven for an ARBITRARY span filter (`span_sel`, see `selected`), so it covers
+//! the base map, the super map, and any span a later arc adds, with no new proof. What remains
+//! outside T: the guest-image block (infrastructure, not model-driven; proven RO+X by Kani),
+//! `GuestMem` (the trusted path), and VMID/table-set binding (hv-metal). Two model states are now
+//! outside the refinement's DOMAIN rather than its theorem — one frame that is a leaf at two spans,
+//! and a leaf level the emitter does not encode — and both are rejected loudly rather than mapped;
+//! see `hv_s2::OutOfDomain`.
 //!
 //! ## Fidelity (a mirror, managed — the #21b discipline)
 //!
@@ -123,8 +131,19 @@ spec fn allocated(o: Option<Id>) -> bool {
 /// The emitter's edge filter: **only leaves map a frame, and only tables this domain owns are its
 /// reachability** (`leaf_map_from_edges`). This one line is the whole isolation content of the
 /// emitter — everything else in T is the argument that it suffices.
-spec fn selected(e: Edge, owner: Owner, dom: Id) -> bool {
-    e.leaf && owner(e.parent) == Some(dom)
+///
+/// **`span_sel` is the M5 Arc 6a generalization, and it is what keeps this mirror faithful.** The
+/// shipped emitter no longer writes one map: it routes each selected edge into the map for its
+/// SPAN (base page or super page), by the level of the edge's parent. Rather than mirror two loops,
+/// this proves T for an **arbitrary** span filter — so the production loop writing `base` is this
+/// theorem at `span_sel = (span_of(parent) == Base)`, writing `sup` is the same theorem at
+/// `== Super`, and a future third span is covered with no new proof. That is sound precisely
+/// because **authorization is span-independent**: a mapped frame must be owned or granted whatever
+/// the size of the mapping, so the span only decides WHICH map, never WHETHER the frame is
+/// authorized. Leaving `span_sel` free (no relation to the other fields assumed) is what makes the
+/// result cover every possible span assignment, exactly as the Kani harness's symbolic span does.
+spec fn selected(e: Edge, owner: Owner, dom: Id, span_sel: spec_fn(Mfn) -> bool) -> bool {
+    e.leaf && owner(e.parent) == Some(dom) && span_sel(e.parent)
 }
 
 /// The emitted leaf map at frame `m`, as a fold over the edge population — mirror of
@@ -133,26 +152,26 @@ spec fn selected(e: Edge, owner: Owner, dom: Id) -> bool {
 ///
 /// The clear-to-full-capacity that opens the real loop is the `edges.len() == 0` base case: a
 /// frame no edge selects is `None`, a hole — the no-stale-leaf property, structurally.
-spec fn emitted(edges: Seq<Edge>, owner: Owner, dom: Id, m: Mfn) -> Option<bool>
+spec fn emitted(edges: Seq<Edge>, owner: Owner, dom: Id, m: Mfn, span_sel: spec_fn(Mfn) -> bool) -> Option<bool>
     decreases edges.len(),
 {
     if edges.len() == 0 {
         None
     } else {
         let last = edges[edges.len() - 1];
-        if selected(last, owner, dom) && last.child == m {
+        if selected(last, owner, dom, span_sel) && last.child == m {
             Some(last.writable)
         } else {
-            emitted(edges.subrange(0, edges.len() - 1), owner, dom, m)
+            emitted(edges.subrange(0, edges.len() - 1), owner, dom, m, span_sel)
         }
     }
 }
 
 /// The witness relation the loop invariant maintains: some edge in the population is a leaf of a
 /// table `dom` owns, pointing at `m`, at permission `w`.
-spec fn witnessed(edges: Seq<Edge>, owner: Owner, dom: Id, m: Mfn, w: bool) -> bool {
+spec fn witnessed(edges: Seq<Edge>, owner: Owner, dom: Id, m: Mfn, w: bool, span_sel: spec_fn(Mfn) -> bool) -> bool {
     exists|i: int| #![trigger edges[i]]
-        0 <= i < edges.len() && selected(edges[i], owner, dom) && edges[i].child == m
+        0 <= i < edges.len() && selected(edges[i], owner, dom, span_sel) && edges[i].child == m
             && edges[i].writable == w
 }
 
@@ -196,28 +215,28 @@ spec fn authorized(owner: Owner, auth: Auth, dom: Id, m: Mfn, w: bool) -> bool {
 ///
 /// This is the whole ∀-N content of T. Everything after it is per-frame case analysis with no
 /// quantifier depth — which is exactly why this obligation was tractable rather than heroic.
-proof fn emitted_is_witnessed(edges: Seq<Edge>, owner: Owner, dom: Id, m: Mfn, w: bool)
+proof fn emitted_is_witnessed(edges: Seq<Edge>, owner: Owner, dom: Id, m: Mfn, w: bool, span_sel: spec_fn(Mfn) -> bool)
     requires
-        emitted(edges, owner, dom, m) == Some(w),
+        emitted(edges, owner, dom, m, span_sel) == Some(w),
     ensures
-        witnessed(edges, owner, dom, m, w),
+        witnessed(edges, owner, dom, m, w, span_sel),
     decreases edges.len(),
 {
     let n = edges.len() as int;
     let last = edges[n - 1];
-    if selected(last, owner, dom) && last.child == m {
+    if selected(last, owner, dom, span_sel) && last.child == m {
         // The last edge wrote it: it is its own witness.
         assert(edges[n - 1] == last);
-        assert(witnessed(edges, owner, dom, m, w));
+        assert(witnessed(edges, owner, dom, m, w, span_sel));
     } else {
         // The value survived from the prefix; lift the prefix's witness.
         let prefix = edges.subrange(0, n - 1);
-        emitted_is_witnessed(prefix, owner, dom, m, w);
+        emitted_is_witnessed(prefix, owner, dom, m, w, span_sel);
         let j = choose|j: int| #![trigger prefix[j]]
-            0 <= j < prefix.len() && selected(prefix[j], owner, dom) && prefix[j].child == m
+            0 <= j < prefix.len() && selected(prefix[j], owner, dom, span_sel) && prefix[j].child == m
                 && prefix[j].writable == w;
         assert(edges[j] == prefix[j]);
-        assert(witnessed(edges, owner, dom, m, w));
+        assert(witnessed(edges, owner, dom, m, w, span_sel));
     }
 }
 
@@ -236,17 +255,18 @@ proof fn leaf_map_is_authorized(
     dom: Id,
     m: Mfn,
     w: bool,
+    span_sel: spec_fn(Mfn) -> bool,
 )
     requires
         no_unauthorized_foreign_link(edges, owner, auth),
         edge_children_allocated(edges, owner),
-        emitted(edges, owner, dom, m) == Some(w),
+        emitted(edges, owner, dom, m, span_sel) == Some(w),
     ensures
         authorized(owner, auth, dom, m, w),
 {
-    emitted_is_witnessed(edges, owner, dom, m, w);
+    emitted_is_witnessed(edges, owner, dom, m, w, span_sel);
     let i = choose|i: int| #![trigger edges[i]]
-        0 <= i < edges.len() && selected(edges[i], owner, dom) && edges[i].child == m
+        0 <= i < edges.len() && selected(edges[i], owner, dom, span_sel) && edges[i].child == m
             && edges[i].writable == w;
     // P2 at the witness: the mapped frame is allocated, so it has an owner to authorize it.
     assert(allocated(owner(edges[i].child)));
@@ -264,29 +284,29 @@ proof fn leaf_map_is_authorized(
 /// reaches, at whatever permission, is authorized. This is `check_authorized` returning `Ok` — for
 /// an arbitrary edge population, an arbitrary ownership assignment, an arbitrary grant relation,
 /// and an arbitrary domain.
-proof fn leaf_map_is_authorized_everywhere(edges: Seq<Edge>, owner: Owner, auth: Auth, dom: Id)
+proof fn leaf_map_is_authorized_everywhere(edges: Seq<Edge>, owner: Owner, auth: Auth, dom: Id, span_sel: spec_fn(Mfn) -> bool)
     requires
         no_unauthorized_foreign_link(edges, owner, auth),
         edge_children_allocated(edges, owner),
     ensures
-        forall|m: Mfn| #![trigger emitted(edges, owner, dom, m)]
-            emitted(edges, owner, dom, m) is Some ==> authorized(
+        forall|m: Mfn| #![trigger emitted(edges, owner, dom, m, span_sel)]
+            emitted(edges, owner, dom, m, span_sel) is Some ==> authorized(
                 owner,
                 auth,
                 dom,
                 m,
-                emitted(edges, owner, dom, m)->Some_0,
+                emitted(edges, owner, dom, m, span_sel)->Some_0,
             ),
 {
-    assert forall|m: Mfn| #![trigger emitted(edges, owner, dom, m)]
-        emitted(edges, owner, dom, m) is Some implies authorized(
+    assert forall|m: Mfn| #![trigger emitted(edges, owner, dom, m, span_sel)]
+        emitted(edges, owner, dom, m, span_sel) is Some implies authorized(
             owner,
             auth,
             dom,
             m,
-            emitted(edges, owner, dom, m)->Some_0,
+            emitted(edges, owner, dom, m, span_sel)->Some_0,
         ) by {
-        leaf_map_is_authorized(edges, owner, auth, dom, m, emitted(edges, owner, dom, m)->Some_0);
+        leaf_map_is_authorized(edges, owner, auth, dom, m, emitted(edges, owner, dom, m, span_sel)->Some_0, span_sel);
     }
 }
 
@@ -302,6 +322,7 @@ proof fn an_unauthorized_frame_is_a_hole(
     auth: Auth,
     dom: Id,
     m: Mfn,
+    span_sel: spec_fn(Mfn) -> bool,
 )
     requires
         no_unauthorized_foreign_link(edges, owner, auth),
@@ -309,11 +330,11 @@ proof fn an_unauthorized_frame_is_a_hole(
         owner(m) != Some(dom),
         forall|w: bool| !authorized(owner, auth, dom, m, w),
     ensures
-        emitted(edges, owner, dom, m) is None,
+        emitted(edges, owner, dom, m, span_sel) is None,
 {
-    if emitted(edges, owner, dom, m) is Some {
-        let w = emitted(edges, owner, dom, m)->Some_0;
-        leaf_map_is_authorized(edges, owner, auth, dom, m, w);
+    if emitted(edges, owner, dom, m, span_sel) is Some {
+        let w = emitted(edges, owner, dom, m, span_sel)->Some_0;
+        leaf_map_is_authorized(edges, owner, auth, dom, m, w, span_sel);
         assert(authorized(owner, auth, dom, m, w));
     }
 }
@@ -328,24 +349,25 @@ proof fn a_writable_leaf_is_owned_or_rw_granted(
     auth: Auth,
     dom: Id,
     m: Mfn,
+    span_sel: spec_fn(Mfn) -> bool,
 )
     requires
         no_unauthorized_foreign_link(edges, owner, auth),
         edge_children_allocated(edges, owner),
-        emitted(edges, owner, dom, m) == Some(true),
+        emitted(edges, owner, dom, m, span_sel) == Some(true),
     ensures
         owner(m) == Some(dom) || (allocated(owner(m)) && auth(owner(m)->Some_0, dom, m, true)),
 {
-    leaf_map_is_authorized(edges, owner, auth, dom, m, true);
+    leaf_map_is_authorized(edges, owner, auth, dom, m, true, span_sel);
 }
 
 /// **Totality / no stale leaf.** With no edges there is no mapping anywhere — the base case that
 /// mirrors the real emitter clearing its **full capacity** before placing any leaf, which is what
 /// stops a reborn tenant (M5 Arc 0) or a peer sharing a table set (M5 Arc 2) inheriting the
 /// previous occupant's reach.
-proof fn no_edges_maps_nothing(owner: Owner, dom: Id, m: Mfn)
+proof fn no_edges_maps_nothing(owner: Owner, dom: Id, m: Mfn, span_sel: spec_fn(Mfn) -> bool)
     ensures
-        emitted(Seq::<Edge>::empty(), owner, dom, m) is None,
+        emitted(Seq::<Edge>::empty(), owner, dom, m, span_sel) is None,
 {
 }
 

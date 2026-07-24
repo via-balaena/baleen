@@ -68,6 +68,12 @@ pub mod desc {
     pub const PAGE_RW: u64 = PAGE | LEAF_COMMON | S2AP_RW | XN;
     /// A 4 KiB data leaf, read-only, execute-never.
     pub const PAGE_RO: u64 = PAGE | LEAF_COMMON | S2AP_RO | XN;
+    /// A **data** 2 MiB block, read/write, execute-never (M5 Arc 6a). Distinct from
+    /// [`BLOCK_ROX`], which is the *shared guest image* block and is deliberately RO **and
+    /// executable** — data must never be executable, whatever its span.
+    pub const BLOCK_RW: u64 = BLOCK | LEAF_COMMON | S2AP_RW | XN;
+    /// A **data** 2 MiB block, read-only, execute-never (M5 Arc 6a).
+    pub const BLOCK_RO: u64 = BLOCK | LEAF_COMMON | S2AP_RO | XN;
 }
 
 /// Where the tables live and what they map — the physical facts the encoder cannot know.
@@ -81,14 +87,48 @@ pub struct Layout {
     pub l2_data_pa: u64,
     /// PA of the `L3` holding the data leaves.
     pub l3_data_pa: u64,
+    /// PA of the `L2` holding the **super-span** leaves (2 MiB blocks) — M5 Arc 6a.
+    pub l2_sup_pa: u64,
     /// Host PA (== IPA, identity) of the 2 MiB guest-image block.
     pub guest_image_pa: u64,
     /// Guest IPA base of the model-data-frame region.
     pub data_ipa_base: u64,
     /// Host PA backing model frame 0.
     pub data_pa_base: u64,
-    /// Bytes per model frame — the Stage-2 leaf granule.
+    /// Bytes per model frame — the Stage-2 leaf granule for a [`Perm`] at [`crate::Span::Base`].
     pub frame_size: u64,
+    /// Guest IPA base of the **super-span** frame region (M5 Arc 6a).
+    ///
+    /// A separate window from `data_ipa_base` on purpose: giving each span its own window is what
+    /// makes "no two emitted leaves overlap" **structural** rather than a runtime check. Within one
+    /// span the map is a total function over an `Mfn`-indexed space, so overlap is unrepresentable;
+    /// across spans, [`Layout::validate`] pins the windows disjoint and in distinct `L1` entries.
+    pub sup_ipa_base: u64,
+    /// Host PA backing super-span frame 0.
+    pub sup_pa_base: u64,
+    /// How many super-span frames are actually **backed** by reserved memory.
+    ///
+    /// Not `TABLE_ENTRIES`: a full super table would span 1 GiB, and the window is only as large as
+    /// the memory behind it. [`Layout::validate`] checks the *backed* span for overlap, so declaring
+    /// a window larger than its backing cannot pass validation and then alias something real.
+    pub sup_frames: u64,
+}
+
+/// Bytes one [`crate::Span::Super`] leaf covers: a whole base-level table's worth of base frames
+/// (2 MiB at a 4 KiB granule). **Derived, not a second constant** — a super leaf is by definition
+/// one level up, so this cannot drift from `frame_size` (design-lesson #14c).
+pub fn super_size(layout: &Layout) -> u64 {
+    TABLE_ENTRIES as u64 * layout.frame_size
+}
+
+/// The host PA backing super-span frame `m`.
+pub fn super_pa(layout: &Layout, m: u32) -> u64 {
+    frame_addr(layout.sup_pa_base, super_size(layout), m)
+}
+
+/// The guest IPA super-span frame `m` is mapped at.
+pub fn super_ipa(layout: &Layout, m: u32) -> u64 {
+    frame_addr(layout.sup_ipa_base, super_size(layout), m)
 }
 
 /// The four tables of one domain's Stage-2 set, as plain mutable slices.
@@ -101,6 +141,8 @@ pub struct Tables<'a> {
     pub l2_data: &'a mut [u64; TABLE_ENTRIES],
     /// The `L3` for the data region.
     pub l3_data: &'a mut [u64; TABLE_ENTRIES],
+    /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
+    pub l2_sup: &'a mut [u64; TABLE_ENTRIES],
 }
 
 /// The address of model frame `m` in a linear frame window based at `base`. The single derivation
@@ -130,12 +172,18 @@ pub fn frame_ipa(layout: &Layout, m: u32) -> u64 {
 /// Leaves beyond [`TABLE_ENTRIES`] are impossible: [`crate::leaf_map`] rejects them as
 /// [`crate::FrameOutOfRange`] before an encode is ever attempted, so callers pass a map whose
 /// length is already bounded by the table size.
-pub fn encode(leaves: &[Option<Perm>], layout: &Layout, tables: Tables<'_>) {
+pub fn encode(
+    leaves: &[Option<Perm>],
+    supers: &[Option<Perm>],
+    layout: &Layout,
+    tables: Tables<'_>,
+) {
     let Tables {
         l1,
         l2_code,
         l2_data,
         l3_data,
+        l2_sup,
     } = tables;
 
     // Guest image: identity 2 MiB RO+X block (infrastructure — the guest's own code).
@@ -161,6 +209,28 @@ pub fn encode(leaves: &[Option<Perm>], layout: &Layout, tables: Tables<'_>) {
                 Perm::Ro => desc::PAGE_RO,
             };
             l3_data[m] = (frame_pa(layout, m as u32) & desc::ADDR_4K) | attrs;
+        }
+    }
+
+    // Super-span region (M5 Arc 6a): its own `L1` entry -> its own `L2`, whose slots hold 2 MiB
+    // BLOCK leaves directly (no `L3` beneath — that is what a superpage is). Its own window is what
+    // keeps super leaves from ever overlapping base ones; `Layout::validate` enforces it.
+    let sup_l1 = ((layout.sup_ipa_base >> 30) & 0x1ff) as usize;
+    l1[sup_l1] = (layout.l2_sup_pa & desc::ADDR_4K) | desc::TABLE;
+    // Clear the WHOLE table — the same no-stale-leaf totality the `L3` gets.
+    for slot in l2_sup.iter_mut() {
+        *slot = 0;
+    }
+    for (m, leaf) in supers.iter().enumerate().take(TABLE_ENTRIES) {
+        if let Some(perm) = leaf {
+            let attrs = match perm {
+                Perm::Rw => desc::BLOCK_RW,
+                Perm::Ro => desc::BLOCK_RO,
+            };
+            // Indexed by the block's own L2 slot, derived from its IPA — NOT by `m` directly, so the
+            // window's base offset cannot silently shift the mapping.
+            let idx = ((super_ipa(layout, m as u32) >> 21) & 0x1ff) as usize;
+            l2_sup[idx] = (super_pa(layout, m as u32) & desc::ADDR_2M) | attrs;
         }
     }
 }
@@ -243,6 +313,8 @@ pub struct TablesRef<'a> {
     pub l2_data: &'a [u64; TABLE_ENTRIES],
     /// The `L3` for the data region.
     pub l3_data: &'a [u64; TABLE_ENTRIES],
+    /// The `L2` holding super-span 2 MiB block leaves (M5 Arc 6a).
+    pub l2_sup: &'a [u64; TABLE_ENTRIES],
 }
 
 /// A way the emitted tables can fail to mean what the leaf map said.
@@ -317,6 +389,10 @@ impl Layout {
     fn data_l2(&self) -> usize {
         ((self.data_ipa_base >> 21) & 0x1ff) as usize
     }
+    /// The `L1` index of the super-span region.
+    fn sup_l1(&self) -> usize {
+        ((self.sup_ipa_base >> 30) & 0x1ff) as usize
+    }
 
     /// Structural preconditions [`encode`] silently assumes.
     ///
@@ -325,10 +401,17 @@ impl Layout {
     /// could reintroduce either silently — a collided `L1` entry makes a whole region vanish, an
     /// overlapping window makes private data alias the *shared* code image — so they are checked.
     pub fn validate(&self) -> Result<(), EncodingViolation> {
-        if self.code_l1() == self.data_l1() {
-            return Err(EncodingViolation::RegionsCollide {
-                l1_index: self.code_l1(),
-            });
+        // THREE regions now, so the collision check is pairwise (M5 Arc 6a). A collision is not a
+        // cosmetic clash: two regions in one `L1` entry means the second write clobbers the first
+        // and a whole region silently vanishes.
+        for (a, b) in [
+            (self.code_l1(), self.data_l1()),
+            (self.code_l1(), self.sup_l1()),
+            (self.data_l1(), self.sup_l1()),
+        ] {
+            if a == b {
+                return Err(EncodingViolation::RegionsCollide { l1_index: a });
+            }
         }
         // The image block is 2 MiB; the data region spans at most one full L3 table.
         const IMAGE_SPAN: u64 = 0x20_0000;
@@ -350,6 +433,47 @@ impl Layout {
         ) {
             return Err(EncodingViolation::WindowsOverlap { space: "pa" });
         }
+        // The super window versus both others, in BOTH address spaces (M5 Arc 6a). **This is the
+        // property that replaces what uniform 4 KiB addressing used to make unrepresentable**: with
+        // one span, two leaves could not overlap because the map was a total function over an
+        // `Mfn`-indexed space. With two spans that is only true *within* a map, so non-overlap
+        // ACROSS maps has to be pinned here — and it is pinned structurally (disjoint windows),
+        // not re-checked per leaf.
+        let sup_span = self.sup_frames * super_size(self);
+        for (a, alen, b, blen, space) in [
+            (
+                self.sup_ipa_base,
+                sup_span,
+                self.data_ipa_base,
+                data_span,
+                "ipa",
+            ),
+            (
+                self.sup_ipa_base,
+                sup_span,
+                self.guest_image_pa,
+                IMAGE_SPAN,
+                "ipa",
+            ),
+            (
+                self.sup_pa_base,
+                sup_span,
+                self.data_pa_base,
+                data_span,
+                "pa",
+            ),
+            (
+                self.sup_pa_base,
+                sup_span,
+                self.guest_image_pa,
+                IMAGE_SPAN,
+                "pa",
+            ),
+        ] {
+            if overlaps(a, alen, b, blen) {
+                return Err(EncodingViolation::WindowsOverlap { space });
+            }
+        }
         Ok(())
     }
 }
@@ -365,17 +489,19 @@ impl Layout {
 /// not authorize.
 pub fn verify_encoding(
     leaves: &[Option<Perm>],
+    supers: &[Option<Perm>],
     layout: &Layout,
     t: TablesRef<'_>,
 ) -> Result<(), EncodingViolation> {
     layout.validate()?;
-    let (code_l1, data_l1) = (layout.code_l1(), layout.data_l1());
+    let (code_l1, data_l1, sup_l1) = (layout.code_l1(), layout.data_l1(), layout.sup_l1());
     let (code_l2, data_l2) = (layout.code_l2(), layout.data_l2());
 
-    // L1: exactly two live entries, pointing at the two L2s.
+    // L1: exactly THREE live entries now, pointing at the three L2s.
     for (idx, expected) in [
         (code_l1, layout.l2_code_pa & desc::ADDR_4K),
         (data_l1, layout.l2_data_pa & desc::ADDR_4K),
+        (sup_l1, layout.l2_sup_pa & desc::ADDR_4K),
     ] {
         if decode_table(t.l1[idx]) != Some(expected) {
             return Err(EncodingViolation::BadTableEntry {
@@ -386,7 +512,7 @@ pub fn verify_encoding(
             });
         }
     }
-    dead_except(t.l1, &[code_l1, data_l1], "l1")?;
+    dead_except(t.l1, &[code_l1, data_l1, sup_l1], "l1")?;
 
     // L2(code): the guest image, read-only and EXECUTABLE (it is the guest's code).
     let want_image = Decoded {
@@ -439,6 +565,35 @@ pub fn verify_encoding(
             });
         }
     }
+
+    // L2(sup): one 2 MiB BLOCK per mapped super-span frame, at its PA and permission, execute-never;
+    // every other slot dead (M5 Arc 6a). The `xn: true` is load-bearing and is the reason data
+    // blocks get their own descriptor constants: the ONLY executable mapping this emitter writes is
+    // the shared guest image, and a data superpage that decoded as executable would hand a guest an
+    // execute surface 512× the size of a page.
+    for m in 0..TABLE_ENTRIES {
+        let want = supers.get(m).copied().flatten().map(|perm| Decoded {
+            pa: super_pa(layout, m as u32) & desc::ADDR_2M,
+            perm,
+            xn: true,
+        });
+        let idx = ((super_ipa(layout, m as u32) >> 21) & 0x1ff) as usize;
+        let found = decode_block(t.l2_sup[idx]);
+        if found != want {
+            if want.is_none() && t.l2_sup[idx] != 0 {
+                return Err(EncodingViolation::SpuriousDescriptor {
+                    table: "l2_sup",
+                    index: idx,
+                    desc: t.l2_sup[idx],
+                });
+            }
+            return Err(EncodingViolation::BadLeaf {
+                mfn: m as u32,
+                found,
+                expected: want.map(|d| (d.pa, d.perm)),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -480,16 +635,29 @@ mod tests {
             data_ipa_base: 0x8000_0000,
             data_pa_base: 0x4060_0000,
             frame_size: 0x1000,
+            // The super-span window: its own L1 entry (0xC0000000 >> 30 = 3, distinct from the
+            // image at 1 and the data region at 2) and its own PA window, clear of both. One L2 of
+            // 512 x 2 MiB blocks covers exactly 1 GiB — exactly one L1 slot, by construction.
+            l2_sup_pa: 0x4010_4000,
+            sup_ipa_base: 0xC000_0000,
+            sup_pa_base: 0x8000_0000,
+            sup_frames: 8,
         }
     }
 
-    fn tables() -> (
+    /// The five tables of one Stage-2 set, all zeroed: `l1`, `l2_code`, `l2_data`, `l3_data`,
+    /// `l2_sup`.
+    type Blank = (
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
-    ) {
+        [u64; TABLE_ENTRIES],
+    );
+
+    fn tables() -> Blank {
         (
+            [0; TABLE_ENTRIES],
             [0; TABLE_ENTRIES],
             [0; TABLE_ENTRIES],
             [0; TABLE_ENTRIES],
@@ -521,15 +689,17 @@ mod tests {
     #[test]
     fn skeleton_indices_and_descriptors() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
         encode(
             &[None; 8],
+            &[None; 0],
             &l,
             Tables {
                 l1: &mut l1,
                 l2_code: &mut l2c,
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
+                l2_sup: &mut l2s,
             },
         );
         // guest image 0x4040_0000 -> L1 index 1, L2 index 2
@@ -544,18 +714,20 @@ mod tests {
     #[test]
     fn leaves_encode_at_their_permission_and_pa() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
         leaves[5] = Some(Perm::Ro);
         encode(
             &leaves,
+            &[None; 0],
             &l,
             Tables {
                 l1: &mut l1,
                 l2_code: &mut l2c,
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
+                l2_sup: &mut l2s,
             },
         );
         assert_eq!(l3[2], (0x4060_2000 & desc::ADDR_4K) | desc::PAGE_RW);
@@ -571,17 +743,19 @@ mod tests {
     #[test]
     fn re_encode_clears_stale_leaves() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
         let mut first = [None; 8];
         first[2] = Some(Perm::Rw);
         encode(
             &first,
+            &[None; 0],
             &l,
             Tables {
                 l1: &mut l1,
                 l2_code: &mut l2c,
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
+                l2_sup: &mut l2s,
             },
         );
         assert_ne!(l3[2], 0);
@@ -590,12 +764,14 @@ mod tests {
         second[5] = Some(Perm::Ro);
         encode(
             &second,
+            &[None; 0],
             &l,
             Tables {
                 l1: &mut l1,
                 l2_code: &mut l2c,
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
+                l2_sup: &mut l2s,
             },
         );
         assert_eq!(l3[2], 0, "the previous tenant's leaf survived");
@@ -608,18 +784,20 @@ mod tests {
     #[test]
     fn golden_descriptor_words_are_literal() {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
         leaves[5] = Some(Perm::Ro);
         encode(
             &leaves,
+            &[None; 0],
             &l,
             Tables {
                 l1: &mut l1,
                 l2_code: &mut l2c,
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
+                l2_sup: &mut l2s,
             },
         );
         // table descriptors: next-table PA | 0b11
@@ -647,26 +825,29 @@ mod tests {
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
         [u64; TABLE_ENTRIES],
+        [u64; TABLE_ENTRIES],
     );
 
     /// Encode a representative map and hand back the tables, for the verifier tests below.
     fn encoded() -> Fixture {
         let l = layout();
-        let (mut l1, mut l2c, mut l2d, mut l3) = tables();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
         leaves[5] = Some(Perm::Ro);
         encode(
             &leaves,
+            &[None; 0],
             &l,
             Tables {
                 l1: &mut l1,
                 l2_code: &mut l2c,
                 l2_data: &mut l2d,
                 l3_data: &mut l3,
+                l2_sup: &mut l2s,
             },
         );
-        (leaves, l, l1, l2c, l2d, l3)
+        (leaves, l, l1, l2c, l2d, l3, l2s)
     }
 
     fn refs<'a>(
@@ -674,13 +855,122 @@ mod tests {
         l2c: &'a [u64; TABLE_ENTRIES],
         l2d: &'a [u64; TABLE_ENTRIES],
         l3: &'a [u64; TABLE_ENTRIES],
+        l2s: &'a [u64; TABLE_ENTRIES],
     ) -> TablesRef<'a> {
         TablesRef {
             l1,
             l2_code: l2c,
             l2_data: l2d,
             l3_data: l3,
+            l2_sup: l2s,
         }
+    }
+
+    /// **M5 Arc 6a — a SUPER-span leaf round-trips as a 2 MiB BLOCK.** The model has had superpages
+    /// since design-lesson #14; until this arc the emitter flattened them into 4 KiB page
+    /// descriptors, mapping 1/512th of what the model authorized.
+    #[test]
+    fn super_leaf_encodes_as_a_block_and_verifies() {
+        let l = layout();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let mut sup = [None; 8];
+        sup[1] = Some(Perm::Rw);
+        sup[3] = Some(Perm::Ro);
+        encode(
+            &[None; 8],
+            &sup,
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+            },
+        );
+        // It is a BLOCK (2 MiB), not a page — and execute-never, unlike the shared image block.
+        assert_eq!(
+            decode_block(l2s[1]),
+            Some(Decoded {
+                pa: super_pa(&l, 1),
+                perm: Perm::Rw,
+                xn: true
+            })
+        );
+        assert_eq!(
+            decode_page(l2s[1]),
+            None,
+            "a block must not decode as a page"
+        );
+        assert_eq!(
+            verify_encoding(&[None; 8], &sup, &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
+            Ok(())
+        );
+    }
+
+    /// A tampered super block is caught, and a stray word in the super table is caught — the same
+    /// standard the `L3` leaves are held to, so the new table is not a hole in `verify_encoding`.
+    #[test]
+    fn verify_catches_a_tampered_or_spurious_super_block() {
+        let l = layout();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s) = tables();
+        let mut sup = [None; 8];
+        sup[1] = Some(Perm::Ro);
+        encode(
+            &[None; 8],
+            &sup,
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+            },
+        );
+
+        let mut tampered = l2s;
+        tampered[1] = (tampered[1] & !desc::S2AP_RO) | desc::S2AP_RW; // RO block escalated to RW
+        assert!(
+            matches!(
+                verify_encoding(&[None; 8], &sup, &l, refs(&l1, &l2c, &l2d, &l3, &tampered)),
+                Err(EncodingViolation::BadLeaf { .. })
+            ),
+            "a read-only superpage escalated to writable must be caught"
+        );
+
+        let mut spurious = l2s;
+        spurious[7] = (0x8000_0000 & desc::ADDR_2M) | desc::BLOCK_RW; // an unauthorized 2 MiB block
+        assert!(
+            matches!(
+                verify_encoding(&[None; 8], &sup, &l, refs(&l1, &l2c, &l2d, &l3, &spurious)),
+                Err(EncodingViolation::SpuriousDescriptor {
+                    table: "l2_sup",
+                    ..
+                }) | Err(EncodingViolation::BadLeaf { .. })
+            ),
+            "an unauthorized 2 MiB block reaches 512 pages' worth of memory"
+        );
+    }
+
+    /// The super window must be structurally separate — its own `L1` entry and a disjoint address
+    /// window. This is what replaces the non-overlap that uniform 4 KiB addressing made
+    /// unrepresentable.
+    #[test]
+    fn super_window_must_not_collide_or_overlap() {
+        let mut l = layout();
+        l.sup_ipa_base = l.data_ipa_base; // same L1 entry as the data region
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::RegionsCollide { .. })
+        ));
+
+        let mut l = layout();
+        l.sup_pa_base = l.data_pa_base; // distinct L1 entry, but the PA windows alias
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::WindowsOverlap { space: "pa" })
+        ));
     }
 
     /// The decoders invert the encoders, bit for bit.
@@ -718,9 +1008,9 @@ mod tests {
     /// THE ROUND TRIP: what `encode` wrote means exactly what the leaf map said, and nothing else.
     #[test]
     fn encode_then_verify_round_trips() {
-        let (leaves, l, l1, l2c, l2d, l3) = encoded();
+        let (leaves, l, l1, l2c, l2d, l3, l2s) = encoded();
         assert_eq!(
-            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
             Ok(())
         );
     }
@@ -728,10 +1018,10 @@ mod tests {
     /// NON-VACUITY: a tampered leaf is caught.
     #[test]
     fn verify_catches_a_tampered_leaf() {
-        let (leaves, l, l1, l2c, l2d, mut l3) = encoded();
+        let (leaves, l, l1, l2c, l2d, mut l3, l2s) = encoded();
         l3[2] = (l3[2] & !desc::S2AP_RW) | desc::S2AP_RO; // silently downgrade RW -> RO
         assert!(matches!(
-            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
             Err(EncodingViolation::BadLeaf { mfn: 2, .. })
         ));
     }
@@ -740,10 +1030,10 @@ mod tests {
     /// not reach anything extra.
     #[test]
     fn verify_catches_a_spurious_descriptor() {
-        let (leaves, l, l1, l2c, l2d, mut l3) = encoded();
+        let (leaves, l, l1, l2c, l2d, mut l3, l2s) = encoded();
         l3[7] = (0x4060_7000 & desc::ADDR_4K) | desc::PAGE_RW; // a frame nobody authorized
         assert!(matches!(
-            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
             Err(EncodingViolation::BadLeaf { mfn: 7, .. })
                 | Err(EncodingViolation::SpuriousDescriptor { .. })
         ));
@@ -752,10 +1042,10 @@ mod tests {
     /// NON-VACUITY: a broken skeleton (an `L1` entry pointing at the wrong table) is caught.
     #[test]
     fn verify_catches_a_broken_skeleton() {
-        let (leaves, l, mut l1, l2c, l2d, l3) = encoded();
+        let (leaves, l, mut l1, l2c, l2d, l3, l2s) = encoded();
         l1[2] = (0xdead_0000u64 & desc::ADDR_4K) | desc::TABLE;
         assert!(matches!(
-            verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+            verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
             Err(EncodingViolation::BadTableEntry { table: "l1", .. })
         ));
     }
@@ -765,13 +1055,13 @@ mod tests {
     /// from it). Both directions are caught — this used to rest on a comment.
     #[test]
     fn verify_catches_a_writable_or_non_executable_image() {
-        let (leaves, l, l1, l2c_ok, l2d, l3) = encoded();
+        let (leaves, l, l1, l2c_ok, l2d, l3, l2s) = encoded();
 
         let mut l2c = l2c_ok;
         l2c[2] = (l2c[2] & !desc::S2AP_RO) | desc::S2AP_RW; // shared image made WRITABLE
         assert!(
             matches!(
-                verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+                verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
                 Err(EncodingViolation::BadImageBlock { .. })
             ),
             "a writable shared image is a cross-domain write channel"
@@ -781,7 +1071,7 @@ mod tests {
         l2c[2] |= desc::XN; // image made non-executable
         assert!(
             matches!(
-                verify_encoding(&leaves, &l, refs(&l1, &l2c, &l2d, &l3)),
+                verify_encoding(&leaves, &[None; 0], &l, refs(&l1, &l2c, &l2d, &l3, &l2s)),
                 Err(EncodingViolation::BadImageBlock { .. })
             ),
             "the guest must still be able to fetch from its image"

@@ -102,5 +102,19 @@ SECTIONS {
     . += 0x200000;
     __guest_data_end = .;
 
+    /*
+     * Guest SUPER-span frames (M5 Arc 6a). The model has had superpages since design-lesson #14;
+     * this is the memory behind them on the metal. 2 MiB-aligned and 2 MiB-sized: exactly ONE
+     * super frame, which is enough to exercise the path end to end with a real witness without
+     * reserving the 1 GiB a full super table would span. `hv_s2::arm64::Layout::sup_frames` must
+     * match the count reserved here — `validate()` checks the BACKED span for overlap, so a
+     * declared window larger than its backing cannot silently alias something real.
+     * NOLOAD, like the other guest windows: reserves DRAM without bloating the image.
+     */
+    . = ALIGN(0x200000);
+    __guest_sup_start = .;
+    . += 0x200000;
+    __guest_sup_end = .;
+
     /DISCARD/ : { *(.comment) *(.note .note.*) *(.eh_frame*) }
 }
