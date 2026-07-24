@@ -19,11 +19,15 @@
 //! edge population in Verus, and on this shipped predicate by Kani over every ownership assignment
 //! and grant table at bounded edge count (`docs/STAGE2-REFINEMENT-FORALL-N.md`).
 //!
-//! **That theorem is CONDITIONAL, and the premise is the weaker link.**
-//! `UnauthorizedForeignLink` is checked by the enumerator over every reachable state and carries a
-//! Tier-B locality cutoff — but no Verus proof discharges it, so it is **not** itself a
-//! machine-checked ∀-N theorem. (An earlier revision of this comment called it "already-proven";
-//! it was not, and the correction is the point of design-lesson #37.) Lifting it is Arc 3b.
+//! **The premise is now discharged too.** That theorem was stated conditional on
+//! `UnauthorizedForeignLink`, which at the time was enumerator-checked with a Tier-B locality cutoff
+//! but proven by no Verus file. (An earlier revision of this comment called it "already-proven"; it
+//! was not, and the correction is the point of design-lesson #37.) Arc 3b
+//! (`hv-verify/verus/foreign_link_preservation.rs`) proves its **preservation step ∀-N** for every
+//! transition class that can move toward violating it, so the composition no longer rests on an
+//! un-proven invariant. The residual is narrower and named in
+//! `docs/STAGE2-REFINEMENT-FORALL-N.md` §7 — chiefly that the *completeness* of that transition
+//! list is an audit argument backed by the enumerator, not a machine-checked fact.
 //!
 //! **[`check_exact`] is a consistency check, not a theorem.** It re-derives the expected map from
 //! the same `link_edges` relation the emitter reads, so it cannot fail for a *reason the emitter got
