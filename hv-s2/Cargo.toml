@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[package]
+name = "hv-s2"
+description = "Stage-2 emission: the proven p2m relation to a hardware page-table image, as a pure no_std library with zero unsafe."
+# Internal workspace crate — not for crates.io. Guards against an accidental publish.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+hv-core = { path = "../hv-core" }
+
+[lints]
+workspace = true

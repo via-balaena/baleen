@@ -35,6 +35,10 @@ real-linux = []
 [dependencies]
 hv-core = { path = "../hv-core" }
 hv-hal = { path = "../hv-hal" }
+# The Stage-2 emission, factored OUT of this crate's `unsafe` (see `src/stage2.rs`): `hv-s2` decides
+# which frames a domain reaches and encodes the descriptors, as pure zero-`unsafe` code under the
+# workspace fence; hv-metal keeps only the publish (barriers + TLB maintenance + VTTBR).
+hv-s2 = { path = "../hv-s2" }
 
 # Standalone: its own workspace so the parent's stable `cargo test --workspace` never tries to
 # build this bare-metal binary (it targets `aarch64-unknown-none-softfloat` and would fail on the
