@@ -131,8 +131,6 @@ pub const NUM_SUP_FRAMES: u64 = windows().sup_frames;
 /// two-emitters problem this whole arc exists to end. So the windows are data and the emission path
 /// is shared, proofs and all.
 pub struct Windows {
-    /// The hypervisor-owned guest image, or `None` when the guest's code lives in mapped RAM.
-    pub guest_image_pa: Option<u64>,
     /// Guest IPA base of the base-span (4 KiB) frame window.
     pub data_ipa_base: u64,
     /// Guest IPA base of the super-span (2 MiB) frame window.
@@ -153,7 +151,6 @@ pub const fn windows() -> Windows {
     #[cfg(not(feature = "real-linux"))]
     {
         Windows {
-            guest_image_pa: None, // filled at emission from the linker symbol
             data_ipa_base: DATA_IPA_BASE,
             sup_ipa_base: SUP_IPA_BASE,
             sup_frames: 1,
@@ -164,9 +161,6 @@ pub const fn windows() -> Windows {
     #[cfg(feature = "real-linux")]
     {
         Windows {
-            // A real kernel is deposited INTO guest RAM before the hypervisor runs, so it is covered
-            // by the ordinary leaf mapping — there is no separate hypervisor-owned image block.
-            guest_image_pa: None,
             // The synthetic base-frame window is unused by this build (the Linux guest's memory is
             // all super-span), but it must still be a valid, disjoint window for `validate`.
             data_ipa_base: DATA_IPA_BASE,
@@ -175,7 +169,8 @@ pub const fn windows() -> Windows {
             // `base + m*size` in both spaces, so equal bases give identity for free.
             sup_ipa_base: LINUX_RAM_BASE,
             // 896 MiB of guest RAM in 2 MiB blocks — under `TABLE_ENTRIES`, so ONE L2 covers it.
-            sup_frames: (LINUX_RAM_END - LINUX_RAM_BASE) / (hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE),
+            sup_frames: (LINUX_RAM_END - LINUX_RAM_BASE)
+                / (hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE),
             // GICv3 distributor + redistributor + PL011, as pass-through MMIO.
             device_base: 0x0800_0000,
             device_len: 0x0200_0000,
@@ -185,11 +180,14 @@ pub const fn windows() -> Windows {
 
 /// How many `L2`-pinned model tables the real-Linux guest needs to hold its leaves, at
 /// `hv_core::TABLE_SLOTS` (8) leaves each. See `crate::NUM_FRAMES` on why this is not one.
+#[cfg(feature = "real-linux")]
 pub const NUM_LINUX_TABLES: u64 = NUM_SUP_FRAMES.div_ceil(hv_core::p2m::TABLE_SLOTS as u64);
 
 /// Guest RAM for the real-Linux guest — must match `xtask`'s `-device loader` addresses and the DTB.
+#[cfg(feature = "real-linux")]
 pub const LINUX_RAM_BASE: u64 = 0x4800_0000;
 /// Exclusive end of guest RAM (QEMU `-m 1024` puts the top of DRAM at `0x8000_0000`).
+#[cfg(feature = "real-linux")]
 pub const LINUX_RAM_END: u64 = 0x8000_0000;
 
 extern "C" {
@@ -410,7 +408,7 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         } else {
             Some(guest_ram_start())
         },
-        data_ipa_base: DATA_IPA_BASE,
+        data_ipa_base: windows().data_ipa_base,
         data_pa_base: data_ram_start(),
         frame_size: FRAME_SIZE,
         sup_ipa_base: windows().sup_ipa_base,

@@ -137,7 +137,10 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
 
     let mut go = |caller: DomId, call: HvCall, what: &str| {
         if let Err(e) = crate::teardown::dispatch(hv, caller, call) {
-            let _ = writeln!(uart, "baleen: linux model setup '{what}' failed: {e:?}; halting");
+            let _ = writeln!(
+                uart,
+                "baleen: linux model setup '{what}' failed: {e:?}; halting"
+            );
             crate::park();
         }
     };
@@ -156,7 +159,11 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
     // and pinned before its leaves are linked.
     for t in 0..stage2::NUM_LINUX_TABLES {
         let table = FIRST_TABLE + t as Mfn;
-        go(GUEST, HvCall::P2mAllocate { mfn: table }, "allocate a table");
+        go(
+            GUEST,
+            HvCall::P2mAllocate { mfn: table },
+            "allocate a table",
+        );
         go(
             GUEST,
             HvCall::P2mPin {
@@ -170,7 +177,11 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
             if m >= stage2::NUM_SUP_FRAMES as Mfn {
                 break;
             }
-            go(GUEST, HvCall::P2mAllocate { mfn: m }, "allocate a RAM frame");
+            go(
+                GUEST,
+                HvCall::P2mAllocate { mfn: m },
+                "allocate a RAM frame",
+            );
             go(
                 GUEST,
                 HvCall::P2mLink {
