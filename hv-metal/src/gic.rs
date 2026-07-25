@@ -103,6 +103,57 @@ pub(crate) fn inject(intid: u32) {
     }
 }
 
+/// Enable just enough of the EL2 virtual CPU interface to *access* the list registers as system
+/// registers — `ICC_SRE_EL2.SRE` (turn on the system-register interface) and `ICH_HCR_EL2.En` (the
+/// virtual interface operational) — WITHOUT `HCR_EL2.IMO`, so no physical IRQ is routed to EL2 and no
+/// virtual IRQ is presented to a guest. Used by the Arc-7c LR-ownership self-test so it can read/write
+/// `ICH_LR0_EL2` as plain registers without perturbing the interrupt routing the real phases set up.
+/// (`selftest`-only: the real phases enable the full interface via [`enable_el2`].)
+#[cfg(feature = "selftest")]
+pub(crate) fn enable_lr_sysreg_access() {
+    // SAFETY: `ICC_SRE_EL2`/`ICH_HCR_EL2` are EL2 controls; we set only SRE (RMW to preserve IMPDEF SRE
+    // bits) and the virtual-interface enable, `isb` before a dependent `ICH_LR0_EL2` access follows. No
+    // `HCR_EL2` change, so physical-IRQ routing is untouched. No memory effect.
+    unsafe {
+        asm!(
+            "mrs {t}, ICC_SRE_EL2",
+            "orr {t}, {t}, {sre}",
+            "msr ICC_SRE_EL2, {t}",
+            "isb",
+            "msr ICH_HCR_EL2, {en}",
+            "isb",
+            t = out(reg) _,
+            sre = in(reg) ICC_SRE_EL2_SRE,
+            en = in(reg) ICH_HCR_EL2_EN,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Read list register 0 (`ICH_LR0_EL2`) — the raw 64-bit value, pending vINT state and all. Used by the
+/// per-vCPU context switch (M5 Arc 7c) to *save* the outgoing vCPU's pending virtual interrupt: the LRs
+/// are per-vCPU state the hardware does not swap, so a context switch must carry them like any other
+/// register. The metal only ever populates `ICH_LR0_EL2` (see [`inject`]), so LR0 is the whole store.
+pub(crate) fn read_lr0() -> u64 {
+    let lr: u64;
+    // SAFETY: `ICH_LR0_EL2` is a RW EL2 list register, readable at EL2; the read has no memory effect.
+    unsafe {
+        asm!("mrs {lr}, ICH_LR0_EL2", lr = out(reg) lr, options(nomem, nostack, preserves_flags));
+    }
+    lr
+}
+
+/// Write list register 0 (`ICH_LR0_EL2`) — the inverse of [`read_lr0`], to *restore* an incoming vCPU's
+/// saved pending virtual interrupt on a context switch (M5 Arc 7c). Writing a previously-read LR value
+/// is idempotent; writing 0 leaves LR0 with no pending interrupt (state = Invalid).
+pub(crate) fn write_lr0(lr: u64) {
+    // SAFETY: `ICH_LR0_EL2` is a RW EL2 list register. `isb` so the write is in effect before the
+    // following `eret` presents the (restored) interrupt state to the incoming guest. No memory effect.
+    unsafe {
+        asm!("msr ICH_LR0_EL2, {lr}", "isb", lr = in(reg) lr, options(nomem, nostack, preserves_flags));
+    }
+}
+
 // ─── physical GICv3 (for receiving the virtual-timer PPI at EL2 — M5 Arc 5d) ─────────────────────────
 //
 // So far the vGIC only INJECTED. To deliver a real timer TICK, EL2 must RECEIVE the physical virtual-
