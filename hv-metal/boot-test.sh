@@ -241,6 +241,7 @@ boot_and_check "selftest" "--features selftest" \
     "HvCall CreditGrant(100) -> balance=100" \
     "selftest: HvCall accounting OK" \
     "selftest: BootCell exclusion OK (second borrow refused while live, accepted after drop" \
+    "selftest: I1 IRQ-mask check OK (masked DAIF accepted, unmasked rejected, live EL2 context masked)" \
     "selftest: Stage-2 encoding verified" \
     "1 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \

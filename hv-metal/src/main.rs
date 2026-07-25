@@ -225,6 +225,14 @@ pub extern "C" fn rust_main() -> ! {
     #[cfg(feature = "selftest")]
     cell::selftest_exclusion(&mut uart);
 
+    // (6c) M5 Arc 7a — invariant I1's non-vacuity witness. Realizing `VcpuOps::inject_interrupt`
+    //      makes an asynchronous EL2 injector possible; I1 (a `BootCell` is claimed only with IRQ
+    //      masked) is what keeps that async agent from ever overlapping a live borrow. This asserts
+    //      the IRQ-mask check discriminates (masked accepted, unmasked rejected) and that the live
+    //      EL2 claim context is masked. The unmasked half is a synthetic value — never a real IRQ.
+    #[cfg(feature = "selftest")]
+    cell::selftest_irq_masked(&mut uart);
+
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven
     //     `p2m`, run the Arc-5 authorize/deny isolation matrix (the proof touches reality), then the
     //     M5 Arc 0 LIFECYCLE phase — destroy the guest and reborn a fresh domain in the same slot,

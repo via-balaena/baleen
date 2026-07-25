@@ -28,9 +28,15 @@
 //!    — not the type system, not a comment — prevented two live aliases. **This is what [`BootCell`]
 //!    enforces.**
 //!
-//! Class 3 is what breaks first, and *not because of SMP*: `handle_guest_irq` touches no cell today,
-//! but `VcpuOps::inject_interrupt` is unrealized and sits in the deferral ledger. Realizing it puts
-//! an asynchronous EL2 handler onto `hv-core` state — a second agent **on one CPU**.
+//! Class 3 is what breaks first, and *not because of SMP*. `VcpuOps::inject_interrupt` is now
+//! realized (M5 Arc 7a — it drives the vGIC list register, first from the *synchronous* HVC path),
+//! but `handle_guest_irq`, the one *asynchronous* EL2 agent, still touches no cell. What keeps it
+//! safe when Arc 7b routes it onto `hv-core` state is **invariant I1**, checked at every claim by
+//! [`assert_irq_masked`]: a [`BootCell`] is claimed only with `PSTATE.I` masked, and no EL2 handler
+//! clears it (every `DAIFClr` on the metal is guest-side), so the async handler — which fires only
+//! while the *guest* runs — can never hold a claim overlapping a masked EL2 borrow. The two agents
+//! are serialized by hardware masking, and class 3 ("≤1 live mutable borrow per cell") holds by
+//! mutual exclusion in time rather than by the halt-on-collision fallback.
 //!
 //! ## Contract
 //!
@@ -97,6 +103,56 @@ pub(crate) fn assert_boot_cpu(what: &str) {
     }
 }
 
+/// The `PSTATE.I` (physical IRQ mask) bit as read back through `MRS Xt, DAIF` — the DAIF field is
+/// `[9]=D [8]=A [7]=I [6]=F`, so I is bit 7; masked = 1.
+const DAIF_I: u64 = 1 << 7;
+
+/// Is physical IRQ masked in this `DAIF` value? A pure predicate of the register value, so the boot
+/// self-test can witness *both* halves (masked → `true`, unmasked → `false`) without ever unmasking
+/// a real IRQ at EL2.
+const fn irq_masked_in(daif: u64) -> bool {
+    daif & DAIF_I != 0
+}
+
+/// This core's live `DAIF`. Deliberately **not** `pure`: unlike `MPIDR_EL1`, `DAIF` changes over
+/// time, so the read must not be hoisted or CSE'd across a mask change.
+fn read_daif() -> u64 {
+    let daif: u64;
+    // SAFETY: `DAIF` is a process-state special register readable at EL2; the read has no memory
+    // effect and no side effect (but is not constant, hence no `pure`).
+    unsafe {
+        core::arch::asm!(
+            "mrs {d}, DAIF",
+            d = out(reg) daif,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    daif
+}
+
+/// Halt unless physical IRQ is masked — **invariant I1** for asynchronous interrupt injection (M5
+/// Arc 7a). A [`BootCell`] may be claimed only with `PSTATE.I` masked, so the one asynchronous EL2
+/// agent (`handle_guest_irq`, which fires *only while the guest runs*) can never hold a claim
+/// overlapping this one: the two EL2 agents are serialized by hardware masking, and class 3 ("≤1
+/// live mutable borrow per cell") holds by mutual exclusion in time, not by the halt-on-collision
+/// fallback.
+///
+/// **Expected never to fire.** Exception entry masks `DAIF` in hardware and no EL2 handler clears it
+/// (no `DAIFClr` on any EL2 path — every unmask is guest-side), so every claim today is already
+/// masked. Like [`assert_boot_cpu`], it earns its place by catching the exact regression that would
+/// arm the hazard: a future EL2 path that unmasks IRQ while a borrow is live (e.g. Arc 7b routing
+/// `handle_guest_irq` onto `hv-core` state without preserving the mask discipline).
+fn assert_irq_masked(what: &str) {
+    if !irq_masked_in(read_daif()) {
+        let mut uart = crate::uart();
+        let _ = writeln!(
+            uart,
+            "baleen: {what}: BootCell claimed with physical IRQ UNMASKED — invariant I1 (no async EL2 overlap) violated; halting"
+        );
+        park();
+    }
+}
+
 /// An interior-mutable `static` whose exclusivity is **checked**, not commented.
 ///
 /// Replaces the per-site `UnsafeCell` + `unsafe impl Sync` + unbounded `&'static mut` accessor with
@@ -141,6 +197,7 @@ impl<T> BootCell<T> {
     /// idiom rather than returning an error nobody could act on.
     pub(crate) fn borrow_mut(&'static self) -> BootRef<T> {
         assert_boot_cpu(self.name);
+        assert_irq_masked(self.name);
         match self.try_claim() {
             Some(r) => r,
             None => {
@@ -252,6 +309,36 @@ pub(crate) fn selftest_exclusion(uart: &mut crate::Pl011) {
         let _ = writeln!(
             uart,
             "baleen: selftest: BootCell exclusion FAIL (refused={refused} regained={regained} hv_refused={hv_refused} hv_regained={hv_regained}); halting"
+        );
+        park();
+    }
+}
+
+/// **The I1 non-vacuity witness (`selftest` builds).** Invariant I1 ([`assert_irq_masked`]) is what
+/// lets an asynchronous injector coexist with [`BootCell`] at all: every claim is taken with IRQ
+/// masked, so the async agent can never overlap a live borrow. Assert the predicate actually
+/// discriminates — a masked `DAIF` value is accepted, an unmasked one rejected — and that the
+/// *live* claim context here is genuinely masked. Both halves matter: a predicate stuck at `true`
+/// would accept the unmasked case, one stuck at `false` would reject the real masked claim; neither
+/// degenerate check can print this marker (design-lesson #24(f)).
+///
+/// The unmasked half is tested against a *synthetic* `DAIF` value, never by unmasking a real IRQ at
+/// EL2 — the witness proves the check is non-vacuous without arming the hazard it guards.
+#[cfg(feature = "selftest")]
+pub(crate) fn selftest_irq_masked(uart: &mut crate::Pl011) {
+    let masked_accepted = irq_masked_in(DAIF_I); // a masked DAIF → accepted
+    let unmasked_rejected = !irq_masked_in(0); // an unmasked DAIF → rejected
+    let live_masked = irq_masked_in(read_daif()); // the real EL2 claim context is masked
+
+    if masked_accepted && unmasked_rejected && live_masked {
+        let _ = writeln!(
+            uart,
+            "baleen: selftest: I1 IRQ-mask check OK (masked DAIF accepted, unmasked rejected, live EL2 context masked)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: selftest: I1 IRQ-mask check FAIL (masked_accepted={masked_accepted} unmasked_rejected={unmasked_rejected} live_masked={live_masked}); halting"
         );
         park();
     }
