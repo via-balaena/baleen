@@ -55,6 +55,27 @@ const LR_STATE_PENDING: u64 = 0b01 << 62;
 /// A moderate priority for injected interrupts — below `ICC_PMR_EL1 = 0xff`, so it passes the mask.
 const INJECT_PRIORITY: u64 = 0x80;
 
+/// The LR **State** field, bits [63:62]: `0b00` Invalid (free), `0b01` Pending, `0b10` Active, `0b11`
+/// Pending+Active. A free list register the allocator may reuse has State = Invalid (the whole field 0).
+const LR_STATE_MASK: u64 = 0b11 << 62;
+
+/// The architectural maximum number of list registers (GICv3 implements at most 16, `ICH_LR0..15`); the
+/// per-vCPU LR store ([`crate::guest`]'s `GuestContext`) is sized to this, though only
+/// [`num_list_registers`] are live on a given machine (4 on QEMU `virt`).
+pub(crate) const MAX_LIST_REGISTERS: usize = 16;
+
+/// A list register with State = Invalid holds no interrupt — a free slot [`inject`] may allocate.
+pub(crate) fn lr_is_free(lr: u64) -> bool {
+    lr & LR_STATE_MASK == 0
+}
+
+/// The vINTID a list register carries (bits [31:0]). (`selftest`-only: the LR-bank ownership witness
+/// checks it; the switch and injector treat the LR as an opaque 64-bit value.)
+#[cfg(feature = "selftest")]
+pub(crate) fn lr_vintid(lr: u64) -> u32 {
+    (lr & 0xffff_ffff) as u32
+}
+
 /// Enable the hardware virtual CPU interface at EL2: `ICC_SRE_EL2` (SRE + Enable, so the guest may use
 /// `ICC_SRE_EL1`), `ICH_HCR_EL2.En`, and `HCR_EL2.IMO` (so a list-register interrupt reaches the guest).
 /// Call once, after `enable_stage2`, before entering an interrupt-capable guest. Only the block phases
@@ -83,24 +104,30 @@ pub(crate) fn enable_el2() {
     }
 }
 
-/// Inject virtual interrupt `intid` into the guest by making list register 0 hold a *pending* Group 1
-/// virtual interrupt. The hardware CPU interface then presents it to the guest (as a taken IRQ if the
-/// guest has `PSTATE.I` unmasked, or via `ICC_IAR1_EL1` if it polls).
-pub(crate) fn inject(intid: u32) {
+/// Inject virtual interrupt `intid`: place a *pending* Group-1 virtual interrupt in the **first free**
+/// list register (M5 Arc 8b). Up to [`num_list_registers`] distinct interrupts can be simultaneously
+/// pending, each in its own LR, so a new injection never overwrites one the guest has not yet taken.
+/// The hardware CPU interface presents them to the guest (as a taken IRQ if `PSTATE.I` is unmasked, or
+/// via `ICC_IAR1_EL1` if it polls).
+///
+/// Returns `false` if the bank is full — the caller **must not** treat that as delivered. A software
+/// pending queue (+ `ICH_HCR_EL2.UIE` maintenance-interrupt refill) is the general answer and is
+/// deferred residue; today the metal has too few interrupt sources to fill the bank.
+#[must_use]
+pub(crate) fn inject(intid: u32) -> bool {
     let lr = LR_STATE_PENDING
         | LR_GROUP1
         | (INJECT_PRIORITY << LR_PRIORITY_SHIFT)
         | ((intid as u64) << LR_VINTID_SHIFT);
-    // SAFETY: `ICH_LR0_EL2` is an EL2 list register; writing a pending virtual interrupt is exactly its
-    // purpose. `isb` so the injection is in effect before the following `eret` into the guest.
-    unsafe {
-        asm!(
-            "msr ICH_LR0_EL2, {lr}",
-            "isb",
-            lr = in(reg) lr,
-            options(nomem, nostack, preserves_flags),
-        );
+    let n = num_list_registers();
+    for i in 0..n {
+        if lr_is_free(read_lr(i)) {
+            // `write_lr` `isb`s, so the injection is in effect before the following `eret`.
+            write_lr(i, lr);
+            return true;
+        }
     }
+    false
 }
 
 /// Enable just enough of the EL2 virtual CPU interface to *access* the list registers as system
@@ -130,27 +157,89 @@ pub(crate) fn enable_lr_sysreg_access() {
     }
 }
 
-/// Read list register 0 (`ICH_LR0_EL2`) — the raw 64-bit value, pending vINT state and all. Used by the
-/// per-vCPU context switch (M5 Arc 7c) to *save* the outgoing vCPU's pending virtual interrupt: the LRs
-/// are per-vCPU state the hardware does not swap, so a context switch must carry them like any other
-/// register. The metal only ever populates `ICH_LR0_EL2` (see [`inject`]), so LR0 is the whole store.
-pub(crate) fn read_lr0() -> u64 {
-    let lr: u64;
-    // SAFETY: `ICH_LR0_EL2` is a RW EL2 list register, readable at EL2; the read has no memory effect.
+/// The number of implemented list registers, `ICH_VTR_EL2.ListRegs + 1` (bits [4:0]) — 4 on QEMU
+/// `virt` GICv3, clamped to [`MAX_LIST_REGISTERS`]. Accesses to `ICH_LR<n>_EL2` for `n >=` this are
+/// UNPREDICTABLE, so every LR loop bounds itself by this. `ICH_VTR_EL2` is an `ICH_*` register readable
+/// at EL2 without the CPU-interface `ICC_SRE_EL2` gate (the same class as the LRs, which the Arc-7c
+/// scheduler-phase save/restore already accessed with no phase enabling the interface).
+pub(crate) fn num_list_registers() -> usize {
+    let vtr: u64;
+    // SAFETY: `ICH_VTR_EL2` is a RO EL2 identification register for the virtual interface; no effect.
     unsafe {
-        asm!("mrs {lr}, ICH_LR0_EL2", lr = out(reg) lr, options(nomem, nostack, preserves_flags));
+        asm!("mrs {v}, ICH_VTR_EL2", v = out(reg) vtr, options(nomem, nostack, preserves_flags));
     }
-    lr
+    (((vtr & 0x1f) as usize) + 1).min(MAX_LIST_REGISTERS)
 }
 
-/// Write list register 0 (`ICH_LR0_EL2`) — the inverse of [`read_lr0`], to *restore* an incoming vCPU's
-/// saved pending virtual interrupt on a context switch (M5 Arc 7c). Writing a previously-read LR value
-/// is idempotent; writing 0 leaves LR0 with no pending interrupt (state = Invalid).
-pub(crate) fn write_lr0(lr: u64) {
-    // SAFETY: `ICH_LR0_EL2` is a RW EL2 list register. `isb` so the write is in effect before the
-    // following `eret` presents the (restored) interrupt state to the incoming guest. No memory effect.
-    unsafe {
-        asm!("msr ICH_LR0_EL2, {lr}", "isb", lr = in(reg) lr, options(nomem, nostack, preserves_flags));
+// The `ICH_LR<n>_EL2` register encoding must be a string literal in `asm!`, so a runtime index `n`
+// dispatches through the 16-arm matches below. `concat!` builds the register name at compile time.
+macro_rules! read_one_lr {
+    ($n:literal) => {{
+        let v: u64;
+        // SAFETY: `ICH_LR<n>_EL2` (n < num_list_registers()) is a RW EL2 list register; read-only here.
+        unsafe {
+            asm!(concat!("mrs {v}, ICH_LR", stringify!($n), "_EL2"),
+                 v = out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    }};
+}
+macro_rules! write_one_lr {
+    ($n:literal, $v:expr) => {{
+        // SAFETY: `ICH_LR<n>_EL2` (n < num_list_registers()) is a RW EL2 list register. `isb` so the
+        // write is in effect before a following `eret` presents the interrupt state to the guest.
+        unsafe {
+            asm!(concat!("msr ICH_LR", stringify!($n), "_EL2, {v}"), "isb",
+                 v = in(reg) $v, options(nomem, nostack, preserves_flags));
+        }
+    }};
+}
+
+/// Read list register `n` — the raw 64-bit value, pending-vINT State and all (`n < num_list_registers()`).
+/// The LRs are per-vCPU state the hardware does not swap, so the context switch saves them (M5 Arc 7c/8b).
+pub(crate) fn read_lr(n: usize) -> u64 {
+    match n {
+        0 => read_one_lr!(0),
+        1 => read_one_lr!(1),
+        2 => read_one_lr!(2),
+        3 => read_one_lr!(3),
+        4 => read_one_lr!(4),
+        5 => read_one_lr!(5),
+        6 => read_one_lr!(6),
+        7 => read_one_lr!(7),
+        8 => read_one_lr!(8),
+        9 => read_one_lr!(9),
+        10 => read_one_lr!(10),
+        11 => read_one_lr!(11),
+        12 => read_one_lr!(12),
+        13 => read_one_lr!(13),
+        14 => read_one_lr!(14),
+        15 => read_one_lr!(15),
+        _ => 0,
+    }
+}
+
+/// Write list register `n` — the inverse of [`read_lr`], to restore a vCPU's saved bank on a switch
+/// (writing 0 leaves the LR Invalid) or to inject (`n < num_list_registers()`).
+pub(crate) fn write_lr(n: usize, v: u64) {
+    match n {
+        0 => write_one_lr!(0, v),
+        1 => write_one_lr!(1, v),
+        2 => write_one_lr!(2, v),
+        3 => write_one_lr!(3, v),
+        4 => write_one_lr!(4, v),
+        5 => write_one_lr!(5, v),
+        6 => write_one_lr!(6, v),
+        7 => write_one_lr!(7, v),
+        8 => write_one_lr!(8, v),
+        9 => write_one_lr!(9, v),
+        10 => write_one_lr!(10, v),
+        11 => write_one_lr!(11, v),
+        12 => write_one_lr!(12, v),
+        13 => write_one_lr!(13, v),
+        14 => write_one_lr!(14, v),
+        15 => write_one_lr!(15, v),
+        _ => {}
     }
 }
 
