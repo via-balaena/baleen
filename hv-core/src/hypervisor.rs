@@ -38,7 +38,7 @@ pub type DomId = u16;
 
 /// The core's typed, ABI-neutral hypercall vocabulary. A personality decodes a
 /// guest's wire-format call into one of these; the core never sees raw registers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount)]
 pub enum HvCall {
     /// Deposit credits into the caller's account.
     CreditGrant { amount: u32 },
@@ -239,6 +239,17 @@ pub enum HvCall {
     /// restriction is the policy refinement that closes the flat model's revoke-anyone wart.
     ControlRevoke { target: DomId, from: DomId },
 }
+
+/// The number of [`HvCall`] variants — the size of the guest hypercall vocabulary, maintained
+/// by the compiler via `strum::EnumCount` (so it cannot drift from the enum).
+///
+/// `hv-sim`'s transition-list-completeness census uses this: it asserts the ∀-N enumerator
+/// drives exactly `HVCALL_VARIANT_COUNT` minus the declared exclusions (the credit ops). That
+/// balance is what makes "every non-excluded transition is actually swept" a machine check
+/// rather than an audit — a variant added and classified `Enumerated` but never wired into the
+/// enumerator bumps this count without bumping the emitted set, so the census fails. Exposed as
+/// a plain `usize` so consumers need no `strum` dependency of their own.
+pub const HVCALL_VARIANT_COUNT: usize = <HvCall as strum::EnumCount>::COUNT;
 
 /// The success value of a routed hypercall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
