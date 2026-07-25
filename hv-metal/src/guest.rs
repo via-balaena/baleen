@@ -1929,18 +1929,17 @@ extern "C" fn handle_guest_irq(_frame: *mut GuestFrame) {
     }
 }
 
-/// A minimal `hv_hal::VcpuOps` realized on ARM (Arc 4). `set_entry` writes `ELR_EL2`;
-/// `inject_interrupt` is honestly deferred (no GIC yet).
+/// A minimal `hv_hal::VcpuOps` realized on ARM. `set_entry` writes `ELR_EL2`; `inject_interrupt`
+/// (M5 Arc 7a) makes `vector` pending in the guest's vGIC via [`gic::inject`] — the first real body
+/// behind the architecture-neutral fence, driven from the synchronous HVC path (Arc 7b adds the
+/// asynchronous caller).
 struct ArmVcpu;
 
 impl hv_hal::VcpuOps for ArmVcpu {
-    fn inject_interrupt(&mut self, _vector: u8) {
-        let mut uart = crate::uart();
-        let _ = writeln!(
-            uart,
-            "baleen: VcpuOps::inject_interrupt is unrealized (no GIC until a later arc); halting"
-        );
-        crate::park();
+    fn inject_interrupt(&mut self, vector: u8) {
+        // The `u8` vector is a vGIC vINTID (Arc 7a exercises INTID 42). The trait's `u8` cannot
+        // express SPIs > 255 — recorded in the Arc-7 ledger as a HAL-fence limit, not a metal one.
+        gic::inject(vector as u32);
     }
 
     fn set_entry(&mut self, entry: u64) {
@@ -2520,7 +2519,13 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_BLK_NEGOTIATED => virtio_blk_report_negotiated(frame, uart), // assert VERSION_1 + FEATURES_OK
         NR_BLK_READ_REPORT => virtio_blk_report_read(frame, uart), // assert the read round-tripped
         NR_BLK_FINAL => finish_virtio_blk_test(uart), // -> ! (block phase → vGIC phase)
-        NR_GIC_READY => gic::inject(GIC_TEST_INTID),  // M5 Arc 5a/b: inject a virtual interrupt now
+        NR_GIC_READY => {
+            // M5 Arc 7a: the vGIC injection now goes through the architecture-neutral
+            // `VcpuOps::inject_interrupt` fence (its first real call site) rather than calling
+            // `gic::inject` directly — the same delivery the existing `gic_report` witness asserts.
+            use hv_hal::VcpuOps;
+            ArmVcpu.inject_interrupt(GIC_TEST_INTID as u8);
+        }
         NR_GIC_REPORT => gic_report(frame, uart), // assert the guest acknowledged the right INTID
         NR_GIC_FINAL => finish_gic_test(uart),    // -> ! (vGIC poll phase → async phase)
         NR_GIC_ASYNC_REPORT => gic_async_report(frame, uart), // M5 Arc 5b: assert vectored delivery
