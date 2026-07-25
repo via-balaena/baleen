@@ -150,9 +150,20 @@ authorized**", with no third outcome.
    `first_cross_violation` after **every** dispatch of **every** transition over every reachable
    state — so a missed class would have to be one the enumerator also never drives. This is now the
    top of the ledger.
-3. **`MislevelledLink` is load-bearing and is itself enumerator-checked, not Verus-proven.** Arc 3b's
-   `p2m_allocate` case borrows it (§9), and P2 now rests on it (§3). The borrow **moves** the
-   residual rather than erasing it — the honest accounting design-lesson #20 asks for.
+3. **`MislevelledLink` — the page-table *shape* is now ∀-N Verus (Phase I-2a); the count coupling is
+   deferred (I-2b).** Arc 3b's `p2m_allocate` case borrows it (§9), and P2 rests on it (§3).
+   `mislevelled_link_preservation.rs` (14 verified) proves the invariant preserved ∀-N by its
+   *additive* transitions outright — `link` (establish), `grant_map`/`pin` (adds-only), `allocate`
+   (purely type-monotone, needing no borrow) — plus the base case. Its *decrement* transitions
+   (`unlink`, `unpin`/`grant_unmap`, `free`, `DomainDestroy`) are stated with one named hypothesis,
+   `type_preserved_on` (`TypeRefsAccounted`): when a holder leaves, a frame a surviving edge still
+   references keeps its type. That coupling — the p2m cousin of `RefcountMismatch`, held by
+   construction of the balanced `get`/`put` discipline but **not** itself a checked invariant — is
+   what **I-2b** discharges, closing this residual. Until then I-2a *moves* the residual onto the
+   named coupling (the honest accounting design-lesson #20/#47 asks for), rather than erasing it.
+   *Finding: for `MislevelledLink`, `DomainDestroy`'s `has_foreign_link_into` precondition is
+   genuinely load-bearing (unlike for `UnauthorizedForeignLink`), cashing the localization §9
+   recorded.*
 4. **Mirror fidelity** for both Verus files — managed by layered anchors (§5), not eliminated.
 5. **Arrows (2) and (3)** of the chain are Arc 2.5's and QEMU's, unchanged by these arcs.
 6. **Edge count in Kani is bounded** (3 for the emitter harnesses; a 2-domain/3-frame world for the
