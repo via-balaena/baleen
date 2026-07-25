@@ -67,9 +67,9 @@ use std::collections::HashMap;
 use hv_core::evtchn::PortState;
 use hv_core::p2m::PageType;
 use hv_core::sched::RunState;
-use hv_core::{HvCall, HvOutcome, Hypervisor};
+use hv_core::{Hypervisor, Transition, TransitionOutcome};
 
-use crate::enumerate::{ops, state_key, Config};
+use crate::enumerate::{state_key, transitions, Config};
 
 /// A domain id (matches [`hv_core`]'s `DomId`).
 type Dom = u16;
@@ -316,17 +316,35 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
 }
 
 /// A local-respect counterexample: actor `actor` had no authorized channel to observer
-/// `observer`, yet `call` changed `obs(observer)`.
+/// `observer`, yet `transition` changed `obs(observer)`.
 #[derive(Clone, Debug)]
 pub struct NiViolation {
-    /// The domain that issued the transition.
+    /// The domain the transition is attributed to (its `caller`, or for the async agent the
+    /// domain it raises into — the `transition_actor` projection).
     pub actor: Dom,
     /// The domain whose observation changed without authorization.
     pub observer: Dom,
-    /// The hypercall that caused it.
-    pub call: HvCall,
-    /// The hypercall path from `new()` to the pre-state where it happened.
-    pub trace: Vec<(Dom, HvCall)>,
+    /// The transition that caused it.
+    pub transition: Transition,
+    /// The transition path from `new()` to the pre-state where it happened.
+    pub trace: Vec<Transition>,
+}
+
+/// The domain a [`Transition`] is **attributed to** for the local-respect check — the actor
+/// `b` in `¬(b ⇝ a) ⟹ obs(a)` unchanged.
+///
+/// A guest hypercall is attributed to its `caller`. The async EL2 agent
+/// ([`Transition::RaiseVcpuVirq`]) is not guest-issued, but for the isolation question the
+/// bridge asks — *can this transition move some other domain's observation?* — the domain
+/// whose state it touches is the right principal: it raises a virq on `dom`'s own port, so
+/// attributing it to `dom` and checking every observer `a ≠ dom` is exactly the test that the
+/// raise leaks into no *other* domain. (Whether `dom` "authorized" its own timer is not an
+/// isolation concern — a domain observing its own state move is definitionally fine.)
+fn transition_actor(t: &Transition) -> Dom {
+    match t {
+        Transition::Guest { caller, .. } => *caller,
+        Transition::RaiseVcpuVirq { dom, .. } => *dom,
+    }
 }
 
 /// The result of a non-interference sweep.
@@ -349,8 +367,8 @@ pub struct NiOutcome {
 /// the non-interference sweep can drive every transition from every reachable state and
 /// report a reproducible counterexample. Mirrors [`crate::enumerate::enumerate`]'s frontier
 /// loop; stops at `cfg.max_states`.
-fn reachable(cfg: &Config) -> Vec<(Hypervisor, Vec<(Dom, HvCall)>)> {
-    let universe = ops(cfg);
+fn reachable(cfg: &Config) -> Vec<(Hypervisor, Vec<Transition>)> {
+    let universe = transitions(cfg);
     let init = Hypervisor::new(
         cfg.domains,
         cfg.ports,
@@ -359,22 +377,22 @@ fn reachable(cfg: &Config) -> Vec<(Hypervisor, Vec<(Dom, HvCall)>)> {
         cfg.pcpus,
         cfg.frames,
     );
-    let mut seen: HashMap<Vec<u64>, Vec<(Dom, HvCall)>> = HashMap::new();
+    let mut seen: HashMap<Vec<u64>, Vec<Transition>> = HashMap::new();
     seen.insert(state_key(&init), Vec::new());
     let mut frontier = vec![(init, Vec::new())];
     for _ in 0..cfg.depth {
         let mut next = Vec::new();
         for (hv, trace) in &frontier {
-            for &(caller, call) in &universe {
+            for &transition in &universe {
                 let mut h = hv.clone();
-                let _: Result<HvOutcome, _> = h.dispatch(caller, call);
+                let _: Result<TransitionOutcome, _> = h.apply(transition);
                 let key = state_key(&h);
                 if !seen.contains_key(&key) {
                     if seen.len() >= cfg.max_states {
                         continue;
                     }
                     let mut t = trace.clone();
-                    t.push((caller, call));
+                    t.push(transition);
                     seen.insert(key, t.clone());
                     next.push((h, t));
                 }
@@ -399,8 +417,8 @@ fn reachable(cfg: &Config) -> Vec<(Hypervisor, Vec<(Dom, HvCall)>)> {
                 cfg.pcpus,
                 cfg.frames,
             );
-            for &(caller, call) in &trace {
-                let _: Result<HvOutcome, _> = h.dispatch(caller, call);
+            for &transition in &trace {
+                let _: Result<TransitionOutcome, _> = h.apply(transition);
             }
             (h, trace)
         })
@@ -416,24 +434,25 @@ fn reachable(cfg: &Config) -> Vec<(Hypervisor, Vec<(Dom, HvCall)>)> {
 /// and a positive `unauthorized_checks` (the property held, non-vacuously). Dropping a term
 /// from `ch` makes the check *find* the flow that term governs — the non-vacuity discipline.
 pub fn check(cfg: &Config, ch: Channels) -> NiOutcome {
-    let universe = ops(cfg);
+    let universe = transitions(cfg);
     let states = reachable(cfg);
     let n = cfg.domains as Dom;
     let mut checks = 0u64;
     let mut unauthorized_checks = 0u64;
 
     for (hv, trace) in &states {
-        for &(caller, call) in &universe {
+        for &transition in &universe {
+            let actor = transition_actor(&transition);
             // Project every observer's pre-image once, then compare against the post-image.
             let before: Vec<Vec<u64>> = (0..n).map(|a| obs(hv, a)).collect();
             let mut h = hv.clone();
-            let _: Result<HvOutcome, _> = h.dispatch(caller, call);
+            let _: Result<TransitionOutcome, _> = h.apply(transition);
             for a in 0..n {
-                if a == caller {
+                if a == actor {
                     continue;
                 }
                 checks += 1;
-                if ch.authorized(hv, caller, a) {
+                if ch.authorized(hv, actor, a) {
                     continue;
                 }
                 unauthorized_checks += 1;
@@ -444,9 +463,9 @@ pub fn check(cfg: &Config, ch: Channels) -> NiOutcome {
                         checks,
                         unauthorized_checks,
                         violation: Some(NiViolation {
-                            actor: caller,
+                            actor,
                             observer: a,
-                            call,
+                            transition,
                             trace: trace.clone(),
                         }),
                     };
@@ -526,6 +545,44 @@ mod tests {
             max_states: 400_000,
             symmetry: false,
         }
+    }
+
+    /// `ni_cfg` with the async EL2 agent folded into the swept universe (Phase I-1c).
+    fn ni_cfg_async(depth: u32) -> Config {
+        Config {
+            async_agent: true,
+            ..ni_cfg(depth)
+        }
+    }
+
+    /// **The async agent respects isolation (closes ledger 6c's NI half).** With
+    /// `Transition::RaiseVcpuVirq` in the swept universe — attributed to the domain it touches
+    /// ([`transition_actor`]) — local respect still holds under the full channel relation: the
+    /// raise moves only its own domain's port, so no observer `a ≠ dom` sees a change. This is
+    /// the machine-checked form of "same-domain-only, no cross-domain flow", and it is
+    /// non-vacuous (the raise is checked against unauthorized observers over every state where a
+    /// guest has bound a virq). Had the async path leaked into another domain, this would catch
+    /// it — the point of driving it through the bridge rather than asserting it by construction.
+    #[test]
+    fn local_respect_holds_with_the_async_agent_in_the_universe() {
+        assert!(
+            transitions(&ni_cfg_async(3))
+                .iter()
+                .any(|t| matches!(t, Transition::RaiseVcpuVirq { .. })),
+            "the async agent transition is not in the NI universe"
+        );
+        let out = check(&ni_cfg_async(3), Channels::full());
+        assert!(
+            out.violation.is_none(),
+            "the async agent created an unauthorized cross-domain flow: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(
+            out.unauthorized_checks > 1_000,
+            "async NI sweep near-vacuous: only {} unauthorized checks over {} states",
+            out.unauthorized_checks,
+            out.states
+        );
     }
 
     /// **The bridge, green (CI size).** Over every reachable state of the two-domain
