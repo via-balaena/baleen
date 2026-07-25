@@ -33,6 +33,7 @@ pub mod sched;
 
 pub use hypervisor::{
     Control, HvCall, HvError, HvOutcome, Hypervisor, Transition, TransitionOutcome,
+    HVCALL_VARIANT_COUNT,
 };
 
 use hv_hal::{GuestMemory, TimeSource};

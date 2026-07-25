@@ -45,9 +45,9 @@ use hv_core::p2m::{PageType, PtLevel};
 use hv_core::sched::RunState;
 use hv_core::{Control, HvCall, Hypervisor, Transition, TransitionOutcome};
 // Used only by the test-local guest-call enumerators (`enumerate` itself now drives `apply`,
-// whose outcome is `TransitionOutcome`).
+// whose outcome is `TransitionOutcome`) and the completeness census.
 #[cfg(test)]
-use hv_core::HvOutcome;
+use hv_core::{HvOutcome, HVCALL_VARIANT_COUNT};
 
 /// Which subsystems' hypercalls the enumeration drives, plus the tiny universe sizes.
 #[derive(Debug, Clone)]
@@ -1210,11 +1210,15 @@ mod tests {
             "the async agent transition was not emitted with async_agent = true"
         );
 
-        // (c) Every non-excluded guest hypercall variant is emitted. 31 = the 33 `HvCall`
-        // variants minus the 2 credit ops (the Excluded set). `coverage`'s wildcard-free match
-        // is the compiler backstop that keeps this arithmetic honest: a new `HvCall` variant
-        // cannot compile until it is classified there, forcing this count to be revisited.
-        const NON_EXCLUDED_HVCALL_VARIANTS: usize = 31;
+        // (c) Every non-excluded guest hypercall variant is emitted — the "Enumerated ⇒ emitted"
+        // direction, made a machine check by balancing against `hv_core::HVCALL_VARIANT_COUNT`
+        // (compiler-maintained via `strum::EnumCount`). NUM_EXCLUDED is the sole policy number:
+        // the count of transitions deliberately kept out of the sweep, exactly the credit ops
+        // (re-asserted by `census_excludes_exactly_the_credit_ops`). A variant added and classified
+        // `Enumerated` but never wired into `ops` bumps HVCALL_VARIANT_COUNT without bumping the
+        // emitted set, so this balance breaks — closing the residual that a bare count left open.
+        const NUM_EXCLUDED: usize = 2;
+        let expected_enumerated = HVCALL_VARIANT_COUNT - NUM_EXCLUDED;
         let distinct_guest: HashSet<_> = set
             .iter()
             .filter_map(|t| match t {
@@ -1224,10 +1228,12 @@ mod tests {
             .collect();
         assert_eq!(
             distinct_guest.len(),
-            NON_EXCLUDED_HVCALL_VARIANTS,
-            "transitions() emitted {} distinct guest variants, expected {} (33 HvCall - 2 credit)",
+            expected_enumerated,
+            "transitions() emitted {} distinct guest variants, expected {} ({} HvCall - {} excluded)",
             distinct_guest.len(),
-            NON_EXCLUDED_HVCALL_VARIANTS
+            expected_enumerated,
+            HVCALL_VARIANT_COUNT,
+            NUM_EXCLUDED
         );
     }
 
