@@ -33,10 +33,6 @@ allow = [
     # The NCSA (University of Illinois/NCSA) license covers the LLVM libFuzzer runtime that
     # `libfuzzer-sys` bundles for the `hv-fuzz` targets — permissive and Apache/MIT-compatible.
     "NCSA",
-    # `unicode-ident` (a transitive dep of `syn`, itself pulled by `hv-core`'s `strum::EnumCount`
-    # derive) is `(MIT OR Apache-2.0) AND Unicode-3.0`; the Unicode-3.0 term must be allowed
-    # explicitly. Permissive (the Unicode License v3), Apache/MIT-compatible.
-    "Unicode-3.0",
 ]
 confidence-threshold = 0.9
 

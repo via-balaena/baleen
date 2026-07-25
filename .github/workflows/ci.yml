@@ -85,6 +85,34 @@ jobs:
         working-directory: hv-fuzz
         run: cargo check --all-targets
 
+  # Machine-check the hypercall-vocabulary count with FIRST-PARTY rustc only. `hv-core` keeps its
+  # `HVCALL_VARIANT_COUNT` as a hand-written const so the verified core carries zero external
+  # dependencies (no proc-macro toolchain in its build). This job proves that const equals the true
+  # number of `HvCall` variants via the nightly `core::mem::variant_count` intrinsic — the sole
+  # place the completeness census's count is mechanically pinned, at PR time, without adding any
+  # third-party trust. See `hv-core`'s `HVCALL_VARIANT_COUNT` docs.
+  variant-count:
+    name: HvCall variant count (first-party)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: variant_count assertion (nightly, first-party)
+        run: cargo test -p hv-core --features variant_count_check hvcall_variant_count_is_current
+
   # Metal boot smoke-test (M3): build the standalone bare-metal `hv-metal` binary for
   # `aarch64-unknown-none-softfloat` and boot it on the QEMU `virt` machine at EL2. As of Arc 2 it
   # asserts the serial markers for the alive banner, `CurrentEL = EL2`, and — in the `--features

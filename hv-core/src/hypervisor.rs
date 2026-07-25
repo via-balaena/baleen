@@ -38,7 +38,7 @@ pub type DomId = u16;
 
 /// The core's typed, ABI-neutral hypercall vocabulary. A personality decodes a
 /// guest's wire-format call into one of these; the core never sees raw registers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumCount)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HvCall {
     /// Deposit credits into the caller's account.
     CreditGrant { amount: u32 },
@@ -240,16 +240,22 @@ pub enum HvCall {
     ControlRevoke { target: DomId, from: DomId },
 }
 
-/// The number of [`HvCall`] variants — the size of the guest hypercall vocabulary, maintained
-/// by the compiler via `strum::EnumCount` (so it cannot drift from the enum).
+/// The number of [`HvCall`] variants — the size of the guest hypercall vocabulary.
 ///
-/// `hv-sim`'s transition-list-completeness census uses this: it asserts the ∀-N enumerator
-/// drives exactly `HVCALL_VARIANT_COUNT` minus the declared exclusions (the credit ops). That
-/// balance is what makes "every non-excluded transition is actually swept" a machine check
-/// rather than an audit — a variant added and classified `Enumerated` but never wired into the
-/// enumerator bumps this count without bumping the emitted set, so the census fails. Exposed as
-/// a plain `usize` so consumers need no `strum` dependency of their own.
-pub const HVCALL_VARIANT_COUNT: usize = <HvCall as strum::EnumCount>::COUNT;
+/// `hv-sim`'s transition-list-completeness census balances against this: it asserts the ∀-N
+/// enumerator drives exactly `HVCALL_VARIANT_COUNT` minus the declared exclusions (the credit
+/// ops), so a variant added and classified `Enumerated` but never wired into the enumerator
+/// leaves the emitted set short of the count and the census fails.
+///
+/// The value is written by hand so the **verified core carries no external dependency** — no
+/// proc-macro derive, nothing executing in its build. It cannot silently drift: adding an
+/// `HvCall` variant is already a compile error in the exhaustive `dispatch`/`route` match and in
+/// `hv-sim`'s `coverage` census, and the dedicated **nightly CI job** (`variant_count_check`
+/// feature) mechanically proves `HVCALL_VARIANT_COUNT == core::mem::variant_count::<HvCall>()`
+/// using only first-party `rustc` — so the count is machine-verified with zero third-party trust.
+/// If you add or remove a variant: update this number, classify it in `hv-sim`'s `coverage`, and
+/// (if not excluded) wire it into `ops`.
+pub const HVCALL_VARIANT_COUNT: usize = 33;
 
 /// The success value of a routed hypercall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1843,6 +1849,22 @@ mod tests {
         )
         .unwrap();
         h
+    }
+
+    // Mechanically pins `HVCALL_VARIANT_COUNT` to the true number of `HvCall` variants using the
+    // first-party `core::mem::variant_count` intrinsic — no external dependency. Gated behind the
+    // `variant_count_check` feature (nightly only) and run by a dedicated required CI job, so the
+    // count is machine-verified at PR time while the stable/shipped build stays dependency-free. A
+    // stale count (a variant added/removed without updating the const) fails this assertion.
+    #[cfg(feature = "variant_count_check")]
+    #[test]
+    fn hvcall_variant_count_is_current() {
+        assert_eq!(
+            HVCALL_VARIANT_COUNT,
+            core::mem::variant_count::<HvCall>(),
+            "HVCALL_VARIANT_COUNT is stale: update it, and classify the new/removed variant in \
+             hv-sim's `coverage` census (and wire an added one into `ops`)"
+        );
     }
 
     // The `apply` seam must be a faithful re-spelling of the legacy entry points: routing a

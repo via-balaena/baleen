@@ -16,6 +16,10 @@
 //! machinery that checks it here is the machinery that will check those.
 
 #![no_std]
+// Nightly-only, opt-in: lets the `variant_count_check` test mechanically prove
+// `HVCALL_VARIANT_COUNT` via the first-party `core::mem::variant_count` intrinsic. Off in the
+// stable/shipped build, so this attribute is inert there and the crate needs no external crate.
+#![cfg_attr(feature = "variant_count_check", feature(variant_count))]
 
 // The event-channel state machine needs a dynamically sized port table, so the core
 // gains an `alloc` dependency at M2. Both implementations supply a global allocator

@@ -14,11 +14,14 @@ repository.workspace = true
 
 [dependencies]
 hv-hal = { path = "../hv-hal" }
-# The verified core's sole external dependency. `strum`'s `EnumCount` derive gives a
-# compiler-maintained count of `HvCall` variants (`HVCALL_VARIANT_COUNT`), which `hv-sim`'s
-# transition-list-completeness census uses to catch a variant added but never wired into the
-# ∀-N sweep. `default-features = false` keeps it `no_std`; only the derive feature is pulled.
-strum = { version = "0.26", default-features = false, features = ["derive"] }
+
+[features]
+# Opt-in, nightly-only: enables `#![feature(variant_count)]` so a test can mechanically prove
+# `HVCALL_VARIANT_COUNT` equals the true number of `HvCall` variants (`core::mem::variant_count`).
+# Kept off by default and out of the stable build, so the verified core carries ZERO external
+# dependencies and no proc-macro toolchain. The dedicated nightly CI job turns this on; see the
+# `HVCALL_VARIANT_COUNT` docs and `.github/workflows/ci.yml`.
+variant_count_check = []
 
 [lints]
 workspace = true
