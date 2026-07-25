@@ -985,6 +985,32 @@ impl Hypervisor {
         Ok(HvOutcome::Done)
     }
 
+    /// Raise a per-vCPU VIRQ for `dom` and report whether it is now **deliverable** — the
+    /// hypervisor-side signal for a bound VIRQ (the virtual timer, classically). Sets the
+    /// port's pending bit ([`evtchn::System::raise_virq`]), wakes its notify-target if the
+    /// signal made it deliverable (mirroring the private `evtchn_send`; a *masked* target stays
+    /// asleep until the later unmask), and returns the core's deliverability decision so the
+    /// HAL can perform the injection past the fence — **core decides, metal translates**.
+    ///
+    /// Unlike an event `send`, this is *not* an [`HvCall`]: a guest cannot raise its own
+    /// VIRQ (that is what `send`/[`evtchn::System::send_target`] refuse), so there is no
+    /// dispatch arm — the raiser is the hypervisor itself. The metal's asynchronous EL2
+    /// timer handler calls it directly, past the [`hv_hal::VcpuOps::inject_interrupt`] fence.
+    /// `WrongState` if `(vcpu, virq)` is unbound in `dom`.
+    pub fn raise_vcpu_virq(&mut self, dom: DomId, vcpu: Vcpu, virq: Virq) -> Result<bool, HvError> {
+        let port = self
+            .evtchn
+            .raise_virq(dom, vcpu, virq)
+            .map_err(HvError::Evtchn)?;
+        self.wake_if_deliverable(dom, port);
+        debug_assert!(
+            self.first_cross_violation().is_none(),
+            "cross-subsystem invariant violated after raise_vcpu_virq: {:?}",
+            self.first_cross_violation()
+        );
+        Ok(self.evtchn.deliverable(dom, port))
+    }
+
     /// Unmask a port, then deliver the wake it may have deferred. Unmasking an
     /// already-pending port is the *other* edge into deliverability (besides `send`):
     /// a vCPU that blocked while this port was pending-but-masked is stranded until the

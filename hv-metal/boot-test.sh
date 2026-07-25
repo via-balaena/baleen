@@ -220,6 +220,7 @@ boot_and_check "default" "" \
     "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
     "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF" \
     "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
+    "async EL2 timer handler drove hv-core evtchn (raise VIRQ -> deliverable -> inject via the realized fence); the async agent touched GUEST_HV under I1, no halt" \
     "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt" \
     "thesis non-interference OK: the disposable's probe of the vault secret -> translation fault" \
     "thesis channel enumeration: no grant, no event channel, no shared page-table link, no control edge between vault and disposable" \
@@ -296,6 +297,7 @@ boot_and_check "selftest" "--features selftest" \
     "PSCI SYSTEM_OFF — the guest powered off (serviced by the hypervisor)" \
     "PSCI TEST PASSED — the guest discovered PSCI (v1.1) and powered off via SYSTEM_OFF" \
     "timer tick OK: the guest took an asynchronous virtual-timer interrupt (INTID 27) at its EL1 vector" \
+    "async EL2 timer handler drove hv-core evtchn (raise VIRQ -> deliverable -> inject via the realized fence); the async agent touched GUEST_HV under I1, no halt" \
     "TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt" \
     "thesis non-interference OK: the disposable's probe of the vault secret -> translation fault" \
     "thesis channel enumeration: no grant, no event channel, no shared page-table link, no control edge between vault and disposable" \

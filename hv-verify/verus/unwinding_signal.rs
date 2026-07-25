@@ -17,6 +17,15 @@
 //! that is the **peer** the port names (`evtchn.rs::send_target`). So a step by `b` can move
 //! `obs(a)`'s pending bits only if `b` holds a port whose peer is one of `a`'s ports.
 //!
+//! **Re-audit for `evtchn.rs::raise_virq` (M5 Arc 7b).** A second transition now sets a pending
+//! bit — the hypervisor-side `raise_virq(dom, vcpu, virq)` (the vtimer). It does **not** widen
+//! this argument: a `Virq` port is bound *within* `dom` (`send_target` returns `None` for it —
+//! it has no foreign peer), so `raise_virq` can set pending only on `dom`'s **own** port, moving
+//! `obs(dom)` alone and never a *foreign* `obs(a)`. It is also not a guest `HvCall` (no dispatch
+//! arm — the raiser is the hypervisor on a hardware tick), so it is outside the guest-step
+//! transition system this lemma quantifies over. `EvtchnSend` therefore remains the *only*
+//! transition that can cross a domain boundary, and the involution bridge below is unaffected.
+//!
 //! The non-interference **channel relation** (`noninterference.rs`) is stated on `a`'s side:
 //! `b ⇝ a` via the signal channel iff **`a`** holds a port toward `b`. The transition acts
 //! from **`b`**'s side (`b`'s port toward `a`). Local respect therefore requires bridging the
