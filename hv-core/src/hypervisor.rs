@@ -486,6 +486,48 @@ pub struct Hypervisor {
     controls: Vec<Vec<Control>>,
 }
 
+/// The complete state-transition vocabulary of the integrated core — a *type-level*
+/// enumeration of every way [`Hypervisor`] state can move.
+///
+/// There are exactly two actors that mutate core state, and this enum names both:
+///  - a **guest**, via a decoded [`HvCall`] routed through the lifecycle gate
+///    ([`Self::Guest`]);
+///  - an **async EL2 agent**, raising a per-vCPU virtual IRQ into a domain
+///    ([`Self::RaiseVcpuVirq`]) — the vtimer-tick path realized in Arc 7b. This one is
+///    *not* an `HvCall`: it originates in the hypervisor, not a guest, so it never appears
+///    in the [`HvCall`] dispatch match and, before this type existed, escaped the
+///    transition list that the refinement and non-interference proofs quantify over.
+///
+/// [`Hypervisor::apply`] is the single seam that consumes a `Transition`, and its `match`
+/// is **exhaustive with no wildcard**. Adding a way for the core to change state therefore
+/// means adding a variant here, which fails to compile until `apply` handles it *and* until
+/// `hv-sim`'s coverage census classifies it (`hv-sim`'s `ops` enumerator produces exactly
+/// `Vec<Transition>`). That is what turns "the transition list is complete" from an audit
+/// argument (`docs/STAGE2-REFINEMENT-FORALL-N.md` §7.2) into a machine-checked fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    /// A guest hypercall issued by `caller`, routed through the lifecycle gate in
+    /// [`Hypervisor::dispatch`].
+    Guest { caller: DomId, call: HvCall },
+    /// An async agent raising virtual IRQ `virq` on domain `dom`'s `vcpu` — the Arc 7b
+    /// vtimer path, via [`Hypervisor::raise_vcpu_virq`]. Not guest-issued, so it carries no
+    /// `caller` and is subject to no lifecycle gate.
+    RaiseVcpuVirq { dom: DomId, vcpu: Vcpu, virq: Virq },
+}
+
+/// The result of applying a [`Transition`]. One variant per transition actor: a guest
+/// hypercall yields a rich [`HvOutcome`], while the async agent yields only a
+/// deliverability bit — so the unified seam reports each without flattening either into a
+/// lossy common type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionOutcome {
+    /// The outcome of a guest hypercall ([`Transition::Guest`]).
+    Guest(HvOutcome),
+    /// Whether the raised virtual IRQ is now deliverable to a blocked vCPU
+    /// ([`Transition::RaiseVcpuVirq`]).
+    RaiseVcpuVirq { deliverable: bool },
+}
+
 impl Hypervisor {
     /// A hypervisor of `num_domains` domains, each with `ports_per_domain`
     /// event-channel ports, `grants_per_domain` grant slots, and `vcpus_per_domain`
@@ -545,6 +587,29 @@ impl Hypervisor {
             self.first_cross_violation()
         );
         outcome
+    }
+
+    /// Apply one [`Transition`] to the core — the single seam every state mutation flows
+    /// through, guest hypercall and async agent alike. The `match` is **exhaustive over
+    /// [`Transition`] with no wildcard**, so the transition list cannot silently grow: a new
+    /// variant fails to compile until it is handled here.
+    ///
+    /// [`Self::dispatch`] and [`Self::raise_vcpu_virq`] predate this unified vocabulary and
+    /// remain as thin, signature-preserving entry points for the metal and the proof anchors
+    /// that call them; `apply` simply routes each `Transition` to the matching one. `hv-sim`'s
+    /// `∀`-N enumerator drives the core through *this* seam, so the set of transitions the
+    /// invariant/non-interference proofs quantify over is exactly the set of [`Transition`]
+    /// variants — no more (nothing is enumerated that the core cannot do) and, by the
+    /// exhaustive match, no fewer (nothing the core can do escapes the enumeration).
+    pub fn apply(&mut self, transition: Transition) -> Result<TransitionOutcome, HvError> {
+        match transition {
+            Transition::Guest { caller, call } => {
+                self.dispatch(caller, call).map(TransitionOutcome::Guest)
+            }
+            Transition::RaiseVcpuVirq { dom, vcpu, virq } => self
+                .raise_vcpu_virq(dom, vcpu, virq)
+                .map(|deliverable| TransitionOutcome::RaiseVcpuVirq { deliverable }),
+        }
     }
 
     fn route(&mut self, caller: DomId, call: HvCall) -> Result<HvOutcome, HvError> {
@@ -1767,6 +1832,55 @@ mod tests {
         )
         .unwrap();
         h
+    }
+
+    // The `apply` seam must be a faithful re-spelling of the legacy entry points: routing a
+    // `Transition` through `apply` yields the same outcome and the same resulting state as
+    // calling `dispatch`/`raise_vcpu_virq` directly. This is what lets the `∀`-N enumerator
+    // drive the core through the single `apply` seam without testing a different machine — the
+    // completeness census (`hv-sim`) is only meaningful if `apply` *is* the transitions.
+    #[test]
+    fn apply_routes_the_guest_transition_exactly_like_dispatch() {
+        let mut via_apply = hv();
+        let mut via_dispatch = via_apply.clone();
+
+        let call = HvCall::CreditGrant { amount: 50 };
+        let a = via_apply.apply(Transition::Guest { caller: 1, call });
+        let d = via_dispatch.dispatch(1, call);
+
+        assert_eq!(a, Ok(TransitionOutcome::Guest(HvOutcome::Balance(50))));
+        assert_eq!(
+            a.map(|o| match o {
+                TransitionOutcome::Guest(hv) => hv,
+                _ => unreachable!("guest transition yields a guest outcome"),
+            }),
+            d
+        );
+        assert_eq!(via_apply.balance(1), via_dispatch.balance(1));
+        assert!(via_apply.invariants_hold());
+    }
+
+    #[test]
+    fn apply_routes_the_async_agent_transition_exactly_like_raise_vcpu_virq() {
+        let mut via_apply = hv();
+        // Bind a per-vCPU virq the async agent can raise (dom 1, vcpu 0, virq 7).
+        via_apply
+            .dispatch(1, HvCall::EvtchnBindVirq { vcpu: 0, virq: 7 })
+            .unwrap();
+        let mut via_raise = via_apply.clone();
+
+        let a = via_apply.apply(Transition::RaiseVcpuVirq {
+            dom: 1,
+            vcpu: 0,
+            virq: 7,
+        });
+        let r = via_raise.raise_vcpu_virq(1, 0, 7);
+
+        assert_eq!(
+            a,
+            r.map(|deliverable| TransitionOutcome::RaiseVcpuVirq { deliverable })
+        );
+        assert!(via_apply.invariants_hold());
     }
 
     #[test]
