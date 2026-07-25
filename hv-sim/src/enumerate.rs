@@ -43,7 +43,11 @@ use std::collections::{HashMap, HashSet};
 use hv_core::evtchn::PortState;
 use hv_core::p2m::{PageType, PtLevel};
 use hv_core::sched::RunState;
-use hv_core::{Control, HvCall, HvOutcome, Hypervisor};
+use hv_core::{Control, HvCall, Hypervisor, Transition, TransitionOutcome};
+// Used only by the test-local guest-call enumerators (`enumerate` itself now drives `apply`,
+// whose outcome is `TransitionOutcome`).
+#[cfg(test)]
+use hv_core::HvOutcome;
 
 /// Which subsystems' hypercalls the enumeration drives, plus the tiny universe sizes.
 #[derive(Debug, Clone)]
@@ -66,6 +70,15 @@ pub struct Config {
     pub create: bool,
     pub destroy: bool,
     pub delegate: bool,
+    /// Drive the **async EL2 agent** transition ([`Transition::RaiseVcpuVirq`], the Arc 7b
+    /// vtimer path) as well as the guest hypercalls. Unlike the others this is not an op
+    /// *group* over `HvCall` — it is the one transition that is not guest-issued at all — so it
+    /// is gated on its own flag and left **off by default**: enabling it reaches states no guest
+    /// hypercall can (a port pending via `raise_virq`, not `send`), which is exactly the point
+    /// (it folds the async transition into the ∀-N invariant sweep — the half of ledger 6c the
+    /// enumerator can close), but it also shifts the reachable-state counts, so the existing
+    /// Tier-B saturation witnesses run with it off and a dedicated config turns it on.
+    pub async_agent: bool,
     /// Maximum hypercall depth from the initial state to explore.
     pub depth: u32,
     /// Safety cap: stop after this many distinct states (a partial result).
@@ -101,6 +114,7 @@ impl Config {
             create: false,
             destroy: false,
             delegate: false,
+            async_agent: false,
             depth: 5,
             max_states: 1_500_000,
             symmetry: false,
@@ -127,9 +141,9 @@ pub struct EnumOutcome {
     /// set bounded by the config's fixed sizes, so the distinct-state set is finite and BFS
     /// must eventually empty its frontier at *some* depth.
     pub saturated: bool,
-    /// A shortest counterexample: the hypercall path from `new()` to a state that
+    /// A shortest counterexample: the [`Transition`] path from `new()` to a state that
     /// violates the integrated invariant, or `None` if none exists within `depth`.
-    pub violation: Option<Vec<(u16, HvCall)>>,
+    pub violation: Option<Vec<Transition>>,
     /// If the counterexample is a **Stage-2 refinement** failure rather than (or as well as) a
     /// model-invariant failure, the specific way the emitted page table betrayed the model. `None`
     /// when the run was clean, or when the counterexample was a pure `invariants_hold` violation.
@@ -151,9 +165,9 @@ pub struct EnumOutcome {
 
 /// A canonical state fingerprint (see [`state_key`]).
 type StateKey = Vec<u64>;
-/// How each visited state was first reached: its parent state and the `(caller, call)`
-/// that produced it, or `None` for the root — enough to reconstruct a counterexample.
-type CameFrom = HashMap<StateKey, Option<(StateKey, u16, HvCall)>>;
+/// How each visited state was first reached: its parent state and the [`Transition`] that
+/// produced it, or `None` for the root — enough to reconstruct a counterexample.
+type CameFrom = HashMap<StateKey, Option<(StateKey, Transition)>>;
 
 /// The clock value stamped on every time-bearing op. Because `runtime`/`dispatched_at`
 /// are excluded from [`state_key`], its exact value never creates a distinct state, so a
@@ -360,6 +374,111 @@ pub(crate) fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
         }
     }
     v
+}
+
+/// The complete typed transition set the `∀`-N sweep drives: [`ops`] lifted into the unified
+/// [`Transition`] vocabulary, plus the async EL2 agent ([`Transition::RaiseVcpuVirq`]) when
+/// `cfg.async_agent` is set. [`enumerate`] drives the core through `apply(transition)` over
+/// *exactly* this set, so it is the transition list the invariant sweep quantifies over.
+///
+/// Pairing this with [`coverage`] is what makes transition-list completeness a machine-checked
+/// fact rather than an audit argument: `coverage` is an exhaustive `match` over [`Transition`]
+/// with no wildcard, so a transition added to the core (a new `Transition` variant) cannot
+/// compile until it is classified there, and the census tests then force every `Enumerated`
+/// variant to actually appear in this function's output. Nothing the core can do can silently
+/// stay out of the swept set.
+pub(crate) fn transitions(cfg: &Config) -> Vec<Transition> {
+    let mut v: Vec<Transition> = ops(cfg)
+        .into_iter()
+        .map(|(caller, call)| Transition::Guest { caller, call })
+        .collect();
+    if cfg.async_agent {
+        // The async EL2 agent raising a per-vCPU virq into each domain, over the tiny universe —
+        // the same `(vcpu, virq)` shape `ops` binds through `EvtchnBindVirq`, so a raise finds a
+        // live binding in exactly the states where a guest bound one.
+        let doms = cfg.domains as u16;
+        for dom in 0..doms {
+            for vcpu in 0..cfg.vcpus as u32 {
+                for virq in 0..2u8 {
+                    v.push(Transition::RaiseVcpuVirq { dom, vcpu, virq });
+                }
+            }
+        }
+    }
+    v
+}
+
+/// How the `∀`-N enumerator covers a [`Transition`] variant — the machine-checked half of
+/// transition-list completeness.
+//
+// Consumed by the `census_*` tests, but deliberately compiled in *every* build (not
+// `#[cfg(test)]`): the whole point is that `coverage`'s wildcard-free `match` fails to compile
+// the moment a `Transition`/`HvCall` variant is added without being classified, so even a plain
+// `cargo check` enforces the census. `allow(dead_code)` silences the non-test unused warning
+// without weakening that.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Coverage {
+    /// Driven by [`transitions`] (guest op group enabled, or `async_agent` for the async one).
+    Enumerated,
+    /// Deliberately kept out of the sweep, with a reason. The *only* excluded transitions are
+    /// the credit ops: credit is a per-domain conservation scalar that touches no cross-domain
+    /// or isolation state, so it is orthogonal to every invariant the sweep checks (see this
+    /// module's docs). Excluding it is a declared choice, re-asserted by
+    /// `census_excludes_exactly_the_credit_ops`, not a silent omission.
+    Excluded,
+}
+
+/// Classify **every** [`Transition`] variant — an exhaustive `match` with **no wildcard**. This
+/// is the compiler-enforced completeness census: adding a `Transition` variant (a new way the
+/// core can move state) fails to compile here until it is classified, and the `census_*` tests
+/// then force each `Enumerated` variant to actually appear in [`transitions`]. Together they
+/// close the transition-list-completeness residual (`docs/STAGE2-REFINEMENT-FORALL-N.md` §7.2):
+/// no transition the core can perform can stay out of the set the invariant sweep quantifies
+/// over, whether by an unclassified variant (caught here) or an unemitted one (caught there).
+#[allow(dead_code)]
+pub(crate) fn coverage(t: &Transition) -> Coverage {
+    match t {
+        // The guest hypercall vocabulary. Credit is the sole declared exclusion; every other
+        // `HvCall` variant is driven by `ops` under its op group. This inner match is itself
+        // wildcard-free, so a new `HvCall` variant also fails to compile until classified.
+        Transition::Guest { call, .. } => match call {
+            HvCall::CreditGrant { .. } | HvCall::CreditSpend { .. } => Coverage::Excluded,
+            HvCall::EvtchnAllocUnbound { .. }
+            | HvCall::EvtchnBindInterdomain { .. }
+            | HvCall::EvtchnBindVirq { .. }
+            | HvCall::EvtchnBindIpi { .. }
+            | HvCall::EvtchnClose { .. }
+            | HvCall::EvtchnSend { .. }
+            | HvCall::EvtchnMask { .. }
+            | HvCall::EvtchnUnmask { .. }
+            | HvCall::EvtchnConsume { .. }
+            | HvCall::GrantAccess { .. }
+            | HvCall::GrantEndAccess { .. }
+            | HvCall::GrantMap { .. }
+            | HvCall::GrantUnmap { .. }
+            | HvCall::GrantCopy { .. }
+            | HvCall::SchedAdmit { .. }
+            | HvCall::SchedRun { .. }
+            | HvCall::SchedPreempt { .. }
+            | HvCall::SchedBlock { .. }
+            | HvCall::SchedWake { .. }
+            | HvCall::SchedOffline { .. }
+            | HvCall::SchedSetAffinity { .. }
+            | HvCall::P2mAllocate { .. }
+            | HvCall::P2mFree { .. }
+            | HvCall::P2mPin { .. }
+            | HvCall::P2mUnpin { .. }
+            | HvCall::P2mLink { .. }
+            | HvCall::P2mUnlink { .. }
+            | HvCall::DomainCreate { .. }
+            | HvCall::DomainDestroy { .. }
+            | HvCall::ControlGrant { .. }
+            | HvCall::ControlRevoke { .. } => Coverage::Enumerated,
+        },
+        // The async EL2 agent — driven by `transitions` under `cfg.async_agent`.
+        Transition::RaiseVcpuVirq { .. } => Coverage::Enumerated,
+    }
 }
 
 fn level_tag(ty: Option<PageType>) -> u64 {
@@ -919,7 +1038,7 @@ fn canonical_key(sn: &Snapshot, grp: &[Perm]) -> Vec<u64> {
 /// the integrated invariant at each. Returns the distinct-state count and, if any state
 /// violates the invariant, a shortest hypercall path to it.
 pub fn enumerate(cfg: &Config) -> EnumOutcome {
-    let universe = ops(cfg);
+    let universe = transitions(cfg);
     let init = Hypervisor::new(
         cfg.domains,
         cfg.ports,
@@ -966,9 +1085,9 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
     for _ in 0..cfg.depth {
         let mut next: Vec<(StateKey, Hypervisor)> = Vec::new();
         for (_, hv) in &frontier {
-            for &(caller, call) in &universe {
+            for &transition in &universe {
                 let mut h = hv.clone();
-                let _: Result<HvOutcome, _> = h.dispatch(caller, call);
+                let _: Result<TransitionOutcome, _> = h.apply(transition);
                 // Two predicates at every reachable state: hv-core's own invariants, and the
                 // Stage-2 REFINEMENT — that the page table emitted from this state authorizes
                 // exactly what the model permits (no reachability without ownership or a grant).
@@ -989,7 +1108,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                 };
                 if !h.invariants_hold() || refinement.is_some() {
                     let key = keyfn(&h);
-                    came_from.insert(key.clone(), Some((keyfn(hv), caller, call)));
+                    came_from.insert(key.clone(), Some((keyfn(hv), transition)));
                     return EnumOutcome {
                         states: came_from.len(),
                         truncated,
@@ -1005,7 +1124,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                         truncated = true;
                         continue;
                     }
-                    came_from.insert(key.clone(), Some((keyfn(hv), caller, call)));
+                    came_from.insert(key.clone(), Some((keyfn(hv), transition)));
                     next.push((key, h));
                 }
             }
@@ -1030,12 +1149,12 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
     }
 }
 
-/// Reconstruct the hypercall path from the root to `key` by walking parent links.
-fn trace(came_from: &CameFrom, key: &[u64]) -> Vec<(u16, HvCall)> {
+/// Reconstruct the [`Transition`] path from the root to `key` by walking parent links.
+fn trace(came_from: &CameFrom, key: &[u64]) -> Vec<Transition> {
     let mut path = Vec::new();
     let mut cur = key.to_vec();
-    while let Some(Some((parent, caller, call))) = came_from.get(&cur) {
-        path.push((*caller, *call));
+    while let Some(Some((parent, transition))) = came_from.get(&cur) {
+        path.push(*transition);
         cur = parent.clone();
     }
     path.reverse();
@@ -1045,6 +1164,158 @@ fn trace(came_from: &CameFrom, key: &[u64]) -> Vec<(u16, HvCall)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------------------
+    // Phase I-1b — transition-list completeness census
+    //
+    // `coverage`'s wildcard-free match already guarantees (at compile time) that every
+    // `Transition` variant is *classified*. These tests guarantee the other direction — that
+    // every variant classified `Enumerated` is actually *emitted* into the swept universe by
+    // `transitions`, and that the async EL2 agent is folded into the invariant sweep. Together
+    // they turn "the transition list is complete" from an audit argument into a machine check.
+    // ---------------------------------------------------------------------------------------
+
+    /// Every op group on, plus the async agent — the one config that can emit the whole
+    /// transition vocabulary. Used by the census tests.
+    fn all_transitions_cfg() -> Config {
+        Config {
+            evtchn: true,
+            grant: true,
+            sched: true,
+            p2m: true,
+            create: true,
+            destroy: true,
+            delegate: true,
+            async_agent: true,
+            ..Config::tiny()
+        }
+    }
+
+    #[test]
+    fn census_transitions_emit_every_enumerated_variant_including_the_async_agent() {
+        let set = transitions(&all_transitions_cfg());
+
+        // (a) Nothing classified `Excluded` is ever driven: the credit ops must not leak into
+        // the swept universe (they are orthogonal to every invariant the sweep checks).
+        assert!(
+            set.iter().all(|t| coverage(t) == Coverage::Enumerated),
+            "an Excluded transition (credit) was emitted into the swept universe"
+        );
+
+        // (b) The async EL2 agent is present — the transition that is not an `HvCall` and, before
+        // Phase I-1, escaped the transition list entirely (ledger 6c).
+        assert!(
+            set.iter()
+                .any(|t| matches!(t, Transition::RaiseVcpuVirq { .. })),
+            "the async agent transition was not emitted with async_agent = true"
+        );
+
+        // (c) Every non-excluded guest hypercall variant is emitted. 31 = the 33 `HvCall`
+        // variants minus the 2 credit ops (the Excluded set). `coverage`'s wildcard-free match
+        // is the compiler backstop that keeps this arithmetic honest: a new `HvCall` variant
+        // cannot compile until it is classified there, forcing this count to be revisited.
+        const NON_EXCLUDED_HVCALL_VARIANTS: usize = 31;
+        let distinct_guest: HashSet<_> = set
+            .iter()
+            .filter_map(|t| match t {
+                Transition::Guest { call, .. } => Some(std::mem::discriminant(call)),
+                Transition::RaiseVcpuVirq { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            distinct_guest.len(),
+            NON_EXCLUDED_HVCALL_VARIANTS,
+            "transitions() emitted {} distinct guest variants, expected {} (33 HvCall - 2 credit)",
+            distinct_guest.len(),
+            NON_EXCLUDED_HVCALL_VARIANTS
+        );
+    }
+
+    #[test]
+    fn census_excludes_exactly_the_credit_ops() {
+        // The declared exclusion set is exactly {CreditGrant, CreditSpend} — asserted directly on
+        // `coverage` so growing it is a deliberate, reviewed change, not a silent omission.
+        assert_eq!(
+            coverage(&Transition::Guest {
+                caller: 0,
+                call: HvCall::CreditGrant { amount: 1 }
+            }),
+            Coverage::Excluded
+        );
+        assert_eq!(
+            coverage(&Transition::Guest {
+                caller: 0,
+                call: HvCall::CreditSpend { amount: 1 }
+            }),
+            Coverage::Excluded
+        );
+        // A representative non-credit guest op and the async agent are both Enumerated.
+        assert_eq!(
+            coverage(&Transition::Guest {
+                caller: 0,
+                call: HvCall::P2mAllocate { mfn: 0 }
+            }),
+            Coverage::Enumerated
+        );
+        assert_eq!(
+            coverage(&Transition::RaiseVcpuVirq {
+                dom: 0,
+                vcpu: 0,
+                virq: 0
+            }),
+            Coverage::Enumerated
+        );
+    }
+
+    #[test]
+    fn async_agent_off_leaves_the_guest_universe_unchanged() {
+        // With the async flag off, `transitions` is exactly `ops` re-spelled as `Transition::Guest`
+        // — so every existing Tier-B saturation witness runs over an identical universe.
+        let cfg = Config {
+            async_agent: false,
+            ..all_transitions_cfg()
+        };
+        let guest = ops(&cfg);
+        let set = transitions(&cfg);
+        assert_eq!(set.len(), guest.len(), "async-off must add no transitions");
+        for (t, &(caller, call)) in set.iter().zip(guest.iter()) {
+            assert_eq!(*t, Transition::Guest { caller, call });
+        }
+    }
+
+    #[test]
+    fn async_agent_transition_is_swept_and_preserves_invariants() {
+        // Fold the async EL2 agent into the ∀-N invariant sweep. Enabling it reaches states no
+        // guest hypercall can — a virq port pending via `raise_virq`, not `send` — so the reachable
+        // set strictly grows, and *every* new state is proven to satisfy the integrated invariant.
+        // This is the half of ledger 6c the enumerator can close.
+        let off = enumerate(&evtchn_sched_cfg(4));
+        let mut on_cfg = evtchn_sched_cfg(4);
+        on_cfg.async_agent = true;
+        let on = enumerate(&on_cfg);
+
+        assert!(
+            off.violation.is_none(),
+            "guest-only sweep violated: {:?}",
+            off.violation
+        );
+        assert!(
+            on.violation.is_none(),
+            "async-agent sweep violated: {:?}",
+            on.violation
+        );
+        assert!(
+            !off.truncated && !on.truncated,
+            "a sweep truncated; adjust depth/cap"
+        );
+        // Anti-vacuity: the async transition genuinely reaches new reachable states.
+        assert!(
+            on.states > off.states,
+            "async agent reached no new state ({} on vs {} off) — the raise was vacuous",
+            on.states,
+            off.states
+        );
+    }
 
     // Run an enumeration and assert it closed (not truncated) with no invariant
     // violation, returning the distinct-state count. For the CI-sized configs.
