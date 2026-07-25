@@ -31,7 +31,9 @@ pub mod policy;
 pub mod prng;
 pub mod sched;
 
-pub use hypervisor::{Control, HvCall, HvError, HvOutcome, Hypervisor};
+pub use hypervisor::{
+    Control, HvCall, HvError, HvOutcome, Hypervisor, Transition, TransitionOutcome,
+};
 
 use hv_hal::{GuestMemory, TimeSource};
 
