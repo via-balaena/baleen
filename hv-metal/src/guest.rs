@@ -1711,10 +1711,12 @@ pub struct GuestFrame {
 /// **Scope:** the FP/SIMD registers (`v0..v31`) are deliberately NOT part of the saved context — the
 /// scheduler guests are integer-register-only. A future FP-using guest would need `v0..v31` added here
 /// (and to `__enter_guest_ctx`), or two such guests would silently cross-leak FP state across a switch.
-/// The **vGIC list registers** were the same latent omission until M5 Arc 7c added `ich_lr0` below: a
-/// pending virtual interrupt lives in `ICH_LR0_EL2`, per-vCPU state the hardware does not swap, so two
-/// interrupt-carrying vCPUs would have cross-leaked it across a switch. Only LR0 is saved because
-/// [`gic::inject`] only ever populates LR0; a future multi-LR injector must widen this (like FP).
+/// The **vGIC list registers** were the same latent omission until M5 Arc 7c/8b added the `ich_lr`
+/// bank below: pending virtual interrupts live in `ICH_LR<0..N>_EL2`, per-vCPU state the hardware does
+/// not swap, so interrupt-carrying vCPUs would have cross-leaked them across a switch. The whole
+/// implemented bank (`gic::num_list_registers()`) is saved/restored, so up to N interrupts can be
+/// simultaneously pending per vCPU without loss — the multi-LR case 7c's single `ich_lr0` could not
+/// represent. (The FP registers remain the standing example of the same, still-unsaved, class.)
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GuestContext {
@@ -1730,10 +1732,12 @@ struct GuestContext {
     spsr_el2: u64,
     /// `SCTLR_EL1` — the guest's EL1 system control (MMU/cache enables etc.).
     sctlr_el1: u64,
-    /// `ICH_LR0_EL2` — this vCPU's pending virtual interrupt (M5 Arc 7c). Saved/restored by the Rust
-    /// [`save_context`]/[`restore_context`], NOT the asm — it sits *after* the asm-bound offsets
-    /// (@280), so `__enter_guest_ctx` never touches it and its layout assumptions are unchanged.
-    ich_lr0: u64,
+    /// `ICH_LR<0..N>_EL2` — this vCPU's pending-interrupt **bank** (M5 Arc 7c → 8b). The whole set of
+    /// list registers is per-vCPU state the hardware does not swap; [`save_context`]/[`restore_context`]
+    /// carry the `gic::num_list_registers()` implemented entries `[0..N)`. Sized to the architectural
+    /// max (16) and saved/restored by Rust, NOT the asm — it sits *after* the asm-bound offsets (@280),
+    /// so `__enter_guest_ctx` never touches it and its layout assumptions are unchanged.
+    ich_lr: [u64; gic::MAX_LIST_REGISTERS],
 }
 
 impl GuestContext {
@@ -1743,7 +1747,7 @@ impl GuestContext {
         elr_el2: 0,
         spsr_el2: 0,
         sctlr_el1: 0,
-        ich_lr0: 0,
+        ich_lr: [0; gic::MAX_LIST_REGISTERS],
     };
 }
 
@@ -1756,9 +1760,9 @@ const _: () = {
     assert!(core::mem::offset_of!(GuestContext, elr_el2) == 256);
     assert!(core::mem::offset_of!(GuestContext, spsr_el2) == 264);
     assert!(core::mem::offset_of!(GuestContext, sctlr_el1) == 272);
-    // Arc 7c: `ich_lr0` sits *past* the last asm-referenced field (@272), so `__enter_guest_ctx`
-    // (which reads through offset 272) is untouched by the addition — the LRs are Rust-only state.
-    assert!(core::mem::offset_of!(GuestContext, ich_lr0) == 280);
+    // Arc 7c/8b: the `ich_lr` bank sits *past* the last asm-referenced field (@272), so
+    // `__enter_guest_ctx` (which reads through offset 272) is untouched — the LRs are Rust-only state.
+    assert!(core::mem::offset_of!(GuestContext, ich_lr) == 280);
 };
 
 static VCPU_CTX: BootCell<[GuestContext; NUM_VCPUS_METAL]> =
@@ -1985,7 +1989,17 @@ impl hv_hal::VcpuOps for ArmVcpu {
     fn inject_interrupt(&mut self, vector: u8) {
         // The `u8` vector is a vGIC vINTID (Arc 7a exercises INTID 42). The trait's `u8` cannot
         // express SPIs > 255 — recorded in the Arc-7 ledger as a HAL-fence limit, not a metal one.
-        gic::inject(vector as u32);
+        // Arc 8b: `inject` allocates a free list register; a full bank is reported, not silently
+        // dropped. The software pending queue is deferred, so halt loudly rather than lose a vINT
+        // (the metal has too few interrupt sources to fill the bank today — this never fires).
+        if !gic::inject(vector as u32) {
+            let mut uart = crate::uart();
+            let _ = writeln!(
+                uart,
+                "baleen: vGIC list-register bank full injecting vINT {vector} — software pending queue deferred (Arc 8b); halting"
+            );
+            crate::park();
+        }
     }
 
     fn set_entry(&mut self, entry: u64) {
@@ -2337,9 +2351,13 @@ fn write_sysctx(sp_el1: u64, elr: u64, spsr: u64, sctlr: u64) {
 /// into `VCPU_CTX[vcpu]` (M5 Arc 1).
 fn save_context(vcpu: usize, frame: &GuestFrame) {
     let (sp_el1, elr, spsr, sctlr) = read_sysctx();
-    // Arc 7c: capture the outgoing vCPU's pending virtual interrupt (LR0) *before* the incoming
-    // vCPU's restore overwrites the live `ICH_LR0_EL2`, so a pending vINT rides the switch with it.
-    let ich_lr0 = gic::read_lr0();
+    // Arc 7c/8b: capture the outgoing vCPU's whole pending-interrupt bank *before* the incoming vCPU's
+    // restore overwrites the live list registers, so every pending vINT rides the switch with it.
+    let n = gic::num_list_registers();
+    let mut ich_lr = [0u64; gic::MAX_LIST_REGISTERS];
+    for (i, slot) in ich_lr.iter_mut().enumerate().take(n) {
+        *slot = gic::read_lr(i);
+    }
     let mut ctxs = VCPU_CTX.borrow_mut();
     let ctx = &mut ctxs[vcpu];
     ctx.x = frame.x;
@@ -2347,7 +2365,7 @@ fn save_context(vcpu: usize, frame: &GuestFrame) {
     ctx.elr_el2 = elr;
     ctx.spsr_el2 = spsr;
     ctx.sctlr_el1 = sctlr;
-    ctx.ich_lr0 = ich_lr0;
+    ctx.ich_lr = ich_lr;
 }
 
 /// Restore a vCPU's context — GPRs into the trampoline `frame` (so its `ldp`+`eret` resumes that
@@ -2360,10 +2378,13 @@ fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
     let ctx = VCPU_CTX.borrow_mut()[vcpu];
     frame.x = ctx.x;
     write_sysctx(ctx.sp_el1, ctx.elr_el2, ctx.spsr_el2, ctx.sctlr_el1);
-    // Arc 7c: restore this vCPU's own pending virtual interrupt (its saved LR0), so it resumes with
-    // exactly the vINT state it left — and, crucially, the incoming vCPU does NOT inherit the outgoing
-    // one's (a switch to a vCPU with no pending vINT writes 0, clearing the peer's).
-    gic::write_lr0(ctx.ich_lr0);
+    // Arc 7c/8b: restore this vCPU's own pending-interrupt bank (its saved list registers), so it
+    // resumes with exactly the vINTs it left — and the incoming vCPU does NOT inherit the outgoing
+    // one's (a switch to a vCPU with fewer pending vINTs writes 0 over the peer's higher LRs).
+    let n = gic::num_list_registers();
+    for (i, &lr) in ctx.ich_lr.iter().enumerate().take(n) {
+        gic::write_lr(i, lr);
+    }
     set_vttbr_no_flush(vcpu_meta(vcpu).vttbr);
 }
 
@@ -4888,57 +4909,79 @@ fn finish_timer_irq_test(uart: &mut Pl011) -> ! {
     crate::park();
 }
 
-/// **The Arc-7c per-vCPU vGIC LR-ownership witness (`selftest` builds).** A pending virtual interrupt
-/// lives in `ICH_LR0_EL2` — per-vCPU state the hardware does not swap on a world switch — so
-/// [`save_context`]/[`restore_context`] now carry it in [`GuestContext::ich_lr0`]. Assert that carry
-/// gives each vCPU its OWN LR0 across a switch: a vINT injected for slot 0, then a switch to slot 1
-/// (which had none), must leave LR0 EMPTY — slot 1 does **not** inherit slot 0's interrupt — and a
-/// switch back to slot 0 must find its vINT PRESERVED. Both halves matter: a restore that failed to
-/// write the LR would leak the peer's pending vINT (isolation half); a save that dropped it would lose
-/// the vCPU's own on resume (preservation half). Neither degenerate switch can print this marker.
+/// The base vINTID the Arc-8b LR-bank witness fans out across the list registers (distinct SPIs
+/// `BASE..BASE+N`, all fitting the LR vINTID field and staying clear of the live INTIDs 27/42).
+#[cfg(feature = "selftest")]
+const SELFTEST_LR_BASE_INTID: u32 = 96;
+
+/// **The Arc-7c/8b per-vCPU vGIC LR-**bank** ownership witness (`selftest` builds).** The pending
+/// virtual interrupts live in the `ICH_LR<0..N>_EL2` bank — per-vCPU state the hardware does not swap
+/// on a world switch — so [`save_context`]/[`restore_context`] carry the whole implemented bank in
+/// [`GuestContext::ich_lr`]. Assert that carry gives each vCPU its OWN bank across a switch:
 ///
-/// Exercises the real `gic::read_lr0`/`write_lr0` the switch uses, over two synthetic per-vCPU LR slots
-/// (mirroring `GuestContext::ich_lr0` for slots 0/1) so it cannot perturb live guest state; it enables
-/// only the LR sysreg interface (no `IMO`), and clears LR0 before returning so no phantom vINT bleeds
-/// into the first real phase.
+/// 1. slot 0 **fills every LR** (N distinct pending vINTs) via the allocating [`gic::inject`] — each
+///    finds a free LR, none overwrites another (the multi-LR capacity 7c's single-LR0 lacked);
+/// 2. with the bank full, the next injection is **reported full**, not silently clobbering a pending
+///    vINT (the deferred-overflow boundary made loud, not silent);
+/// 3. a switch to slot 1 (no pending interrupts) leaves the bank EMPTY — slot 1 inherits none of
+///    slot 0's N interrupts (isolation);
+/// 4. a switch back to slot 0 finds all N vINTs PRESERVED, each in order (no loss).
+///
+/// Exercises the real `gic::read_lr`/`write_lr`/`inject`/`num_list_registers` the switch and injector
+/// use, over the live registers (which no guest is using this early in boot); it enables only the LR
+/// sysreg interface (no `IMO`) and clears the bank before returning so no phantom vINT bleeds into the
+/// first real phase.
 #[cfg(feature = "selftest")]
 pub(crate) fn selftest_vgic_lr_ownership(uart: &mut Pl011) {
     gic::enable_lr_sysreg_access();
+    let n = gic::num_list_registers();
+    let base = SELFTEST_LR_BASE_INTID;
 
-    // Two synthetic per-vCPU LR stores — exactly the role `GuestContext::ich_lr0` plays for slots 0/1.
-    let mut lr = [0u64; 2];
+    // Start from a clear bank.
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
 
-    // Slot 0 acquires a pending virtual interrupt (INTID 42), as an injection would produce.
-    gic::inject(GIC_TEST_INTID);
-    // --- context switch 0 -> 1 (the steps `save_context(0)` then `restore_context(1)` perform) ---
-    lr[0] = gic::read_lr0(); // save_context(0): capture slot 0's pending vINT
-    gic::write_lr0(lr[1]); // restore_context(1): slot 1 had none, so LR0 is overwritten with 0
-    let slot1_lr = gic::read_lr0();
+    // (1) slot 0 fills the whole bank: N distinct pending vINTs, each allocated to a free LR.
+    let mut all_placed = true;
+    for k in 0..n {
+        all_placed &= gic::inject(base + k as u32);
+    }
+    // (2) bank full: the next injection reports failure rather than clobbering a pending vINT.
+    let overflow_reported = !gic::inject(base + n as u32);
 
-    // Slot 1 acquires its OWN pending virtual interrupt (INTID 27), distinct from slot 0's.
-    gic::inject(gic::VTIMER_INTID);
-    // --- context switch 1 -> 0 ---
-    lr[1] = gic::read_lr0(); // save_context(1)
-    gic::write_lr0(lr[0]); // restore_context(0): slot 0's saved vINT restored
-    let slot0_lr = gic::read_lr0();
+    // Save slot 0's full bank (what `save_context` does).
+    let mut slot0 = [0u64; gic::MAX_LIST_REGISTERS];
+    for (i, s) in slot0.iter_mut().enumerate().take(n) {
+        *s = gic::read_lr(i);
+    }
 
-    // Leave LR0 clean so no phantom pending vINT bleeds into the first real phase.
-    gic::write_lr0(0);
+    // (3) --- switch to slot 1 (no pending interrupts): restore zeros over the whole bank ---
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
+    let slot1_sees_none = (0..n).all(|i| gic::lr_is_free(gic::read_lr(i)));
 
-    let vintid = |lr: u64| lr & 0xffff_ffff; // the LR_VINTID field, bits [31:0]
-    let no_inherit = vintid(slot1_lr) != GIC_TEST_INTID as u64; // slot 1 did NOT inherit slot 0's vINT
-    let preserved = vintid(slot0_lr) == GIC_TEST_INTID as u64; // slot 0's vINT survived the round trip
-    let distinct = vintid(lr[1]) == gic::VTIMER_INTID as u64; // slot 1 carried its own, distinct vINT
+    // (4) --- switch back to slot 0: restore its saved bank ---
+    for (i, &lr) in slot0.iter().enumerate().take(n) {
+        gic::write_lr(i, lr);
+    }
+    let slot0_preserved = (0..n).all(|i| gic::lr_vintid(gic::read_lr(i)) == base + i as u32);
 
-    if no_inherit && preserved && distinct {
+    // Leave the bank clean so no phantom vINT bleeds into the first real phase.
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
+
+    if all_placed && overflow_reported && slot1_sees_none && slot0_preserved {
         let _ = writeln!(
             uart,
-            "baleen: selftest: vGIC LR ownership OK (a switched-in vCPU does not inherit the peer's pending vINT; its own is preserved across the switch)"
+            "baleen: selftest: vGIC LR-bank ownership OK ({n} LRs filled; a switched-in vCPU inherits none, its own {n} pending vINTs are preserved, a full bank is reported not clobbered)"
         );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: selftest: vGIC LR ownership FAIL (no_inherit={no_inherit} preserved={preserved} distinct={distinct}); halting"
+            "baleen: selftest: vGIC LR-bank ownership FAIL (n={n} placed={all_placed} overflow={overflow_reported} none={slot1_sees_none} preserved={slot0_preserved}); halting"
         );
         crate::park();
     }
