@@ -233,6 +233,14 @@ pub extern "C" fn rust_main() -> ! {
     #[cfg(feature = "selftest")]
     cell::selftest_irq_masked(&mut uart);
 
+    // (6d) M5 Arc 7c — per-vCPU vGIC LR-ownership witness. A pending virtual interrupt lives in
+    //      `ICH_LR0_EL2`, per-vCPU state the hardware does not swap; the context switch now carries it
+    //      (`GuestContext::ich_lr0`). This asserts a switched-in vCPU does NOT inherit the peer's
+    //      pending vINT and its own survives the round trip — closing the same class of latent leak the
+    //      FP-register scope note names. Enables only the LR sysreg interface (no IMO); clears LR0 after.
+    #[cfg(feature = "selftest")]
+    guest::selftest_vgic_lr_ownership(&mut uart);
+
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven
     //     `p2m`, run the Arc-5 authorize/deny isolation matrix (the proof touches reality), then the
     //     M5 Arc 0 LIFECYCLE phase — destroy the guest and reborn a fresh domain in the same slot,
