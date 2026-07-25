@@ -266,6 +266,32 @@ impl System {
         }
     }
 
+    /// Raise a per-vCPU VIRQ: set the `pending` bit on the port bound to `(vcpu, virq)`
+    /// in `dom`. This is the **hypervisor-side** counterpart to [`Self::send`]: a guest
+    /// `send`s on interdomain/IPI ports, but a VIRQ is *raised by the hypervisor* (the
+    /// virtual timer, classically — Xen's `send_guest_vcpu_virq`) and never sent by the
+    /// guest, which is exactly why `send`/[`Self::send_target`] reject `Virq`. Returns the
+    /// port raised so the caller can wake/deliver its notify-target. `WrongState` if no
+    /// port in `dom` binds `(vcpu, virq)` — raising an unbound VIRQ mutates nothing.
+    ///
+    /// Invariant-preserving by construction: `pending` is set only on a *bound* `Virq`
+    /// port, so none of `FreePortHasSignal` / `ReciprocityBroken` / `UnboundGhostDomain` /
+    /// `DuplicateVirq` can be introduced — the same argument that lets [`Self::send`] set a
+    /// target's pending bit.
+    pub fn raise_virq(&mut self, dom: DomId, vcpu: Vcpu, virq: Virq) -> Result<Port, EvtchnError> {
+        let d = self.domain(dom)?;
+        let port = d
+            .ports
+            .iter()
+            .position(|c| {
+                matches!(c.state, PortState::Virq { vcpu: v, virq: q } if v == vcpu && q == virq)
+            })
+            .ok_or(EvtchnError::WrongState)? as Port;
+        self.chan_mut(dom, port).unwrap().pending = true;
+        self.check_invariants();
+        Ok(port)
+    }
+
     /// Mask a bound port (suppresses delivery, not the pending bit).
     pub fn mask(&mut self, dom: DomId, port: Port) -> Result<(), EvtchnError> {
         self.set_masked(dom, port, true)
@@ -657,6 +683,32 @@ mod tests {
         let v = s.bind_virq(0, 0, 1).unwrap();
         assert_eq!(s.send(0, v), Err(EvtchnError::WrongState));
         assert_eq!(s.send(0, 7), Err(EvtchnError::WrongState)); // a free port
+    }
+
+    #[test]
+    fn raise_virq_is_the_hypervisor_side_signal() {
+        let mut s = sys();
+        let v = s.bind_virq(0, 0, 27).unwrap(); // the vtimer VIRQ, classically
+        assert!(!s.deliverable(0, v)); // freshly bound: not pending
+
+        // The hypervisor raises it (what `send` refuses for a guest): pending -> deliverable.
+        assert_eq!(s.raise_virq(0, 0, 27), Ok(v));
+        assert!(s.deliverable(0, v));
+
+        // Masking suppresses delivery but not the pending bit (the mask/pending split).
+        s.mask(0, v).unwrap();
+        assert!(!s.deliverable(0, v));
+        s.unmask(0, v).unwrap();
+        assert!(s.deliverable(0, v));
+
+        // Consuming (the guest acking) clears it.
+        assert_eq!(s.consume(0, v), Ok(true));
+        assert!(!s.deliverable(0, v));
+
+        // Raising a (vcpu, virq) that no port binds is WrongState and mutates nothing.
+        assert_eq!(s.raise_virq(0, 1, 27), Err(EvtchnError::WrongState));
+        assert_eq!(s.raise_virq(0, 0, 99), Err(EvtchnError::WrongState));
+        assert_eq!(s.first_violation(), None);
     }
 
     #[test]

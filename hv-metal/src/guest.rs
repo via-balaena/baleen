@@ -392,6 +392,9 @@ const NR_BLK_FINAL: u64 = 0xe3;
 
 /// The domain running the vGIC test guest (a fresh `Hypervisor` for this phase).
 const GIC_DOM: DomId = 1;
+/// The vCPU the timer-tick phase (5d/7b) binds the virtual-timer VIRQ to and raises it on — the
+/// single-vCPU guest runs as vCPU 0. `evtchn::Vcpu` (a `u32`) so it feeds `raise_vcpu_virq` directly.
+const TIMER_IRQ_VCPU: hv_core::evtchn::Vcpu = 0;
 /// The guest's page-table root (the only frame it needs — it touches no guest data memory).
 const F_GIC_ROOT: Mfn = 1;
 /// The virtual INTID the hypervisor injects and the guest must acknowledge (an arbitrary SPI).
@@ -1646,6 +1649,11 @@ static TIMER_IRQ_FIRED: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 5d: the guest TOOK the timer tick at its EL1 IRQ vector with the virtual-timer INTID (the full
 /// physical-IRQ → EL2 → inject → guest-vIRQ path — a real hardware-driven timer tick).
 static TIMER_IRQ_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Arc 7b: the ASYNC EL2 timer handler routed the injection through hv-core's proven evtchn — it
+/// claimed `GUEST_HV` (safe under I1), raised the vtimer VIRQ, and hv-core's deliverability decision
+/// (`pending && !masked`) came back true, so the realized fence injected. The witness that an async EL2
+/// agent touched the proven brain and translated its decision — no halt.
+static GIC_ASYNC_VIRQ_OK: AtomicBool = AtomicBool::new(false);
 
 /// M5 Arc 6: the disposable's authorized write landed AND its probe of the vault secret did NOT read it
 /// (`x1`==sentinel, `x2`!=secret) — the disposable never obtained the secret.
@@ -1921,7 +1929,33 @@ extern "C" fn handle_guest_irq(_frame: *mut GuestFrame) {
     if intid == gic::VTIMER_INTID {
         gic::disable_vtimer(); // one-shot: stop the level-triggered PPI re-asserting after EOI
         TIMER_IRQ_FIRED.store(true, Ordering::Relaxed);
-        gic::inject(gic::VTIMER_INTID); // hand the guest its own virtual timer interrupt
+
+        // M5 Arc 7b: the FIRST asynchronous EL2 agent to touch hv-core state, and it is safe by the
+        // I1 argument — this is an EL2 exception handler (so physical IRQ is masked, and no EL2 path
+        // unmasks) and the run loop dropped every `BootCell` claim before `eret`, so while the guest
+        // ran no borrow was live: the claim here always wins, never halts. Route the injection through
+        // the proven evtchn seam — the core DECIDES deliverability (raise the vtimer VIRQ, read back
+        // `pending && !masked`), the metal TRANSLATES it (inject only if so), past the HAL fence.
+        let mut uart = crate::uart();
+        let mut cell = GUEST_HV.borrow_mut();
+        let hv = hv_or_halt(&mut cell, &mut uart, "timer-irq async inject");
+        match hv.raise_vcpu_virq(GIC_DOM, TIMER_IRQ_VCPU, gic::VTIMER_INTID as u8) {
+            Ok(deliverable) => {
+                drop(cell); // release the model claim before the injection (the fence touches no cell)
+                if deliverable {
+                    use hv_hal::VcpuOps;
+                    ArmVcpu.inject_interrupt(gic::VTIMER_INTID as u8);
+                    GIC_ASYNC_VIRQ_OK.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: timer-irq: raising the vtimer VIRQ failed ({e:?}) — the phase did not bind it; halting"
+                );
+                crate::park();
+            }
+        }
     }
     // INTID 1023 (spurious) or anything else: just complete it.
     if intid < 1020 {
@@ -4811,7 +4845,14 @@ fn timer_irq_report(frame: &mut GuestFrame, uart: &mut Pl011) {
 fn finish_timer_irq_test(uart: &mut Pl011) -> ! {
     let fired = TIMER_IRQ_FIRED.load(Ordering::Relaxed);
     let taken = TIMER_IRQ_OK.load(Ordering::Relaxed);
-    if fired && taken {
+    // M5 Arc 7b: the tick's injection was decided by hv-core's proven evtchn deliverability, driven
+    // from the async EL2 handler that claimed `GUEST_HV` under I1 (see `handle_guest_irq`).
+    let via_evtchn = GIC_ASYNC_VIRQ_OK.load(Ordering::Relaxed);
+    if fired && taken && via_evtchn {
+        let _ = writeln!(
+            uart,
+            "baleen: async EL2 timer handler drove hv-core evtchn (raise VIRQ -> deliverable -> inject via the realized fence); the async agent touched GUEST_HV under I1, no halt"
+        );
         let _ = writeln!(
             uart,
             "baleen: TIMER TICK TEST PASSED — a physical timer interrupt reached EL2 and was delivered to the guest as a virtual interrupt"
@@ -4822,7 +4863,7 @@ fn finish_timer_irq_test(uart: &mut Pl011) -> ! {
     }
     let _ = writeln!(
         uart,
-        "baleen: TIMER TICK TEST FAILED (fired={fired} taken={taken})"
+        "baleen: TIMER TICK TEST FAILED (fired={fired} taken={taken} via_evtchn={via_evtchn})"
     );
     crate::park();
 }
@@ -4833,6 +4874,24 @@ fn finish_timer_irq_test(uart: &mut Pl011) -> ! {
 /// inject path to the guest's EL1 vector. Never returns.
 fn begin_timer_irq_phase(uart: &mut Pl011) -> ! {
     gic_fresh_guest(uart);
+    // M5 Arc 7b: bind the virtual-timer VIRQ through the proven `EvtchnBindVirq` hypercall, so the
+    // async EL2 tick handler has a port to raise. `EvtchnBindVirq` existed but nothing ever raised what
+    // it bound (a dead-end); the vtimer is its first raiser. The VIRQ id is the GIC INTID (27) for a
+    // transparent raise→inject correspondence. Claim/bind/drop before the guest runs.
+    {
+        let mut cell = GUEST_HV.borrow_mut();
+        let hv = hv_or_halt(&mut cell, uart, "timer-irq phase");
+        expect(
+            hv,
+            GIC_DOM,
+            HvCall::EvtchnBindVirq {
+                vcpu: TIMER_IRQ_VCPU,
+                virq: gic::VTIMER_INTID as u8,
+            },
+            "bind vtimer VIRQ",
+            uart,
+        );
+    }
     // Physical side: let EL2 receive PPI 27 (the guest's CNTV) and hand it on as a virtual interrupt.
     gic::init_physical_vtimer();
     gic::enable_physical_cpu_interface_el2();
