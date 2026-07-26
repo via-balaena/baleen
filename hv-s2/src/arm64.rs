@@ -490,7 +490,13 @@ impl Layout {
     /// Building the list once and checking it pairwise is what keeps [`validate`](Self::validate)
     /// from being N² hand-written comparisons that a later region silently escapes — the failure
     /// mode when this was three open-coded pairs and a fourth region arrived (M5 Arc 6b).
-    fn regions(&self) -> [Option<(usize, u64, u64, u64)>; 4] {
+    ///
+    /// Public because it is the **disjointness seam** the ∀-value proof reads: `hv-verify`'s Kani
+    /// harnesses drive the real [`validate`](Self::validate) over a symbolic [`Layout`] and then
+    /// read this same list back to assert what validation *guarantees* — that a passing layout has
+    /// every present region pairwise-disjoint in both IPA and PA and in distinct `L1` entries (M5
+    /// Phase I-3). Proving over the shipped list, not a re-modelled copy, is design-lesson #14c.
+    pub fn regions(&self) -> [Option<(usize, u64, u64, u64)>; 4] {
         let data_span = TABLE_ENTRIES as u64 * self.frame_size;
         [
             self.guest_image_pa

@@ -230,10 +230,56 @@ which is where they earn their keep. Recording a mutation that fails to fire is 
 ## 10. Running it
 
 ```sh
-cargo kani -p hv-verify                                              # 15 harnesses (Arc 3 + Arc 3b)
+cargo kani -p hv-verify                                              # 19 harnesses (Arc 3 + Arc 3b + Phase I-3)
 verus --crate-type=lib hv-verify/verus/stage2_leaf_authorized.rs     # → 7 verified, 0 errors  (T)
 verus --crate-type=lib hv-verify/verus/foreign_link_preservation.rs  # → 9 verified, 0 errors  (P1)
 ```
 
 Both run in CI's `deep-verify.yml` (the Kani job runs the whole crate; the Verus job loops over
 every `hv-verify/verus/*.rs`), so neither needed a workflow change to pick this arc up.
+
+## 11. Phase I-3 — the device pass-through region under the refinement theorem
+
+`T` is *edge-driven* and the device MMIO window is **p2m-unbacked** — identity `IPA == PA`,
+Device-nGnRnE, execute-never, 2 MiB blocks, described by no `p2m` edge — so `T`,
+`check_authorized`, and `stage2_leaf_authorized.rs` say nothing about it. Its isolation had rested
+on `hv_s2::arm64::Layout::validate` passing over the **one concrete metal layout** plus the runtime
+decode in `verify_encoding`: a fail-**silent** surface — a hole would let a guest reach RAM through
+the device window, or decode MMIO as cacheable Normal memory — resting on a runtime check, not a
+theorem.
+
+The shape of the claim differs from `T` because the region is not an authorization property of
+edges. It is a **disjointness + attributes** property of the `Layout` and emitter — the refinement
+*absorbing a shape mismatch* (design-lesson #44), proven by composition, **not** by widening the
+clean p2m-level checker (`mapped ⇒ owned-or-granted`) with an MMIO carve-out:
+
+> **T_dev.** If `Layout::validate` returns `Ok`, then **(i)** every emitted device block is disjoint
+> in **both** IPA and PA from every RAM leaf the emitter can emit (data `L3`, super `L2`), and
+> **(ii)** every emitted device block is Device-nGnRnE + execute-never + identity.
+
+**Kani alone closes it — no Verus mirror, no fidelity gap.** Unlike `T` (∀-N over an *unbounded*
+edge/frame population, which forced the mirror), the device region has **no unbounded axis**: the
+region count is structurally 4, blocks per window are bounded by one `L2` (≤ `TABLE_ENTRIES`), and a
+leaf beyond `TABLE_ENTRIES` is `FrameOutOfRange`. So Kani closes it on the **real shipped
+`hv_s2::arm64` code over every address** — a strictly stronger result than `T`'s managed-mirror gap
+(design-lesson #20b). `hv-verify::stage2_device_region`:
+
+| harness | closes | object |
+|---|---|---|
+| `device_block_encodes_as_device_ngnrne_xn_identity` | (ii) attributes | real `decode_device_block`, ∀ address |
+| `normal_memory_never_decodes_as_a_device_block` | (ii) the confusion — RAM never masquerades as MMIO | real `decode_device_block`, ∀ word |
+| `validate_ok_implies_regions_pairwise_disjoint` | (i) the gate is total (no pair escapes the loop) | real `validate` / `regions`, symbolic `Layout` |
+| `validate_ok_implies_device_disjoint_from_ram_leaves` | (i) the isolation corollary | real `validate` + `frame_pa`/`super_pa`, symbolic `Layout` |
+
+**Declared parameter (design-lesson #44b):** the symbolic-layout harnesses fix `frame_size = 0x1000`
+(the system's 4 KiB granule, a genuine constant on the metal) and bound region bases to the 48-bit
+PA/IPA range the descriptor masks already enforce — both keep `validate`'s unchecked `b + blen`
+interval arithmetic overflow-free while remaining faithful to every layout the emitter builds.
+
+**Non-vacuity (measured, not asserted):** dropping the `validate().is_ok()` assumption makes an
+alias reachable and both disjointness harnesses **fail**; asserting the device block is *executable*
+(`xn: false`) makes the attribute harness **fail**. So `validate` and the `xn` bit are proven
+load-bearing, not vacuously satisfied.
+
+This closes the honest ledger's device-region item: the device region now rests on a Kani theorem
+over real code, not on `validate` + a decode check.
