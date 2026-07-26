@@ -185,12 +185,15 @@ fuzz_target!(|data: &[u8]| {
             // is refused at the seam, so only well-formed edges ever take. `leaf` lets the
             // fuzzer build both interior entries and leaves — including superpages (a leaf
             // above L1), which the generalized hierarchy invariant must hold across too.
+            // `execute` drives the write-xor-execute bit, so the fuzzer builds executable
+            // leaves and the refused writable+executable ones (Phase II-1a).
             25 => HvCall::P2mLink {
                 parent: mfn,
                 slot,
                 child,
                 writable: b & 1 == 0,
                 leaf: b & 2 == 0,
+                execute: b & 4 == 0,
             },
             26 => HvCall::P2mUnlink { parent: mfn, slot },
             // Bring a slot to life (the birth half of the lifecycle) — a no-op unless the

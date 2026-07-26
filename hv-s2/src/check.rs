@@ -235,7 +235,7 @@ pub fn check_exact(
         // The model's verdict for this frame: the LAST leaf edge into it from a table `dom` owns
         // (later edges overwrite earlier ones, exactly as the emitter applies them).
         let mut expected: Option<Perm> = None;
-        for (parent, _slot, child, writable, leaf) in edges.iter().copied() {
+        for (parent, _slot, child, writable, leaf, _execute) in edges.iter().copied() {
             // Filter to THIS span's map: an edge only belongs to the map whose span its parent's
             // level implies (the same translation `leaf_map` uses, re-derived here from the model).
             if leaf
@@ -351,6 +351,7 @@ mod tests {
                 child: 2,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         );
         assert_eq!(
@@ -403,6 +404,7 @@ mod tests {
                 child: 4,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         );
         // Forge dom0's map so it reaches dom1's frame 4, which dom1 never granted.
@@ -529,6 +531,7 @@ mod tests {
                 child: 2,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         );
 

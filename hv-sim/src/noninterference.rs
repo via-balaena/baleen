@@ -282,6 +282,11 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
                 u64::from(mfn),
                 u64::from(p.refs(mfn).unwrap_or(0)),
                 u64::from(p.type_refs(mfn, PageType::Writable).unwrap_or(0)),
+                // Write-xor-execute count (Phase II-1a): behaviourally live for `a`, since it
+                // gates whether `a` may take a writable reference on its own frame. An authorized
+                // peer can bump it via a foreign read-execute leaf, so it must be observed or such
+                // a change would be invisible to the non-interference check (design-lesson #16).
+                u64::from(p.executable_refs(mfn).unwrap_or(0)),
                 u64::from(pt_refs),
                 level_tag(ty),
                 p.is_pinned(mfn) as u64,
@@ -292,17 +297,20 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
 
     // The page-table edges rooted in `a`'s own tables (parent owned by `a`). Only `a`'s own
     // link/unlink touches these. A canonical (sorted) set.
-    let mut edges: Vec<[u64; 5]> = p
+    let mut edges: Vec<[u64; 6]> = p
         .link_edges()
         .into_iter()
         .filter(|&(parent, ..)| p.owner_of(parent) == Some(a))
-        .map(|(par, slot, ch, w, leaf)| {
+        .map(|(par, slot, ch, w, leaf, execute)| {
             [
                 u64::from(par),
                 u64::from(slot),
                 u64::from(ch),
                 w as u64,
                 leaf as u64,
+                // The write-xor-execute edge bit (Phase II-1a) — behaviourally live for the same
+                // reason `leaf` is: it selects what `a`'s own `unlink` gives back.
+                execute as u64,
             ]
         })
         .collect();
@@ -510,6 +518,7 @@ mod tests {
             destroy: true,
             delegate: false,
             async_agent: false,
+            drive_execute: false,
             depth,
             max_states: 200_000,
             symmetry: false,
@@ -541,6 +550,7 @@ mod tests {
             destroy: true,
             delegate: false,
             async_agent: false,
+            drive_execute: false,
             depth,
             max_states: 400_000,
             symmetry: false,

@@ -23,6 +23,17 @@
 //! > `get_type` refuses a writable reference while any page-table reference is live,
 //! > and vice-versa; therefore [`Violation::TypeConfusion`] can never arise.
 //!
+//! A second, orthogonal exclusivity rides the same machinery — **write-xor-execute** (W^X):
+//!
+//! > **A frame is never referenced as writable and as executable at the same time.**
+//! > An executable leaf takes an *executable* reference (`get_exec`) that the acquire guard
+//! > refuses while any writable reference is live, and a writable reference is refused while any
+//! > executable one is; therefore [`Violation::WriteExecuteConfusion`] can never arise. This
+//! > denies the write-then-execute (shellcode-injection) surface at the model level. Execute is a
+//! > *permission*, not a page *type*, so unlike writable it does **not** conflict with the
+//! > page-table type — a read-execute leaf may point at a page table exactly as a read-only one
+//! > may (the guest executing its own PTE bytes is no more a hazard than reading them).
+//!
 //! Around that sit reference coherence (every typed reference is also an existence
 //! reference, so the typed counts never exceed the total — [`Violation::TypedExceedsRefs`])
 //! and owner integrity (an allocated frame's owner is a real domain). A frame can only
@@ -157,6 +168,18 @@ enum Frame {
         refs: u32,
         /// How many references require the frame to be writable.
         writable_refs: u32,
+        /// How many references require the frame to be **executable** — held by executable leaf
+        /// entries mapping this frame as guest code. A separate, orthogonal axis from
+        /// `writable_refs`: execute is a *permission* on a mapping, not a page *type*, so it does
+        /// not conflict with `pagetable_refs` the way writable does (a read-execute leaf may point
+        /// at a page table, exactly as a read-only one may — the guest executing its own PTE bytes
+        /// is no more an isolation hazard than reading them). The one combination the model forbids
+        /// is `writable_refs > 0 && executable_refs > 0` — **write-xor-execute** (W^X), the leaf-
+        /// permission cousin of write-xor-pagetable, enforced by the same acquire-time conflict
+        /// guard and caught by [`Violation::WriteExecuteConfusion`]. No grant ever takes an
+        /// executable reference (grants are read/write only), so this count is entirely
+        /// `p2m`-local.
+        executable_refs: u32,
         /// How many references require the frame to be a page table *at `pt_level`*.
         pagetable_refs: u32,
         /// Which paging level this frame is a page table at. Meaningful only while
@@ -184,9 +207,16 @@ impl Frame {
 /// leaf pins only the child's existence, imposing no type (the linear-map view).
 #[derive(Clone, Copy)]
 enum ChildRef {
-    /// A bare existence reference — a read-only leaf. Type-agnostic, so the child may be
-    /// any allocated frame, a live page table included.
+    /// A bare existence reference — a read-only, non-executable leaf. Type-agnostic, so the
+    /// child may be any allocated frame, a live page table included.
     Bare,
+    /// An **executable** existence reference — a read-only, executable leaf (guest code). Pins the
+    /// child's existence and marks it executable (bumping `executable_refs`), which conflicts with
+    /// any writable reference (W^X) but *not* with a page-table type, exactly as [`Self::Bare`]
+    /// does not. Only ever taken for a read-only executable leaf: a *writable* executable leaf is
+    /// refused up front ([`P2mError::WxConflict`]), since one mapping being both W and X is the
+    /// very thing W^X forbids.
+    Exec,
     /// A type reference: [`PageType::Writable`] for a writable leaf, `PageTable(k-1)` for an
     /// interior entry descending to the level below.
     Typed(PageType),
@@ -195,10 +225,16 @@ enum ChildRef {
 /// The reference an entry of the given shape holds on its child. `None` only for an
 /// interior entry under an `L1` — nonsensical, since nothing sits below `L1`; `link`
 /// rejects it up front, so no recorded edge is ever that shape.
-fn entry_child_ref(level: PtLevel, leaf: bool, writable: bool) -> Option<ChildRef> {
+///
+/// `execute` is meaningful only for a *leaf* (an interior entry maps a table, never executable
+/// guest code — `link` forces it clear there). A writable-and-executable leaf is caught by `link`
+/// before this is called, so the two leaf cases here are writable-xor-executable-xor-neither.
+fn entry_child_ref(level: PtLevel, leaf: bool, writable: bool, execute: bool) -> Option<ChildRef> {
     if leaf {
         Some(if writable {
             ChildRef::Typed(PageType::Writable)
+        } else if execute {
+            ChildRef::Exec
         } else {
             ChildRef::Bare
         })
@@ -247,6 +283,14 @@ struct Link {
     /// [`System::unlink`] gives back (a leaf's `Writable`/bare reference, or an interior
     /// entry's `PageTable(k-1)` one).
     leaf: bool,
+    /// Whether this entry maps its child **executable** — the paging entry's execute bit (the
+    /// inverse of AArch64's `XN`). Meaningful only for a *leaf* (an interior entry maps a table,
+    /// never guest code, so it is always clear there). An executable leaf holds an executable
+    /// existence reference on its child ([`ChildRef::Exec`]), bumping `executable_refs`, which
+    /// conflicts with any writable reference — **write-xor-execute**. A leaf is never both
+    /// `writable` and `execute` (that single-mapping W+X is refused at [`System::link`]); this bit
+    /// selects, with `writable`, exactly which reference [`System::unlink`] gives back.
+    execute: bool,
 }
 
 /// The whole-system page state: a flat table of machine frames plus every domain's
@@ -284,6 +328,12 @@ pub enum P2mError {
     Overflow,
     /// A page-table entry slot is out of range for a table.
     BadSlot,
+    /// A mapping was requested that would make a frame simultaneously writable and executable —
+    /// an executable leaf onto a writable-referenced frame, a writable reference onto an
+    /// executable-mapped one, or a single leaf declared both `writable` and `execute`. **This
+    /// guard is what makes write-xor-execute (W^X) hold by construction**, the leaf-permission
+    /// cousin of [`Self::TypePinned`]'s write-xor-pagetable.
+    WxConflict,
 }
 
 /// A named invariant breach, carrying the frame it was found at.
@@ -294,6 +344,16 @@ pub enum Violation {
     /// A frame is referenced as writable *and* as a page table at once — the exact
     /// type-confusion the whole module exists to prevent.
     TypeConfusion { mfn: usize },
+    /// A frame is referenced as writable *and* as executable at once — the **write-xor-execute**
+    /// (W^X) breach. A frame mapped writable through one leaf and executable through another (or a
+    /// grant's writable reference coexisting with an executable leaf) would let a guest write bytes
+    /// and then execute them — the shellcode-injection surface Stage-2 W^X exists to deny. Held by
+    /// construction: the acquire guard refuses either reference while the other is live
+    /// ([`P2mError::WxConflict`]), so `writable_refs > 0 && executable_refs > 0` never arises. The
+    /// leaf-permission cousin of [`Self::TypeConfusion`]; unlike it, this is a purely raw-count
+    /// property (both counts are read directly, not through a derived type), so every decrement
+    /// preserves it trivially and no holder-coupling is needed.
+    WriteExecuteConfusion { mfn: usize },
     /// The typed references outnumber the total references — a typed reference that is
     /// not also an existence reference, which should be impossible.
     TypedExceedsRefs { mfn: usize },
@@ -362,6 +422,7 @@ impl System {
             owner,
             refs: 0,
             writable_refs: 0,
+            executable_refs: 0,
             pagetable_refs: 0,
             // No page-table reference yet, so the level is a placeholder the first
             // `get_type(PageTable(..))` overwrites; `L1` is as good as any.
@@ -393,10 +454,11 @@ impl System {
             Frame::Allocated {
                 refs,
                 writable_refs,
+                executable_refs,
                 pagetable_refs,
                 ..
             } => {
-                let typed = *writable_refs + *pagetable_refs;
+                let typed = *writable_refs + *executable_refs + *pagetable_refs;
                 if *refs == 0 {
                     return Err(P2mError::WrongState);
                 }
@@ -425,21 +487,32 @@ impl System {
             Frame::Allocated {
                 refs,
                 writable_refs,
+                executable_refs,
                 pagetable_refs,
                 pt_level,
                 ..
             } => {
-                // Any incompatible live type blocks the acquire. For a writable request
-                // that is any page-table reference; for a page-table request it is any
-                // writable reference *or* a page table already live at another level.
-                let conflict = match ty {
-                    PageType::Writable => *pagetable_refs > 0,
-                    PageType::PageTable(level) => {
-                        *writable_refs > 0 || (*pagetable_refs > 0 && *pt_level != level)
+                // Any incompatible live type blocks the acquire. For a writable request that is
+                // any page-table reference (write-xor-pagetable) *or* any executable reference
+                // (write-xor-execute — the W^X guard, so a writable ref cannot join an executable
+                // one). For a page-table request it is any writable reference *or* a page table
+                // already live at another level; an executable reference does NOT block it (a
+                // read-execute leaf may point at a page table, exactly as a read-only one may).
+                let (conflict, err) = match ty {
+                    PageType::Writable => {
+                        if *executable_refs > 0 {
+                            (true, P2mError::WxConflict)
+                        } else {
+                            (*pagetable_refs > 0, P2mError::TypePinned)
+                        }
                     }
+                    PageType::PageTable(level) => (
+                        *writable_refs > 0 || (*pagetable_refs > 0 && *pt_level != level),
+                        P2mError::TypePinned,
+                    ),
                 };
                 if conflict {
-                    return Err(P2mError::TypePinned);
+                    return Err(err);
                 }
                 // Bump the existence and typed counts together, overflow-checked before
                 // either is written so a rejected call mutates nothing. A page-table
@@ -495,6 +568,60 @@ impl System {
                 *slot -= 1;
                 // A typed reference always took an existence reference with it, so refs
                 // is guaranteed non-zero here; saturating_sub is belt-and-braces.
+                *refs = refs.saturating_sub(1);
+            }
+            Frame::Free => return Err(P2mError::WrongState),
+        }
+        self.check_invariants();
+        Ok(())
+    }
+
+    /// Take an **executable** reference (an executable leaf's grip on its child): mark the frame
+    /// executable and pin its existence, taking an existence reference at the same time. **Fails
+    /// with [`P2mError::WxConflict`] if the frame is currently referenced as writable** — the W^X
+    /// guard, the executable-side mirror of the writable request's check in [`Self::get_type`]. It
+    /// deliberately does *not* conflict with a page-table reference: a read-execute leaf onto a
+    /// page table is as sound as a read-only one (§write-xor-execute is orthogonal to
+    /// write-xor-pagetable). Overflow-checked before either count is written, so a rejected call
+    /// mutates nothing.
+    fn get_exec(&mut self, mfn: Mfn) -> Result<(), P2mError> {
+        match self.frame_mut(mfn)? {
+            Frame::Allocated {
+                refs,
+                writable_refs,
+                executable_refs,
+                ..
+            } => {
+                if *writable_refs > 0 {
+                    return Err(P2mError::WxConflict);
+                }
+                let new_refs = refs.checked_add(1).ok_or(P2mError::Overflow)?;
+                let new_exec = executable_refs.checked_add(1).ok_or(P2mError::Overflow)?;
+                *executable_refs = new_exec;
+                *refs = new_refs;
+            }
+            Frame::Free => return Err(P2mError::WrongState),
+        }
+        self.check_invariants();
+        Ok(())
+    }
+
+    /// Drop an executable reference (the mirror of [`Self::put_type`] for the executable axis),
+    /// releasing both the executable claim and the existence reference it took. Fails if no
+    /// executable reference is held.
+    fn put_exec(&mut self, mfn: Mfn) -> Result<(), P2mError> {
+        match self.frame_mut(mfn)? {
+            Frame::Allocated {
+                refs,
+                executable_refs,
+                ..
+            } => {
+                if *executable_refs == 0 {
+                    return Err(P2mError::WrongState);
+                }
+                *executable_refs -= 1;
+                // An executable reference always took an existence reference with it, so refs is
+                // non-zero here; saturating_sub is belt-and-braces.
                 *refs = refs.saturating_sub(1);
             }
             Frame::Free => return Err(P2mError::WrongState),
@@ -615,6 +742,17 @@ impl System {
     /// child is a page table regardless); it is only the traversal read/write bit the MMU
     /// ANDs down the walk, and what the seam matches a foreign grant's permission against.
     ///
+    /// `execute` marks a **leaf** as guest code (the inverse of AArch64's `XN`). An executable
+    /// read-only leaf takes an *executable* existence reference on `child` (bumping
+    /// `executable_refs`) — orthogonal to the page-table type, so it may still point at a page
+    /// table, but it conflicts with any *writable* reference: a leaf declared both `writable` and
+    /// `execute` is refused with [`P2mError::WxConflict`] (one mapping being W+X is the very thing
+    /// W^X forbids), and an executable leaf onto a frame already mapped writable — or a later
+    /// writable reference onto this executable frame — is refused the same way. `execute` is
+    /// forced clear for an *interior* entry (a table is never executable guest code). **This is
+    /// the model-level home of write-xor-execute**, the leaf-permission cousin of the
+    /// write-xor-pagetable rule; enforcing it on the emitted Stage-2 descriptors is a later arc.
+    ///
     /// The hierarchy is enforced by the type system: for an interior or writable-leaf entry
     /// the link takes a `get_type` reference on `child` at the required type, so a `child`
     /// of the wrong kind (a writable page where a table belongs, a table at the wrong level,
@@ -639,6 +777,10 @@ impl System {
     /// the caller is *authorized* to reference a foreign frame is a cross-subsystem
     /// question (it must hold a grant from the frame's owner, of matching writability),
     /// checked at the dispatch seam — the same split as the grant↔page-type join.
+    // The six edge parameters mirror the guest ABI's `HvCall::P2mLink` fields 1:1 (parent, slot,
+    // child, writable, leaf, execute); bundling them into a struct only to satisfy the lint would
+    // obscure that direct correspondence, which the verified TCB values over the arg count.
+    #[allow(clippy::too_many_arguments)]
     pub fn link(
         &mut self,
         caller: DomId,
@@ -647,9 +789,17 @@ impl System {
         child: Mfn,
         writable: bool,
         leaf: bool,
+        execute: bool,
     ) -> Result<(), P2mError> {
         if slot >= TABLE_SLOTS {
             return Err(P2mError::BadSlot);
+        }
+        // Execute is a leaf-only permission — a table is never executable guest code, so force it
+        // clear for an interior entry. A single leaf that is both writable and executable is a W+X
+        // mapping, exactly what write-xor-execute forbids: refuse it up front.
+        let execute = execute && leaf;
+        if writable && execute {
+            return Err(P2mError::WxConflict);
         }
         // The caller must own the table it is editing. Validate everything against an
         // immutable view first, so a rejected link mutates nothing.
@@ -685,21 +835,26 @@ impl System {
         // nonsensical, since nothing sits below `L1` — refused before any mutation. A leaf's
         // *size* (4 KiB at `L1`, 2 MiB/1 GiB at `L2`/`L3`) is `parent`'s level, and needs no
         // distinct type.
-        let child_ref = entry_child_ref(level, leaf, writable).ok_or(P2mError::WrongState)?;
+        let child_ref =
+            entry_child_ref(level, leaf, writable, execute).ok_or(P2mError::WrongState)?;
 
-        // Take the child reference (a `get_type` here is the guard that makes the hierarchy
-        // hold: it fails unless `child` is, or can become, that exact type). Then take the
-        // parent self-reference, which cannot fail (`parent` is already that level). If the
-        // second acquire somehow overflowed, roll the first back so a rejected link mutates
-        // nothing.
+        // Take the child reference (a `get_type`/`get_exec` here is the guard that makes the
+        // hierarchy and W^X hold: `get_type` fails unless `child` is, or can become, that exact
+        // type; `get_exec` fails if `child` is writable-mapped). Then take the parent
+        // self-reference, which cannot fail (`parent` is already that level). If the second
+        // acquire somehow overflowed, roll the first back so a rejected link mutates nothing.
         match child_ref {
             ChildRef::Bare => self.get(child)?,
+            ChildRef::Exec => self.get_exec(child)?,
             ChildRef::Typed(ty) => self.get_type(child, ty)?,
         }
         if let Err(e) = self.get_type(parent, PageType::PageTable(level)) {
             match child_ref {
                 ChildRef::Bare => {
                     let _ = self.put(child);
+                }
+                ChildRef::Exec => {
+                    let _ = self.put_exec(child);
                 }
                 ChildRef::Typed(ty) => {
                     let _ = self.put_type(child, ty);
@@ -714,6 +869,7 @@ impl System {
             child,
             writable,
             leaf,
+            execute,
         });
         self.check_invariants();
         Ok(())
@@ -739,6 +895,7 @@ impl System {
         let child = self.links[idx].child;
         let writable = self.links[idx].writable;
         let leaf = self.links[idx].leaf;
+        let execute = self.links[idx].execute;
         // Deactivate the edge first, then release both references. Neither release can
         // fail: the link took and held them, so they are exactly the ones it gives back.
         self.links[idx].active = false;
@@ -748,11 +905,13 @@ impl System {
             "unlink could not release its parent ref: {rc:?}"
         );
         // Mirror exactly what the link took on `child`, from the same derivation: a read-only
-        // leaf gave a bare existence reference, a writable leaf a `Writable` type reference,
-        // an interior entry a `PageTable(k-1)` one. A recorded edge is never the interior-at-
-        // `L1` shape the helper rejects, so `None` here is unreachable.
-        let cc = match entry_child_ref(level, leaf, writable) {
+        // leaf gave a bare existence reference, an executable leaf an executable one, a writable
+        // leaf a `Writable` type reference, an interior entry a `PageTable(k-1)` one. A recorded
+        // edge is never the interior-at-`L1` shape the helper rejects, so `None` here is
+        // unreachable.
+        let cc = match entry_child_ref(level, leaf, writable, execute) {
             Some(ChildRef::Bare) => self.put(child),
+            Some(ChildRef::Exec) => self.put_exec(child),
             Some(ChildRef::Typed(ty)) => self.put_type(child, ty),
             None => {
                 debug_assert!(false, "unlink found an interior entry under an L1");
@@ -837,6 +996,20 @@ impl System {
         }
     }
 
+    /// How many **executable** references a frame holds, if it is allocated — the count behind
+    /// write-xor-execute, the executable-axis analogue of `type_refs(_, Writable)`. Non-zero
+    /// exactly when a live executable leaf maps this frame as guest code; W^X keeps it and the
+    /// writable count from both being non-zero. Exposed so the model enumerator can fingerprint
+    /// it and later arcs can drive the emitter's `XN` bit from it.
+    pub fn executable_refs(&self, mfn: Mfn) -> Option<u32> {
+        match self.frame(mfn) {
+            Ok(Frame::Allocated {
+                executable_refs, ..
+            }) => Some(*executable_refs),
+            _ => None,
+        }
+    }
+
     /// The number of references of `ty` a frame currently holds, if it is allocated. A
     /// page-table type at a level the frame is *not* held at reads as zero — the frame
     /// carries references at exactly one level.
@@ -900,8 +1073,8 @@ impl System {
         self.links.iter().filter(|l| l.active).count()
     }
 
-    /// Every live page-table entry as a `(parent, slot, child, writable, leaf)` tuple. The
-    /// integrating layer uses this to reason about *cross-domain* entries — a link whose
+    /// Every live page-table entry as a `(parent, slot, child, writable, leaf, execute)` tuple.
+    /// The integrating layer uses this to reason about *cross-domain* entries — a link whose
     /// `parent` and `child` have different owners — which `p2m` itself is deliberately
     /// blind to (ownership authorization lives at the seam, not in the type discipline).
     /// `writable` is the entry's read/write bit, so the seam can require a grant of the
@@ -909,12 +1082,17 @@ impl System {
     /// one only a read-only grant. `leaf` distinguishes a page-mapping entry (a leaf — a
     /// superpage when its parent is above `L1`) from an interior table pointer; the seam
     /// authorizes both identically (one grant of the child frame), but a canonical state
-    /// fingerprint keeps it so a superpage and a small-page mapping never merge.
-    pub fn link_edges(&self) -> Vec<(Mfn, u32, Mfn, bool, bool)> {
+    /// fingerprint keeps it so a superpage and a small-page mapping never merge. `execute` is
+    /// the leaf's execute bit (write-xor-execute's edge half): a canonical fingerprint must keep
+    /// it too, since which edge into a frame carries it decides what [`Self::unlink`] gives back.
+    /// The Stage-2 emitter does not yet consume `execute` (a later arc turns it into the
+    /// descriptor's `XN` bit and the emitted-table W^X check); it is exported now so the model's
+    /// enumerator can drive and fingerprint it.
+    pub fn link_edges(&self) -> Vec<(Mfn, u32, Mfn, bool, bool, bool)> {
         self.links
             .iter()
             .filter(|l| l.active)
-            .map(|l| (l.parent, l.slot, l.child, l.writable, l.leaf))
+            .map(|l| (l.parent, l.slot, l.child, l.writable, l.leaf, l.execute))
             .collect()
     }
 
@@ -985,6 +1163,7 @@ impl System {
                 owner,
                 refs,
                 writable_refs,
+                executable_refs,
                 pagetable_refs,
                 pinned,
                 pt_level: _,
@@ -996,7 +1175,17 @@ impl System {
                 if writable_refs > 0 && pagetable_refs > 0 {
                     return Some(Violation::TypeConfusion { mfn: m });
                 }
-                if writable_refs + pagetable_refs > refs {
+                // Write-xor-execute: no frame is writable-mapped and executable-mapped at once.
+                // Held by construction (the acquire guard refuses either while the other lives),
+                // so like `TypeConfusion` this can never fire; a purely raw-count property.
+                if writable_refs > 0 && executable_refs > 0 {
+                    return Some(Violation::WriteExecuteConfusion { mfn: m });
+                }
+                // Every typed/permission reference took an existence reference with it, so their
+                // sum never exceeds the total. `executable_refs` joins the sum (an executable leaf
+                // took one); W^X keeps `writable_refs` and `executable_refs` from both being live,
+                // but the bound holds regardless of that.
+                if writable_refs + executable_refs + pagetable_refs > refs {
                     return Some(Violation::TypedExceedsRefs { mfn: m });
                 }
                 if pinned && pagetable_refs == 0 {
@@ -1019,8 +1208,13 @@ impl System {
                     // be `Writable`-typed; an interior entry's must be the table one level
                     // below. An interior-under-`L1` edge is unrepresentable (`link` refuses
                     // it), so `None` is a corruption and fails the check.
-                    match entry_child_ref(level, link.leaf, link.writable) {
-                        Some(ChildRef::Bare) => self.is_allocated(link.child),
+                    match entry_child_ref(level, link.leaf, link.writable, link.execute) {
+                        // A bare or executable leaf imposes no page-table type on its child — an
+                        // executable leaf is guest code, type-agnostic exactly as a read-only one
+                        // — so the hierarchy asks only that the child stay allocated.
+                        Some(ChildRef::Bare) | Some(ChildRef::Exec) => {
+                            self.is_allocated(link.child)
+                        }
                         Some(ChildRef::Typed(ty)) => self.current_type(link.child) == Some(ty),
                         None => false,
                     }
@@ -1423,10 +1617,10 @@ mod tests {
             s.allocate(0, m).unwrap();
         }
         s.pin(0, root, PtLevel::L4).unwrap();
-        s.link(0, root, 0, l3, true, false).unwrap(); // L4 -> L3
-        s.link(0, l3, 0, l2, true, false).unwrap(); //   L3 -> L2
-        s.link(0, l2, 0, l1, true, false).unwrap(); //   L2 -> L1
-        s.link(0, l1, 0, leaf, true, true).unwrap(); // L1 -> writable leaf
+        s.link(0, root, 0, l3, true, false, false).unwrap(); // L4 -> L3
+        s.link(0, l3, 0, l2, true, false, false).unwrap(); //   L3 -> L2
+        s.link(0, l2, 0, l1, true, false, false).unwrap(); //   L2 -> L1
+        s.link(0, l1, 0, leaf, true, true, false).unwrap(); // L1 -> writable leaf
         (root, l3, l2, l1, leaf)
     }
 
@@ -1457,14 +1651,17 @@ mod tests {
 
         // An L4 entry must point at an L3 — pointing at the L2 frame is refused, since
         // the frame is already typed L2 and cannot also be L3.
-        assert_eq!(s.link(0, 0, 0, 2, true, false), Err(P2mError::TypePinned));
+        assert_eq!(
+            s.link(0, 0, 0, 2, true, false, false),
+            Err(P2mError::TypePinned)
+        );
         // Nothing was recorded, and the L2 table is untouched.
         assert_eq!(s.child_at(0, 0), None);
         assert_eq!(s.current_type(2), Some(PageType::PageTable(PtLevel::L2)));
         assert!(s.invariants_hold());
 
         // Frame 1 is untyped, so linking it as the L4's L3 child *establishes* it as L3.
-        s.link(0, 0, 0, 1, true, false).unwrap();
+        s.link(0, 0, 0, 1, true, false, false).unwrap();
         assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L3)));
         assert!(s.invariants_hold());
     }
@@ -1515,7 +1712,7 @@ mod tests {
         s.allocate(1, 6).unwrap();
         s.allocate(1, 7).unwrap();
         s.pin(1, 6, PtLevel::L1).unwrap();
-        s.link(1, 6, 0, 7, true, true).unwrap();
+        s.link(1, 6, 0, 7, true, true, false).unwrap();
 
         s.unlink_all(0);
         assert_eq!(s.active_links(), 1, "only domain 1's entry remains");
@@ -1539,18 +1736,27 @@ mod tests {
 
         // Slot out of range.
         assert_eq!(
-            s.link(0, 0, TABLE_SLOTS, 1, true, false),
+            s.link(0, 0, TABLE_SLOTS, 1, true, false, false),
             Err(P2mError::BadSlot)
         );
         // The caller must own the *table* it edits (though not necessarily the child).
-        assert_eq!(s.link(1, 0, 0, 1, true, false), Err(P2mError::NotYours));
+        assert_eq!(
+            s.link(1, 0, 0, 1, true, false, false),
+            Err(P2mError::NotYours)
+        );
         // Linking into a frame that is not a table is refused.
-        assert_eq!(s.link(0, 1, 0, 0, true, false), Err(P2mError::WrongState));
+        assert_eq!(
+            s.link(0, 1, 0, 0, true, false, false),
+            Err(P2mError::WrongState)
+        );
 
         // A good link, then a second into the same slot is refused (no in-place
         // overwrite); unlinking frees the slot again.
-        s.link(0, 0, 0, 1, true, false).unwrap();
-        assert_eq!(s.link(0, 0, 0, 1, true, false), Err(P2mError::WrongState));
+        s.link(0, 0, 0, 1, true, false, false).unwrap();
+        assert_eq!(
+            s.link(0, 0, 0, 1, true, false, false),
+            Err(P2mError::WrongState)
+        );
         assert_eq!(s.unlink(0, 0, 1), Err(P2mError::WrongState)); // no entry at slot 1
         s.unlink(0, 0, 0).unwrap();
         assert_eq!(s.child_at(0, 0), None);
@@ -1567,7 +1773,7 @@ mod tests {
         s.allocate(1, 2).unwrap(); // a frame domain 1 owns
         s.pin(0, 0, PtLevel::L1).unwrap();
 
-        s.link(0, 0, 0, 2, true, true).unwrap();
+        s.link(0, 0, 0, 2, true, true, false).unwrap();
         assert_eq!(s.child_at(0, 0), Some(2));
         // The foreign frame is now writable-typed and pinned alive by the entry — domain
         // 1 can neither free nor re-type it while domain 0's table points at it.
@@ -1594,7 +1800,7 @@ mod tests {
 
         // A read-only leaf takes only a bare existence reference — the child stays
         // untyped (a reader imposes no type), exactly as a read-only grant map does.
-        s.link(0, 0, 0, 2, false, true).unwrap();
+        s.link(0, 0, 0, 2, false, true, false).unwrap();
         assert_eq!(s.child_at(0, 0), Some(2));
         assert_eq!(s.current_type(2), None, "a read-only leaf types nothing");
         assert_eq!(s.refs(2), Some(1), "but it does pin the page against reuse");
@@ -1622,12 +1828,15 @@ mod tests {
 
         // A *writable* leaf onto the page table is refused — that would let the guest
         // write arbitrary PTEs, the type confusion the module exists to prevent.
-        assert_eq!(s.link(0, 0, 0, 1, true, true), Err(P2mError::TypePinned));
+        assert_eq!(
+            s.link(0, 0, 0, 1, true, true, false),
+            Err(P2mError::TypePinned)
+        );
         assert_eq!(s.child_at(0, 0), None);
 
         // A *read-only* leaf onto the very same page table is fine: the frame stays a
         // page table and simultaneously carries the leaf's bare reference.
-        s.link(0, 0, 0, 1, false, true).unwrap();
+        s.link(0, 0, 0, 1, false, true, false).unwrap();
         assert_eq!(s.child_at(0, 0), Some(1));
         assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L2)));
         assert_eq!(s.refs(1), Some(2), "the pin's ref plus the leaf's bare ref");
@@ -1643,6 +1852,133 @@ mod tests {
     }
 
     #[test]
+    fn writable_and_executable_leaves_are_mutually_exclusive() {
+        // Write-xor-execute at the frame level: a frame mapped writable by one leaf cannot also
+        // be mapped executable by another, and vice-versa — the dual-alias shellcode surface
+        // (write through the RW view, execute through the X view) is refused.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.allocate(0, 3).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        s.pin(0, 1, PtLevel::L1).unwrap();
+
+        // A writable leaf onto frame 3; then an executable leaf onto the SAME frame from another
+        // table is refused.
+        s.link(0, 0, 0, 3, true, true, false).unwrap();
+        assert_eq!(s.current_type(3), Some(PageType::Writable));
+        assert_eq!(
+            s.link(0, 1, 0, 3, false, true, true),
+            Err(P2mError::WxConflict)
+        );
+        assert_eq!(
+            s.executable_refs(3),
+            Some(0),
+            "the refused link took nothing"
+        );
+        assert!(s.invariants_hold());
+
+        // The reverse ordering: drop the writable leaf, map the frame executable, and now a
+        // writable leaf is the one refused.
+        s.unlink(0, 0, 0).unwrap();
+        s.link(0, 1, 0, 3, false, true, true).unwrap();
+        assert_eq!(s.executable_refs(3), Some(1));
+        assert_eq!(
+            s.link(0, 0, 0, 3, true, true, false),
+            Err(P2mError::WxConflict)
+        );
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn a_single_writable_executable_leaf_is_refused() {
+        // A leaf declared BOTH writable and executable is itself a W+X mapping — refused up
+        // front, before any reference is taken.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 2).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        assert_eq!(
+            s.link(0, 0, 0, 2, true, true, true),
+            Err(P2mError::WxConflict)
+        );
+        assert_eq!(s.child_at(0, 0), None, "no edge recorded");
+        assert_eq!(s.refs(2), Some(0), "no reference taken");
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn an_executable_leaf_maps_and_unlinks_cleanly() {
+        // An executable read-only leaf pins the frame executable, and unlink gives back exactly
+        // that executable reference — the frame returns to untyped and reclaimable.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 2).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+
+        s.link(0, 0, 0, 2, false, true, true).unwrap();
+        assert_eq!(s.executable_refs(2), Some(1));
+        assert_eq!(
+            s.current_type(2),
+            None,
+            "execute is a permission, not a type"
+        );
+        assert_eq!(s.refs(2), Some(1), "the executable ref pins existence");
+        assert_eq!(s.free(0, 2), Err(P2mError::InUse), "pinned while mapped");
+
+        s.unlink(0, 0, 0).unwrap();
+        assert_eq!(s.executable_refs(2), Some(0));
+        assert_eq!(s.refs(2), Some(0));
+        assert!(s.free(0, 2).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn a_read_execute_leaf_may_point_at_a_live_page_table() {
+        // Execute is orthogonal to the page-table type, exactly as read-only is: a guest may map
+        // one of its own page tables read-execute — the frame stays a page table AND carries the
+        // executable leaf's reference. Only writable-xor-pagetable and writable-xor-execute are
+        // forbidden; execute-and-pagetable coexist.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        s.pin(0, 1, PtLevel::L2).unwrap();
+
+        s.link(0, 0, 0, 1, false, true, true).unwrap();
+        assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L2)));
+        assert_eq!(s.executable_refs(1), Some(1));
+        assert!(s.invariants_hold());
+
+        s.unlink(0, 0, 0).unwrap();
+        assert_eq!(s.executable_refs(1), Some(0));
+        s.unpin(0, 1).unwrap();
+        assert!(s.free(0, 1).is_ok());
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn execute_is_forced_clear_on_an_interior_entry() {
+        // An interior entry maps a table, never guest code — the execute bit is forced clear, so
+        // it takes no executable reference on the child node.
+        let mut s = System::new(2, 8);
+        s.allocate(0, 0).unwrap(); // L2 table
+        s.allocate(0, 1).unwrap(); // its L1 child table
+        s.pin(0, 0, PtLevel::L2).unwrap();
+        s.pin(0, 1, PtLevel::L1).unwrap();
+
+        // Ask for execute on an interior edge; it is ignored (leaf-only).
+        s.link(0, 0, 0, 1, true, false, true).unwrap();
+        assert_eq!(
+            s.executable_refs(1),
+            Some(0),
+            "an interior edge takes no executable reference"
+        );
+        assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L1)));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
     fn readonly_and_writable_leaves_share_one_slot_only_serially() {
         // Read-only and writable leaves onto the same untyped page: the writable one
         // types it, the read-only one does not, and each releases exactly its own kind of
@@ -1653,7 +1989,7 @@ mod tests {
         s.pin(0, 0, PtLevel::L1).unwrap();
 
         // Writable leaf → child becomes writable-typed.
-        s.link(0, 0, 0, 3, true, true).unwrap();
+        s.link(0, 0, 0, 3, true, true, false).unwrap();
         assert_eq!(s.current_type(3), Some(PageType::Writable));
         assert_eq!(s.type_refs(3, PageType::Writable), Some(1));
         s.unlink(0, 0, 0).unwrap();
@@ -1665,7 +2001,7 @@ mod tests {
         assert_eq!(s.refs(3), Some(0));
 
         // Read-only leaf into the same slot → child pinned but untyped.
-        s.link(0, 0, 0, 3, false, true).unwrap();
+        s.link(0, 0, 0, 3, false, true, false).unwrap();
         assert_eq!(s.current_type(3), None);
         assert_eq!(s.refs(3), Some(1));
         s.unlink(0, 0, 0).unwrap();
@@ -1700,7 +2036,7 @@ mod tests {
         s.allocate(0, 1).unwrap();
         s.pin(0, 0, PtLevel::L2).unwrap();
 
-        s.link(0, 0, 0, 1, true, true).unwrap(); // L2 → 2 MiB writable leaf
+        s.link(0, 0, 0, 1, true, true, false).unwrap(); // L2 → 2 MiB writable leaf
         assert_eq!(s.child_at(0, 0), Some(1));
         assert_eq!(s.current_type(0), Some(PageType::PageTable(PtLevel::L2)));
         assert_eq!(
@@ -1729,7 +2065,7 @@ mod tests {
         s.allocate(0, 1).unwrap();
         s.pin(0, 0, PtLevel::L3).unwrap();
 
-        s.link(0, 0, 0, 1, true, true).unwrap(); // L3 → 1 GiB writable leaf
+        s.link(0, 0, 0, 1, true, true, false).unwrap(); // L3 → 1 GiB writable leaf
         assert_eq!(s.current_type(0), Some(PageType::PageTable(PtLevel::L3)));
         assert_eq!(s.current_type(1), Some(PageType::Writable));
         assert_eq!(s.active_links(), 1);
@@ -1753,12 +2089,15 @@ mod tests {
 
         // A *writable* superpage leaf onto the page table is refused — writable-xor-pagetable
         // binds at superpage size exactly as at 4 KiB.
-        assert_eq!(s.link(0, 0, 0, 1, true, true), Err(P2mError::TypePinned));
+        assert_eq!(
+            s.link(0, 0, 0, 1, true, true, false),
+            Err(P2mError::TypePinned)
+        );
         assert_eq!(s.child_at(0, 0), None);
 
         // A *read-only* superpage leaf onto the same page table is fine: the frame stays a
         // page table and simultaneously carries the leaf's bare reference.
-        s.link(0, 0, 0, 1, false, true).unwrap();
+        s.link(0, 0, 0, 1, false, true, false).unwrap();
         assert_eq!(s.child_at(0, 0), Some(1));
         assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L3)));
         assert_eq!(s.refs(1), Some(2), "the pin's ref plus the leaf's bare ref");
@@ -1782,11 +2121,14 @@ mod tests {
         s.allocate(0, 1).unwrap();
         s.pin(0, 0, PtLevel::L1).unwrap();
 
-        assert_eq!(s.link(0, 0, 0, 1, true, false), Err(P2mError::WrongState));
+        assert_eq!(
+            s.link(0, 0, 0, 1, true, false, false),
+            Err(P2mError::WrongState)
+        );
         assert_eq!(s.child_at(0, 0), None);
         assert_eq!(s.current_type(1), None, "the child was never touched");
         // The leaf form of the very same entry is fine.
-        s.link(0, 0, 0, 1, true, true).unwrap();
+        s.link(0, 0, 0, 1, true, true, false).unwrap();
         assert_eq!(s.current_type(1), Some(PageType::Writable));
         assert!(s.invariants_hold());
     }
@@ -1805,11 +2147,11 @@ mod tests {
         s.pin(0, 1, PtLevel::L2).unwrap(); // table B
 
         // A: interior L2→L1 — the child *becomes* an L1 table.
-        s.link(0, 0, 0, 2, true, false).unwrap();
+        s.link(0, 0, 0, 2, true, false, false).unwrap();
         assert_eq!(s.current_type(2), Some(PageType::PageTable(PtLevel::L1)));
 
         // B: read-only 2 MiB superpage leaf onto an untyped child — the child stays untyped.
-        s.link(0, 1, 0, 3, false, true).unwrap();
+        s.link(0, 1, 0, 3, false, true, false).unwrap();
         assert_eq!(
             s.current_type(3),
             None,
@@ -1840,11 +2182,11 @@ mod tests {
         }
         s.pin(0, 0, PtLevel::L3).unwrap();
         // slot 0: interior L3→L2→L1→4 KiB leaf.
-        s.link(0, 0, 0, 1, true, false).unwrap(); // L3 → L2 (frame 1)
-        s.link(0, 1, 0, 2, true, false).unwrap(); // L2 → L1 (frame 2)
-        s.link(0, 2, 0, 3, true, true).unwrap(); //  L1 → 4 KiB leaf (frame 3)
-                                                 // slot 1: a 1 GiB superpage leaf directly off the L3.
-        s.link(0, 0, 1, 4, true, true).unwrap(); // L3 → 1 GiB leaf (frame 4)
+        s.link(0, 0, 0, 1, true, false, false).unwrap(); // L3 → L2 (frame 1)
+        s.link(0, 1, 0, 2, true, false, false).unwrap(); // L2 → L1 (frame 2)
+        s.link(0, 2, 0, 3, true, true, false).unwrap(); //  L1 → 4 KiB leaf (frame 3)
+                                                        // slot 1: a 1 GiB superpage leaf directly off the L3.
+        s.link(0, 0, 1, 4, true, true, false).unwrap(); // L3 → 1 GiB leaf (frame 4)
 
         assert_eq!(s.current_type(1), Some(PageType::PageTable(PtLevel::L2)));
         assert_eq!(s.current_type(2), Some(PageType::PageTable(PtLevel::L1)));
@@ -1881,7 +2223,7 @@ mod tests {
         s.allocate(0, 0).unwrap();
         s.allocate(0, 1).unwrap();
         s.pin(0, 0, PtLevel::L2).unwrap();
-        s.link(0, 0, 0, 1, true, true).unwrap(); // writable 2 MiB leaf onto frame 1
+        s.link(0, 0, 0, 1, true, true, false).unwrap(); // writable 2 MiB leaf onto frame 1
         assert_eq!(s.current_type(1), Some(PageType::Writable));
         assert_eq!(
             s.pin(0, 1, PtLevel::L1),

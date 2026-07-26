@@ -79,6 +79,18 @@ pub struct Config {
     /// enumerator can close), but it also shifts the reachable-state counts, so the existing
     /// Tier-B saturation witnesses run with it off and a dedicated config turns it on.
     pub async_agent: bool,
+    /// Drive the **write-xor-execute** leaf bit (Phase II-1a): emit each `P2mLink` with
+    /// `execute ∈ {false, true}` (for leaves), so the sweep builds executable-leaf states and the
+    /// refused writable+executable ones. Left **off by default** for the *same* reason as
+    /// [`Self::async_agent`]: it is an orthogonal leaf-permission dimension that shifts the
+    /// reachable-state counts, so the existing Tier-B structural-saturation witnesses (the
+    /// `sym_*` configs, whose invariant is page-table *levelling*, not permission) run with it off
+    /// and keep their exact calibration. W^X's own ∀-N witness is a **dedicated config** that turns
+    /// this on (`write_xor_execute_holds` / `..._saturates`), which suffices because W^X is a
+    /// per-frame *local* invariant — its size generalization is the Tier-B locality cutoff, not a
+    /// deep hierarchy sweep (design-lesson #50). With it off, every `P2mLink` maps `execute =
+    /// false`, exactly the pre-II-1a behaviour.
+    pub drive_execute: bool,
     /// Maximum hypercall depth from the initial state to explore.
     pub depth: u32,
     /// Safety cap: stop after this many distinct states (a partial result).
@@ -115,6 +127,7 @@ impl Config {
             destroy: false,
             delegate: false,
             async_agent: false,
+            drive_execute: false,
             depth: 5,
             max_states: 1_500_000,
             symmetry: false,
@@ -305,25 +318,43 @@ pub(crate) fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                 for slot in 0..2u32 {
                     v.push((caller, HvCall::P2mUnlink { parent: mfn, slot }));
                     for child in 0..cfg.frames as u32 {
-                        // Every (writable, leaf) shape. `writable`: a writable vs a read-only
-                        // entry — the read-only leaf is the linear-map case, one that may point
-                        // at a live page table. `leaf`: an interior entry (descends one level)
-                        // vs a leaf (maps a page and terminates — a *superpage* when its parent
-                        // is above `L1`). Driving both is what makes the model-checker build,
-                        // and prove sound, an `L2`→leaf 2 MiB superpage as well as the interior
-                        // `L2`→`L1` edge, over the same reachable-state sweep.
+                        // Every (writable, leaf, execute) shape. `writable`: a writable vs a
+                        // read-only entry — the read-only leaf is the linear-map case, one that
+                        // may point at a live page table. `leaf`: an interior entry (descends one
+                        // level) vs a leaf (maps a page and terminates — a *superpage* when its
+                        // parent is above `L1`). `execute`: the write-xor-execute bit — an
+                        // executable leaf (guest code) vs a non-executable one. Driving all three
+                        // is what makes the model-checker build, and prove sound, W^X: the
+                        // executable-leaf states, the refused writable+executable leaf (a no-op the
+                        // sweep confirms adds no state, design-lesson #9), and the read-execute
+                        // leaf onto a page table — all over the same reachable-state sweep.
+                        // `execute` is forced clear on an interior entry, so skip that redundant
+                        // `execute == true, leaf == false` duplicate. `execute == true` is driven
+                        // only when the config asks (`drive_execute`) — off by default so the
+                        // structural-saturation witnesses keep their calibration (see the flag).
+                        let exec_vals: &[bool] = if cfg.drive_execute {
+                            &[false, true]
+                        } else {
+                            &[false]
+                        };
                         for &writable in &bools {
                             for &leaf in &bools {
-                                v.push((
-                                    caller,
-                                    HvCall::P2mLink {
-                                        parent: mfn,
-                                        slot,
-                                        child,
-                                        writable,
-                                        leaf,
-                                    },
-                                ));
+                                for &execute in exec_vals {
+                                    if execute && !leaf {
+                                        continue;
+                                    }
+                                    v.push((
+                                        caller,
+                                        HvCall::P2mLink {
+                                            parent: mfn,
+                                            slot,
+                                            child,
+                                            writable,
+                                            leaf,
+                                            execute,
+                                        },
+                                    ));
+                                }
                             }
                         }
                     }
@@ -496,8 +527,11 @@ fn level_tag(ty: Option<PageType>) -> u64 {
 type GrantEntry = (u16, u32, bool, u32, u32);
 /// A live grant mapping at a handle: `(grantee, grantor, gref, writable)`.
 type Mapping = (u16, u16, u32, bool);
-/// A page-table edge: `(parent, slot, child, writable, leaf)`.
-type Edge = (u32, u32, u32, bool, bool);
+/// A page-table edge: `(parent, slot, child, writable, leaf, execute)`. `execute` is the
+/// write-xor-execute bit (Phase II-1a); it must be fingerprinted because which edge into a frame
+/// carries it decides what `unlink` gives back, so two states differing only in it are behaviourally
+/// distinct (design-lesson #7).
+type Edge = (u32, u32, u32, bool, bool, bool);
 
 /// A plain-data extract of exactly the observable state that [`snapshot_key`]
 /// fingerprints — the read-once form of a [`Hypervisor`] that [`permute`] can relabel
@@ -760,7 +794,7 @@ fn snapshot_key(sn: &Snapshot) -> Vec<u64> {
     let mut edges = sn.edges.clone();
     edges.sort_unstable();
     k.push(edges.len() as u64);
-    for (par, slot, ch, writable, leaf) in edges {
+    for (par, slot, ch, writable, leaf, execute) in edges {
         k.extend([
             u64::from(par),
             u64::from(slot),
@@ -771,6 +805,10 @@ fn snapshot_key(sn: &Snapshot) -> Vec<u64> {
             // Two states that agree on every edge's (parent, slot, child, writable) but differ
             // in an edge's shape are *not* the same state — keep the bit so they never merge.
             leaf as u64,
+            // `execute` (write-xor-execute, Phase II-1a) is behaviourally live for the same
+            // reason: which edge into a frame carries it decides what `unlink` gives back, so two
+            // states differing only in an edge's execute bit have distinct successors — keep it.
+            execute as u64,
         ]);
     }
     k.push(0xFFFF_0004);
@@ -902,17 +940,19 @@ fn permute(sn: &Snapshot, g: &Perm) -> Snapshot {
         frames[g.frame[m]] = sn.frames[m];
     }
 
-    // Edges: remap parent and child frame ids; slot / writable / leaf are unchanged.
+    // Edges: remap parent and child frame ids; slot / writable / leaf / execute are unchanged
+    // (an id-permutation relabels frames, never an edge's permission bits).
     let edges = sn
         .edges
         .iter()
-        .map(|&(par, slot, ch, w, leaf)| {
+        .map(|&(par, slot, ch, w, leaf, execute)| {
             (
                 g.frame[par as usize] as u32,
                 slot,
                 g.frame[ch as usize] as u32,
                 w,
                 leaf,
+                execute,
             )
         })
         .collect();
@@ -2363,6 +2403,58 @@ mod tests {
             "expected the unreduced run to truncate at the cap, not saturate — reduction would \
              then be adding nothing"
         );
+    }
+
+    /// The dedicated **write-xor-execute** config (Phase II-1a): one domain builds page tables and
+    /// maps a frame writable, read-only, *and* executable across the sweep, so the reachable set
+    /// contains executable-leaf states, the refused writable+executable ones, and the read-execute
+    /// leaf onto a page table. `drive_execute` is the whole point — every other config leaves it
+    /// off to preserve its calibration (see [`Config::drive_execute`]). `L1` + `L2` so both base
+    /// leaves and superpage leaves carry the execute bit.
+    fn wx_cfg(depth: u32) -> Config {
+        Config {
+            p2m: true,
+            drive_execute: true,
+            domains: 1,
+            frames: 2,
+            levels: vec![PtLevel::L1, PtLevel::L2],
+            depth,
+            max_states: 2_000_000,
+            ..Config::tiny()
+        }
+    }
+
+    /// **W^X holds over every reachable state** (CI-shallow): the sweep checks `first_violation`
+    /// (which includes `WriteExecuteConfusion`) after every transition, so reaching the end with no
+    /// violation means no reachable state has a frame mapped both writable and executable. The
+    /// non-vacuity check confirms driving execute genuinely reaches new states — the config is not
+    /// trivially W^X-clean because nothing is ever executable.
+    #[test]
+    fn write_xor_execute_holds() {
+        let on = expect_no_violation(&wx_cfg(6));
+        let mut off_cfg = wx_cfg(6);
+        off_cfg.drive_execute = false;
+        let off = enumerate(&off_cfg);
+        assert!(
+            on.states > off.states,
+            "driving execute reached no new states ({} vs {}) — the W^X sweep would be vacuous",
+            on.states,
+            off.states
+        );
+    }
+
+    /// **The all-depths W^X theorem** (deep): the config's whole reachable set is explored (the
+    /// frontier empties, not the depth budget) with no `WriteExecuteConfusion` — for *every* state
+    /// at *every* depth, no frame is both writable- and executable-mapped. This is W^X's saturation
+    /// witness; its size generalization is the Tier-B locality cutoff (W^X is a per-frame local
+    /// invariant), not a deep hierarchy sweep, which is why a small config suffices (design-lesson
+    /// #50). The 4-level hierarchy config deliberately does *not* drive execute — the execute
+    /// dimension enlarges its reachable set past this laptop's saturation memory (a #19 "the wall
+    /// moved" datapoint), and its invariant is levelling, not permission.
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn write_xor_execute_saturates() {
+        expect_saturated(&wx_cfg(16));
     }
 
     #[test]

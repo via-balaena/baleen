@@ -40,11 +40,16 @@
 use hv_core::p2m::{DomId, Mfn, PageType, PtLevel, System};
 
 /// A live page-table edge, exactly as [`System::link_edges`] yields it:
-/// `(parent, slot, child, writable, leaf)`.
+/// `(parent, slot, child, writable, leaf, execute)`.
 ///
 /// Named so the proof harnesses can build one symbolically without re-modelling the tuple
 /// (design-lesson #14c: one derivation, consumed by production and proof alike).
-pub type Edge = (Mfn, u32, Mfn, bool, bool);
+///
+/// **`execute` (the trailing bool) is carried but not yet consumed here.** Phase II-1a added it to
+/// the model as the write-xor-execute edge bit; giving it meaning in the emitter — driving the
+/// Stage-2 descriptor's `XN` bit per leaf and checking W^X on the emitted table — is a later arc
+/// (II-1b). This layer threads it through as `_execute` so the tuple stays the single derivation.
+pub type Edge = (Mfn, u32, Mfn, bool, bool, bool);
 
 /// The permission a Stage-2 leaf carries. The model's `writable` bit, named at the layer that
 /// consumes it.
@@ -209,8 +214,9 @@ where
     for slot in sup.iter_mut() {
         *slot = None;
     }
-    for (parent, _slot, child, writable, leaf) in edges.iter().copied() {
-        // Only leaves map a frame; only tables this domain owns are its reachability.
+    for (parent, _slot, child, writable, leaf, _execute) in edges.iter().copied() {
+        // Only leaves map a frame; only tables this domain owns are its reachability. (`_execute`
+        // is II-1b's to consume — the emitter's XN bit and emitted-table W^X check.)
         if !leaf || owner_of(parent) != Some(dom) {
             continue;
         }
@@ -273,6 +279,7 @@ mod tests {
                 child,
                 writable,
                 leaf: true,
+                execute: false,
             },
         );
     }
@@ -372,6 +379,7 @@ mod tests {
                 child: 2,
                 writable: false,
                 leaf: false,
+                execute: false,
             },
         );
         if linked.is_ok() {
@@ -502,6 +510,7 @@ mod tests {
                 child,
                 writable,
                 leaf: true,
+                execute: false,
             },
         );
     }
@@ -582,6 +591,7 @@ mod tests {
                 child: 3,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         );
 

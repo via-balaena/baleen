@@ -190,6 +190,7 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
                     child: m,
                     writable: true,
                     leaf: true,
+                    execute: false,
                 },
                 "link a RAM superpage",
             );
