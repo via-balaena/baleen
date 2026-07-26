@@ -23,10 +23,17 @@
 # ALWAYS runs (so its context always reports a real success, never the ambiguous `skipped`
 # conclusion), and a fail-safe change-detection job decides whether the HEAVY steps execute. On a
 # non-proof PR the proof jobs report green in seconds; on a proof PR they run the real proof.
+#
+# `pull_request` ONLY (unlike ci.yml's push + pull_request): this is a MERGE gate, and a PR event
+# always carries an accurate base sha to diff against, so the change detection is exact and the
+# fail-safe almost never has to over-run. A `push` trigger would add nothing (direct pushes to
+# `main` are forbidden by branch protection, and deep-verify.yml backstops `main` weekly) while
+# COSTING a redundant ~15-min proof run on every proof PR and — because a new branch's first push
+# has an all-zero `before` sha that the fail-safe treats as "diff unavailable → run" — a full proof
+# run on the first push of every branch, proof-relevant or not.
 name: Proofs (PR gate)
 
 on:
-  push:
   pull_request:
 
 concurrency:
