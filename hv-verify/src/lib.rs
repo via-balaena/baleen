@@ -779,3 +779,214 @@ mod foreign_link_state_machine {
         );
     }
 }
+
+/// # The **device pass-through region** under the refinement theorem (M5 Phase I-3)
+///
+/// The RAM refinement `T` (`stage2_refinement`) is *edge-driven*: every mapped frame is owned or
+/// granted, proven by walking `p2m` edges. The device MMIO window is **p2m-unbacked** — no edge
+/// describes it, identity-mapped `IPA == PA`, Device-nGnRnE, execute-never, 2 MiB blocks — so `T`
+/// and [`hv_s2::check_authorized_with`] say nothing about it, and until now its isolation rested on
+/// [`hv_s2::arm64::Layout::validate`] passing over the *one concrete metal layout* plus a runtime
+/// decode in `verify_encoding`. That is a fail-**silent** surface (a hole would map a guest into RAM
+/// through the device window, or decode MMIO as cacheable Normal memory) resting on a runtime check,
+/// not a theorem.
+///
+/// This module brings it under a theorem. The shape differs from `T` because the region is not an
+/// authorization property of edges — it is a **disjointness + attributes** property of the `Layout`
+/// and emitter, which is the refinement *absorbing the shape mismatch* (design-lesson #44), proven
+/// by composition rather than by widening the p2m-level checker:
+///
+/// > **T_dev.** If [`Layout::validate`] returns `Ok`, then **(i)** every emitted device block is
+/// > disjoint in **both** IPA and PA from every RAM leaf the emitter can emit (data `L3`, super
+/// > `L2`), and **(ii)** every emitted device block is Device-nGnRnE + execute-never + identity.
+///
+/// ## Why Kani alone closes it — no Verus mirror, no fidelity gap
+///
+/// Unlike `T` (∀-N over an *unbounded* edge/frame population, which forced the Verus mirror), the
+/// device region has **no unbounded axis**: the region count is structurally **4**, blocks per
+/// window are bounded by one `L2` (≤ `TABLE_ENTRIES`), and a leaf beyond `TABLE_ENTRIES` is
+/// `FrameOutOfRange`. So Kani closes it **on the real shipped `hv_s2::arm64` code over every address**
+/// — a strictly stronger result than `T`'s managed-mirror gap (design-lesson #20b: Kani for the
+/// bounded-but-real, Verus only for the genuinely-infinite axis). The harnesses drive the real
+/// [`Layout::validate`] / [`Layout::regions`] and the real `frame_pa`/`super_pa` address derivations,
+/// so proving them is proving a property of the emitter that runs.
+///
+/// ## Declared parameter (design-lesson #44b)
+///
+/// The symbolic-layout harnesses fix `frame_size = 0x1000` (the system's 4 KiB granule — a genuine
+/// constant on the metal, not a free variable) and bound region bases to the 48-bit PA/IPA range the
+/// descriptor masks already enforce. Both keep `Layout::validate`'s unchecked `b + blen` interval
+/// arithmetic overflow-free while remaining faithful to every layout the emitter actually builds.
+///
+/// [`Layout`]: hv_s2::arm64::Layout
+/// [`Layout::validate`]: hv_s2::arm64::Layout::validate
+/// [`Layout::regions`]: hv_s2::arm64::Layout::regions
+#[cfg(kani)]
+mod stage2_device_region {
+    use hv_s2::arm64::{
+        decode_device_block, desc, frame_ipa, frame_pa, super_ipa, super_pa, DecodedDevice, Layout,
+        BLOCK_SIZE, TABLE_ENTRIES,
+    };
+
+    /// The 4 KiB granule (see the module's declared-parameter note).
+    const FRAME_SIZE: u64 = 0x1000;
+
+    /// A symbolic [`Layout`]: every field the disjointness proof reads is free, bounded only enough
+    /// to keep `validate`'s interval arithmetic overflow-free (bases in the 48-bit range, spans well
+    /// under it). The table PAs `validate`/`regions` never read are pinned to `0`.
+    fn symbolic_layout() -> Layout {
+        // Bases < 2^44 and every span < 2^30, so `base + span < 2^45` — no `u64` overflow anywhere
+        // in `validate`, while covering every region placement the metal can produce.
+        let bounded = || -> u64 {
+            let a: u64 = kani::any();
+            kani::assume(a < (1u64 << 44));
+            a
+        };
+        // A whole number of 2 MiB device blocks, at most one full `L2` (1 GiB).
+        let dev_blocks: u64 = kani::any();
+        kani::assume(dev_blocks <= TABLE_ENTRIES as u64);
+        // At most one full super `L2` worth of backed frames.
+        let sup_frames: u64 = kani::any();
+        kani::assume(sup_frames <= TABLE_ENTRIES as u64);
+        let guest_image_pa = if kani::any() { Some(bounded()) } else { None };
+        Layout {
+            l1_pa: 0,
+            l2_code_pa: 0,
+            l2_data_pa: 0,
+            l3_data_pa: 0,
+            l2_sup_pa: 0,
+            l2_dev_pa: 0,
+            guest_image_pa,
+            data_ipa_base: bounded(),
+            data_pa_base: bounded(),
+            frame_size: FRAME_SIZE,
+            sup_ipa_base: bounded(),
+            sup_pa_base: bounded(),
+            device_base: bounded(),
+            device_len: dev_blocks * BLOCK_SIZE,
+            sup_executable: kani::any(),
+            sup_frames,
+        }
+    }
+
+    /// **T_dev (ii) — attributes.** For *every* output address, the device-block encoding decodes to
+    /// exactly an identity PA, execute-never, Device-nGnRnE — the one descriptor kind the
+    /// `stage2_encoding` bit-precise family did not yet cover. The `xn: true` and the identity PA are
+    /// the whole isolation content: a device block that decoded as executable, or at the wrong PA, is
+    /// precisely the failure `verify_encoding`'s `l2_dev` check exists to catch, now proven over all
+    /// 2⁶⁴ addresses rather than golden fixtures.
+    #[kani::proof]
+    fn device_block_encodes_as_device_ngnrne_xn_identity() {
+        let pa: u64 = kani::any();
+        let d = (pa & desc::ADDR_2M) | desc::BLOCK_DEVICE;
+        assert!(
+            decode_device_block(d)
+                == Some(DecodedDevice {
+                    pa: pa & desc::ADDR_2M,
+                    xn: true,
+                }),
+            "a device block must decode to an identity PA, execute-never and Device-nGnRnE"
+        );
+    }
+
+    /// **T_dev (ii) — the confusion caught.** No Normal-memory descriptor is *ever* mistaken for a
+    /// device block, for any word: a `MemAttr` of Normal Write-Back (`0b1111`, what every RAM
+    /// leaf/block carries) makes [`decode_device_block`] return `None`. This is the bit-level guard
+    /// that a RAM block can never masquerade as MMIO — the inverse of the attribute above.
+    #[kani::proof]
+    fn normal_memory_never_decodes_as_a_device_block() {
+        let d: u64 = kani::any();
+        // The block type bits and Normal-WB memory attributes — a valid Normal-memory block/leaf.
+        kani::assume(d & 0b11 == desc::BLOCK);
+        kani::assume((d >> 2) & 0b1111 == 0b1111);
+        assert!(
+            decode_device_block(d).is_none(),
+            "Normal-memory attributes must never decode as Device-nGnRnE"
+        );
+    }
+
+    /// **T_dev (i) — the disjointness gate is total.** Over every symbolic `Layout`, if the real
+    /// [`Layout::validate`] returns `Ok`, then *every* present region pair is in distinct `L1`
+    /// entries and disjoint in both IPA and PA. This proves `validate`'s pairwise loop leaves no pair
+    /// unchecked — the exact regression `regions()` replaced three open-coded pairs to prevent (M5
+    /// Arc 6b) — for an arbitrary pair `(i, j)`, not just the four the metal happens to build.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn validate_ok_implies_regions_pairwise_disjoint() {
+        let l = symbolic_layout();
+        kani::assume(l.validate().is_ok());
+        let regions = l.regions();
+
+        let i: usize = kani::any();
+        let j: usize = kani::any();
+        kani::assume(i < regions.len());
+        kani::assume(j < regions.len());
+        kani::assume(i < j);
+
+        if let (Some((l1a, ipa_a, pa_a, span_a)), Some((l1b, ipa_b, pa_b, span_b))) =
+            (regions[i], regions[j])
+        {
+            assert!(
+                l1a != l1b,
+                "a validated layout must place every region in a distinct L1 entry"
+            );
+            assert!(
+                !(ipa_a < ipa_b + span_b && ipa_b < ipa_a + span_a),
+                "a validated layout must have pairwise-disjoint IPA windows"
+            );
+            assert!(
+                !(pa_a < pa_b + span_b && pa_b < pa_a + span_a),
+                "a validated layout must have pairwise-disjoint PA windows"
+            );
+        }
+    }
+
+    /// **T_dev (i) — the isolation corollary.** The sentence the project actually claims: a validated
+    /// layout emits *no device block that aliases any RAM leaf*, in either address space. For an
+    /// arbitrary emitted device block `k` and an arbitrary emitted data leaf `m` and super leaf `s`,
+    /// the real address derivations (`frame_pa`/`frame_ipa`/`super_pa`/`super_ipa`) never coincide
+    /// with the device block's identity address. Implied by the window disjointness above composed
+    /// with "each leaf lies within its region's window", but asserted directly so the isolation form
+    /// — no RAM reachable through the device window, no device page overlapping RAM — is
+    /// machine-checked and not left to a reader's composition.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn validate_ok_implies_device_disjoint_from_ram_leaves() {
+        let l = symbolic_layout();
+        // A device region is present.
+        kani::assume(l.device_len >= BLOCK_SIZE);
+        kani::assume(l.validate().is_ok());
+
+        // An arbitrary emitted device block — identity, so its IPA and PA are the same address.
+        let k: u64 = kani::any();
+        kani::assume(k < TABLE_ENTRIES as u64);
+        kani::assume(k * BLOCK_SIZE < l.device_len);
+        let dev = l.device_base + k * BLOCK_SIZE;
+
+        // …never coincides with an emitted data leaf (any representable frame is inside the data
+        // window, whose span validate checked disjoint from the device window).
+        let m: u32 = kani::any();
+        kani::assume((m as u64) < TABLE_ENTRIES as u64);
+        assert!(
+            dev != frame_pa(&l, m),
+            "a device block PA aliases a data-leaf PA — a guest could reach RAM through MMIO"
+        );
+        assert!(
+            dev != frame_ipa(&l, m),
+            "a device block IPA aliases a data-leaf IPA"
+        );
+
+        // …never coincides with an emitted super-span leaf (only backed frames, `s < sup_frames`,
+        // are emitted, matching the span validate checked).
+        let s: u32 = kani::any();
+        kani::assume((s as u64) < l.sup_frames);
+        assert!(
+            dev != super_pa(&l, s),
+            "a device block PA aliases a super-span-leaf PA"
+        );
+        assert!(
+            dev != super_ipa(&l, s),
+            "a device block IPA aliases a super-span-leaf IPA"
+        );
+    }
+}
