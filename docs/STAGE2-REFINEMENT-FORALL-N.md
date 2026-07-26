@@ -90,6 +90,10 @@ boundaries: superpage size (a model leaf pins one `Mfn`), the guest-image block 
 model-driven; proven RO+X by Kani in Arc 2.5), `GuestMem` (the trusted path, unconditional on
 `S2AP`), and VMID/table-set binding (lives in `hv-metal`).
 
+Two model states are outside T's **domain** rather than its statement — a frame that is a leaf at
+two spans, and a leaf level the emitter does not encode — both `hv_s2::OutOfDomain`, both rejected
+loudly. The first is now a **decided, machine-checked boundary** (Phase I-4, §12): not a gap.
+
 ## 5. What each tool closes — three complementary axes over one obligation
 
 Neither tool alone is the theorem, and the split was chosen by what each can actually reach on the
@@ -173,6 +177,10 @@ authorized**", with no third outcome.
 6. **Edge count in Kani is bounded** (3 for the emitter harnesses; a 2-domain/3-frame world for the
    real-`Hypervisor` harnesses) — deliberately, since Verus lifts exactly that axis. The bounds are
    stated in the harnesses, not silently chosen.
+7. ~~**`SpanConflict` is rejected, not resolved** — whether `hv-core` *should* forbid a frame being a
+   leaf at two spans was a model question, deliberately unopened.~~ **Decided and proven by Phase
+   I-4** (§12): it should **not** — a benign representability limit, not an isolation hazard; the
+   fail-loud is proven total and the out-of-domain classification proven sound.
 
 ## 8. Where the metal's isolation claim now stands
 
@@ -283,3 +291,54 @@ load-bearing, not vacuously satisfied.
 
 This closes the honest ledger's device-region item: the device region now rests on a Kani theorem
 over real code, not on `validate` + a decode check.
+
+## 12. Phase I-4 — the span-conflict boundary, decided then proven
+
+`hv-core` **permits** one frame being a leaf at two different spans (a base-level table and a
+super-level table both leaf-linking the same child): `MislevelledLink` constrains only an *interior*
+entry's child against its parent's level, never a *leaf's* child. The emitter cannot represent it —
+each span has its own **disjoint** host-PA window (`Layout::validate`, §11's `regions()`), so one
+`Mfn` would need two backings — so `leaf_map_from_edges` fails **loud** (`MapError::SpanConflict`)
+and `check_all` classifies it `OutOfDomain::SpanConflict`, **not** a `Violation` (the enumerator
+reaches it in 6 hypercalls; folding it into `Violation` would flag a legal model state).
+
+**The model question — should `hv-core` forbid it? — is decided: no.** A frame at two spans is a
+representability limit that fails **closed**, not an isolation hazard. In the model both mappings
+reach the same authorized `Mfn`, and **authorization is span-independent** (the whole shape of `T`:
+`span_sel` is free). Forbidding it in `hv-core` would be over-restrictive (design-lesson #8) and
+would push an emitter concern down into the clean, dependency-free model (compose, don't widen —
+#44/#50). So `hv-core` carries **no** guard and stays untouched; the refinement absorbs the mismatch
+by fail-loud + a side proof, exactly as I-3 did for the device region.
+
+The deliverable is therefore a **decision plus a proof that the fail-loud resting place is sound and
+total** — the audit-arc shape of design-lesson #17, not a new invariant:
+
+> **T_span.** (i) The emitter's fail-loud is **total** — whenever `leaf_map_from_edges` returns
+> `Ok`, no frame is mapped at both spans (no span-conflict is silently canonicalised); (ii) it is
+> **sound** — an `Err(SpanConflict{m})` names a frame genuinely resident in both maps; (iii) the
+> classification hides nothing — under P1 + P2 a span-conflict state's maps reach only frames the
+> domain owns or is granted, at **each** span, so `OutOfDomain` (not `Violation`) conceals no
+> unauthorized reach.
+
+**No unbounded axis in the detection** (a post-pass over `≤ min(base,sup)` frames), so — per
+design-lesson #50 — Kani closes (i)–(iii) on the **real shipped `hv_s2::leaf_map_from_edges` over
+every ownership, span assignment, edge set and capacity**; the ∀-*edge-count* companion for (iii) is
+one Verus lemma reusing `leaf_map_is_authorized`. `hv-verify::stage2_refinement` +
+`verus/stage2_leaf_authorized.rs`:
+
+| harness / lemma | closes | object |
+|---|---|---|
+| `an_accepted_map_has_no_span_conflict` (Kani) | (i) fail-loud total | real `leaf_map_from_edges`, symbolic world |
+| `a_reported_span_conflict_is_real` (Kani) | (ii) no false conflict | real `leaf_map_from_edges`, symbolic world |
+| `a_span_conflict_state_maps_only_authorized_frames` (Kani) | (iii) classification sound, real code | real `leaf_map_from_edges` + `check_authorized_with` |
+| `a_span_conflict_frame_is_authorized` (Verus) | (iii) ∀-edge-count | `emitted` mirror, arbitrary `Seq<Edge>` |
+| `a_constructed_span_conflict_is_rejected` (Kani) | non-vacuity + teeth | a concrete two-span frame |
+
+**Non-vacuity (measured, not asserted):** dropping the post-pass makes both
+`an_accepted_map_has_no_span_conflict` and `a_constructed_span_conflict_is_rejected` **fail** — the
+detection is proven load-bearing, not vacuously satisfied by "no conflict is reachable" (the last
+harness constructs one).
+
+This closes the honest ledger's `SpanConflict` item and, with I-1/I-2/I-3, leaves **Phase I fully
+airtight**: every load-bearing isolation claim on the refinement path is machine-checked, no
+audit-only rung remains, and the two out-of-domain boundaries are decided rather than deferred.

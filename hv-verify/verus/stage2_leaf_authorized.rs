@@ -68,6 +68,14 @@
 //! and a leaf level the emitter does not encode — and both are rejected loudly rather than mapped;
 //! see `hv_s2::OutOfDomain`.
 //!
+//! **The two-span state is a decided, proven boundary (Phase I-4).** `hv-core` deliberately does
+//! **not** forbid a frame being a leaf at two spans: it is benign — a representability limit of the
+//! `Mfn` → host-PA function, which cannot back one frame at two disjoint windows, so the emitter
+//! fails loud — *not* an isolation hazard. `a_span_conflict_frame_is_authorized` proves ∀-N that
+//! such a frame was authorized all along (authorization is span-independent), so classifying it
+//! `OutOfDomain` rather than a `Violation` can conceal nothing; the shipped `leaf_map_from_edges`'s
+//! fail-loud is proven **total** by Kani (`hv-verify/src/lib.rs::stage2_refinement`).
+//!
 //! ## Fidelity (a mirror, managed — the #21b discipline)
 //!
 //! `emitted` mirrors `leaf_map_from_edges`'s loop, including its **overwrite** semantics: a later
@@ -359,6 +367,62 @@ proof fn a_writable_leaf_is_owned_or_rw_granted(
         owner(m) == Some(dom) || (allocated(owner(m)) && auth(owner(m)->Some_0, dom, m, true)),
 {
     leaf_map_is_authorized(edges, owner, auth, dom, m, true, span_sel);
+}
+
+/// **A span-conflict frame is authorized (Phase I-4, ∀-N).** If a frame is emitted `Some` under
+/// **both** a base-span filter and a super-span filter — the state `hv_s2` refuses as
+/// `MapError::SpanConflict` / classifies as `OutOfDomain::SpanConflict` — then it is one `dom`
+/// **owns**, or holds a grant for, at *each* mapped permission.
+///
+/// This is the load-bearing fact behind the I-4 decision **not to forbid a frame being a leaf at
+/// two spans in `hv-core`**. The hazard of a two-span frame is emitter *representability* — the
+/// `Mfn` → host-PA function cannot give one frame two coherent backings (each span has its own
+/// disjoint window), so the emitter fails **loud**. It is **not** an isolation hazard: the frame
+/// the conflict names was authorized all along, exactly because **authorization is
+/// span-independent** (the whole shape of T — `span_sel` is left free). So classifying a
+/// span-conflict as *out-of-domain* rather than a `Violation` can never conceal an unauthorized
+/// reach, and the model need not carry a "at most one span per frame" guard to stay sound.
+///
+/// The two filters are left arbitrary (not assumed mutually exclusive), so this covers the real
+/// emitter's `span_of(parent) == Base` / `== Super` pair as one instance and any future span split
+/// with no new proof. It is `leaf_map_is_authorized` applied twice — the conflict adds no new
+/// ∀-N content, which is precisely why I-4 needs no new invariant, only this corollary.
+proof fn a_span_conflict_frame_is_authorized(
+    edges: Seq<Edge>,
+    owner: Owner,
+    auth: Auth,
+    dom: Id,
+    m: Mfn,
+    base_sel: spec_fn(Mfn) -> bool,
+    super_sel: spec_fn(Mfn) -> bool,
+)
+    requires
+        no_unauthorized_foreign_link(edges, owner, auth),
+        edge_children_allocated(edges, owner),
+        emitted(edges, owner, dom, m, base_sel) is Some,
+        emitted(edges, owner, dom, m, super_sel) is Some,
+    ensures
+        authorized(owner, auth, dom, m, emitted(edges, owner, dom, m, base_sel)->Some_0),
+        authorized(owner, auth, dom, m, emitted(edges, owner, dom, m, super_sel)->Some_0),
+{
+    leaf_map_is_authorized(
+        edges,
+        owner,
+        auth,
+        dom,
+        m,
+        emitted(edges, owner, dom, m, base_sel)->Some_0,
+        base_sel,
+    );
+    leaf_map_is_authorized(
+        edges,
+        owner,
+        auth,
+        dom,
+        m,
+        emitted(edges, owner, dom, m, super_sel)->Some_0,
+        super_sel,
+    );
 }
 
 /// **Totality / no stale leaf.** With no edges there is no mapping anywhere — the base case that
