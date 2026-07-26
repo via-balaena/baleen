@@ -279,7 +279,7 @@ mod p2m_write_xor_execute {
 /// emitter.
 #[cfg(kani)]
 mod stage2_encoding {
-    use hv_s2::arm64::{decode_block, decode_page, decode_table, desc, Decoded};
+    use hv_s2::arm64::{decode_block, decode_page, decode_table, desc, leaf_access_xn, Decoded};
     use hv_s2::Perm;
 
     /// A data leaf round-trips: for **every** output address and **both** permissions, encoding a
@@ -324,8 +324,9 @@ mod stage2_encoding {
         assert!(!got.xn, "the guest must be able to fetch from its image");
     }
 
-    /// A data leaf is **always** execute-never, whatever its address or permission — a guest can
-    /// never execute from a data frame.
+    /// A **data** leaf (writable or read-only — never a read-*execute* leaf) is always execute-never,
+    /// whatever its address or permission. Post-II-1b only a `Perm::Rx` leaf drops `XN`; `Rw`/`Ro`
+    /// data stays execute-never, so this still holds.
     #[kani::proof]
     fn data_leaves_are_always_execute_never() {
         let pa: u64 = kani::any();
@@ -340,6 +341,55 @@ mod stage2_encoding {
             decode_page(d).unwrap().xn,
             "a data leaf must be execute-never"
         );
+    }
+
+    /// **Phase II-1b — a read-execute (`Rx`) leaf decodes read-only AND executable**, at both spans,
+    /// for every address. Executability (the absent `XN`) is the model's, and it never comes with
+    /// write access — `Rx` is read-only, so it is never W+X.
+    #[kani::proof]
+    fn rx_leaf_decodes_executable_and_read_only() {
+        let pa: u64 = kani::any();
+        let page = decode_page((pa & desc::ADDR_4K) | desc::PAGE_RX).unwrap();
+        assert!(!page.xn, "an Rx page must be executable");
+        assert!(
+            matches!(page.perm, Perm::Ro),
+            "an Rx page is read-only, never W+X"
+        );
+        let block = decode_block((pa & desc::ADDR_2M) | desc::BLOCK_RX).unwrap();
+        assert!(!block.xn, "an Rx block must be executable");
+        assert!(
+            matches!(block.perm, Perm::Ro),
+            "an Rx block is read-only, never W+X"
+        );
+    }
+
+    /// **THE II-1b FIDELITY THEOREM — the emitted execute bit follows the model, and the declared
+    /// exemption is its SOLE writable+executable source.** Over every `(perm, wx_exempt)`, the
+    /// shared [`leaf_access_xn`] derivation the emitter and verifier both trust produces a
+    /// writable-AND-executable leaf (`access == Rw && !xn`) **iff** the model leaf is writable and
+    /// its window is W^X-exempt; a read-only or read-execute leaf is never writable-executable, and
+    /// a read-only (`Ro`) leaf is never executable. So "no W+X descriptor except the one declared
+    /// relaxation" is machine-checked on the shipped code, not argued.
+    #[kani::proof]
+    fn the_exemption_is_the_sole_writable_and_executable_leaf() {
+        let wx_exempt: bool = kani::any();
+        for perm in [Perm::Ro, Perm::Rw, Perm::Rx] {
+            let (access, xn) = leaf_access_xn(perm, wx_exempt);
+            let writable_and_executable = matches!(access, Perm::Rw) && !xn;
+            assert!(
+                writable_and_executable == (matches!(perm, Perm::Rw) && wx_exempt),
+                "a writable+executable leaf arises iff the declared exemption applies"
+            );
+            // Executability follows the model: executable iff read-execute, or the exemption on a
+            // writable leaf. A read-only leaf is never executable.
+            assert!(
+                (!xn) == (matches!(perm, Perm::Rx) || (matches!(perm, Perm::Rw) && wx_exempt)),
+                "the emitted execute bit must follow the model's leaf permission"
+            );
+            if matches!(perm, Perm::Ro) {
+                assert!(xn, "a read-only data leaf is never executable");
+            }
+        }
     }
 
     /// **No silent privilege escalation in the bits.** A read-only leaf can never decode as
@@ -1132,7 +1182,7 @@ mod stage2_device_region {
             sup_pa_base: bounded(),
             device_base: bounded(),
             device_len: dev_blocks * BLOCK_SIZE,
-            sup_executable: kani::any(),
+            sup_wx_exempt: kani::any(),
             sup_frames,
         }
     }

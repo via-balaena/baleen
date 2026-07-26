@@ -13,7 +13,8 @@
 //! [`leaf_map`] computes, for domain `G`, the total function
 //!
 //! > `leaf(G, m) = Some(π)` **⟺** `m` is a **leaf** child of a page table `G` **owns**, at
-//! > permission `π` (`writable → Rw`, else `Ro`); `None` otherwise (a translation-fault hole).
+//! > permission `π` (`writable → Rw`, `execute → Rx`, else `Ro`); `None` otherwise (a
+//! > translation-fault hole).
 //!
 //! That biconditional is the refinement `docs/AUDIT-2-P2M-STAGE2.md` argues in prose. Extracting it
 //! here makes it a property of a pure function — checkable over every reachable state by
@@ -45,20 +46,45 @@ use hv_core::p2m::{DomId, Mfn, PageType, PtLevel, System};
 /// Named so the proof harnesses can build one symbolically without re-modelling the tuple
 /// (design-lesson #14c: one derivation, consumed by production and proof alike).
 ///
-/// **`execute` (the trailing bool) is carried but not yet consumed here.** Phase II-1a added it to
-/// the model as the write-xor-execute edge bit; giving it meaning in the emitter — driving the
-/// Stage-2 descriptor's `XN` bit per leaf and checking W^X on the emitted table — is a later arc
-/// (II-1b). This layer threads it through as `_execute` so the tuple stays the single derivation.
+/// The trailing `execute` bool is the model's write-xor-execute edge bit (Phase II-1a). II-1b
+/// consumes it here: an executable leaf maps [`Perm::Rx`], which [`crate::arm64`] emits as a
+/// *not-`XN`* descriptor. The model forbids a writable+executable edge, so `writable` and `execute`
+/// are never both set on a leaf the model produces.
 pub type Edge = (Mfn, u32, Mfn, bool, bool, bool);
 
-/// The permission a Stage-2 leaf carries. The model's `writable` bit, named at the layer that
-/// consumes it.
+/// The permission a Stage-2 leaf carries — the model's `writable` and `execute` bits, named at the
+/// layer that consumes them.
+///
+/// **Write-xor-execute is structural here (Phase II-1b): there is no `RwX` variant.** The model
+/// (hv-core `p2m`) forbids a frame being writable- and executable-mapped at once
+/// (`Violation::WriteExecuteConfusion`), so `leaf_map_from_edges` never needs to represent a
+/// writable-and-executable leaf — making it unrepresentable is the emitter-side echo of the model
+/// invariant (the same "a bad state the map cannot hold is a state you need not prove absent"
+/// discipline as the two-span maps). Executability is emitted as the descriptor's *not-`XN`* bit;
+/// the one place W^X is relaxed — a real kernel's writable+executable RAM — is the declared
+/// [`crate::arm64::Layout`] exemption window, never a value here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Perm {
-    /// Read-only — a guest *write* to this frame must take a permission fault.
+    /// Read-only, execute-never — a guest *write* takes a permission fault, and it is not an
+    /// instruction source.
     Ro,
-    /// Read/write.
+    /// Read/write, execute-never — ordinary guest data.
     Rw,
+    /// Read-execute — read-only *and* an instruction source (guest code). Never writable (that
+    /// would be W+X, which the model forbids and this enum cannot express).
+    Rx,
+}
+
+impl Perm {
+    /// Whether a guest may write through this leaf.
+    pub fn writable(self) -> bool {
+        matches!(self, Perm::Rw)
+    }
+
+    /// Whether a guest may execute from this leaf (the inverse of the descriptor's `XN` bit).
+    pub fn executable(self) -> bool {
+        matches!(self, Perm::Rx)
+    }
 }
 
 /// How much guest memory ONE emitted leaf covers.
@@ -189,7 +215,7 @@ pub fn span_of_table(p2m: &System, parent: Mfn) -> Option<Span> {
 /// The loop's guarantee, stated as the proof uses it:
 ///
 /// > every `out[m] == Some(π)` is **witnessed** by an edge in `edges` with `leaf == true`,
-/// > `owner_of(parent) == Some(dom)`, `child == m`, and `π = writable ? Rw : Ro`.
+/// > `owner_of(parent) == Some(dom)`, `child == m`, and `π = writable ? Rw : execute ? Rx : Ro`.
 ///
 /// That witness plus hv-core's `UnauthorizedForeignLink` is the whole authorization argument —
 /// see [`crate::check::check_authorized`].
@@ -214,9 +240,8 @@ where
     for slot in sup.iter_mut() {
         *slot = None;
     }
-    for (parent, _slot, child, writable, leaf, _execute) in edges.iter().copied() {
-        // Only leaves map a frame; only tables this domain owns are its reachability. (`_execute`
-        // is II-1b's to consume — the emitter's XN bit and emitted-table W^X check.)
+    for (parent, _slot, child, writable, leaf, execute) in edges.iter().copied() {
+        // Only leaves map a frame; only tables this domain owns are its reachability.
         if !leaf || owner_of(parent) != Some(dom) {
             continue;
         }
@@ -234,7 +259,17 @@ where
                 capacity: target.len(),
             }));
         }
-        target[idx] = Some(if writable { Perm::Rw } else { Perm::Ro });
+        // The model forbids a leaf being both writable and executable (W+X is refused at
+        // `p2m::link`), so `writable` takes precedence here only to keep this a total function over
+        // an ARBITRARY edge set (Kani drives edges the model never produces): a hypothetical W+X
+        // edge maps `Rw` — writable preserved, execute denied — which fails CLOSED for W^X.
+        target[idx] = Some(if writable {
+            Perm::Rw
+        } else if execute {
+            Perm::Rx
+        } else {
+            Perm::Ro
+        });
     }
     // One frame must have exactly ONE span, or it would need two machine-frame backings (see
     // `MapError::SpanConflict`). Checked as a total post-pass rather than inline, so the result does
@@ -353,6 +388,44 @@ mod tests {
         )
         .is_ok());
         assert_eq!(out[2], Some(Perm::Ro), "a non-writable leaf is RO, not RW");
+    }
+
+    /// **Phase II-1b — an executable model edge maps to `Rx`.** A read-only *executable* leaf (the
+    /// model's `execute` bit) carries through to the leaf map as read-execute, distinct from a plain
+    /// read-only leaf, so the emitter can drop `XN` for it.
+    #[test]
+    fn executable_leaf_maps_rx() {
+        let mut h = hv();
+        rooted(&mut h, DOM0, 1);
+        ok(&mut h, DOM0, HvCall::P2mAllocate { mfn: 2 });
+        ok(
+            &mut h,
+            DOM0,
+            HvCall::P2mLink {
+                parent: 1,
+                slot: 0,
+                child: 2,
+                writable: false,
+                leaf: true,
+                execute: true,
+            },
+        );
+
+        let mut out = [None; CAP];
+        assert!(leaf_map(
+            h.p2m(),
+            DOM0,
+            Maps {
+                base: &mut out,
+                sup: &mut []
+            }
+        )
+        .is_ok());
+        assert_eq!(
+            out[2],
+            Some(Perm::Rx),
+            "an executable leaf maps read-execute, not plain read-only"
+        );
     }
 
     /// The parent table itself is reachable as *structure*, never as a data leaf — an interior edge
