@@ -68,18 +68,25 @@ pub mod desc {
     pub const PAGE_RW: u64 = PAGE | LEAF_COMMON | S2AP_RW | XN;
     /// A 4 KiB data leaf, read-only, execute-never.
     pub const PAGE_RO: u64 = PAGE | LEAF_COMMON | S2AP_RO | XN;
+    /// A 4 KiB **read-execute** leaf (guest code): read-only and an instruction source — the
+    /// `Perm::Rx` case (Phase II-1b). Read-only, so it is never W+X; executability is the absent
+    /// `XN`. Model-driven — emitted iff the model's leaf edge carries `execute`.
+    pub const PAGE_RX: u64 = PAGE | LEAF_COMMON | S2AP_RO;
     /// A **data** 2 MiB block, read/write, execute-never (M5 Arc 6a). Distinct from
     /// [`BLOCK_ROX`], which is the *shared guest image* block and is deliberately RO **and
     /// executable** — data must never be executable, whatever its span.
     pub const BLOCK_RW: u64 = BLOCK | LEAF_COMMON | S2AP_RW | XN;
     /// A **data** 2 MiB block, read-only, execute-never (M5 Arc 6a).
     pub const BLOCK_RO: u64 = BLOCK | LEAF_COMMON | S2AP_RO | XN;
-    /// A 2 MiB block a guest may **execute** from — read/write and read-only forms (M5 Arc 6b).
-    /// Only ever emitted when [`super::Layout::sup_executable`] asks for it.
+    /// A 2 MiB block that is **writable AND executable** — the one W+X descriptor this emitter
+    /// produces. Emitted **only** for a writable super leaf inside the declared W^X-exemption window
+    /// ([`super::Layout::sup_wx_exempt`]) — a real kernel's RAM, where code and data share frames
+    /// and Stage-2 cannot tell them apart. Everywhere else W^X is enforced and this never appears.
     pub const BLOCK_RW_X: u64 = BLOCK | LEAF_COMMON | S2AP_RW;
-    /// Read-only and executable — the same shape as the guest-image block, for a guest whose code
-    /// lives in its own RAM.
-    pub const BLOCK_RO_X: u64 = BLOCK | LEAF_COMMON | S2AP_RO;
+    /// A 2 MiB **read-execute** block (guest code): read-only and an instruction source — the super
+    /// `Perm::Rx` case. Read-only, so never W+X; model-driven (emitted iff the edge carries
+    /// `execute`). Same bits as the guest-image block.
+    pub const BLOCK_RX: u64 = BLOCK | LEAF_COMMON | S2AP_RO;
     /// A **device** 2 MiB block (M5 Arc 6b): `MemAttr = 0b0000` (Device-nGnRnE — no gathering, no
     /// reordering, no early write acknowledgement), read/write, **execute-never**. Note the absent
     /// `0b1111 << 2`: that is the whole difference from a Normal-memory block, and getting it wrong
@@ -137,17 +144,22 @@ pub struct Layout {
     pub device_base: u64,
     /// Length of the device window in bytes; `0` = absent. Must be a multiple of 2 MiB.
     pub device_len: u64,
-    /// Whether super-span leaves are **executable** (M5 Arc 6b).
+    /// The declared **write-xor-execute exemption** for the super window (Phase II-1b): whether a
+    /// *writable* super leaf may ALSO be emitted executable (a `BLOCK_RW_X` — the one W+X descriptor
+    /// this emitter produces).
     ///
-    /// **A named weakening, not an oversight.** Arc 6a made every data leaf execute-never, and that
-    /// is right for a guest whose code lives in a separate read-only image: an executable data
-    /// superpage is a 512-page execute surface. But a *real kernel* runs from its own RAM, so it
-    /// cannot be hosted at all under a blanket XN. Making it a declared flag rather than a constant
-    /// keeps the property **checked** — `verify_encoding` asserts the emitted blocks match this
-    /// exactly, so a config that did not ask for execute cannot silently get it, and one that did
-    /// cannot silently lose it. Base-span (4 KiB) leaves stay XN unconditionally; only the super
-    /// window, which is what a real guest's RAM is made of, is affected.
-    pub sup_executable: bool,
+    /// **The single, declared place W^X is relaxed — not an oversight.** The model (hv-core `p2m`)
+    /// enforces W^X universally: no frame is writable- and executable-mapped at once. But a *real
+    /// kernel* runs from its own RAM, where code and data share writable frames and Stage-2 cannot
+    /// tell them apart (that is Stage-1's job, which the hypervisor does not own under pass-through),
+    /// so its RAM is intrinsically writable AND executable. This flag is that exemption, made a
+    /// **declared, checked parameter** (design-lesson #44): `verify_encoding` proves the emitted
+    /// blocks match it exactly, so a config that did not ask for W+X cannot silently get it, and the
+    /// exemption window is the *only* source of an emitted writable-and-executable descriptor. It
+    /// affects only **writable** (`Perm::Rw`) super leaves — read-only (`Ro`) and read-execute
+    /// (`Rx`) leaves are emitted per the model (XN / not-XN) regardless. Base-span (4 KiB) leaves
+    /// are never exempt: they follow the model's execute bit strictly.
+    pub sup_wx_exempt: bool,
     /// How many super-span frames are actually **backed** by reserved memory.
     ///
     /// Not `TABLE_ENTRIES`: a full super table would span 1 GiB, and the window is only as large as
@@ -252,9 +264,12 @@ pub fn encode(
     }
     for (m, leaf) in leaves.iter().enumerate().take(TABLE_ENTRIES) {
         if let Some(perm) = leaf {
+            // Base leaves follow the model's execute bit strictly — never exempt (only the super
+            // window can be W^X-exempt). `Rx` is the model-driven read-execute leaf (not-`XN`).
             let attrs = match perm {
                 Perm::Rw => desc::PAGE_RW,
                 Perm::Ro => desc::PAGE_RO,
+                Perm::Rx => desc::PAGE_RX,
             };
             l3_data[m] = (frame_pa(layout, m as u32) & desc::ADDR_4K) | attrs;
         }
@@ -271,11 +286,15 @@ pub fn encode(
     }
     for (m, leaf) in supers.iter().enumerate().take(TABLE_ENTRIES) {
         if let Some(perm) = leaf {
-            let attrs = match (perm, layout.sup_executable) {
+            // The W^X-exemption affects ONLY writable super leaves: `sup_wx_exempt` turns a `Rw`
+            // leaf into the one W+X descriptor (`BLOCK_RW_X`), for a real kernel's writable+
+            // executable RAM. Read-only (`Ro`, XN) and read-execute (`Rx`, model-driven not-XN)
+            // leaves ignore the exemption — they follow the model's execute bit either way.
+            let attrs = match (perm, layout.sup_wx_exempt) {
                 (Perm::Rw, false) => desc::BLOCK_RW,
-                (Perm::Ro, false) => desc::BLOCK_RO,
                 (Perm::Rw, true) => desc::BLOCK_RW_X,
-                (Perm::Ro, true) => desc::BLOCK_RO_X,
+                (Perm::Ro, _) => desc::BLOCK_RO,
+                (Perm::Rx, _) => desc::BLOCK_RX,
             };
             // Indexed by the block's own L2 slot, derived from its IPA — NOT by `m` directly, so the
             // window's base offset cannot silently shift the mapping.
@@ -322,10 +341,34 @@ pub const BLOCK_SIZE: u64 = 0x20_0000;
 pub struct Decoded {
     /// The output address it maps to.
     pub pa: u64,
-    /// The access permission it grants the guest.
+    /// The `S2AP` **access** the descriptor grants — [`Perm::Ro`] or [`Perm::Rw`] only. The
+    /// descriptor's execute bit lives separately in [`Self::xn`]; the leaf-map's [`Perm::Rx`]
+    /// (read-execute) decodes as `perm: Ro, xn: false`, and the exempt writable+executable block as
+    /// `perm: Rw, xn: false`. So the `(perm, xn)` pair spans all four combinations the hardware can
+    /// express, while the `Perm` enum alone keeps W+X unrepresentable.
     pub perm: Perm,
     /// Whether it is execute-never.
     pub xn: bool,
+}
+
+/// The `(S2AP access, XN)` a leaf of model permission `perm` must decode to, given whether its
+/// window is W^X-exempt. The **single derivation** [`encode`] and [`verify_encoding`] share for the
+/// execute bit (design-lesson #14c): `Rx` is read-execute (`Ro`, not-`XN`); a writable leaf is
+/// executable (not-`XN`) ONLY in an exempt window — the `BLOCK_RW_X` relaxation; everything else is
+/// execute-never. Returns the `S2AP` access ([`Perm::Ro`]/[`Perm::Rw`], never `Rx`) so it lines up
+/// with what the descriptor actually encodes.
+///
+/// **Public as the fidelity seam** (design-lesson #14c, like [`Layout::regions`]): `hv-verify`'s
+/// Kani harnesses drive it over every `(perm, wx_exempt)` to prove the emitted execute bit follows
+/// the model — a writable+executable leaf arises IFF the declared exemption applies, and a
+/// read-only leaf is never executable — so "no W+X except the one declared relaxation" is a
+/// machine-checked property of the shipped derivation, not a comment.
+pub fn leaf_access_xn(perm: Perm, wx_exempt: bool) -> (Perm, bool) {
+    match perm {
+        Perm::Ro => (Perm::Ro, true),
+        Perm::Rw => (Perm::Rw, !wx_exempt),
+        Perm::Rx => (Perm::Ro, false),
+    }
 }
 
 /// The `S2AP` field of a leaf, or `None` if it is a reserved encoding.
@@ -641,13 +684,18 @@ pub fn verify_encoding(
     }
     dead_except(t.l2_data, &[data_l2], "l2_data")?;
 
-    // L3: one page descriptor per mapped frame, at its PA and permission, execute-never; every
-    // other slot dead.
+    // L3: one page descriptor per mapped frame, at its PA and the `(S2AP, XN)` the model's leaf
+    // permission demands. Base leaves are never W^X-exempt (`false`), so a writable base leaf is
+    // always XN and a read-execute (`Rx`) leaf is the only not-XN base leaf — the model's execute
+    // bit, faithful to the descriptor. Every other slot dead.
     for m in 0..TABLE_ENTRIES {
-        let want = leaves.get(m).copied().flatten().map(|perm| Decoded {
-            pa: frame_pa(layout, m as u32) & desc::ADDR_4K,
-            perm,
-            xn: true,
+        let want = leaves.get(m).copied().flatten().map(|perm| {
+            let (access, xn) = leaf_access_xn(perm, false);
+            Decoded {
+                pa: frame_pa(layout, m as u32) & desc::ADDR_4K,
+                perm: access,
+                xn,
+            }
         });
         let found = decode_page(t.l3_data[m]);
         if found != want {
@@ -666,15 +714,19 @@ pub fn verify_encoding(
         }
     }
 
-    // L2(sup): one 2 MiB BLOCK per mapped super-span frame, execute-never; every other slot dead
-    // (M5 Arc 6a). `xn: true` is load-bearing — the only executable mapping this emitter writes is
-    // the shared guest image, and an executable data superpage is a 512-page execute surface.
+    // L2(sup): one 2 MiB BLOCK per mapped super-span frame, at the `(S2AP, XN)` the model's leaf
+    // permission demands under the declared W^X-exemption. A writable super leaf is executable
+    // (not-XN) ONLY when `sup_wx_exempt` — the one declared W+X relaxation, checked here so execute
+    // can be neither gained nor lost silently; read-only and read-execute leaves follow the model
+    // regardless. Every other slot dead.
     for m in 0..TABLE_ENTRIES {
-        let want = supers.get(m).copied().flatten().map(|perm| Decoded {
-            pa: super_pa(layout, m as u32) & desc::ADDR_2M,
-            perm,
-            // Exactly what the layout declared — so execute cannot be gained or lost silently.
-            xn: !layout.sup_executable,
+        let want = supers.get(m).copied().flatten().map(|perm| {
+            let (access, xn) = leaf_access_xn(perm, layout.sup_wx_exempt);
+            Decoded {
+                pa: super_pa(layout, m as u32) & desc::ADDR_2M,
+                perm: access,
+                xn,
+            }
         });
         let idx = ((super_ipa(layout, m as u32) >> 21) & 0x1ff) as usize;
         let found = decode_block(t.l2_sup[idx]);
@@ -801,7 +853,7 @@ mod tests {
             // Device pass-through window: its own L1 entry (0x0800_0000 >> 30 = 0), 32 MiB.
             device_base: 0x0800_0000,
             device_len: 0x0200_0000,
-            sup_executable: false,
+            sup_wx_exempt: false,
             sup_ipa_base: 0xC000_0000,
             sup_pa_base: 0x8000_0000,
             sup_frames: 8,
@@ -842,12 +894,50 @@ mod tests {
             0x77d,
             "2 MiB block, RO + executable"
         );
-        assert_ne!(desc::PAGE_RW & desc::XN, 0, "data leaves are execute-never");
-        assert_ne!(desc::PAGE_RO & desc::XN, 0, "data leaves are execute-never");
+        assert_ne!(
+            desc::PAGE_RW & desc::XN,
+            0,
+            "writable data is execute-never"
+        );
+        assert_ne!(
+            desc::PAGE_RO & desc::XN,
+            0,
+            "read-only data is execute-never"
+        );
         assert_eq!(
             desc::BLOCK_ROX & desc::XN,
             0,
             "the guest image must stay EXECUTABLE"
+        );
+        // Phase II-1b: read-execute leaves (Rx) are RO and NOT execute-never. `PAGE_RX` differs
+        // from `PAGE_RO` only in bit 54 (XN), so its low 12 bits match `PAGE_RO`'s 0x77f.
+        assert_eq!(desc::PAGE_RX & 0xfff, 0x77f, "4 KiB page, RO + executable");
+        assert_eq!(desc::PAGE_RX & desc::XN, 0, "an Rx page must be executable");
+        assert_eq!(
+            desc::PAGE_RX & desc::S2AP_RW,
+            desc::S2AP_RO,
+            "Rx is read-only"
+        );
+        assert_eq!(
+            desc::BLOCK_RX & desc::XN,
+            0,
+            "an Rx block must be executable"
+        );
+        assert_eq!(
+            desc::BLOCK_RX & desc::S2AP_RW,
+            desc::S2AP_RO,
+            "Rx block is read-only, never W+X"
+        );
+        // The one W+X descriptor — writable AND executable — the declared exemption only.
+        assert_eq!(
+            desc::BLOCK_RW_X & desc::XN,
+            0,
+            "the exempt block is executable"
+        );
+        assert_eq!(
+            desc::BLOCK_RW_X & desc::S2AP_RW,
+            desc::S2AP_RW,
+            "the exempt block is writable"
         );
     }
 
@@ -1088,6 +1178,157 @@ mod tests {
                 refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
             ),
             Ok(())
+        );
+    }
+
+    /// **Phase II-1b — a read-execute (`Rx`) leaf encodes NOT execute-never**, at both spans, and
+    /// round-trips. Executability follows the model's leaf permission, not a config flag.
+    #[test]
+    fn rx_leaves_encode_executable_and_verify() {
+        let l = layout(); // sup_wx_exempt: false — Rx executability is model-driven, not the exemption
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
+        let mut leaves = [None; 8];
+        leaves[4] = Some(Perm::Rx); // a base read-execute leaf
+        let mut sup = [None; 8];
+        sup[2] = Some(Perm::Rx); // a super read-execute leaf
+        encode(
+            &leaves,
+            &sup,
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
+            },
+        );
+        // A base Rx page: read-only S2AP, executable (not XN).
+        assert_eq!(
+            decode_page(l3[4]),
+            Some(Decoded {
+                pa: frame_pa(&l, 4) & desc::ADDR_4K,
+                perm: Perm::Ro,
+                xn: false
+            })
+        );
+        // A super Rx block: read-only, executable.
+        assert_eq!(
+            decode_block(l2s[((super_ipa(&l, 2) >> 21) & 0x1ff) as usize]),
+            Some(Decoded {
+                pa: super_pa(&l, 2) & desc::ADDR_2M,
+                perm: Perm::Ro,
+                xn: false
+            })
+        );
+        assert_eq!(
+            verify_encoding(&leaves, &sup, &l, refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)),
+            Ok(())
+        );
+    }
+
+    /// **The declared W^X-exemption makes a WRITABLE super leaf executable — and only there.** With
+    /// `sup_wx_exempt`, a `Rw` super leaf emits the one W+X descriptor (`BLOCK_RW_X`); without it,
+    /// the same leaf is execute-never. Base leaves are never exempt.
+    #[test]
+    fn wx_exempt_makes_only_writable_super_leaves_executable() {
+        let mut l = layout();
+        l.sup_wx_exempt = true;
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
+        let mut leaves = [None; 8];
+        leaves[5] = Some(Perm::Rw); // a base writable leaf — must stay XN even under the exemption
+        let mut sup = [None; 8];
+        sup[1] = Some(Perm::Rw); // a writable super leaf — exempt → W+X
+        encode(
+            &leaves,
+            &sup,
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
+            },
+        );
+        let idx = ((super_ipa(&l, 1) >> 21) & 0x1ff) as usize;
+        assert_eq!(
+            decode_block(l2s[idx]),
+            Some(Decoded {
+                pa: super_pa(&l, 1) & desc::ADDR_2M,
+                perm: Perm::Rw,
+                xn: false // writable AND executable — the exemption
+            })
+        );
+        // The base writable leaf is NOT exempt — it stays execute-never.
+        assert_eq!(
+            decode_page(l3[5]),
+            Some(Decoded {
+                pa: frame_pa(&l, 5) & desc::ADDR_4K,
+                perm: Perm::Rw,
+                xn: true
+            }),
+            "base leaves are never W^X-exempt"
+        );
+        assert_eq!(
+            verify_encoding(&leaves, &sup, &l, refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)),
+            Ok(())
+        );
+
+        // Without the exemption, the SAME writable super leaf is execute-never, and the exempt
+        // descriptor is now spurious — `verify_encoding` catches the silently-gained execute.
+        let mut plain = l;
+        plain.sup_wx_exempt = false;
+        assert!(
+            matches!(
+                verify_encoding(
+                    &leaves,
+                    &sup,
+                    &plain,
+                    refs(&l1, &l2c, &l2d, &l3, &l2s, &l2dv)
+                ),
+                Err(EncodingViolation::BadLeaf { .. })
+            ),
+            "a writable+executable super block must be rejected when the window is not exempt"
+        );
+    }
+
+    /// A base data leaf that silently drops `XN` (gains execute) is caught — base leaves follow the
+    /// model's execute bit strictly, with no exemption.
+    #[test]
+    fn verify_catches_a_base_data_leaf_that_gained_execute() {
+        let l = layout();
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
+        let mut leaves = [None; 8];
+        leaves[2] = Some(Perm::Rw);
+        encode(
+            &leaves,
+            &[None; 8],
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
+            },
+        );
+        let mut tampered = l3;
+        tampered[2] &= !desc::XN; // a writable data page made executable — W+X
+        assert!(
+            matches!(
+                verify_encoding(
+                    &leaves,
+                    &[None; 8],
+                    &l,
+                    refs(&l1, &l2c, &l2d, &tampered, &l2s, &l2dv)
+                ),
+                Err(EncodingViolation::BadLeaf { .. })
+            ),
+            "a data page that silently gained execute must be caught"
         );
     }
 

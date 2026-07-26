@@ -235,7 +235,7 @@ pub fn check_exact(
         // The model's verdict for this frame: the LAST leaf edge into it from a table `dom` owns
         // (later edges overwrite earlier ones, exactly as the emitter applies them).
         let mut expected: Option<Perm> = None;
-        for (parent, _slot, child, writable, leaf, _execute) in edges.iter().copied() {
+        for (parent, _slot, child, writable, leaf, execute) in edges.iter().copied() {
             // Filter to THIS span's map: an edge only belongs to the map whose span its parent's
             // level implies (the same translation `leaf_map` uses, re-derived here from the model).
             if leaf
@@ -243,7 +243,16 @@ pub fn check_exact(
                 && hv.p2m().owner_of(parent) == Some(dom)
                 && crate::leafmap::span_of_table(hv.p2m(), parent) == Some(span)
             {
-                expected = Some(if writable { Perm::Rw } else { Perm::Ro });
+                // Independently re-derive the permission the SAME way `leaf_map` does — writable
+                // wins, then execute (`Rx`), else read-only — so this consistency check catches the
+                // emitter mis-applying the relation, not a spurious execute/permission disagreement.
+                expected = Some(if writable {
+                    Perm::Rw
+                } else if execute {
+                    Perm::Rx
+                } else {
+                    Perm::Ro
+                });
             }
         }
         if *mapped != expected {

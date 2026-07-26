@@ -418,10 +418,12 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         // emulated, and the PL011 is EL2-only. The real-Linux guest drives real hardware.
         device_base: windows().device_base,
         device_len: windows().device_len,
-        // A real kernel executes from its own RAM; the synthetic guests run from a separate
-        // read-only image and keep every data leaf execute-never. Declared, and checked by
-        // `verify_encoding` — see `Layout::sup_executable`.
-        sup_executable: cfg!(feature = "real-linux"),
+        // A real kernel executes from its own writable RAM (code and data share frames — Stage-2
+        // cannot tell them apart), so its super window is the one declared W^X-EXEMPTION: a writable
+        // super leaf may also be executable. The synthetic guests run from a separate read-only
+        // image and keep every writable leaf execute-never. Declared, and checked per-leaf by
+        // `verify_encoding` — see `Layout::sup_wx_exempt` (Phase II-1b).
+        sup_wx_exempt: cfg!(feature = "real-linux"),
     };
 
     // Structural preconditions the encoder silently assumes: the guest-image and data regions must
