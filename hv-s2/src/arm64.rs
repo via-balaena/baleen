@@ -265,12 +265,10 @@ pub fn encode(
     for (m, leaf) in leaves.iter().enumerate().take(TABLE_ENTRIES) {
         if let Some(perm) = leaf {
             // Base leaves follow the model's execute bit strictly — never exempt (only the super
-            // window can be W^X-exempt). `Rx` is the model-driven read-execute leaf (not-`XN`).
-            let attrs = match perm {
-                Perm::Rw => desc::PAGE_RW,
-                Perm::Ro => desc::PAGE_RO,
-                Perm::Rx => desc::PAGE_RX,
-            };
+            // window can be W^X-exempt). `Rx` is the model-driven read-execute leaf (not-`XN`). The
+            // attribute selection routes through the named [`page_leaf_attrs`] emit-seam so it is
+            // Kani-provable ∀ to decode back to `leaf_access_xn(perm, false)` (design-lesson #14c).
+            let attrs = page_leaf_attrs(*perm);
             l3_data[m] = (frame_pa(layout, m as u32) & desc::ADDR_4K) | attrs;
         }
     }
@@ -290,12 +288,9 @@ pub fn encode(
             // leaf into the one W+X descriptor (`BLOCK_RW_X`), for a real kernel's writable+
             // executable RAM. Read-only (`Ro`, XN) and read-execute (`Rx`, model-driven not-XN)
             // leaves ignore the exemption — they follow the model's execute bit either way.
-            let attrs = match (perm, layout.sup_wx_exempt) {
-                (Perm::Rw, false) => desc::BLOCK_RW,
-                (Perm::Rw, true) => desc::BLOCK_RW_X,
-                (Perm::Ro, _) => desc::BLOCK_RO,
-                (Perm::Rx, _) => desc::BLOCK_RX,
-            };
+            // Same #14c emit-seam routing as the base leaves, but the super window carries the
+            // declared W^X exemption, so the attributes read `layout.sup_wx_exempt`.
+            let attrs = block_leaf_attrs(*perm, layout.sup_wx_exempt);
             // Indexed by the block's own L2 slot, derived from its IPA — NOT by `m` directly, so the
             // window's base offset cannot silently shift the mapping.
             let idx = ((super_ipa(layout, m as u32) >> 21) & 0x1ff) as usize;
@@ -368,6 +363,38 @@ pub fn leaf_access_xn(perm: Perm, wx_exempt: bool) -> (Perm, bool) {
         Perm::Ro => (Perm::Ro, true),
         Perm::Rw => (Perm::Rw, !wx_exempt),
         Perm::Rx => (Perm::Ro, false),
+    }
+}
+
+/// The descriptor attribute bits [`encode`] writes for a 4 KiB **base leaf** (`L3` page) of model
+/// permission `perm`. Base leaves are never W^X-exempt — only the super window can be (see
+/// [`block_leaf_attrs`]).
+///
+/// **The emit-side seam, named so it is machine-checkable** (design-lesson #14c): `encode` selects
+/// its descriptor constants by *calling this*, not through an inline `match`, so `hv-verify`'s Kani
+/// harness can prove ∀ that `decode_page(pa | page_leaf_attrs(perm))` recovers exactly
+/// [`leaf_access_xn`]`(perm, false)` — i.e. the descriptor words the MMU walks follow the model's
+/// execute bit, not just the verifier's expectation. It stays a SEPARATE derivation from the decode
+/// seam `leaf_access_xn` (the #36 independent-cross-check), and the harness proves the two coincide.
+pub fn page_leaf_attrs(perm: Perm) -> u64 {
+    match perm {
+        Perm::Rw => desc::PAGE_RW,
+        Perm::Ro => desc::PAGE_RO,
+        Perm::Rx => desc::PAGE_RX,
+    }
+}
+
+/// The descriptor attribute bits [`encode`] writes for a 2 MiB **super leaf** (`L2` block) of model
+/// permission `perm` under the declared W^X exemption `wx_exempt`. The exemption turns ONLY a
+/// writable leaf into the one W+X descriptor (`BLOCK_RW_X`); read-only and read-execute leaves
+/// follow the model regardless. The emit-side counterpart of [`page_leaf_attrs`] for the super
+/// window — same #14c rationale.
+pub fn block_leaf_attrs(perm: Perm, wx_exempt: bool) -> u64 {
+    match (perm, wx_exempt) {
+        (Perm::Rw, false) => desc::BLOCK_RW,
+        (Perm::Rw, true) => desc::BLOCK_RW_X,
+        (Perm::Ro, _) => desc::BLOCK_RO,
+        (Perm::Rx, _) => desc::BLOCK_RX,
     }
 }
 

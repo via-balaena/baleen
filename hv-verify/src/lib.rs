@@ -279,7 +279,10 @@ mod p2m_write_xor_execute {
 /// emitter.
 #[cfg(kani)]
 mod stage2_encoding {
-    use hv_s2::arm64::{decode_block, decode_page, decode_table, desc, leaf_access_xn, Decoded};
+    use hv_s2::arm64::{
+        block_leaf_attrs, decode_block, decode_page, decode_table, desc, leaf_access_xn,
+        page_leaf_attrs, Decoded,
+    };
     use hv_s2::Perm;
 
     /// A data leaf round-trips: for **every** output address and **both** permissions, encoding a
@@ -389,6 +392,51 @@ mod stage2_encoding {
             if matches!(perm, Perm::Ro) {
                 assert!(xn, "a read-only data leaf is never executable");
             }
+        }
+    }
+
+    /// **THE II-1b EMITTER-FIDELITY THEOREM — the descriptor bits `encode` WRITES decode to exactly
+    /// the seam, over every address, permission, and the symbolic W^X exemption.** The
+    /// [`the_exemption_is_the_sole_writable_and_executable_leaf`] theorem proves the *decode* seam
+    /// [`leaf_access_xn`], and [`hv_s2::arm64::verify_encoding`] checks the emitted table against it
+    /// — but the emitter's own descriptor selection was, until II-1b's `#14c` refactor, an inline
+    /// `match` no ∀ proof ever ran (only concrete golden tests + the boot-time `verify_encoding`
+    /// touched it). `encode` now selects its bits by calling the named emit-seams
+    /// [`page_leaf_attrs`] / [`block_leaf_attrs`], so this harness drives the very functions the
+    /// emitter runs and proves — over ALL 2⁶⁴ addresses — that decoding what `encode` writes
+    /// (`pa | page_leaf_attrs(perm)`, `pa | block_leaf_attrs(perm, exempt)`) recovers exactly what
+    /// the decode seam [`leaf_access_xn`] prescribes. So the descriptor *words the MMU walks*, not
+    /// just the verifier's expectation, follow the model's execute bit. Emit-seam and decode-seam
+    /// stay INDEPENDENT derivations (the #36 cross-check); this proves they coincide. Base leaves
+    /// are never exempt (the emitter passes `false`); the super window carries the declared exemption.
+    #[kani::proof]
+    fn encode_leaf_descriptors_follow_the_seam() {
+        let pa: u64 = kani::any();
+        let wx_exempt: bool = kani::any();
+        for perm in [Perm::Ro, Perm::Rw, Perm::Rx] {
+            // Base leaf (`L3` page): the emitter passes `false` — never W^X-exempt.
+            let (base_access, base_xn) = leaf_access_xn(perm, false);
+            assert!(
+                decode_page((pa & desc::ADDR_4K) | page_leaf_attrs(perm))
+                    == Some(Decoded {
+                        pa: pa & desc::ADDR_4K,
+                        perm: base_access,
+                        xn: base_xn,
+                    }),
+                "the base-leaf bits encode writes must decode to exactly leaf_access_xn(perm, false)"
+            );
+
+            // Super leaf (`L2` block): the emitter passes the declared exemption.
+            let (sup_access, sup_xn) = leaf_access_xn(perm, wx_exempt);
+            assert!(
+                decode_block((pa & desc::ADDR_2M) | block_leaf_attrs(perm, wx_exempt))
+                    == Some(Decoded {
+                        pa: pa & desc::ADDR_2M,
+                        perm: sup_access,
+                        xn: sup_xn,
+                    }),
+                "the super-leaf bits encode writes must decode to exactly leaf_access_xn(perm, exempt)"
+            );
         }
     }
 
