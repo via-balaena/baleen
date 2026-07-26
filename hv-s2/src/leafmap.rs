@@ -107,6 +107,14 @@ pub enum MapError {
     /// `Writable`-or-untyped at any level, so a frame really can be a leaf under an `L1` and an
     /// `L2` table at once. Surfaced by unfolding the statement for this arc (#37), and rejected
     /// here rather than silently canonicalised to one span.
+    ///
+    /// **Phase I-4 decided this is a benign representability limit, not an isolation hazard, so
+    /// `hv-core` deliberately carries no guard against it.** In the model both mappings reach the
+    /// same authorized `Mfn`, and authorization is span-independent; the conflict is only that the
+    /// `Mfn` → host-PA function cannot back one frame at two disjoint windows. Failing loud here is
+    /// therefore correct and is proven **total** — every span-conflict is caught, and the frame it
+    /// names is provably authorized — by `hv-verify/src/lib.rs::stage2_refinement` (Kani) and
+    /// `hv-verify/verus/stage2_leaf_authorized.rs::a_span_conflict_frame_is_authorized` (∀-N).
     SpanConflict {
         /// The frame claimed at two spans.
         mfn: Mfn,

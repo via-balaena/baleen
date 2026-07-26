@@ -108,6 +108,13 @@ pub enum OutOfDomain {
     /// One frame is a leaf at two different spans, so it would need two machine-frame backings
     /// (each span has its own window). `hv-core` permits this — `MislevelledLink` constrains only
     /// *interior* children — and the enumerator reaches it in 6 hypercalls.
+    ///
+    /// **Phase I-4 proved this classification sound:** a span-conflict frame is one the domain owns
+    /// or holds a grant for (authorization is span-independent), so routing it here rather than to
+    /// [`Violation`] conceals no isolation failure — and the emitter's fail-loud that produces it is
+    /// total. See `hv-verify` (`stage2_refinement` Kani harnesses + the `a_span_conflict_frame_is_authorized`
+    /// Verus lemma). The frame-at-two-spans state is a decided, benign, machine-checked boundary,
+    /// not a gap.
     SpanConflict {
         /// The domain whose map claims it twice.
         dom: DomId,

@@ -337,7 +337,9 @@ mod stage2_encoding {
 #[cfg(kani)]
 mod stage2_refinement {
     use hv_core::p2m::{DomId, Mfn};
-    use hv_s2::{check_authorized_with, leaf_map_from_edges, Edge, Maps, Perm, Violation};
+    use hv_s2::{
+        check_authorized_with, leaf_map_from_edges, Edge, MapError, Maps, Perm, Violation,
+    };
 
     /// Distinct domains the symbolic model may name. Three is the smallest world that can express
     /// the confused deputy: an owner, a mapper, and a *third* party whose grant must not count.
@@ -642,6 +644,180 @@ mod stage2_refinement {
                 perm: Perm::Rw,
             }),
             "with P1 dropped the confused deputy must be caught — the checker is not vacuous"
+        );
+    }
+
+    // ─── Phase I-4: the span-conflict boundary, decided then proven ────────────────────────────
+    //
+    // `hv-core` PERMITS one frame being a leaf at two different spans (a base-level table and a
+    // super-level table both leaf-linking the same child): `MislevelledLink` constrains only an
+    // *interior* entry's child, never a leaf's. The emitter cannot represent it — each span has its
+    // own disjoint host-PA window, so one `Mfn` would need two backings — so `leaf_map_from_edges`
+    // fails **loud** (`MapError::SpanConflict`) and `check_all` classifies it `OutOfDomain`, NOT a
+    // `Violation` (the enumerator reaches it in 6 hypercalls; folding it into `Violation` would flag
+    // a legal state).
+    //
+    // The I-4 decision is that this resting place is CORRECT — a frame at two spans is a
+    // representability limit that fails closed, not an isolation hazard, so `hv-core` need not (and
+    // should not, #8/#44) carry a guard against it. These harnesses prove that decision sound on the
+    // shipped emitter: the fail-loud is TOTAL and the out-of-domain classification conceals nothing.
+    // The ∀-edge-count companion is `verus/stage2_leaf_authorized.rs::a_span_conflict_frame_is_authorized`.
+
+    /// **Detection is complete — the fail-loud is TOTAL.** Whenever the real `leaf_map_from_edges`
+    /// returns `Ok`, no frame is left mapped at BOTH spans. Contrapositive: a state that would
+    /// produce a span-conflict can never be silently accepted and canonicalised to one span — it
+    /// must fail loud. Over every ownership assignment, span assignment, edge set and capacity.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn an_accepted_map_has_no_span_conflict() {
+        let w = World::any();
+        let dom: DomId = kani::any();
+        kani::assume((dom as usize) < DOMS);
+        let cap: usize = kani::any();
+        kani::assume(cap <= FRAMES);
+
+        let mut base = [None; FRAMES];
+        let mut sup = [None; FRAMES];
+        if leaf_map_from_edges(
+            &w.edges,
+            |m| w.owner_of(m),
+            |p| Some(w.span_of(p)),
+            dom,
+            Maps {
+                base: &mut base[..cap],
+                sup: &mut sup[..cap],
+            },
+        )
+        .is_ok()
+        {
+            let m: Mfn = kani::any();
+            kani::assume((m as usize) < cap);
+            assert!(
+                !(base[m as usize].is_some() && sup[m as usize].is_some()),
+                "an accepted Stage-2 emission left a frame mapped at BOTH spans — a silent span-conflict"
+            );
+        }
+    }
+
+    /// **Detection is sound — no false conflict.** When the emitter reports
+    /// `Err(SpanConflict { mfn })`, that frame really is mapped at both spans (both maps hold it).
+    /// So the `OutOfDomain::SpanConflict` verdict never fires on a state that is *not* a conflict —
+    /// the refinement's domain is not silently narrowed by a spurious rejection.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn a_reported_span_conflict_is_real() {
+        let w = World::any();
+        let dom: DomId = kani::any();
+        kani::assume((dom as usize) < DOMS);
+        let cap: usize = kani::any();
+        kani::assume(cap <= FRAMES);
+
+        let mut base = [None; FRAMES];
+        let mut sup = [None; FRAMES];
+        let verdict = leaf_map_from_edges(
+            &w.edges,
+            |m| w.owner_of(m),
+            |p| Some(w.span_of(p)),
+            dom,
+            Maps {
+                base: &mut base[..cap],
+                sup: &mut sup[..cap],
+            },
+        );
+        // On `SpanConflict` the post-pass runs *after* the whole edge loop, so both maps are fully
+        // built — the named frame is genuinely resident in each.
+        if let Err(MapError::SpanConflict { mfn }) = verdict {
+            assert!(
+                base[mfn as usize].is_some() && sup[mfn as usize].is_some(),
+                "SpanConflict named a frame that is not actually a leaf at two spans"
+            );
+        }
+    }
+
+    /// **The out-of-domain classification hides no `Violation`.** Under P1 and P2, a span-conflict
+    /// state's emitted maps reach only frames the domain owns or holds a grant for — at BOTH spans.
+    /// So routing a two-span frame to `OutOfDomain` rather than `Violation` cannot mask an
+    /// unauthorized reach: the conflict names an authorized frame, exactly because authorization is
+    /// span-independent. This is the real-code companion to the ∀-N Verus lemma; it closes T's
+    /// silence on the `Err` branch (T asserts authorization only when the emitter returns `Ok`).
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn a_span_conflict_state_maps_only_authorized_frames() {
+        let w = World::any();
+        let dom: DomId = kani::any();
+        kani::assume((dom as usize) < DOMS);
+        w.assume_no_unauthorized_foreign_link();
+        w.assume_edge_children_allocated();
+        let cap: usize = kani::any();
+        kani::assume(cap <= FRAMES);
+
+        let mut base = [None; FRAMES];
+        let mut sup = [None; FRAMES];
+        // Both maps are fully built whether the call ends in `Ok` or `Err(SpanConflict)` (the
+        // conflict is a post-pass), so this assertion covers the rejected state too.
+        if let Err(MapError::SpanConflict { .. }) = leaf_map_from_edges(
+            &w.edges,
+            |m| w.owner_of(m),
+            |p| Some(w.span_of(p)),
+            dom,
+            Maps {
+                base: &mut base[..cap],
+                sup: &mut sup[..cap],
+            },
+        ) {
+            for out in [&base[..cap], &sup[..cap]] {
+                assert!(
+                    check_authorized_with(
+                        dom,
+                        out,
+                        |m| w.owner_of(m),
+                        |g, d, f, wr| w.authorizes(g, d, f, wr),
+                    )
+                    .is_ok(),
+                    "a rejected span-conflict state still mapped a frame no ownership or grant authorizes"
+                );
+            }
+        }
+    }
+
+    /// **Non-vacuity + teeth: a real span-conflict IS constructible and IS caught.** Frame 2 is a
+    /// leaf under table 1 (a BASE-span parent) and under table 3 (a SUPER-span parent), both owned
+    /// by dom0. The emitter must reject it as `SpanConflict { mfn: 2 }` — proving the harnesses
+    /// above are not vacuously satisfied by "no conflict is ever reachable", and that the post-pass
+    /// genuinely fires (drop it and this fails).
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn a_constructed_span_conflict_is_rejected() {
+        let mut owners = [None; FRAMES];
+        owners[1] = Some(0); // a base-level table of dom0
+        owners[2] = Some(0); // the shared child frame
+        owners[3] = Some(0); // a super-level table of dom0
+        let mut spans = [false; FRAMES];
+        spans[3] = true; // leaves out of table 3 are SUPER; out of table 1 are BASE
+        let w = World {
+            owners,
+            auth: 0,
+            edges: [
+                (1, 0, 2, true, true), // dom0 base-leafs frame 2
+                (3, 0, 2, true, true), // dom0 super-leafs the SAME frame 2
+                (1, 0, 2, true, true), // benign duplicate — must not change the verdict
+            ],
+            spans,
+        };
+        let mut base = [None; FRAMES];
+        let mut sup = [None; FRAMES];
+        assert!(
+            leaf_map_from_edges(
+                &w.edges,
+                |m| w.owner_of(m),
+                |p| Some(w.span_of(p)),
+                0,
+                Maps {
+                    base: &mut base,
+                    sup: &mut sup,
+                },
+            ) == Err(MapError::SpanConflict { mfn: 2 }),
+            "a frame leafed under both a base and a super table must fail loud, not be canonicalised"
         );
     }
 }
