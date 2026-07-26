@@ -410,8 +410,58 @@ const NR_GIC_REPORT: u64 = 0xd1;
 const NR_GIC_FINAL: u64 = 0xd2;
 /// The async-delivery guest reports (from its EL1 IRQ vector) the INTID it took (`x1`). A checkpoint.
 const NR_GIC_ASYNC_REPORT: u64 = 0xd3;
-/// The async-delivery phase's terminal — chains into the virtual-timer phase.
+/// The async-delivery phase's terminal — chains into the cross-vCPU phase (Phase III-3).
 const NR_GIC_ASYNC_FINAL: u64 = 0xd4;
+
+// ─── M5 Phase III-3: cross-vCPU vGIC LR-ownership, guest-OBSERVED ──────────────────────────────────────
+//
+// Arc 8b's LR-bank save/restore proved (register-observed) that a switched-in vCPU inherits none of the
+// peer's pending list-register interrupts. This phase upgrades that to a GUEST-observed witness of the
+// isolation property: two vCPUs of one domain time-slice under hv-core's REAL scheduler — reusing
+// `NR_YIELD`/[`handle_yield`], so the switch rides the SAME proven save/restore that carries
+// [`GuestContext::ich_lr`] — WITH the vGIC actually presenting interrupts to guest EL1
+// (`gic::enable_el2` → `ICH_HCR_EL2.En` + `HCR_EL2.IMO`).
+//
+// vCPU A injects a pending vINT into its own live list registers (IRQs still masked — it stays pending),
+// then yields. The switch saves A's LR bank and restores vCPU B's (empty). B runs guest EL1 code with
+// IRQs UNMASKED and full presentation: a bounded spin gives any leaked vINT time to fire (it must not),
+// then B reads `ICC_IAR1_EL1` directly and gets the spurious 1023 — it took NOTHING of A's. B reports
+// none and yields back. The switch restores A's LR bank (its vINT pending again); A unmasks and TAKES
+// its own vINT at its EL1 IRQ vector, acks it, and reports the INTID. The witness — B took NONE of A's
+// pending vINT AND A took exactly its own — is the isolation observed end-to-end by the guests, not by
+// hypervisor-side register bookkeeping (design-lesson #24f). Second guard: if B ever reaches its IRQ
+// vector (a leaked vINT), it reports as a TOOK from vCPU B, which the handler flags as a cross-vCPU leak
+// and halts (a FORBIDDEN boot marker).
+
+/// The domain running the cross-vCPU vGIC guests (a fresh `Hypervisor` for this phase; both vCPUs share
+/// it and its single Stage-2 image — register/GIC-only guests, no data frames, as the scheduler phase).
+const XVCPU_DOM: DomId = 1;
+/// The two vCPU indices (within [`XVCPU_DOM`]) that time-slice: A holds+takes its own vINT, B takes none.
+const XVCPU_VCPU_A: u32 = 0;
+const XVCPU_VCPU_B: u32 = 1;
+/// The virtual INTID vCPU A injects into its own list registers and must take at its EL1 vector (an
+/// arbitrary SPI; fits the `u8` HAL fence and the LR vINTID field, clear of the live INTIDs 27/42).
+const XVCPU_A_INTID: u32 = 42;
+/// vCPU B's bounded no-interrupt spin. With no pending vINT nothing can EVER fire, so this only gives a
+/// (hypothetical) leaked vINT time to manifest before B reads the CPU interface and declares none. Never
+/// an open wait — a fixed countdown, so the boot-test stays deterministic (map's one real risk, bounded).
+const XVCPU_B_SPIN: u64 = 0x40000;
+/// The GIC "spurious / nothing pending" INTID `ICC_IAR1_EL1` returns when no interrupt is pending — what
+/// vCPU B must read to prove it took none of the peer's vINT.
+const GIC_SPURIOUS_INTID: u64 = 1023;
+
+/// vCPU A asks the hypervisor to inject [`XVCPU_A_INTID`] into its live list registers (through the
+/// realized HAL fence, as Arc 7a). IRQs are masked, so it pends across the yield. A checkpoint.
+const NR_XVCPU_INJECT: u64 = 0xd5;
+/// A vCPU reports (from its EL1 IRQ vector) that it TOOK a vINT: `x1` = the INTID, `x2` = its own vCPU
+/// id. vCPU A taking [`XVCPU_A_INTID`] is the witness; vCPU B reaching the vector at all means a leak.
+const NR_XVCPU_TOOK: u64 = 0xd6;
+/// vCPU B reports it took NONE of A's pending vINT: `x1` = its `ICC_IAR1_EL1` read (must be the spurious
+/// [`GIC_SPURIOUS_INTID`]), `x2` = its vCPU id. A checkpoint.
+const NR_XVCPU_NONE: u64 = 0xd7;
+/// The cross-vCPU phase's terminal (vCPU A, after taking its own vINT) — asserts both halves of the
+/// witness and chains into the virtual-timer phase.
+const NR_XVCPU_FINAL: u64 = 0xd8;
 
 // ─── M5 Arc 5b: the virtual timer ────────────────────────────────────────────────────────────────────
 //
@@ -1254,6 +1304,102 @@ __guest_gic_async_tpl_end:
     NR_GIC_ASYNC_FINAL = const NR_GIC_ASYNC_FINAL,
 );
 
+// The CROSS-vCPU vGIC LR-ownership test guest program (M5 Phase III-3). ONE shared code image for both
+// vCPUs (like the scheduler guest), role-branched on the seeded vCPU id in `x22`: vCPU A (id 0) injects a
+// pending vINT into its OWN list registers and yields with IRQs still masked, then — resumed after the
+// peer ran — unmasks and TAKES its own vINT at the shared EL1 IRQ vector; vCPU B (id 1) unmasks with an
+// empty LR bank, spins a bounded count, reads `ICC_IAR1_EL1` (must be spurious — it took none of A's),
+// reports none, and yields back to A. `x22` (the id) is seeded per-vCPU and rides every switch in the
+// saved GPR frame, so it is un-forgeable in the reports. The whole blob is `0x800`-aligned so the vector
+// table (`0x800`-aligned within it) lands `0x800`-aligned at runtime for `VBAR_EL1` (as the async guest).
+global_asm!(
+    r#"
+    .section .rodata.guest, "a"
+    .balign 0x800
+    .global __guest_xvcpu_tpl_start
+__guest_xvcpu_tpl_start:
+    // ── common: point VBAR_EL1 at the shared vector table (0x800-aligned, below) ──
+    adr     x0, 9f
+    msr     VBAR_EL1, x0
+    isb
+    // ── common: enable the GICv3 CPU system-register interface at EL1 (as the async guest) ──
+    mrs     x0, ICC_SRE_EL1
+    orr     x0, x0, #1
+    msr     ICC_SRE_EL1, x0
+    isb
+    mov     x0, #0xff
+    msr     ICC_PMR_EL1, x0                // priority mask = allow every priority
+    mov     x0, #1
+    msr     ICC_IGRPEN1_EL1, x0            // enable Group 1 interrupts
+    isb
+    // ── role branch on the seeded vCPU id (x22): 0 = A, non-zero = B ──
+    cbnz    x22, 2f
+
+    // ── vCPU A: inject my OWN pending vINT (IRQs still MASKED, so it pends), then yield to B ──
+    mov     x0, #{NR_XVCPU_INJECT}
+    hvc     #0                             // hypervisor injects XVCPU_A_INTID into A's live list registers
+    mov     x0, #{NR_YIELD}
+    hvc     #0                             // switch to B; A's pending vINT rides in its saved LR bank
+    // ── resumed after B ran: unmask IRQ → the still-pending vINT is taken at the vector below ──
+    msr     DAIFClr, #2
+    isb
+1:  wfi
+    b       1b
+
+    // ── vCPU B: unmask with an EMPTY LR bank — I must take NONE of A's pending vINT ──
+2:  msr     DAIFClr, #2
+    isb
+    mov     x3, #{XVCPU_B_SPIN}            // bounded spin: give any leaked vINT time to fire (it must not)
+3:  subs    x3, x3, #1
+    b.ne    3b
+    mrs     x1, ICC_IAR1_EL1              // read the CPU interface directly → spurious (1023) iff none
+    msr     ICC_EOIR1_EL1, x1             // end of interrupt (a no-op for the spurious INTID)
+    mov     x2, x22                        // my vCPU id (= 1), un-forgeable in the report
+    mov     x0, #{NR_XVCPU_NONE}
+    hvc     #0                             // report (x1 = IAR readback, x2 = id) — asserts none taken
+    mov     x0, #{NR_YIELD}
+    hvc     #0                             // yield back to A (terminal for B — A runs on to FINAL)
+4:  wfe
+    b       4b
+
+    // ── shared EL1 exception vector table (16 entries, 0x80 apart). Guests run at EL1h (SP_ELx), so an
+    //    IRQ vectors to offset 0x280 (Current EL with SP_ELx, IRQ). Others spin (never expected). ──
+    .balign 0x800
+9:
+    b       8f                            // 0x000 Current EL SP0, Synchronous
+    .balign 0x80
+    b       8f                            // 0x080 Current EL SP0, IRQ
+    .balign 0x80
+    b       8f                            // 0x100 Current EL SP0, FIQ
+    .balign 0x80
+    b       8f                            // 0x180 Current EL SP0, SError
+    .balign 0x80
+    b       8f                            // 0x200 Current EL SPx, Synchronous
+    .balign 0x80
+    // 0x280 Current EL SPx, IRQ — a TAKEN vINT lands here (vCPU A expected; vCPU B ⇒ cross-vCPU leak)
+    mrs     x1, ICC_IAR1_EL1              // acknowledge → INTID
+    msr     ICC_EOIR1_EL1, x1             // end of interrupt
+    mov     x2, x22                        // the id of the vCPU that took it
+    mov     x0, #{NR_XVCPU_TOOK}
+    hvc     #0                             // report (x1 = INTID, x2 = id)
+    mov     x0, #{NR_XVCPU_FINAL}
+    hvc     #0                             // vCPU A's terminal — asserts the witness, chains onward
+7:  wfe
+    b       7b
+    .balign 0x80
+8:  wfe                                    // catch-all for any unexpected vector
+    b       8b
+    .global __guest_xvcpu_tpl_end
+__guest_xvcpu_tpl_end:
+    "#,
+    NR_XVCPU_INJECT = const NR_XVCPU_INJECT,
+    NR_YIELD = const NR_YIELD,
+    XVCPU_B_SPIN = const XVCPU_B_SPIN,
+    NR_XVCPU_NONE = const NR_XVCPU_NONE,
+    NR_XVCPU_TOOK = const NR_XVCPU_TOOK,
+    NR_XVCPU_FINAL = const NR_XVCPU_FINAL,
+);
+
 // The virtual-timer test guest program (M5 Arc 5b). It uses the ARM architected VIRTUAL timer for
 // timekeeping: read the count, program a short deadline (CNTV_TVAL), enable the timer, and poll
 // CNTV_CTL.ISTATUS until the compare condition fires — no interrupts (the timer *interrupt* rides the
@@ -1637,6 +1783,13 @@ static GIC_INJECT_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 5b: the guest took the injected virtual interrupt ASYNCHRONOUSLY at its EL1 IRQ vector (not by
 /// polling) with the correct INTID — real vectored interrupt delivery, the mechanism Linux depends on.
 static GIC_ASYNC_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Phase III-3: vCPU B (interrupts unmasked, full vGIC presentation) took NONE of vCPU A's pending
+/// virtual interrupt — its `ICC_IAR1_EL1` read was spurious. The isolation half of the guest-observed
+/// cross-vCPU witness.
+static XVCPU_B_NONE_OK: AtomicBool = AtomicBool::new(false);
+/// M5 Phase III-3: vCPU A took its OWN pending virtual interrupt (the right INTID) at its EL1 vector,
+/// AFTER the peer ran — its vINT rode the real-scheduler switch in the saved LR bank. The delivery half.
+static XVCPU_A_TOOK_OK: AtomicBool = AtomicBool::new(false);
 /// M5 Arc 5b: the guest used the virtual timer — programmed a deadline, the `CNTVCT` counter advanced,
 /// and the `ISTATUS` compare condition fired (timekeeping, what Linux depends on).
 static TIMER_OK: AtomicBool = AtomicBool::new(false);
@@ -1678,6 +1831,8 @@ extern "C" {
     static __guest_gic_poll_tpl_end: u8;
     static __guest_gic_async_tpl_start: u8;
     static __guest_gic_async_tpl_end: u8;
+    static __guest_xvcpu_tpl_start: u8;
+    static __guest_xvcpu_tpl_end: u8;
     static __guest_timer_tpl_start: u8;
     static __guest_timer_tpl_end: u8;
     static __guest_psci_tpl_start: u8;
@@ -2146,6 +2301,24 @@ fn load_guest_gic_async() -> u64 {
     ram_start as u64
 }
 
+/// Copy the **cross-vCPU vGIC** guest template into guest RAM and return its `entry` guest-physical
+/// address (M5 Phase III-3). The template is `0x800`-aligned and the guest RAM base is 2 MiB-aligned, so
+/// the vector table (`0x800`-aligned within the blob) lands at a `0x800`-aligned runtime address for
+/// `VBAR_EL1` (as the async guest). Both vCPUs run this one shared image, role-branched on `x22`.
+fn load_guest_xvcpu() -> u64 {
+    let tpl_start = core::ptr::addr_of!(__guest_xvcpu_tpl_start) as usize;
+    let tpl_end = core::ptr::addr_of!(__guest_xvcpu_tpl_end) as usize;
+    let ram_start = core::ptr::addr_of!(__guest_ram_start) as usize;
+    let len = tpl_end - tpl_start;
+    // SAFETY: as `load_guest` — in-image template source, reserved guest-RAM destination far larger than
+    // the template, non-overlapping. `ram_start` is 2 MiB-aligned so the blob's internal 0x800 alignment
+    // is preserved at runtime.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tpl_start as *const u8, ram_start as *mut u8, len);
+    }
+    ram_start as u64
+}
+
 /// Copy the **virtual-timer** guest template into guest RAM and return its `entry` guest-physical address
 /// (M5 Arc 5b).
 fn load_guest_timer() -> u64 {
@@ -2604,9 +2777,19 @@ fn service_hvc(frame: &mut GuestFrame, uart: &mut Pl011) {
         NR_GIC_REPORT => gic_report(frame, uart), // assert the guest acknowledged the right INTID
         NR_GIC_FINAL => finish_gic_test(uart),    // -> ! (vGIC poll phase → async phase)
         NR_GIC_ASYNC_REPORT => gic_async_report(frame, uart), // M5 Arc 5b: assert vectored delivery
-        NR_GIC_ASYNC_FINAL => finish_gic_async_test(uart), // -> ! (async phase → timer phase)
+        NR_GIC_ASYNC_FINAL => finish_gic_async_test(uart), // -> ! (async phase → cross-vCPU phase)
+        NR_XVCPU_INJECT => {
+            // M5 Phase III-3: inject vCPU A's OWN pending vINT into its live list registers, through the
+            // realized HAL fence (as Arc 7a; it halts loudly on a full bank). IRQs are masked, so it
+            // stays pending until A unmasks after the peer has run.
+            use hv_hal::VcpuOps;
+            ArmVcpu.inject_interrupt(XVCPU_A_INTID as u8);
+        }
+        NR_XVCPU_NONE => xvcpu_none_report(frame, uart), // M5 III-3: assert B took none of A's vINT
+        NR_XVCPU_TOOK => xvcpu_took_report(frame, uart), // M5 III-3: assert A took its own (B ⇒ leak)
+        NR_XVCPU_FINAL => finish_xvcpu_test(uart),       // -> ! (cross-vCPU phase → timer phase)
         NR_TIMER_REPORT => timer_report(frame, uart), // M5 Arc 5b: assert the virtual timer fired
-        NR_TIMER_FINAL => finish_timer_test(uart), // -> ! (timer phase → PSCI phase)
+        NR_TIMER_FINAL => finish_timer_test(uart),    // -> ! (timer phase → PSCI phase)
         NR_PSCI_REPORT => psci_report(frame, uart), // M5 Arc 5c: assert the guest read the PSCI version
         NR_TIMER_IRQ_REPORT => timer_irq_report(frame, uart), // M5 Arc 5d: assert the tick was taken
         NR_TIMER_IRQ_FINAL => finish_timer_irq_test(uart), // -> ! (timer-tick phase → thesis phase)
@@ -4710,19 +4893,217 @@ fn gic_async_report(frame: &mut GuestFrame, uart: &mut Pl011) {
 }
 
 /// **M5 Arc 5b, async-delivery phase terminal.** Assert vectored delivery, then chain into the
-/// virtual-timer phase.
+/// cross-vCPU LR-ownership phase (Phase III-3).
 fn finish_gic_async_test(uart: &mut Pl011) -> ! {
     if GIC_ASYNC_OK.load(Ordering::Relaxed) {
         let _ = writeln!(
             uart,
             "baleen: VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector"
         );
+        // M5 Phase III-3: prove a pending vINT stays isolated to its vCPU across a real-scheduler switch,
+        // observed by the guests themselves. Never returns (its terminal chains into the timer phase).
+        begin_xvcpu_iso_phase(uart);
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: VGIC ASYNC TEST FAILED — interrupt not delivered to the guest vector"
+    );
+    crate::park();
+}
+
+/// **M5 Phase III-3** — vCPU B's report: it read `ICC_IAR1_EL1` with interrupts unmasked and the vGIC
+/// presenting, and must have gotten the spurious [`GIC_SPURIOUS_INTID`] — proving it took NONE of vCPU
+/// A's pending virtual interrupt. `x1` = the IAR readback, `x2` = its (un-forgeable, seeded) vCPU id. A
+/// checkpoint (resumes B so it can yield back to A).
+fn xvcpu_none_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let iar = frame.x[1];
+    let id = frame.x[2];
+    let took_none = iar == GIC_SPURIOUS_INTID;
+    XVCPU_B_NONE_OK.store(took_none, Ordering::Relaxed);
+    if took_none {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC cross-vCPU isolation OK: vCPU {id} (interrupts unmasked, full vGIC presentation) took none of the peer's pending virtual interrupt (ICC_IAR1_EL1 spurious)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: XVCPU-LEAK-peer-vint-crossed-vcpus: vCPU {id} read INTID {iar} — a peer's pending virtual interrupt crossed vCPUs; halting"
+        );
+        crate::park();
+    }
+}
+
+/// **M5 Phase III-3** — a vCPU's report that it TOOK a vINT at its EL1 IRQ vector. `x1` = the INTID, `x2`
+/// = the (seeded) vCPU id. vCPU A taking exactly [`XVCPU_A_INTID`] is the delivery half of the witness;
+/// vCPU B reaching the vector at ALL means a peer's vINT leaked across the switch — a hard failure that
+/// prints a FORBIDDEN boot marker and halts. A checkpoint for A (it goes on to report FINAL).
+fn xvcpu_took_report(frame: &mut GuestFrame, uart: &mut Pl011) {
+    let intid = frame.x[1] as u32;
+    let id = frame.x[2];
+    if id != XVCPU_VCPU_A as u64 {
+        // vCPU B took an interrupt at its vector — the peer's vINT leaked across vCPUs. The FORBIDDEN
+        // marker is also asserted-absent by boot-test.sh, so this fails the test two ways.
+        let _ = writeln!(
+            uart,
+            "baleen: XVCPU-LEAK-peer-vint-crossed-vcpus: vCPU {id} took INTID {intid} at its EL1 vector; halting"
+        );
+        crate::park();
+    }
+    let ok = intid == XVCPU_A_INTID;
+    XVCPU_A_TOOK_OK.store(ok, Ordering::Relaxed);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC cross-vCPU delivery OK: vCPU {id} took its OWN pending virtual interrupt (INTID {intid}) at its EL1 vector after the peer ran"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vGIC cross-vCPU delivery MISMATCH: vCPU {id} took INTID {intid} (expected {XVCPU_A_INTID}); halting"
+        );
+        crate::park();
+    }
+}
+
+/// **M5 Phase III-3 — the cross-vCPU vGIC LR-ownership phase (guest-observed).** Build a fresh
+/// `Hypervisor`, create the domain, admit both vCPUs, enable the vGIC presentation, seed both vCPUs with
+/// the shared cross-vCPU guest (distinct ids), CLEAR the list registers, and enter vCPU A. The two
+/// time-slice via `NR_YIELD`/[`handle_yield`] — the SAME real-scheduler switch that carries the LR bank
+/// (Arc 8b) — so A's injected vINT rides the switch in its saved bank while B runs and takes none of it.
+/// Setup mirrors [`begin_scheduler_phase3`] (register/GIC-only guests, one Stage-2 image, no data
+/// frames), minus the sched-pillar probes, plus `gic::enable_el2` and the LR clear. Never returns.
+fn begin_xvcpu_iso_phase(uart: &mut Pl011) -> ! {
+    // A fresh Hypervisor: the async vGIC phase mutated the previous one. SAFETY: single-CPU, one-time
+    // rebuild before any cross-vCPU guest runs; no handler is touching the cell.
+    *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
+    let mut cell = GUEST_HV.borrow_mut();
+    let hv = hv_or_halt(&mut cell, uart, "phase setup");
+
+    // Both vCPUs belong to ONE domain sharing one address space (the isolation under test here is the
+    // per-vCPU list-register state, not memory — that is Arc 2). Register/GIC-only → no data frames.
+    expect(
+        hv,
+        DOM0,
+        HvCall::DomainCreate {
+            target: XVCPU_DOM,
+            may_create: false,
+        },
+        "create xvcpu domain",
+        uart,
+    );
+
+    let now = sched_now();
+    // Admit both vCPUs (Offline → Runnable); dispatch A onto the pCPU (Runnable → Running). The A↔B
+    // switches then go through hv-core's real scheduler in `handle_yield` (SchedPreempt + SchedRun).
+    expect(
+        hv,
+        XVCPU_DOM,
+        HvCall::SchedAdmit { vcpu: XVCPU_VCPU_A },
+        "admit xvcpu A",
+        uart,
+    );
+    expect(
+        hv,
+        XVCPU_DOM,
+        HvCall::SchedAdmit { vcpu: XVCPU_VCPU_B },
+        "admit xvcpu B",
+        uart,
+    );
+    expect(
+        hv,
+        XVCPU_DOM,
+        HvCall::SchedRun {
+            vcpu: XVCPU_VCPU_A,
+            pcpu: PCPU0,
+            now,
+        },
+        "run xvcpu A",
+        uart,
+    );
+
+    // Emit Stage-2 (one set, VMID 1 — both vCPUs share the domain's address space; the guest image is the
+    // identity RO+X block) and enable it, then turn ON the vGIC presentation (En + IMO) so a list-register
+    // interrupt actually reaches guest EL1 — the piece the register-only scheduler/isolation phases lack.
+    let vttbr = stage2::build_stage2_from_p2m(hv, XVCPU_DOM, STAGE2_SET_SINGLE);
+    let entry = load_guest_xvcpu();
+    let ram_end = core::ptr::addr_of!(__guest_ram_end) as u64;
+    enable_stage2(vttbr);
+    gic::enable_el2(); // ICC_SRE_EL2 + ICH_HCR_EL2.En + HCR_EL2.IMO — after enable_stage2
+    init_guest_el1(ram_end);
+    let (sp_el1, _elr, _spsr, sctlr) = read_sysctx();
+
+    // Start from a CLEARED list-register bank so A's injection deterministically finds free LRs and B
+    // genuinely begins with nothing pending (no residue from the prior single-vCPU vGIC phase).
+    for i in 0..gic::num_list_registers() {
+        gic::write_lr(i, 0);
+    }
+
+    // Seed both vCPU contexts: same entry + system state, DISTINCT ids (x22 = role select + un-forgeable
+    // identity in the reports). Both slots carry the SAME (dom, vttbr) — one shared address space.
+    {
+        let mut ctxs = VCPU_CTX.borrow_mut();
+        let mut metas = VCPU_META.borrow_mut();
+        for i in 0..NUM_VCPUS_METAL {
+            let c = &mut ctxs[i];
+            *c = GuestContext::ZERO;
+            c.x[22] = i as u64; // vCPU id
+            c.sp_el1 = sp_el1;
+            c.elr_el2 = entry;
+            c.spsr_el2 = SPSR_EL2_GUEST;
+            c.sctlr_el1 = sctlr;
+            metas[i] = VcpuMeta {
+                dom: XVCPU_DOM,
+                vcpu: i as u32,
+                vttbr,
+            };
+        }
+    }
+
+    CUR_VCPU.store(XVCPU_VCPU_A as u64, Ordering::Relaxed);
+    YIELDS_HANDLED.store(0, Ordering::Relaxed);
+    XVCPU_B_NONE_OK.store(false, Ordering::Relaxed);
+    XVCPU_A_TOOK_OK.store(false, Ordering::Relaxed);
+    IN_GUEST_HANDLER.store(false, Ordering::Relaxed);
+    let _ = writeln!(
+        uart,
+        "baleen: vGIC cross-vCPU phase — two vCPUs time-slice; one holds a pending virtual interrupt across the switch, the peer runs with interrupts unmasked and must take none of it"
+    );
+    let exc_stack_top = core::ptr::addr_of!(__exc_stack_top) as u64;
+    // Release the model claim BEFORE leaving EL2 (see the other phase entries): a claim taken here could
+    // never be released, and the next trap's borrow would be refused.
+    drop(cell);
+    // SAFETY: VCPU_CTX[A] is a valid, seeded GuestContext; exc_stack_top is the dedicated EL2 stack.
+    // `as_ptr` deliberately does NOT claim the cell (the hand-off to the trampoline, as the scheduler
+    // phase): after it EL2 `eret`s out and holds no borrow.
+    unsafe {
+        __enter_guest_ctx(
+            VCPU_CTX
+                .as_ptr()
+                .cast::<GuestContext>()
+                .add(XVCPU_VCPU_A as usize),
+            exc_stack_top,
+        )
+    }
+}
+
+/// **M5 Phase III-3 terminal** (vCPU A, after taking its own vINT). Assert BOTH halves of the
+/// guest-observed witness — vCPU B took none of A's pending vINT AND vCPU A took exactly its own — then
+/// chain into the virtual-timer phase. Never returns.
+fn finish_xvcpu_test(uart: &mut Pl011) -> ! {
+    let b_none = XVCPU_B_NONE_OK.load(Ordering::Relaxed);
+    let a_took = XVCPU_A_TOOK_OK.load(Ordering::Relaxed);
+    if b_none && a_took {
+        let _ = writeln!(
+            uart,
+            "baleen: VGIC CROSS-VCPU TEST PASSED — a pending virtual interrupt stayed isolated to its vCPU across a real-scheduler switch: the peer (interrupts unmasked) took none, and the owner took exactly its own"
+        );
         // M5 Arc 5b: prove the guest can use the virtual timer for timekeeping. Never returns.
         begin_timer_phase(uart);
     }
     let _ = writeln!(
         uart,
-        "baleen: VGIC ASYNC TEST FAILED — interrupt not delivered to the guest vector"
+        "baleen: VGIC CROSS-VCPU TEST FAILED (b_none={b_none} a_took={a_took})"
     );
     crate::park();
 }
