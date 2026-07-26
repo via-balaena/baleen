@@ -308,6 +308,28 @@ pub enum Violation {
     /// mapped size.) The hierarchical type-confusion the multi-level invariant exists to
     /// prevent — a table whose entries the CPU would walk into a frame of the wrong kind.
     MislevelledLink { parent: usize, slot: usize },
+    /// A frame holds **fewer** page-table references than the live holders that depend on
+    /// it — the count↔holder coupling `TypeRefsAccounted` (the p2m cousin of grant's
+    /// `RefcountMismatch`), in the one-sided form that is a true *state* invariant. The
+    /// page-table references on a frame are held by exactly: each live entry that *points
+    /// into* it as an interior child (an `L(k-1)` table below its parent), each live entry
+    /// *rooted at* it (a table's self-reference, one per entry it holds), and its pin bit if
+    /// set. Grant maps and read-only/writable leaves never take a page-table reference, so
+    /// this population is entirely `p2m`-local. This invariant asserts `pagetable_refs ≥`
+    /// that holder count: **every live holder is backed by a reference**, so a shared table
+    /// can never drop below its holders and silently lose its page-table type — which is
+    /// exactly what makes every *decrement* preserve [`Violation::MislevelledLink`] (a table
+    /// keeps its type when one holder leaves because the count stays ≥ the remaining ones).
+    ///
+    /// It is a *lower bound*, not an equality, on purpose: the primitives take a typed
+    /// reference **before** recording its holder (a `get_type` inside `link`/`pin` bumps the
+    /// count, then the edge/pin bit is written), so the count transiently *exceeds* the
+    /// recorded holders — the exact `==` holds only at whole-transition boundaries, and a
+    /// raw `get_type` driven standalone leaves a backed-but-unrecorded reference for good.
+    /// The reverse direction (no *leaked* over-count) is a transition-boundary property; the
+    /// full exact three-family coupling is proven ∀-N in Verus,
+    /// `hv-verify/verus/mislevelled_link_preservation.rs`.
+    PagetableRefsAccounted { mfn: usize },
 }
 
 impl System {
@@ -1011,6 +1033,44 @@ impl System {
                     parent: link.parent as usize,
                     slot: link.slot as usize,
                 });
+            }
+        }
+        // `TypeRefsAccounted` (page-table family, lower-bound form): every allocated frame's
+        // `pagetable_refs` is at least the page-table references actually held against it, so
+        // no live holder is ever left unbacked. `link` takes a `PageTable(level)` reference
+        // on the *parent* (a self-reference, one per entry) and, for an *interior* entry, a
+        // `PageTable(k-1)` reference on the *child*; `pin` takes one. Nothing else takes a
+        // page-table reference — a writable/read-only leaf types or bare-references its child,
+        // and a grant map is always writable or bare — so this holder population is entirely
+        // `p2m`-local. The count may transiently *exceed* it (a `get_type` bumps the count
+        // before the edge/pin that holds it is recorded), so this is a `≥`, not `==`; the
+        // exact equality is a whole-transition property proven ∀-N in Verus,
+        // `hv-verify/verus/mislevelled_link_preservation.rs`. This is the coupling every
+        // decrement (`unlink`, `unpin`, `DomainDestroy`) relies on to keep `MislevelledLink`:
+        // a shared table keeps its type when one holder leaves because the count stays ≥ the
+        // remaining holders.
+        for (m, frame) in self.frames.iter().enumerate() {
+            if let Frame::Allocated {
+                pagetable_refs,
+                pinned,
+                ..
+            } = *frame
+            {
+                let mut held: u32 = 0;
+                for link in self.links.iter().filter(|l| l.active) {
+                    if link.parent as usize == m {
+                        held += 1; // the parent self-reference this entry pins
+                    }
+                    if link.child as usize == m && !link.leaf {
+                        held += 1; // an interior entry pointing one level down into `m`
+                    }
+                }
+                if pinned {
+                    held += 1;
+                }
+                if pagetable_refs < held {
+                    return Some(Violation::PagetableRefsAccounted { mfn: m });
+                }
             }
         }
         None
