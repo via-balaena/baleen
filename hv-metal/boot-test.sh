@@ -118,13 +118,17 @@ boot_and_check() {
 # Strings that must NEVER appear in a boot (checked by boot_and_check on every run). The virtio-console
 # negative (M5 Arc 3): the un-granted buffer's SECRET payload the backend refused to read. The virtio-blk
 # negatives (M5 Arc 4): tenant 0's write POISON must never cross to the template or to tenant 1's view —
-# it appears on the console only if a write reaches the template or two tenants' overlays alias.
+# it appears on the console only if a write reaches the template or two tenants' overlays alias. The cross-vCPU
+# vGIC negative (M5 Phase III-3): vCPU B, running with interrupts unmasked while vCPU A holds a pending virtual
+# interrupt, must take NONE of it — the XVCPU-LEAK marker prints only if B reads or takes the peer's vINT (a
+# list-register leak across the real-scheduler switch), the exact isolation this phase witnesses guest-observed.
 FORBIDDEN_MARKERS=(
     "SECRET-ungranted-must-not-appear"
     "POISON-blk-guest0-write-must-not-cross"
     "V4ULTSEC"
     "D3ADTENANT-must-not-survive-rebirth"
     "D3ADSUPER-must-not-survive-rebirth"
+    "XVCPU-LEAK-peer-vint-crossed-vcpus"
 )
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
@@ -214,6 +218,9 @@ boot_and_check "default" "" \
     "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
     "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
     "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
+    "vGIC cross-vCPU isolation OK: vCPU 1 (interrupts unmasked, full vGIC presentation) took none of the peer's pending virtual interrupt (ICC_IAR1_EL1 spurious)" \
+    "vGIC cross-vCPU delivery OK: vCPU 0 took its OWN pending virtual interrupt (INTID 42) at its EL1 vector after the peer ran" \
+    "VGIC CROSS-VCPU TEST PASSED — a pending virtual interrupt stayed isolated to its vCPU across a real-scheduler switch: the peer (interrupts unmasked) took none, and the owner took exactly its own" \
     "virtual timer OK: CNTVCT advanced" \
     "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
     "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
@@ -292,6 +299,9 @@ boot_and_check "selftest" "--features selftest" \
     "VGIC TEST PASSED — a virtual interrupt injected via the list registers reached the guest's CPU interface" \
     "vGIC async-delivery OK: guest TOOK the injected virtual interrupt (INTID 42) at its EL1 IRQ vector" \
     "VGIC ASYNC TEST PASSED — a virtual interrupt was delivered asynchronously to the guest's EL1 vector" \
+    "vGIC cross-vCPU isolation OK: vCPU 1 (interrupts unmasked, full vGIC presentation) took none of the peer's pending virtual interrupt (ICC_IAR1_EL1 spurious)" \
+    "vGIC cross-vCPU delivery OK: vCPU 0 took its OWN pending virtual interrupt (INTID 42) at its EL1 vector after the peer ran" \
+    "VGIC CROSS-VCPU TEST PASSED — a pending virtual interrupt stayed isolated to its vCPU across a real-scheduler switch: the peer (interrupts unmasked) took none, and the owner took exactly its own" \
     "virtual timer OK: CNTVCT advanced" \
     "TIMER TEST PASSED — the guest used the virtual timer (CNTVCT + a programmed deadline) for timekeeping" \
     "PSCI version OK: guest read 0x00010001 (v1.1) — PSCI is discoverable" \
