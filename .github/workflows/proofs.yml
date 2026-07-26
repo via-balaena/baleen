@@ -1,0 +1,221 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+# The deductive ∀-N proofs, gated at MERGE time — the PR half of the verification story.
+#
+# `deep-verify.yml` runs Kani + Verus (and the exhaustive sweeps + fuzz) on a WEEKLY cron, so
+# until now a PR could break a preservation proof and stay required-CI-green for up to a week.
+# This workflow closes that gap: it runs the Kani and Verus preservation proofs on every PR that
+# TOUCHES proof-relevant code, and its two jobs are required status checks on `main`. A PR that
+# breaks a proof therefore cannot merge.
+#
+# Why a separate file from deep-verify.yml (which keeps running the SAME proofs weekly):
+#   - deep-verify's identity is "heavy, weekly" — its exhaustive sweeps (GBs of RAM, ~45 min) and
+#     fuzz campaign (~60 min) are impractical as a per-PR required gate and are discovery, not
+#     ∀-N preservation. They stay weekly. Only the deductive proofs (Kani + Verus) gate PRs.
+#   - the weekly deep-verify run is retained as a backstop that ALSO catches toolchain/dependency
+#     drift on a fixed tree (a PR gate only fires when the tree changes).
+#
+# The required-check gotcha this is built around: a required status check is matched by JOB NAME,
+# and a required context that NEVER REPORTS on a PR blocks merge forever ("Expected — waiting for
+# status"). So we must NOT put a `paths:` filter on the trigger (a non-proof PR would then never
+# run this workflow → the required context never reports → permanent block). Instead every job
+# ALWAYS runs (so its context always reports a real success, never the ambiguous `skipped`
+# conclusion), and a fail-safe change-detection job decides whether the HEAVY steps execute. On a
+# non-proof PR the proof jobs report green in seconds; on a proof PR they run the real proof.
+#
+# `pull_request` ONLY (unlike ci.yml's push + pull_request): this is a MERGE gate, and a PR event
+# always carries an accurate base sha to diff against, so the change detection is exact and the
+# fail-safe almost never has to over-run. A `push` trigger would add nothing (direct pushes to
+# `main` are forbidden by branch protection, and deep-verify.yml backstops `main` weekly) while
+# COSTING a redundant ~15-min proof run on every proof PR and — because a new branch's first push
+# has an all-zero `before` sha that the fail-safe treats as "diff unavailable → run" — a full proof
+# run on the first push of every branch, proof-relevant or not.
+name: Proofs (PR gate)
+
+on:
+  pull_request:
+
+concurrency:
+  group: proofs-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: these jobs only read the checkout (same posture as ci.yml / deep-verify.yml).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Decide whether this PR (or push) touches proof-relevant code. Its single output `run` gates the
+  # heavy steps in the two proof jobs below. FAIL-SAFE by construction: any uncertainty (missing or
+  # zero base sha, a failed diff, an unresolvable commit) resolves to `run=true` — the only safe
+  # direction is to run a proof unnecessarily; a false SKIP would let a proof-breaking PR merge. The
+  # step always exits 0 so this job never fails, so the `needs:`-dependent proof jobs never get
+  # cascaded into a `skipped` (and thus never-reporting) required check.
+  changes:
+    name: detect proof-relevant changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      # fetch-depth: 0 so both the base and head commits are present for `git diff` on either event.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes under the proof paths
+        id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+
+          # Proof-relevant closure (confirmed from the manifests): hv-verify -> hv-core + hv-s2,
+          # hv-core -> hv-hal. Plus the workspace manifest and this gate file. Kept deliberately
+          # BROAD — including a path that a given proof does not read only ever runs that proof
+          # unnecessarily; it can never cause a false skip.
+          PROOF_PATHS='^(hv-hal|hv-core|hv-s2|hv-verify)/|^Cargo\.toml$|^\.github/workflows/proofs\.yml$'
+          ZERO='0000000000000000000000000000000000000000'
+
+          if [ "$EVENT" = "pull_request" ]; then
+            base="$PR_BASE"; head="$PR_HEAD"
+          else
+            base="$PUSH_BASE"; head="$PUSH_HEAD"
+          fi
+
+          run_true() { echo "$1"; echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          # Fail-safe: an unresolvable base (new branch's first push -> all-zero `before`, a
+          # force-push, a shallow gap) means "diff unavailable" -> run the proofs.
+          if [ -z "$base" ] || [ "$base" = "$ZERO" ]; then
+            run_true "base sha unavailable ($base) — running proofs (fail-safe)"
+          fi
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            run_true "base commit $base not in history — running proofs (fail-safe)"
+          fi
+
+          changed="$(git diff --name-only "$base" "$head" 2>/dev/null)" \
+            || run_true "git diff failed — running proofs (fail-safe)"
+
+          echo "changed files:"
+          echo "$changed"
+
+          if echo "$changed" | grep -qE "$PROOF_PATHS"; then
+            echo "proof-relevant paths changed — proofs will run"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no proof-relevant paths changed — proofs skip (green)"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Tier C: the Kani preservation proofs in hv-verify — invariant preservation over EVERY refcount
+  # magnitude (all 2^32) at bounded table size, driving the real shipped code through its seams.
+  # ALWAYS runs so the required context always reports; the heavy steps run only on a proof PR.
+  # Recipe kept in lockstep with deep-verify.yml's weekly `kani` job (same pin, same command).
+  kani:
+    name: kani proofs (PR)
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: No proof-relevant changes — skipping (green)
+        if: needs.changes.outputs.run != 'true'
+        run: echo "No proof-relevant paths changed; Kani proofs not required for this PR."
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: needs.changes.outputs.run == 'true'
+
+      - name: Install stable toolchain
+        if: needs.changes.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: needs.changes.outputs.run == 'true'
+
+      # Kani is a cargo subcommand plus its downloaded CBMC backend. The version is pinned so a Kani
+      # release cannot silently change proof semantics (mirrors the cargo-deny @0.19.0 pin); raise
+      # it deliberately, in step with deep-verify.yml. `cargo kani setup` fetches the backend once.
+      - name: Install Kani
+        if: needs.changes.outputs.run == 'true'
+        run: |
+          cargo install --locked kani-verifier@0.67.0
+          cargo kani setup
+
+      - name: cargo kani -p hv-verify (preservation proofs)
+        if: needs.changes.outputs.run == 'true'
+        run: cargo kani -p hv-verify
+
+  # Tier C, the ∀-N step: the Verus preservation proofs in hv-verify/verus — preservation over
+  # ARBITRARY table size (the scalar↔Vec-length axis Kani can only `unwind`). ALWAYS runs so the
+  # required context always reports; the heavy steps run only on a proof PR. Recipe kept in lockstep
+  # with deep-verify.yml's weekly `verus` job (same pinned release, same per-file loop).
+  verus:
+    name: verus proofs (PR)
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Pinned Verus release — keep in step with deep-verify.yml and hv-verify/verus/README.md.
+      VERUS_TAG: release/0.2026.07.12.0b42f4c
+      VERUS_ZIP: verus-0.2026.07.12.0b42f4c-x86-linux.zip
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: No proof-relevant changes — skipping (green)
+        if: needs.changes.outputs.run != 'true'
+        run: echo "No proof-relevant paths changed; Verus proofs not required for this PR."
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: needs.changes.outputs.run == 'true'
+
+      # Verus's prebuilt driver shells out to rustup for the exact toolchain it was built against
+      # (1.96.0 — conveniently our MSRV floor), so it needs no manifest change, just the toolchain.
+      - name: Install the Verus toolchain (1.96.0 — the MSRV floor)
+        if: needs.changes.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: 1.96.0
+
+      - name: Install Verus (pinned prebuilt)
+        if: needs.changes.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/verus.zip \
+            "https://github.com/verus-lang/verus/releases/download/${VERUS_TAG}/${VERUS_ZIP}"
+          mkdir -p "$HOME/.local/verus"
+          unzip -q /tmp/verus.zip -d "$HOME/.local/verus"
+          echo "$HOME/.local/verus/verus-x86-linux" >> "$GITHUB_PATH"
+
+      # Verify every proof file in hv-verify/verus/. `set -e` fails the job if any single proof does
+      # not discharge.
+      - name: verus --crate-type=lib (Tier C ∀-N preservation proofs)
+        if: needs.changes.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          for proof in hv-verify/verus/*.rs; do
+            echo "::group::verus $proof"
+            verus --crate-type=lib "$proof"
+            echo "::endgroup::"
+          done
