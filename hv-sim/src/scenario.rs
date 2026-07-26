@@ -1622,7 +1622,12 @@ fn try_link(sys: &mut p2m::System, rng: &mut Prng, links: &mut Vec<(u32, u32)>) 
     }
     let child = children[rng.below(children.len() as u32) as usize];
     let onto_pagetable = ro_leaf && matches!(sys.current_type(child), Some(PageType::PageTable(_)));
-    if sys.link(owner, parent, slot, child, writable, leaf).is_ok() {
+    // `execute: false` — this randomized scenario builder does not drive the write-xor-execute
+    // bit; the enumerator's exhaustive sweep is W^X's ∀-reachable-state witness (Phase II-1a).
+    if sys
+        .link(owner, parent, slot, child, writable, leaf, false)
+        .is_ok()
+    {
         links.push((parent, slot));
         Linked {
             ro_onto_pagetable: onto_pagetable,
@@ -1798,6 +1803,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                 child: node_leaf,
                 writable: true,
                 leaf: true, // the node's own 4 KiB leaf under its L1
+                execute: false,
             },
         )
         .unwrap();
@@ -1901,6 +1907,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                             child: frame,
                             writable,
                             leaf,
+                            execute: false,
                         },
                     ) {
                         Ok(_) => {
@@ -1956,6 +1963,7 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
                         // A node share (peer's L1 under our L2) is interior; a data-frame
                         // leaf goes under our L1.
                         leaf: !as_node,
+                        execute: false,
                     },
                 ) {
                     out.unauthorized += 1;

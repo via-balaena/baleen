@@ -179,6 +179,86 @@ mod grant_state_machine {
     }
 }
 
+/// **Write-xor-execute on the real p2m (Phase II-1a).** W^X (`¬(writable_refs > 0 ∧
+/// executable_refs > 0)`) is the leaf-permission twin of write-xor-pagetable: a per-frame
+/// invariant whose entire content lives at the **0↔1 count boundary** — the acquire guard refuses
+/// either reference while the other is live, and that decision reads `> 0`, not any magnitude. So
+/// there is **no new unbounded axis** (unlike `RefcountMismatch`'s scalar↔`Vec`-length coupling,
+/// above): the enumerator's saturation for finite configs plus the Tier-B locality cutoff close
+/// the size generalization exactly as they do for `TypeConfusion`. This harness adds the
+/// complementary witness on **real code** — that a symbolic pair of leaves onto one frame can never
+/// leave it both writable- and executable-mapped — which is *complete* for W^X precisely because
+/// the boundary, not the magnitude, is the whole property (design-lesson #50: no Verus mirror where
+/// there is no unbounded `Vec` axis).
+#[cfg(kani)]
+mod p2m_write_xor_execute {
+    use hv_core::p2m::{P2mError, PtLevel, System};
+
+    /// The dual-alias shape W^X exists to forbid: a frame mapped **writable** by one leaf, then a
+    /// second leaf onto the *same* frame with a symbolic `(writable, execute)`. Whatever the guest
+    /// chooses for the second leaf — writable, executable (the write-then-execute shellcode alias),
+    /// or read-only — the real `first_violation()` must find nothing. A refused link is a
+    /// legitimate no-op; either way the frame is never simultaneously writable- and
+    /// executable-mapped. The pre-state is concrete and the second leaf symbolic, which keeps the
+    /// path count (and so the solver) small while covering the whole W^X boundary from the writable
+    /// side; [`executable_frame_stays_wx_under_a_symbolic_leaf`] covers the executable side.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn writable_frame_stays_wx_under_a_symbolic_leaf() {
+        let mut s = System::new(1, 2);
+        s.allocate(0, 0).unwrap(); // the root table
+        s.allocate(0, 1).unwrap(); // the shared child frame
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        s.link(0, 0, 0, 1, true, true, false).unwrap(); // frame 1 mapped writable
+
+        let (w, x): (bool, bool) = (kani::any(), kani::any());
+        let _ = s.link(0, 0, 1, 1, w, true, x);
+
+        assert!(
+            s.first_violation().is_none(),
+            "a symbolic second leaf onto a writable frame left W^X violated"
+        );
+    }
+
+    /// The executable-side mirror: a frame mapped **executable**, then a symbolic second leaf onto
+    /// it — a `writable` choice must be refused (W^X), never producing a writable+executable frame.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn executable_frame_stays_wx_under_a_symbolic_leaf() {
+        let mut s = System::new(1, 2);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        s.link(0, 0, 0, 1, false, true, true).unwrap(); // frame 1 mapped executable
+
+        let (w, x): (bool, bool) = (kani::any(), kani::any());
+        let _ = s.link(0, 0, 1, 1, w, true, x);
+
+        assert!(
+            s.first_violation().is_none(),
+            "a symbolic second leaf onto an executable frame left W^X violated"
+        );
+    }
+
+    /// **Teeth (non-vacuity), on real code.** A writable leaf takes; an executable leaf onto the
+    /// same frame is then refused with `WxConflict`. Confirms the guard the preservation harness
+    /// relies on actually fires, rather than the frame never becoming writable in the first place.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn a_writable_frame_refuses_an_executable_leaf() {
+        let mut s = System::new(1, 2);
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        s.link(0, 0, 0, 1, true, true, false).unwrap(); // a writable leaf takes
+        assert_eq!(
+            s.link(0, 0, 1, 1, false, true, true),
+            Err(P2mError::WxConflict),
+            "an executable leaf onto a writable-mapped frame must be refused"
+        );
+    }
+}
+
 /// # The Stage-2 **encoding**, proven bit-precisely (the refinement's third arrow)
 ///
 /// The chain the metal's isolation rests on is
@@ -388,13 +468,23 @@ mod stage2_refinement {
                     *slot = Some(d);
                 }
             }
-            let mut edges = [(0u32, 0u32, 0u32, false, false); EDGES];
+            let mut edges = [(0u32, 0u32, 0u32, false, false, false); EDGES];
             for e in edges.iter_mut() {
                 let parent: Mfn = kani::any();
                 let child: Mfn = kani::any();
                 kani::assume((parent as usize) < FRAMES);
                 kani::assume((child as usize) < FRAMES);
-                *e = (parent, kani::any(), child, kani::any(), kani::any());
+                // The trailing `execute` bit is symbolic too — T is execute-independent (as it is
+                // span-independent), so proving it over every execute assignment is free coverage
+                // and confirms the write-xor-execute axis threads through without weakening T.
+                *e = (
+                    parent,
+                    kani::any(),
+                    child,
+                    kani::any(),
+                    kani::any(),
+                    kani::any(),
+                );
             }
             World {
                 owners,
@@ -434,7 +524,7 @@ mod stage2_refinement {
         /// permission. Note it *skips* an edge either end of which is unowned — which is precisely
         /// why P2 is needed separately.
         fn assume_no_unauthorized_foreign_link(&self) {
-            for (parent, _slot, child, writable, _leaf) in self.edges.iter().copied() {
+            for (parent, _slot, child, writable, _leaf, _execute) in self.edges.iter().copied() {
                 let (Some(child_owner), Some(parent_owner)) =
                     (self.owner_of(child), self.owner_of(parent))
                 else {
@@ -449,7 +539,7 @@ mod stage2_refinement {
         /// **(P2) every active edge's child is allocated** — `p2m::link` refuses an unallocated
         /// child, and the reference the edge takes blocks a later free.
         fn assume_edge_children_allocated(&self) {
-            for (_parent, _slot, child, _writable, _leaf) in self.edges.iter().copied() {
+            for (_parent, _slot, child, _writable, _leaf, _execute) in self.edges.iter().copied() {
                 kani::assume(self.owner_of(child).is_some());
             }
         }
@@ -611,9 +701,9 @@ mod stage2_refinement {
             // An empty grant table: dom1 has granted dom0 nothing.
             auth: 0,
             edges: [
-                (1, 0, 2, true, true),
-                (1, 0, 2, true, true),
-                (1, 0, 2, true, true),
+                (1, 0, 2, true, true, false),
+                (1, 0, 2, true, true, false),
+                (1, 0, 2, true, true, false),
             ],
             spans: [false; FRAMES],
         };
@@ -798,9 +888,9 @@ mod stage2_refinement {
             owners,
             auth: 0,
             edges: [
-                (1, 0, 2, true, true), // dom0 base-leafs frame 2
-                (3, 0, 2, true, true), // dom0 super-leafs the SAME frame 2
-                (1, 0, 2, true, true), // benign duplicate — must not change the verdict
+                (1, 0, 2, true, true, false), // dom0 base-leafs frame 2
+                (3, 0, 2, true, true, false), // dom0 super-leafs the SAME frame 2
+                (1, 0, 2, true, true, false), // benign duplicate — must not change the verdict
             ],
             spans,
         };
@@ -902,6 +992,7 @@ mod foreign_link_state_machine {
                 child: 2,
                 writable,
                 leaf: true,
+                execute: false,
             },
         );
 
@@ -942,6 +1033,7 @@ mod foreign_link_state_machine {
                     child: 2,
                     writable,
                     leaf: true,
+                    execute: false,
                 }
             )
             .is_ok());

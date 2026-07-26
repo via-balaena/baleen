@@ -170,6 +170,11 @@ pub enum HvCall {
         child: Mfn,
         writable: bool,
         leaf: bool,
+        /// Map the leaf **executable** (guest code — the inverse of AArch64's `XN`). Meaningful
+        /// only for a leaf and never together with `writable`: a W+X mapping is refused
+        /// ([`p2m::P2mError::WxConflict`]), which is how **write-xor-execute** holds by construction.
+        /// Forced clear for an interior entry.
+        execute: bool,
     },
     /// Remove the caller's page-table entry at `parent`'s `slot`, dropping the references
     /// the link held.
@@ -791,7 +796,8 @@ impl Hypervisor {
                 child,
                 writable,
                 leaf,
-            } => self.p2m_link(caller, parent, slot, child, writable, leaf),
+                execute,
+            } => self.p2m_link(caller, parent, slot, child, writable, leaf, execute),
             HvCall::P2mUnlink { parent, slot } => self
                 .p2m
                 .unlink(caller, parent, slot)
@@ -906,6 +912,9 @@ impl Hypervisor {
     /// authorization it is deliberately blind to. The standing
     /// [`CrossViolation::UnauthorizedForeignLink`] invariant re-checks this authorization
     /// for every edge at every level after the fact.
+    // Mirrors `HvCall::P2mLink`'s fields 1:1 (see `p2m::System::link`); the arg count follows the
+    // guest ABI rather than a struct that would hide the correspondence.
+    #[allow(clippy::too_many_arguments)]
     fn p2m_link(
         &mut self,
         caller: DomId,
@@ -914,6 +923,7 @@ impl Hypervisor {
         child: Mfn,
         writable: bool,
         leaf: bool,
+        execute: bool,
     ) -> Result<HvOutcome, HvError> {
         if let Some(owner) = self.p2m.owner_of(child) {
             if owner != caller {
@@ -929,10 +939,15 @@ impl Hypervisor {
                 if !self.grant.authorizes(owner, caller, child, writable) {
                     return Err(HvError::Unauthorized);
                 }
+                // NOTE (Phase II-1a): a *foreign* executable leaf takes no distinct grant check
+                // yet — `execute` is not part of the grant permission. Cross-domain execute
+                // authorization is a later arc; the write-xor-execute invariant this arc adds is a
+                // per-frame property that holds whoever maps the frame, so leaving it here is
+                // sound for the model rung.
             }
         }
         self.p2m
-            .link(caller, parent, slot, child, writable, leaf)
+            .link(caller, parent, slot, child, writable, leaf, execute)
             .map(|()| HvOutcome::Done)
             .map_err(HvError::P2m)
     }
@@ -1635,7 +1650,7 @@ impl Hypervisor {
         // grant for a read-only one. An unauthorized foreign entry is a domain reaching
         // into another's memory without consent — the isolation breach this join exists to
         // prevent.
-        for (parent, _slot, child, writable, _leaf) in self.p2m.link_edges() {
+        for (parent, _slot, child, writable, _leaf, _execute) in self.p2m.link_edges() {
             let (Some(child_owner), Some(parent_owner)) =
                 (self.p2m.owner_of(child), self.p2m.owner_of(parent))
             else {
@@ -2665,6 +2680,7 @@ mod tests {
                     writable: true,
                     // Interior for L4→L3→L2→L1; the entry under the L1 (frame 3) is the leaf.
                     leaf: parent == 3,
+                    execute: false,
                 },
             )
             .unwrap();
@@ -2686,7 +2702,8 @@ mod tests {
                     slot: 1,
                     child: 4,
                     writable: true,
-                    leaf: false
+                    leaf: false,
+                    execute: false,
                 }
             ),
             Err(HvError::P2m(p2m::P2mError::TypePinned))
@@ -2722,6 +2739,7 @@ mod tests {
                 child: 1,
                 writable: true,
                 leaf: false,
+                execute: false,
             },
         )
         .unwrap();
@@ -2733,6 +2751,7 @@ mod tests {
                 child: 2,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         )
         .unwrap();
@@ -2786,6 +2805,7 @@ mod tests {
                 child: 5,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         )
     }
@@ -2799,6 +2819,7 @@ mod tests {
                 child: 5,
                 writable: false,
                 leaf: true,
+                execute: false,
             },
         )
     }
@@ -2943,7 +2964,8 @@ mod tests {
                     slot: 0,
                     child: 5,
                     writable: true,
-                    leaf: false
+                    leaf: false,
+                    execute: false,
                 }
             ),
             Err(HvError::Unauthorized)
@@ -3059,6 +3081,7 @@ mod tests {
                 child: 6,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         )
         .unwrap();
@@ -3093,6 +3116,7 @@ mod tests {
                 child: 5,
                 writable,
                 leaf: false, // an interior entry — domain 0's L2 pointing at domain 1's L1 node
+                execute: false,
             },
         )
     }
@@ -3153,6 +3177,7 @@ mod tests {
                 child: 6,
                 writable: true,
                 leaf: false,
+                execute: false,
             },
         )
         .unwrap(); // L2 → L1
@@ -3164,6 +3189,7 @@ mod tests {
                 child: 7,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         )
         .unwrap(); // L1 → writable leaf
@@ -3199,7 +3225,8 @@ mod tests {
                     slot: 0,
                     child: 5,
                     writable: true,
-                    leaf: false
+                    leaf: false,
+                    execute: false,
                 }
             ),
             Ok(HvOutcome::Done)
@@ -3242,6 +3269,7 @@ mod tests {
                 child: 6,
                 writable: true,
                 leaf: true,
+                execute: false,
             },
         )
         .unwrap();
@@ -3333,7 +3361,8 @@ mod tests {
                     slot: 0,
                     child: 5,
                     writable: true,
-                    leaf: false
+                    leaf: false,
+                    execute: false,
                 }
             ),
             Err(HvError::P2m(p2m::P2mError::TypePinned))
