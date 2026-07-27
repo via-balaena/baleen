@@ -198,7 +198,9 @@ the counterpart of §5g's `step_consistent_holds` — is now also swept on real 
 (`noninterference::check_step_consistency`): `obs⁺(a)` after a step is a **function of**
 `(obs⁺(a), obs⁺(actor))` before it (two states `a` and the actor cannot distinguish go to the same
 successor). It runs over `obs⁺` = `obs` plus (i) the **read-closure** — the grants `a` is a
-*grantee* of, with each grantor, frame, and the frame's owner — and (ii) `a`'s own **authority**.
+*grantee* of, with each grantor, frame, and the **StaleGrant status** `owner_of(frame) == grantor`
+(the boolean `a`'s `grant_map` returns, *not* the owner's identity — see the fidelity note below) —
+and (ii) `a`'s own **authority**.
 
 This is where the **`DomainDestroy` read direction** (§5g finding #3) is validated on real code:
 destroying `a`'s grantor `c` runs `grant::revoke_all(c)`, dropping `a`'s read-cap, and the sweep
@@ -215,11 +217,38 @@ tens of thousands of multi-state classes). Two findings the sweep independently 
   `dropping_authority_from_obs_plus_breaks_step_consistency`) — the enumerator's confirmation that the
   confidentiality theorem is false under the authority-excluding observation.
 
-One honest edge: `DomainBusy` (which refuses a destroy while a foreign domain maps `c`'s frames)
-depends, with a *fourth* domain as that mapper, on state neither `a` nor the actor observes — so at
-≥4 domains step consistency for the destroy channel rests on the instantiation's over-approximation
-of `DomainBusy` (§5g). At ≤3 domains no fourth mapper exists, so the sweep is clean; the deep
-three-domain sweep runs in `deep-verify.yml`.
+**Read-closure real-code fidelity — the boolean, not the owner (②′-(a), landed).** The read-cap
+records the *StaleGrant status* `owner_of(frame) == grantor`, not the raw owner. `a`'s cross-domain
+map/copy learns exactly whether the grantor still owns the frame (`Ok` vs `Err(StaleGrant)` in
+`hypervisor::grant_map`) — never *who* owns it. Under the real code's **dynamic** frame ownership
+(`P2mAllocate`) and ownership-free grant *creation* (`GrantAccess` needs none), exposing the raw
+owner leaks a *third* domain's identity into `a`'s read-cap: a four-domain step-consistency sweep
+finds a depth-4 counterexample on `GrantAccess` (two states agreeing on `obs⁺(a)`/`obs⁺(actor)` but
+differing in which invisible third domain owns the granted frame). The boolean collapses that
+identity — pinned by the unit test `read_cap_records_stale_status_not_owner_identity`. (The Verus
+instantiation keeps the raw owner, sound *there* because its abstract model has static ownership and
+no grant-creation step; the bridge carries the tighter boolean because it runs against the dynamic
+real code — the honest bridge↔composition division, `read_closure.rs` fidelity note, §5g.)
+
+Two honest edges remain in the read-closure's real-code fidelity, tracked under ②′:
+
+* **Allocation contention (②′-(b), open).** Even with the boolean, a four-domain (and a
+  three-domain-with-p2m) sweep finds a `P2mAllocate{mfn}` counterexample: whether the actor's
+  allocation of a shared machine frame *succeeds* depends on whether another domain already grabbed
+  that frame — a race for a shared resource, invisible to grantor and grantee, that flips the
+  StaleGrant boolean. This is the storage-channel analogue of the pCPU-occupancy covert channel
+  §2.1 already abstracts: `hv-core::allocate(owner, mfn)` lets a guest name an arbitrary machine
+  frame first-come-first-owns, whereas a real hypervisor *mediates* machine-frame assignment
+  (guests request via gfn; the host maps gfn→mfn from disjoint per-domain pools — the gfn=mfn fence,
+  design-lesson #14e). So the contention is a model looseness, resolved by abstracting/mediating
+  allocation rather than treating it as a real Baleen channel. (Modeling in progress.)
+* **`DomainBusy` (②′-(c), unreached).** `DomainBusy` (which refuses a destroy while a foreign domain
+  maps `c`'s frames) depends, with a *fourth* domain as that mapper, on state neither `a` nor the
+  actor observes — so at ≥4 domains step consistency for the destroy channel rests on the
+  instantiation's over-approximation of `DomainBusy` (§5g). It sits behind (b) in the sweep.
+
+At ≤3 domains **without dynamic p2m** the sweep is clean (the committed `ni_cfg3` has no allocation),
+and the deep three-domain sweep runs in `deep-verify.yml`.
 
 ## 5. The Verus spike — signal-channel local respect, ∀-N (green)
 
