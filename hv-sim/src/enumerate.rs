@@ -543,8 +543,9 @@ fn level_tag(ty: Option<PageType>) -> u64 {
 
 /// A grant table entry: `(grantee, frame, readonly, maps, writable_maps)`.
 type GrantEntry = (u16, u32, bool, u32, u32);
-/// A live grant mapping at a handle: `(grantee, grantor, gref, writable)`.
-type Mapping = (u16, u16, u32, bool);
+/// A live grant mapping at a handle in a domain's own maptrack: `(grantor, gref, writable)`. The
+/// grantee is the domain whose maptrack holds it (the outer index of [`Snapshot::mappings`]).
+type Mapping = (u16, u32, bool);
 /// A page-table edge: `(parent, slot, child, writable, leaf, execute)`. `execute` is the
 /// write-xor-execute bit (Phase II-1a); it must be fingerprinted because which edge into a frame
 /// carries it decides what `unlink` gives back, so two states differing only in it are behaviourally
@@ -569,8 +570,11 @@ struct Snapshot {
     ports: Vec<PortRec>,
     /// Per `(dom, gref)`.
     grants: Vec<Option<GrantEntry>>,
-    /// Per handle slot (a global pool).
-    mappings: Vec<Option<Mapping>>,
+    /// Per grantee domain, then per handle slot in that domain's own maptrack (Xen-style
+    /// per-domain handles): `mappings[grantee][handle]`. The handle layout is behaviourally live
+    /// (unmap acts on a specific slot in the caller's own table), so a faithful key keeps it, but
+    /// keyed by domain — a domain's handle numbers no longer depend on other domains' allocations.
+    mappings: Vec<Vec<Option<Mapping>>>,
     /// Per `(dom, vcpu)`.
     vcpus: Vec<VcpuRec>,
     /// Per pCPU: the `(dom, vcpu)` occupying it, if any.
@@ -641,8 +645,12 @@ impl Snapshot {
                 grants.push(g.grant_entry(dom, gref));
             }
         }
-        let mappings = (0..g.handle_slots() as u32)
-            .map(|h| g.mapping_at(h))
+        let mappings = (0..n_dom as u16)
+            .map(|dom| {
+                (0..g.handle_slots(dom) as u32)
+                    .map(|h| g.mapping_at(dom, h))
+                    .collect()
+            })
             .collect();
 
         let mut vcpus = Vec::with_capacity(n_dom * n_vcpu);
@@ -753,18 +761,24 @@ fn snapshot_key(sn: &Snapshot) -> Vec<u64> {
             }
         }
     }
-    // Handle layout, trailing free slots trimmed (behaviourally irrelevant).
-    let live = (0..sn.mappings.len())
-        .rev()
-        .find(|&h| sn.mappings[h].is_some())
-        .map(|h| h + 1)
-        .unwrap_or(0);
-    for h in 0..live {
-        match sn.mappings[h] {
-            Some((ge, gr, gref, w)) => {
-                k.extend([1, u64::from(ge), u64::from(gr), u64::from(gref), w as u64])
+    // Handle layout, per grantee domain, trailing free slots trimmed (behaviourally irrelevant).
+    // Keyed by `(grantee domain, slot)` — the handle namespace is per-domain, so a domain's slots
+    // are fingerprinted independently of the others'.
+    for (ge, track) in sn.mappings.iter().enumerate() {
+        let live = (0..track.len())
+            .rev()
+            .find(|&h| track[h].is_some())
+            .map(|h| h + 1)
+            .unwrap_or(0);
+        if live == 0 {
+            continue;
+        }
+        k.extend([0xD_00A0, ge as u64]);
+        for slot in track.iter().take(live) {
+            match slot {
+                Some((gr, gref, w)) => k.extend([1, u64::from(*gr), u64::from(*gref), *w as u64]),
+                None => k.extend([0, 0, 0, 0]),
             }
-            None => k.extend([0, 0, 0, 0, 0]),
         }
     }
     k.push(0xFFFF_0002);
@@ -943,12 +957,18 @@ fn permute(sn: &Snapshot, g: &Perm) -> Snapshot {
         }
     }
 
-    // Grant mappings: `gref` indexes the grantor's entry table — remap by the grantor's
-    // grant perm. Handle position is unchanged (handles are not permuted).
+    // Grant mappings: `gref` indexes the grantor's entry table — remap by the grantor's grant
+    // perm. The grantee (outer index) and the handle position are unchanged (domains are fixed in
+    // Phase 1 and handles are not permuted), so each domain's maptrack is remapped in place.
     let mappings = sn
         .mappings
         .iter()
-        .map(|m| m.map(|(ge, gr, gref, w)| (ge, gr, g.grant[gr as usize][gref as usize] as u32, w)))
+        .map(|track| {
+            track
+                .iter()
+                .map(|m| m.map(|(gr, gref, w)| (gr, g.grant[gr as usize][gref as usize] as u32, w)))
+                .collect()
+        })
         .collect();
 
     // Frames: relabel each frame's id (its record's contents are unchanged — the owner is a

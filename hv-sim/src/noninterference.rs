@@ -268,20 +268,24 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
     }
     k.push(0xD_0002);
 
-    // The grant mappings `a` holds (`a` as grantee) — a canonical set (grantor, gref,
-    // writable). Only `a`'s own map/unmap creates or drops these.
-    let mut held: Vec<[u64; 3]> = Vec::new();
-    for h in 0..g.handle_slots() as u32 {
-        if let Some((grantee, grantor, gref, w)) = g.mapping_at(h) {
-            if grantee == a {
-                held.push([u64::from(grantor), u64::from(gref), w as u64]);
+    // The grant mappings `a` holds (`a` as grantee), **indexed by `a`'s own handle slot** — the
+    // handle namespace is per-domain (Xen-style maptrack), so this is `a`'s private state: only
+    // `a`'s own map/unmap moves it, and no other domain's activity shifts `a`'s handle numbers.
+    // `GrantUnmap{handle}` acts on a specific slot, so keeping the slot→map binding (not a set) is
+    // what makes it deterministic w.r.t. `obs` — two states holding the same maps in different
+    // slots (e.g. a writable and a read-only map of one grant, mapped in opposite order) are
+    // correctly distinct, so `GrantUnmap{handle:0}` no longer looks non-deterministic. This is
+    // faithful precisely *because* handles are per-domain: under the old global pool the slot index
+    // leaked the global allocation order (another domain's activity), which would break local
+    // respect; per-domain, the slot is `a`'s alone. (Design-lesson #7: the handle is behaviourally
+    // live; `obs` keeps it, as `state_key` always has.)
+    for h in 0..g.handle_slots(a) as u32 {
+        match g.mapping_at(a, h) {
+            Some((grantor, gref, w)) => {
+                k.extend([1, u64::from(grantor), u64::from(gref), w as u64])
             }
+            None => k.extend([0, 0, 0, 0]),
         }
-    }
-    held.sort_unstable();
-    k.push(held.len() as u64);
-    for m in held {
-        k.extend(m);
     }
     k.push(0xD_0003);
 
@@ -1261,5 +1265,27 @@ mod tests {
             out.violation.unwrap()
         );
         assert!(out.witnessed_classes > 1_000_000);
+    }
+
+    /// **The grant-handle read direction, per-domain (the ②′ read-closure fidelity — grant-handle
+    /// layer).** With handles a per-domain maptrack, `obs` records the mappings `a` holds indexed by
+    /// `a`'s own handle slot, so `GrantUnmap{handle}` is deterministic w.r.t. `obs` — mediated
+    /// four-domain step consistency holds with dynamic p2m + grants + create + **destroy**, over the
+    /// depth where the *global*-handle model had a `GrantUnmap` counterexample (two maps of one
+    /// grant in swapped slots). Non-vacuous (hundreds of millions of key-classes at depth 5).
+    #[test]
+    #[ignore = "deep — per-domain-handle step consistency with destroy; run in deep-verify.yml"]
+    fn step_consistency_holds_per_domain_handles_with_destroy() {
+        let cfg = Config {
+            destroy: true,
+            ..ni_cfg4_mediated(5)
+        };
+        let out = check_step_consistency(&cfg);
+        assert!(
+            out.violation.is_none(),
+            "per-domain-handle step-consistency violation (destroy on): {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 10_000_000);
     }
 }
