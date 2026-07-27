@@ -3,16 +3,16 @@
 
 # Tier D — non-interference (the property definition + the bridge spike)
 
-*Status: **Both directions established at the model level; the generic premises are now being
-DISCHARGED for a concrete instantiation (§5g, closing the review's GAP-C).** Property definition
-decided and validated on real code (the enumerator bridge); every transition class proven ∀-N (five
-per-transition local-respect lemmas); the **unwinding theorem** (`noninterference_theorem.rs`)
-assembles them into whole-system non-interference; the last mile (`step_consistency.rs`) reduces the
-confidentiality premise to the read direction; and the **read-closure** (`read_closure.rs`) discharges
-that via `obs⁺` and the extended relation `⇝⁺` (§5e–§5f). **§5g (`noninterference_instantiation.rs`)
-then turns the meta-theorem's `local_respect()`/`step_consistent()` *premises* into discharged
-theorems over a concrete carrier — four of the five transition classes done, DomainDestroy the
-follow-on — closing the "paper composition" GAP-C and forcing two `obs` corrections (see §2.1 + §5g).**
+*Status: **Both directions established at the model level; the generic premises are now DISCHARGED
+for a concrete instantiation (§5g) — GAP-C fully closed.** Property definition decided and validated
+on real code (the enumerator bridge); every transition class proven ∀-N (five per-transition
+local-respect lemmas); the **unwinding theorem** (`noninterference_theorem.rs`) assembles them into
+whole-system non-interference; the last mile (`step_consistency.rs`) reduces the confidentiality
+premise to the read direction; and the **read-closure** (`read_closure.rs`) discharges that via
+`obs⁺` and the extended relation `⇝⁺` (§5e–§5f). **§5g (`noninterference_instantiation.rs`, 14
+verified) turns the meta-theorem's `local_respect()`/`step_consistent()` *premises* into discharged
+theorems over a concrete carrier for ALL FIVE transition classes (including the `DomainDestroy`
+cascade), closing the "paper composition" GAP-C and forcing four `obs` corrections (see §2.1 + §5g).**
 This is the deepest and last tier of the true-diamond program — the
 "are we checking the **right** things" capstone. Tiers A–C prove the invariants hold in every
 reachable state, ∀-N; Tier D proves those invariants **collectively imply real isolation**. Read
@@ -378,7 +378,8 @@ the model level in both directions.**
 
 ## 5g. The concrete instantiation — discharging the premises (closing GAP-C)
 
-*Status: **four of the five transition classes done; DomainDestroy is the follow-on.***
+*Status: **all five transition classes done — GAP-C fully closed (`noninterference_instantiation.rs`,
+14 verified).***
 
 §5d's assembly (`noninterference_theorem.rs`) proves the unwinding theorem over *uninterpreted*
 `obs`/`step`/`actor`/`interferes`, taking `local_respect()` and `step_consistent()` as **premises**.
@@ -394,9 +395,13 @@ system — a composite `Sys` state and *interpreted* `obs`/`step`/`actor`/`inter
 `step_consistent_holds`), then re-runs the unwinding induction over the concrete definitions
 (`ni_theorem_a`, `ni_theorem_b`) with **no free premise**. So the top-level conclusion — `obs(a)` over
 any run depends only on principals authorized to affect `a`, integrity *and* confidentiality — now
-stands as a closed Verus obligation. Four classes are modeled: creation, signal, consent (memory) +
-the confidentiality read-closure, and authority. The `DomainDestroy` cascade (§5c) is a focused
-follow-on (it touches four `obs` components at once + the intransitive teardown-reach).
+stands as a closed Verus obligation for **all five** classes: creation, signal, consent (memory) +
+the confidentiality read-closure, authority, and the **`DomainDestroy` cascade** (§5c) — the sole
+multi-domain transition, touching four `obs` components at once (ports, grant rows, the frame-map
+population, read-caps) and carrying the intransitive **teardown-reach** channel (`interferes` gains
+`∃c. controls[caller][c] ∧ reach(a, c)`). The `map`-identity is threaded as a `wf` invariant and
+proven preserved (`wf_step_destroy`) so the drain is owner-local; non-vacuity is validated (dropping
+`teardown_reach` makes Verus reject `local_respect` at the `¬reach` step).
 
 **The honest division (altitude discipline).** The instantiation closes the *composition* gap; it
 does **not** re-derive that the carrier mirrors the real `Hypervisor` — that remains the enumerator
@@ -413,9 +418,19 @@ premises imply whole-run NI (meta-theorem)** — with no prose seam between them
    grantor still owns the frame (`StaleGrant`), so `obs⁺` must expose that owner, else
    `step_consistent` fails for the read direction (non-vacuity validated by a probe). This is §5f's
    `obs⁺` made load-bearing, not decorative.
-3. **Teardown-reach extends to the read direction** (recorded for the DomainDestroy arc): destroying
-   `a`'s *grantor* alters `obs⁺(a)`, so the intransitive reach term needs a read-direction addend the
-   original §2.4 (pre-`obs⁺`) lacked.
+3. **Teardown-reach extends to the read direction**: destroying `a`'s *grantor* alters `obs⁺(a)`, so
+   the intransitive reach term carries a read-direction addend the original §2.4 (pre-`obs⁺`) lacked.
+   `reach(a, c)` is `a→c port ∨ a→c grant ∨ a reads-from c` — the third disjunct discharges the
+   read-cap component of the cascade.
+4. **The actor observes its own *outgoing* destroy authority** (forced by `DomainDestroy`'s
+   `step_consistent`): `destroy_guard` reads `controls[caller][c]` — `caller`'s power over the
+   *target*, not over `a`, so it is in neither `obs(a)` nor `obs(caller)` under the incoming-only
+   §2.1 authority, and two runs agreeing on the documented `obs` disagree on whether the destroy
+   fires. The fix (the outgoing analogue of finding #1): `obs(a)` carries `controls[a][·]`. Also, the
+   `DomainBusy` no-foreign-map precondition is a `c`-frames property invisible to `a`/`caller` and
+   would break `step_consistent` the same way; the carrier instead has the drain *clean up* maps over
+   `c`'s frames — a sound over-approximation coinciding with `DomainBusy`-refusal on `obs(a)` for
+   `a ≠ c`.
 
 ## 6. Honest scope, cost read, and the fork
 

@@ -22,18 +22,23 @@
 //! authorized to affect `a`, integrity *and* confidentiality — now stands as a closed Verus
 //! obligation, not a hand-composition.
 //!
-//! ## Scope of this file (four of the five transition classes; DomainDestroy is the follow-on)
+//! ## Scope of this file (all FIVE transition classes — GAP-C fully closed)
 //!
-//! `Trans` currently models **four** of the five Tier-D transition classes: `Create` (creation),
-//! `Send` (signal), `GrantMap` (consent + the confidentiality read-closure), and `SetAffinity`
-//! (authority). Both unwinding conditions are discharged, and both trace theorems are premise-free,
-//! for exactly these. The fifth — the **`DomainDestroy` cascade**, the sole genuinely multi-domain
-//! transition (`unwinding_destroy.rs`) — touches four `obs` components at once (ports, grant rows,
-//! a frame-refs drain, and the read-caps) and carries the intransitive teardown-reach term; it is a
-//! focused follow-on that extends `Trans`/`step`/`interferes` and the two `*_holds` proofs the same
-//! way each class here does. Composing the read-closure with teardown surfaced a further refinement
-//! (destroying `a`'s *grantor* alters `obs⁺(a)`, so teardown-reach needs a read-direction term) —
-//! recorded for that arc.
+//! `Trans` models **all five** Tier-D transition classes: `Create` (creation), `Send` (signal),
+//! `GrantMap` (consent + the confidentiality read-closure), `SetAffinity` (authority), and
+//! `Destroy` — the **`DomainDestroy` cascade**, the sole genuinely multi-domain transition
+//! (`unwinding_destroy.rs`). Both unwinding conditions are discharged, and both trace theorems
+//! (`ni_theorem_a`, `ni_theorem_b`) are premise-free, for all five.
+//!
+//! The cascade touches four `obs` components at once — `a`'s **ports** (`close_all`/
+//! `clear_unbound_into` drop links naming `c`), **grant rows** (`revoke_grants_to` clears active
+//! grants to `c`, and `c`'s own outgoing rows drop — the read direction), the **frame-map
+//! population** (`drain_maps_of` releases `c`'s maps), and the **read-caps** (destroying `a`'s
+//! grantor `c` alters `obs⁺(a)`) — and carries the intransitive **teardown-reach** term
+//! (`interferes` gains `teardown_reach`: `∃c. controls[caller][c] ∧ reach(a, c)`, where `reach`
+//! includes the read direction the pre-`obs⁺` §2.4 lacked — finding #3). The `map`-identity
+//! (`unwinding_destroy.rs::no_c_map_over_a_frame`) is threaded as a `wf` invariant and proven
+//! preserved (`wf_step_destroy`) so the drain is owner-local. Two modeling choices, recorded below.
 //!
 //! ## What this closes, and what it deliberately does NOT claim (the altitude discipline)
 //!
@@ -60,6 +65,23 @@
 //! affinity channel). This is a genuine model-fidelity correction the paper composition hid; the
 //! design doc §2.1 is updated to match.
 //!
+//! ## Two findings the `DomainDestroy` proof forced
+//!
+//! * **The actor observes its own *outgoing* destroy authority.** `destroy_guard` reads
+//!   `controls[caller][c]` — `caller`'s power over the *target* `c`, not over `a`. That edge is in
+//!   neither `obs(a)` nor `obs(caller)` under the §2.1 (incoming-only) authority. So two runs
+//!   agreeing on the documented observations can disagree on whether the destroy fires, and
+//!   `step_consistent` is *false*. The fix (the outgoing analogue of the finding above): `obs(a)`
+//!   carries `controls[a][·]` (`controls_out`), so the actor observes its own destroy authority.
+//! * **The drain over-approximates `DomainBusy`.** `unwinding_destroy.rs` relies on `DomainBusy`
+//!   *refusing* teardown while a foreign domain maps `c`'s frames — a `c`-frames property invisible
+//!   to `a`/`caller`, which would likewise break `step_consistent`. This carrier instead has the
+//!   drain *clean up* those maps (`drain_pred` drops maps that are `c`'s **or** over a `c`-owned
+//!   frame). The two coincide on `obs(a)` for `a ≠ c` — a map over `c`'s frame is never one of
+//!   `a`'s — so the whole-run NI conclusion is unaffected, and the guard stays a function of the
+//!   actor's `obs`. (It also keeps the `map`-identity trivially preserved: no survivor is over a
+//!   `c`-owned frame, so its witness grant escapes the revoke.)
+//!
 //! Run: `verus --crate-type=lib hv-verify/verus/noninterference_instantiation.rs` (exit 0 = all
 //! proven).
 
@@ -67,6 +89,115 @@ use vstd::prelude::*;
 use vstd::assert_maps_equal;
 
 verus! {
+
+// ============================================================================================
+// Seq-filter plumbing for the frame-map population (the frame-refs drain, `DomainDestroy`).
+// ============================================================================================
+
+/// `filter` is congruent under predicates that agree on the sequence's own elements — so a
+/// pointwise-equal predicate substitution preserves the filtered result.
+pub proof fn filter_ext<A>(sq: Seq<A>, p: spec_fn(A) -> bool, q: spec_fn(A) -> bool)
+    requires
+        forall|i: int| #![trigger sq[i]] 0 <= i < sq.len() ==> p(sq[i]) == q(sq[i]),
+    ensures
+        sq.filter(p) == sq.filter(q),
+    decreases sq.len(),
+{
+    reveal(Seq::filter);
+    if sq.len() > 0 {
+        assert forall|i: int| #![trigger sq.drop_last()[i]] 0 <= i < sq.drop_last().len() implies p(
+            sq.drop_last()[i],
+        ) == q(sq.drop_last()[i]) by {
+            assert(sq.drop_last()[i] == sq[i]);
+        }
+        filter_ext(sq.drop_last(), p, q);
+    }
+}
+
+/// Filtering by `p` then `q` equals filtering by `p ∧ q` — filter composition (so filters
+/// commute, and a drain restricted to a projection is the projection of the drain).
+pub proof fn filter_and<A>(sq: Seq<A>, p: spec_fn(A) -> bool, q: spec_fn(A) -> bool)
+    ensures
+        sq.filter(p).filter(q) == sq.filter(|x: A| p(x) && q(x)),
+    decreases sq.len(),
+{
+    reveal(Seq::filter);
+    broadcast use Seq::lemma_filter_push;
+    if sq.len() > 0 {
+        filter_and(sq.drop_last(), p, q);
+        assert(sq.drop_last().push(sq.last()) =~= sq);
+        let last = sq.last();
+        if p(last) {
+            assert(sq.filter(p) == sq.drop_last().filter(p).push(last));
+        }
+    }
+}
+
+/// Filtering by an always-false predicate yields the empty sequence.
+pub proof fn filter_false<A>(sq: Seq<A>)
+    ensures
+        sq.filter(|x: A| false) == Seq::<A>::empty(),
+    decreases sq.len(),
+{
+    reveal(Seq::filter);
+    if sq.len() > 0 {
+        filter_false(sq.drop_last());
+    }
+}
+
+/// **The compound drain is a no-op on `a`'s frames when `c` maps none of them** (`a ≠ c`). The
+/// destroy filter drops `c`'s maps *and* maps over `c`-owned frames; on `a`'s frames (owned by
+/// `a ≠ c`) the second clause is vacuous, so if no live map is *both* `c`'s and over an `a`-owned
+/// frame, `a`'s frame-map population is unchanged (`unwinding_destroy.rs::drain_preserves_frame_refs`
+/// at the population granularity).
+pub proof fn compound_drain_preserves(maps: Seq<(Dom, int)>, owner: Map<int, Dom>, a: Dom, c: Dom)
+    requires
+        a != c,
+        forall|i: int| #![trigger maps[i]]
+            0 <= i < maps.len() ==> !(maps[i].0 == c && owner.dom().contains(maps[i].1)
+                && owner[maps[i].1] == a),
+    ensures
+        maps.filter(drain_pred(owner, c)).filter(a_frame_pred(owner, a)) == maps.filter(
+            a_frame_pred(owner, a),
+        ),
+{
+    filter_and(maps, drain_pred(owner, c), a_frame_pred(owner, a));
+    filter_ext(
+        maps,
+        |m: (Dom, int)| (drain_pred(owner, c))(m) && (a_frame_pred(owner, a))(m),
+        a_frame_pred(owner, a),
+    );
+}
+
+/// **`a`'s post-destroy frame maps as a function of `obs(a)`** (used by step consistency). When
+/// `a ≠ c` the compound drain restricted to `a`'s frames is exactly `obs(a).frame_maps` with `c`'s
+/// dropped; when `a == c` (`a` destroys itself) every `a`-frame map is over a `c`-owned frame, so
+/// the population empties. Either way the result is determined by `obs(a).frame_maps`.
+pub proof fn frame_maps_destroyed(maps: Seq<(Dom, int)>, owner: Map<int, Dom>, a: Dom, c: Dom)
+    ensures
+        maps.filter(drain_pred(owner, c)).filter(a_frame_pred(owner, a)) == (if a != c {
+            maps.filter(a_frame_pred(owner, a)).filter(not_c_pred(c))
+        } else {
+            Seq::<(Dom, int)>::empty()
+        }),
+{
+    filter_and(maps, drain_pred(owner, c), a_frame_pred(owner, a));
+    if a != c {
+        filter_and(maps, a_frame_pred(owner, a), not_c_pred(c));
+        filter_ext(
+            maps,
+            |m: (Dom, int)| (drain_pred(owner, c))(m) && (a_frame_pred(owner, a))(m),
+            |m: (Dom, int)| (a_frame_pred(owner, a))(m) && (not_c_pred(c))(m),
+        );
+    } else {
+        filter_ext(
+            maps,
+            |m: (Dom, int)| (drain_pred(owner, c))(m) && (a_frame_pred(owner, a))(m),
+            |m: (Dom, int)| false,
+        );
+        filter_false(maps);
+    }
+}
 
 /// A domain id (the security principal). `int` is the ∀-N honest domain (only identity/size
 /// matters — the §2.1 reduction used throughout the Tier-D corpus).
@@ -107,8 +238,12 @@ pub struct Sys {
     pub grants: Map<int, GrantRec>,
     /// Frame ownership: `owner[f]` is the domain that owns machine frame `f` (`p2m`).
     pub owner: Map<int, Dom>,
-    /// Per-frame **reference count** — `refs[f]` (moved `+1` when a peer maps a grant over `f`).
-    pub refs: Map<int, nat>,
+    /// The **live grant-map population** — one `(mapper, frame)` entry per live grant map
+    /// (`grant::map` appends; `drain_maps_of(c)` filters out `c`'s). The per-frame *count*
+    /// `|{ maps naming f }|` is `f`'s reference load (`p2m::refs`); modeled here as the
+    /// population itself (the granularity `unwinding_destroy.rs`'s `Maps` uses), so the
+    /// `DomainDestroy` drain is a `filter` and a peer's authorized `GrantMap` is a `push`.
+    pub maps: Seq<(Dom, int)>,
     /// The **control matrix** as a set of edges: `controls.contains((b, a))` iff `b` controls `a`
     /// (`b` may set `a`'s vCPU affinity, or destroy `a`). Authority over the *control* channel.
     pub controls: Set<(Dom, Dom)>,
@@ -156,6 +291,15 @@ pub enum Trans {
     /// `caller == vowner[vcpu] ∨ controls[caller][vowner[vcpu]]` — the write-restriction *is* the
     /// authorization guard (design-lesson #9; `unwinding_control.rs`). The **authority** channel.
     SetAffinity { caller: Dom, vcpu: int, aff: nat },
+    /// `DomainDestroy` — `caller` tears down `target` (guarded by `caller == target` or
+    /// `controls[caller][target]`, and by the `DomainBusy` no-foreign-map precondition). The sole
+    /// **multi-domain** transition: the cascade reaches `target`'s *partners* — `close_all`/
+    /// `clear_unbound_into` return/free ports naming `target`; `revoke_grants_to` clears active
+    /// grants *to* `target` and `target`'s own outgoing grant rows drop (the read direction);
+    /// `drain_maps_of` releases `target`'s maps, dropping the referenced frames' load. So a step by
+    /// `caller` can move a *third* domain's `obs` — the intransitive **teardown-reach** channel
+    /// (`unwinding_destroy.rs`).
+    Destroy { caller: Dom, target: Dom },
 }
 
 /// The acting principal of an action — the `caller` of the `HvCall`.
@@ -165,6 +309,7 @@ pub open spec fn actor(t: Trans) -> Dom {
         Trans::Send { sender, .. } => sender,
         Trans::GrantMap { mapper, .. } => mapper,
         Trans::SetAffinity { caller, .. } => caller,
+        Trans::Destroy { caller, .. } => caller,
     }
 }
 
@@ -201,6 +346,32 @@ pub open spec fn create_guard(s: Sys, creator: Dom, target: Dom) -> bool {
     s.maycreate.contains(creator) && !s.live.contains(target)
 }
 
+/// The `DomainDestroy` guard: `caller` is authorized to destroy `target` — itself, or a domain it
+/// controls (the write-restriction *is* the authorization, design-lesson #9). The authorization
+/// reads `caller`'s **own outgoing** control edge `controls[caller][target]`, exposed by
+/// `obs(caller).controls_out` — the actor observes its own destroy authority (the outgoing analogue
+/// of the finding-#1 self-authority; without it `step_consistent` is false — the destroy fires in
+/// one run and not the other while both agree on the documented `obs`).
+pub open spec fn destroy_guard(s: Sys, caller: Dom, target: Dom) -> bool {
+    caller == target || s.controls.contains((caller, target))
+}
+
+/// `a` has a **reach relationship** with `c` — an outbound reference the destroy of `c` would
+/// clear: `a` holds a port toward `c` (signal cleanup), `a` granted actively to `c` (consent
+/// revoke + frame drain), or `a` *reads* from `c` (`c` is the grantor of, or owns a frame behind,
+/// a grant `a` holds — the read direction, finding #3). The per-target content of the
+/// `noninterference::teardown_reach` term, extended with the read direction `obs⁺` demands.
+pub open spec fn reach(s: Sys, a: Dom, c: Dom) -> bool {
+    a_holds_port_toward(s, a, c) || a_grants_to(s, a, c) || reads_from(s, a, c)
+}
+
+/// The **teardown-reach** channel — the intransitive two-hop: `caller` controls some `c` that `a`
+/// reaches. `caller` destroying that `c` cleans up `a`'s outbound reference to it, moving `obs(a)`
+/// (`docs/TIER-D-NONINTERFERENCE.md` §2.4; `unwinding_destroy.rs`).
+pub open spec fn teardown_reach(s: Sys, b: Dom, a: Dom) -> bool {
+    exists|c: Dom| #![trigger s.controls.contains((b, c))] s.controls.contains((b, c)) && reach(s, a, c)
+}
+
 /// The transition function — `dispatch(caller, α)`. `DomainCreate` sets `life[target]` when its
 /// guard holds; a fresh domain gains no other observable resource (and no creation authority of
 /// its own — `maycreate` is unchanged).
@@ -221,7 +392,7 @@ pub open spec fn step(s: Sys, t: Trans) -> Sys {
                 let f = s.grants[g].frame;
                 let rec = s.grants[g];
                 Sys {
-                    refs: s.refs.insert(f, s.refs[f] + 1),
+                    maps: s.maps.push((mapper, f)),
                     grants: s.grants.insert(g, GrantRec { count: rec.count + 1, ..rec }),
                     ..s
                 }
@@ -232,6 +403,34 @@ pub open spec fn step(s: Sys, t: Trans) -> Sys {
         Trans::SetAffinity { caller, vcpu, aff } => {
             if set_affinity_guard(s, caller, vcpu) {
                 Sys { vaff: s.vaff.insert(vcpu, aff), ..s }
+            } else {
+                s
+            }
+        },
+        Trans::Destroy { caller, target } => {
+            if destroy_guard(s, caller, target) {
+                let c = target;
+                Sys {
+                    // ports: `close_all(c)` returns `c`'s interdomain peers, `clear_unbound_into(c)`
+                    // frees `c`'s ports — modeled as dropping every link naming `c` (as a key, i.e.
+                    // `c`'s own port, or as a value, i.e. a peer's port toward `c`). Involution-safe.
+                    peer: s.peer.filter_keys(|k: Coord| k.0 != c && s.peer[k].0 != c),
+                    // grant rows: `revoke_grants_to(c)` clears active grants *to* `c`, and `c`'s own
+                    // outgoing rows drop with `c` — modeled as dropping every grant with grantor `c`
+                    // or an active grantee `c`.
+                    grants: s.grants.filter_keys(
+                        |g: int|
+                            !(s.grants[g].grantor == c || (s.grants[g].active
+                                && s.grants[g].grantee == c)),
+                    ),
+                    // frame references: `drain_maps_of(c)` releases every map by `c`, and `c`'s own
+                    // frames (freed with `c`) shed their maps too — so a surviving map is neither
+                    // `c`'s nor over a `c`-owned frame. (This drains what `DomainBusy` would instead
+                    // refuse; the two coincide on `obs(a)` for `a ≠ c` — a map over `c`'s frame is
+                    // not one of `a`'s — and this keeps the guard a function of the actor's `obs`.)
+                    maps: s.maps.filter(drain_pred(s.owner, c)),
+                    ..s
+                }
             } else {
                 s
             }
@@ -259,8 +458,15 @@ pub struct Obs {
     pub pend: Set<Coord>,
     /// `a`'s **grant rows** (as grantor), incl. live-map counts.
     pub grows: Map<int, GrantRec>,
-    /// `a`'s **owned-frame reference counts**.
-    pub frefs: Map<int, nat>,
+    /// `a`'s **owned frames** — the set of machine frames `a` owns. No modeled transition re-owns
+    /// a frame, so this is a stable observable; it exposes `owner[f] == a` (which `frame_maps`
+    /// alone does not, for an as-yet-unmapped owned frame) — load-bearing for the memory channel's
+    /// guard, `owner[frame] == grantor`.
+    pub owned: Set<int>,
+    /// `a`'s **frame-map population** — the live grant-map population restricted to `a`-owned
+    /// frames (per-frame count = `a`'s owned-frame reference load). A peer's authorized
+    /// `GrantMap` of `a`'s grant appends here; a `DomainDestroy` cascade drains it.
+    pub frame_maps: Seq<(Dom, int)>,
     /// `a`'s **read-closure** (`obs⁺`) — read-caps for grants naming `a` as grantee. The
     /// confidentiality read direction (`read_closure.rs`).
     pub read_caps: Map<int, ReadCap>,
@@ -268,6 +474,10 @@ pub struct Obs {
     pub aff: Map<int, nat>,
     /// `a`'s **incoming control edges** — who controls `a` (self-authority; GAP-C).
     pub controllers: Set<(Dom, Dom)>,
+    /// `a`'s **outgoing control edges** — whom `a` controls (may set affinity on, or *destroy*).
+    /// The actor observes its own destroy authority — without it `step_consistent` is false for the
+    /// `DomainDestroy` channel (the outgoing analogue of the finding-#1 self-authority).
+    pub controls_out: Set<(Dom, Dom)>,
 }
 
 /// `obs(s, a)` — the projection of `s` onto what belongs to `a`.
@@ -278,10 +488,12 @@ pub open spec fn obs(s: Sys, a: Dom) -> Obs {
         peer: s.peer.filter_keys(owned_by(a)),
         pend: s.pending.filter(owned_by(a)),
         grows: a_grant_rows(s, a),
-        frefs: a_frame_refs(s, a),
+        owned: a_owned_frames(s, a),
+        frame_maps: a_frame_maps(s, a),
         read_caps: a_read_caps(s, a),
         aff: a_affinity(s, a),
         controllers: a_controllers(s, a),
+        controls_out: a_controls_out(s, a),
     }
 }
 
@@ -299,10 +511,36 @@ pub open spec fn a_grant_rows(s: Sys, a: Dom) -> Map<int, GrantRec> {
     s.grants.filter_keys(|g: int| s.grants.dom().contains(g) && s.grants[g].grantor == a)
 }
 
-/// `a`'s **owned-frame reference counts** — `refs` restricted to frames `a` owns. The quantity a
-/// peer's authorized `GrantMap` moves (`frame_lemma.rs`; `noninterference.rs::obs`).
-pub open spec fn a_frame_refs(s: Sys, a: Dom) -> Map<int, nat> {
-    s.refs.filter_keys(|f: int| s.owner.dom().contains(f) && s.owner[f] == a)
+/// `a`'s **owned frames** — the set of frames `owner` maps to `a`. Stable (no transition
+/// re-owns a frame); exposes `owner[f] == a` for the memory-channel guard.
+pub open spec fn a_owned_frames(s: Sys, a: Dom) -> Set<int> {
+    s.owner.dom().filter(|f: int| s.owner[f] == a)
+}
+
+/// The "`(mapper, frame)` names a frame owned by `a`" predicate — projects the global map
+/// population onto `a`'s owned frames.
+pub open spec fn a_frame_pred(owner: Map<int, Dom>, a: Dom) -> spec_fn((Dom, int)) -> bool {
+    |m: (Dom, int)| owner.dom().contains(m.1) && owner[m.1] == a
+}
+
+/// The `DomainDestroy` **map drain** predicate — a map survives iff it is not `c`'s and not over a
+/// `c`-owned frame. (A named closure so every `filter` over it — in `step` and in the drain lemmas
+/// — refers to the *same* spec object, which is how Verus matches filtered sequences.)
+pub open spec fn drain_pred(owner: Map<int, Dom>, c: Dom) -> spec_fn((Dom, int)) -> bool {
+    |m: (Dom, int)| m.0 != c && owner[m.1] != c
+}
+
+/// The "map is not `c`'s" predicate — `obs(a)`'s frame maps with `c`'s dropped (step consistency).
+pub open spec fn not_c_pred(c: Dom) -> spec_fn((Dom, int)) -> bool {
+    |m: (Dom, int)| m.0 != c
+}
+
+/// `a`'s **frame-map population** — the live map population restricted to frames `a` owns. Its
+/// per-frame count is `a`'s owned-frame reference load; the quantity a peer's authorized
+/// `GrantMap` appends to and a `DomainDestroy` drains (`frame_lemma.rs`, `unwinding_destroy.rs`;
+/// `noninterference.rs::obs`).
+pub open spec fn a_frame_maps(s: Sys, a: Dom) -> Seq<(Dom, int)> {
+    s.maps.filter(a_frame_pred(s.owner, a))
 }
 
 /// `a` has an active grant with grantee `b` — the **consent** channel's `a`-side term
@@ -368,6 +606,13 @@ pub open spec fn a_controllers(s: Sys, a: Dom) -> Set<(Dom, Dom)> {
     s.controls.filter(|e: (Dom, Dom)| e.1 == a)
 }
 
+/// `a`'s **outgoing control edges** — whom `a` controls. Exposes `controls[a][·]` so the actor
+/// observes its own `DomainDestroy` authority (`destroy_guard`); without it `step_consistent` fails
+/// for the destroy channel. Stable — no modeled transition writes the control matrix.
+pub open spec fn a_controls_out(s: Sys, a: Dom) -> Set<(Dom, Dom)> {
+    s.controls.filter(|e: (Dom, Dom)| e.0 == a)
+}
+
 /// The authorized-channel relation `b ⇝ a`: a step by `b` may legitimately move `obs(a)` iff a
 /// direct relationship holds. State-dependent and intransitive (design doc §2.2). Grows one
 /// disjunct per class.
@@ -388,6 +633,7 @@ pub open spec fn interferes(s: Sys, b: Dom, a: Dom) -> bool {
     ||| a_grants_to(s, a, b)
     ||| reads_from(s, a, b)
     ||| s.controls.contains((b, a))
+    ||| teardown_reach(s, b, a)
 }
 
 // ============================================================================================
@@ -407,20 +653,38 @@ pub open spec fn involution(peer: Map<Coord, Coord>) -> bool {
         peer.dom().contains(k) ==> peer.dom().contains(peer[k]) && peer[peer[k]] == k
 }
 
+/// **The grant `map`-identity** (`grant.rs`; `unwinding_destroy.rs::no_c_map_over_a_frame`): every
+/// live map `(mapper, frame)` is witnessed by an **active** grant whose grantor is the frame's
+/// current owner, whose grantee is the mapper, and which names that frame. A map is created only
+/// through `grant_map_guard` (which reads `owner[frame] == grantor`), stays active while mapped
+/// (no-end-while-mapped), and no modeled transition re-owns a frame — so the map population never
+/// outruns the grants that justify it. This is the relational invariant the `DomainDestroy` drain
+/// borrows from: a map by `c` over an `a`-owned frame forces an active `a→c` grant.
+pub open spec fn map_backed(s: Sys, i: int) -> bool {
+    exists|g: int| #![trigger s.grants[g]]
+        s.grants.dom().contains(g) && s.grants[g].active && s.grants[g].grantor == s.owner[s.maps[i].1]
+            && s.grants[g].grantee == s.maps[i].0 && s.grants[g].frame == s.maps[i].1
+}
+
+/// Every live map is `map_backed`.
+pub open spec fn map_identity(s: Sys) -> bool {
+    forall|i: int| 0 <= i < s.maps.len() ==> #[trigger] map_backed(s, i)
+}
+
 /// The conjunction of the reachable-state invariants the local-respect lemmas borrow from
 /// (design doc §2.2 — the invariants keep the channel relation honest). Populated per class.
 ///
 /// * `involution(peer)` — event-channel reciprocity (signal channel);
-/// * `refs.dom() == owner.dom()` — every owned frame carries a reference count (so a frame owned
-///   by `a` is always in `a`'s frame-refs projection; the memory channel / read-closure);
 /// * every grant names an **owned** frame — so a held grant's `owner` read-cap is well-defined
-///   (the read direction, `read_closure.rs`).
+///   (the read direction, `read_closure.rs`);
+/// * `vaff.dom() == vowner.dom()` — every vCPU carries an affinity (authority channel);
+/// * `map_identity` — the grant `map`-identity (the `DomainDestroy` frame-refs drain).
 pub open spec fn wf(s: Sys) -> bool {
     &&& involution(s.peer)
-    &&& s.refs.dom() == s.owner.dom()
     &&& forall|g: int| #![trigger s.grants[g]]
         s.grants.dom().contains(g) ==> s.owner.dom().contains(s.grants[g].frame)
     &&& s.vaff.dom() == s.vowner.dom()
+    &&& map_identity(s)
 }
 
 /// **`wf` is preserved by every transition** — so the trace induction stays inside the reachable
@@ -432,23 +696,12 @@ pub proof fn wf_step(s: Sys, t: Trans)
     ensures
         wf(step(s, t)),
 {
-    // No transition touches the interdomain-link map, so reciprocity is preserved outright.
-    assert(step(s, t).peer == s.peer);
-    // `refs.dom() == owner.dom()`: Create/Send touch neither; GrantMap re-inserts a frame that is
-    // already owned (the guard reads its owner), so `refs.dom()` is unchanged and `owner` is not
-    // written.
-    match t {
-        Trans::GrantMap { mapper, g } => {
-            if grant_map_guard(s, mapper, g) {
-                let f = s.grants[g].frame;
-                assert(s.owner.dom().contains(f));  // guard's StaleGrant read
-                assert(s.refs.dom().contains(f));   // wf: refs.dom() == owner.dom()
-                assert(step(s, t).refs.dom() == s.refs.dom());
-            }
-        },
-        _ => {},
+    if let Trans::Destroy { caller, target } = t {
+        wf_step_destroy(s, caller, target);
+        return ;
     }
-    assert(step(s, t).refs.dom() == step(s, t).owner.dom());
+    // No non-destroy transition touches the interdomain-link map, so reciprocity holds.
+    assert(step(s, t).peer == s.peer);
     // Grants name owned frames: no transition adds a grant or changes a grant's frame, and
     // GrantMap re-inserts the same grant id with the same frame (only `count` bumps), while
     // `owner`'s domain never shrinks.
@@ -474,6 +727,119 @@ pub proof fn wf_step(s: Sys, t: Trans)
         _ => {},
     }
     assert(step(s, t).vaff.dom() == step(s, t).vowner.dom());
+    // `map_identity`: only GrantMap changes the map population (a `push`) or the grants (a count
+    // bump at one key); Create/Send/SetAffinity touch none of `maps`/`grants`/`owner`, so the
+    // witnesses carry over unchanged.
+    assert forall|i: int| 0 <= i < step(s, t).maps.len() implies #[trigger] map_backed(
+        step(s, t),
+        i,
+    ) by {
+        {
+            let st = step(s, t);
+            let pushed = if let Trans::GrantMap { mapper, g } = t {
+                grant_map_guard(s, mapper, g) && i == s.maps.len()
+            } else {
+                false
+            };
+            if pushed {
+                // The pushed map `(mapper, f)`: witnessed by the mapped grant itself (active by the
+                // guard, grantor == owner[f], grantee == mapper, frame == f).
+                let (mapper, g) = if let Trans::GrantMap { mapper, g } = t {
+                    (mapper, g)
+                } else {
+                    (0, 0)
+                };
+                let f = s.grants[g].frame;
+                assert(st.maps[i] == (mapper, f));
+                assert(st.grants.dom().contains(g) && st.grants[g].active && st.grants[g].grantor
+                    == st.owner[st.maps[i].1] && st.grants[g].grantee == st.maps[i].0
+                    && st.grants[g].frame == st.maps[i].1);
+            } else {
+                // Every other case leaves `maps[i]`, `owner`, and the *witnessing* fields of
+                // `grants` fixed (GrantMap only bumps one grant's `count`; other transitions touch
+                // no grant) — so `s`'s witness carries over.
+                assert(st.maps[i] == s.maps[i] && st.owner == s.owner);
+                assert(map_backed(s, i));  // wf
+                let gw = choose|gw: int| #![trigger s.grants[gw]]
+                    s.grants.dom().contains(gw) && s.grants[gw].active && s.grants[gw].grantor
+                        == s.owner[s.maps[i].1] && s.grants[gw].grantee == s.maps[i].0
+                        && s.grants[gw].frame == s.maps[i].1;
+                assert(st.grants.dom().contains(gw) && st.grants[gw].active && st.grants[gw].grantor
+                    == st.owner[st.maps[i].1] && st.grants[gw].grantee == st.maps[i].0
+                    && st.grants[gw].frame == st.maps[i].1);
+            }
+        }
+    }
+    assert(map_identity(step(s, t)));
+}
+
+/// **`wf` preserved by `DomainDestroy`** — the cascade's own preservation obligation. The port
+/// filter keeps the link map an involution (a surviving link's peer survives too — its endpoints
+/// dodge `c` symmetrically); the grant filter only shrinks the table (owned frames stay owned);
+/// `vaff`/`vowner` are untouched; and the `map`-identity survives because a drained map's witness
+/// grant is *not* one the grant cascade revokes — its grantee dodged `c` (it survived the map
+/// drain) and its grantor is the frame's owner, which cannot be `c` (the `DomainBusy`
+/// precondition: no foreign domain maps `c`'s frames).
+pub proof fn wf_step_destroy(s: Sys, caller: Dom, target: Dom)
+    requires
+        wf(s),
+    ensures
+        wf(step(s, Trans::Destroy { caller, target })),
+{
+    broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas, Seq::lemma_filter_contains_rev, Seq::lemma_filter_pred;
+    let t = Trans::Destroy { caller, target };
+    let st = step(s, t);
+    let c = target;
+    if !destroy_guard(s, caller, target) {
+        assert(st == s);
+        assert(wf(st));
+    } else {
+        // ---- involution (the port cascade is reciprocity-safe) ----
+        assert(involution(st.peer)) by {
+            assert forall|k: Coord| st.peer.dom().contains(k) implies st.peer.dom().contains(
+                st.peer[k],
+            ) && st.peer[st.peer[k]] == k by {
+                assert(s.peer.dom().contains(k) && k.0 != c && s.peer[k].0 != c);
+                assert(st.peer[k] == s.peer[k]);
+                assert(s.peer.dom().contains(s.peer[k]) && s.peer[s.peer[k]] == k);  // wf involution
+                // s.peer[k] survives: its own domain != c (from k's second guard) and its peer's
+                // domain == k.0 != c (from k's first guard).
+                assert((s.peer[k]).0 != c && (s.peer[s.peer[k]]).0 != c);
+                assert(st.peer.dom().contains(s.peer[k]) && st.peer[s.peer[k]] == s.peer[s.peer[k]]);
+            }
+        }
+        // ---- grants name owned frames (the table only shrinks; owner is fixed) ----
+        assert forall|gi: int| #![trigger st.grants[gi]] st.grants.dom().contains(gi) implies
+            st.owner.dom().contains(st.grants[gi].frame) by {
+            assert(s.grants.dom().contains(gi) && st.grants[gi] == s.grants[gi]);
+        }
+        // ---- vaff/vowner untouched ----
+        assert(st.vaff.dom() == st.vowner.dom());
+        // ---- map-identity (a drained map's witness grant survives the grant cascade) ----
+        assert forall|i: int| 0 <= i < st.maps.len() implies #[trigger] map_backed(st, i) by {
+            let x = st.maps[i];
+            assert(st.maps.contains(x));  // x is at index i
+            assert(s.maps.contains(x));  // filter ⊆ original (lemma_filter_contains_rev)
+            // A surviving map dodged both drain arms: it is not `c`'s and not over a `c`-owned frame.
+            assert(x.0 != c && s.owner[x.1] != c);  // lemma_filter_pred (the compound drain)
+            let j = choose|j: int| 0 <= j < s.maps.len() && s.maps[j] == x;
+            assert(map_backed(s, j));  // wf
+            let gw = choose|gw: int| #![trigger s.grants[gw]]
+                s.grants.dom().contains(gw) && s.grants[gw].active && s.grants[gw].grantor
+                    == s.owner[s.maps[j].1] && s.grants[gw].grantee == s.maps[j].0 && s.grants[gw].frame
+                    == s.maps[j].1;
+            // its witness grant's grantor is the frame's owner, which the drain guarantees != c.
+            assert(s.owner.dom().contains(x.1));  // grants-name-owned on gw (frame == x.1)
+            // so gw dodges both revocation arms (grantor == owner[x.1] != c; grantee == x.0 != c).
+            assert(!(s.grants[gw].grantor == c || (s.grants[gw].active && s.grants[gw].grantee == c)));
+            assert(st.grants.dom().contains(gw) && st.grants[gw] == s.grants[gw]);
+            assert(st.grants.dom().contains(gw) && st.grants[gw].active && st.grants[gw].grantor
+                == st.owner[st.maps[i].1] && st.grants[gw].grantee == st.maps[i].0
+                && st.grants[gw].frame == st.maps[i].1);
+        }
+        assert(map_identity(st));
+        assert(wf(st));
+    }
 }
 
 // ============================================================================================
@@ -559,7 +925,11 @@ pub proof fn local_respect_holds()
                     }
                     assert(s.owner[f] == rec.grantor && rec.grantor != a);
                     assert(obs(step(s, t), a).grows =~= obs(s, a).grows);
-                    assert(obs(step(s, t), a).frefs =~= obs(s, a).frefs);
+                    // frame_maps: the pushed map (mapper, f) is over frame f, owned by grantor != a,
+                    // so it is not one of `a`'s frame maps — the projection filter drops it.
+                    broadcast use Seq::lemma_filter_push;
+                    assert(!(a_frame_pred(s.owner, a))((mapper, f)));
+                    assert(obs(step(s, t), a).frame_maps == obs(s, a).frame_maps);
                     // Read-closure: the mapped grant has grantee == mapper == b != a, so it is not
                     // one of `a`'s held grants; `a`'s read-caps (and the owners behind them) are
                     // untouched.
@@ -580,6 +950,75 @@ pub proof fn local_respect_holds()
                         }
                     }
                     assert(obs(step(s, t), a).aff =~= obs(s, a).aff);
+                }
+                assert(obs(step(s, t), a) == obs(s, a));
+            },
+            Trans::Destroy { caller, target } => {
+                broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas,
+                    vstd::map_lib::group_map_properties;
+                let c = target;
+                if destroy_guard(s, caller, target) {
+                    // `c != a`: the destroy is authorized (`caller == c ∨ controls[caller][c]`);
+                    // `c == a` would need `controls[caller][a]` (excluded by ¬interferes) or
+                    // `caller == a` (excluded), so the guard could not have fired.
+                    assert(c != a) by {
+                        if c == a {
+                            assert(s.controls.contains((caller, a)));  // guard's auth arm, caller != a
+                        }
+                    }
+                    // `¬reach(a, c)` — the intransitive-channel heart (`no_channel_no_reach_to_c`):
+                    // the peer case (`controls[caller][c]`) is excluded by ¬teardown-reach; the self
+                    // case (`caller == c`) by the direct signal/consent/read terms of ¬interferes.
+                    assert(!reach(s, a, c)) by {
+                        if reach(s, a, c) {
+                            if s.controls.contains((caller, c)) {
+                                assert(teardown_reach(s, caller, a));  // witness c ⟹ interferes, ⊥
+                            } else {
+                                assert(caller == c);  // the guard's only other authorization arm
+                            }
+                        }
+                    }
+                    // ports: every one of `a`'s ports survives (`a != c`, and `a` holds no port
+                    // toward `c`, so no `a`-port names `c` as key or value).
+                    assert(!a_holds_port_toward(s, a, c));  // ¬reach
+                    assert_maps_equal!(obs(step(s, t), a).peer, obs(s, a).peer, k => {
+                        assert(obs(s, a).peer.dom().contains(k) == (s.peer.dom().contains(k) && k.0 == a));
+                        if s.peer.dom().contains(k) && k.0 == a {
+                            assert(k == (a, k.1));
+                            assert(s.peer[(a, k.1)].0 != c);  // ¬a_holds_port_toward at p = k.1
+                            assert(s.peer[k].0 != c);
+                        }
+                    });
+                    // grant rows: `a`'s rows survive (grantor `a != c`; no *active* `a → c` grant).
+                    assert(!a_grants_to(s, a, c));  // ¬reach
+                    assert_maps_equal!(obs(step(s, t), a).grows, obs(s, a).grows, g => {
+                        assert(obs(s, a).grows.dom().contains(g) == (s.grants.dom().contains(g)
+                            && s.grants[g].grantor == a));
+                    });
+                    // frame maps: no live map is both `c`'s and over an `a`-owned frame — a `(c, f)`
+                    // with `owner[f] == a` would be `map_backed` by an active `a → c` grant
+                    // (`a_grants_to`), contradicting ¬reach. So the drain is a no-op on `a`'s frames.
+                    assert forall|i: int| #![trigger s.maps[i]] 0 <= i < s.maps.len() implies !(
+                    s.maps[i].0 == c && s.owner.dom().contains(s.maps[i].1) && s.owner[s.maps[i].1]
+                        == a) by {
+                        if s.maps[i].0 == c && s.owner.dom().contains(s.maps[i].1) && s.owner[s.maps[i].1]
+                            == a {
+                            assert(map_backed(s, i));  // wf
+                            assert(a_grants_to(s, a, c));  // the witness: grantor==owner==a, grantee==c
+                        }
+                    }
+                    compound_drain_preserves(s.maps, s.owner, a, c);
+                    assert(obs(step(s, t), a).frame_maps == obs(s, a).frame_maps);
+                    // read-caps: `a`'s held grants survive (grantee `a != c`; no grant `a` holds has
+                    // grantor `c`, else `reads_from(a, c)` — ¬reach). `owner` is untouched.
+                    assert(!reads_from(s, a, c));  // ¬reach
+                    assert_maps_equal!(obs(step(s, t), a).read_caps, obs(s, a).read_caps, g => {
+                        assert(obs(s, a).read_caps.dom().contains(g) == (s.grants.dom().contains(g)
+                            && s.grants[g].grantee == a));
+                        if s.grants.dom().contains(g) && s.grants[g].grantee == a {
+                            assert(s.grants[g].grantor != c);  // ¬reads_from (grantor-c disjunct)
+                        }
+                    });
                 }
                 assert(obs(step(s, t), a) == obs(s, a));
             },
@@ -655,19 +1094,11 @@ pub proof fn step_consistent_holds()
                         assert(obs(u, a).grows[g] == u.grants[g]);
                     }
                     let f = s.grants[g].frame;
-                    assert(s.owner.dom().contains(f) && s.owner[f] == a
-                        <==> obs(s, a).frefs.dom().contains(f));
-                    assert(u.owner.dom().contains(f) && u.owner[f] == a
-                        <==> obs(u, a).frefs.dom().contains(f));
+                    // The guard's `owner[f] == grantor (== a)` is observed via `a`'s owned-frame set
+                    // (the role `frefs.dom` used to play): `f ∈ owned ⟺ owner.dom ∋ f ∧ owner[f]==a`.
+                    assert(obs(s, a).owned.contains(f) == (s.owner.dom().contains(f) && s.owner[f] == a));
+                    assert(obs(u, a).owned.contains(f) == (u.owner.dom().contains(f) && u.owner[f] == a));
                     assert(grant_map_guard(s, mapper, g) == grant_map_guard(u, mapper, g));
-                    if grant_map_guard(s, mapper, g) {
-                        // owner[f] == grantor == a, so f is in `a`'s frame-refs; its ref value
-                        // agrees across s,u, so both get the same `+1`.
-                        assert(obs(s, a).frefs.dom().contains(f) && obs(u, a).frefs.dom().contains(
-                            f,
-                        ));
-                        assert(s.refs[f] == obs(s, a).frefs[f] && u.refs[f] == obs(u, a).frefs[f]);
-                    }
                     // The successor grant maps differ from s/u only at key `g` (an in-place count
                     // bump) — and agree with EACH OTHER at `g` (same record, same guard). At every
                     // other key they equal `s.grants`/`u.grants`, whose `a`-projections obs-agree.
@@ -681,18 +1112,19 @@ pub proof fn step_consistent_holds()
                             }
                         }
                     });
-                    // Frame refs: same shape — the only frame touched is `f` (when the guard
-                    // fires), whose ref value obs-agrees; every other frame is untouched.
-                    assert_maps_equal!(obs(step(s, t), a).frefs, obs(step(u, t), a).frefs, fr => {
-                        if fr != f || !grant_map_guard(s, mapper, g) {
-                            assert(step(s, t).refs[fr] == s.refs[fr]);
-                            assert(step(u, t).refs[fr] == u.refs[fr]);
-                            assert(obs(s, a).frefs.dom().contains(fr) == obs(u, a).frefs.dom().contains(fr));
-                            if obs(s, a).frefs.dom().contains(fr) {
-                                assert(obs(s, a).frefs[fr] == obs(u, a).frefs[fr]);
-                            }
-                        }
-                    });
+                    // Frame maps: the pushed map (mapper, f) lands in `a`'s frame maps iff the
+                    // guard fires (then owner[f] == grantor == a, an `a`-frame). `f`, the map, and
+                    // the guard all agree across s,u, so the pushed frame map — if any — is
+                    // identical, over the obs-agreeing base populations.
+                    broadcast use Seq::lemma_filter_push;
+                    assert(obs(s, a).frame_maps == obs(u, a).frame_maps);
+                    if grant_map_guard(s, mapper, g) {
+                        assert(s.owner.dom().contains(f) && s.owner[f] == a);  // guard, grantor == a
+                        assert(u.owner.dom().contains(f) && u.owner[f] == a);  // s.grants[g]==u.grants[g]
+                        assert((a_frame_pred(s.owner, a))((mapper, f)));
+                        assert((a_frame_pred(u.owner, a))((mapper, f)));
+                    }
+                    assert(obs(step(s, t), a).frame_maps == obs(step(u, t), a).frame_maps);
                 } else {
                     // `g` is not one of `a`'s grant rows: the map modifies a non-`a` grant row
                     // (grantor != a) and, if the guard fires, a frame owned by that non-`a`
@@ -700,8 +1132,20 @@ pub proof fn step_consistent_holds()
                     // (the local-respect argument), and the two are equal by obs(a)-agreement.
                     assert(obs(step(s, t), a).grows =~= obs(s, a).grows);
                     assert(obs(step(u, t), a).grows =~= obs(u, a).grows);
-                    assert(obs(step(s, t), a).frefs =~= obs(s, a).frefs);
-                    assert(obs(step(u, t), a).frefs =~= obs(u, a).frefs);
+                    // frame_maps: if a side's guard fires it pushes a map over owner[f]==grantor
+                    // != a (a non-`a` frame), dropped by the projection; else no push. Each side's
+                    // frame maps are therefore unchanged, and the two obs-agree.
+                    broadcast use Seq::lemma_filter_push;
+                    if grant_map_guard(s, mapper, g) {
+                        assert(s.grants[g].grantor != a);  // ¬touches ∧ g ∈ dom (guard)
+                        assert(!(a_frame_pred(s.owner, a))((mapper, s.grants[g].frame)));
+                    }
+                    if grant_map_guard(u, mapper, g) {
+                        assert(u.grants[g].grantor != a);  // touches agrees, g ∈ dom (guard)
+                        assert(!(a_frame_pred(u.owner, a))((mapper, u.grants[g].frame)));
+                    }
+                    assert(obs(step(s, t), a).frame_maps == obs(s, a).frame_maps);
+                    assert(obs(step(u, t), a).frame_maps == obs(u, a).frame_maps);
                 }
                 // ---- Read-closure (the confidentiality READ direction, `read_closure.rs`) ----
                 // The map touches `a`'s read-caps iff its grantee is `a` (⟺ mapper == a). Then
@@ -771,6 +1215,73 @@ pub proof fn step_consistent_holds()
                     }
                 });
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+            },
+            Trans::Destroy { caller, target } => {
+                broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas,
+                    vstd::map_lib::group_map_properties;
+                let c = target;
+                // The guard reads `controls[caller][c]` — `caller`'s OWN outgoing edge, in
+                // `obs(caller).controls_out` (the actor's own destroy authority). obs-agreement at
+                // `caller` (= actor) pins it, so the destroy fires in both runs or neither.
+                assert(destroy_guard(s, caller, target) == destroy_guard(u, caller, target)) by {
+                    assert(obs(s, caller).controls_out.contains((caller, target))
+                        == s.controls.contains((caller, target)));
+                    assert(obs(u, caller).controls_out.contains((caller, target))
+                        == u.controls.contains((caller, target)));
+                }
+                if destroy_guard(s, caller, target) {
+                    // ---- ports ---- each of `a`'s surviving links is determined by `obs(a).peer`
+                    // (its endpoints' relation to `c`) — a function of `obs(a).peer` and `c`.
+                    assert_maps_equal!(obs(step(s, t), a).peer, obs(step(u, t), a).peer, k => {
+                        assert(obs(s, a).peer.dom().contains(k) == (s.peer.dom().contains(k) && k.0 == a));
+                        assert(obs(u, a).peer.dom().contains(k) == (u.peer.dom().contains(k) && k.0 == a));
+                        assert(obs(s, a).peer.dom().contains(k) ==> obs(s, a).peer[k] == s.peer[k]);
+                        assert(obs(u, a).peer.dom().contains(k) ==> obs(u, a).peer[k] == u.peer[k]);
+                        assert(obs(s, a).peer.dom().contains(k) == obs(u, a).peer.dom().contains(k));
+                        if obs(s, a).peer.dom().contains(k) {
+                            assert(obs(s, a).peer[k] == obs(u, a).peer[k]);
+                        }
+                    });
+                    // ---- grant rows ---- a row survives iff it dodges the revocation arms
+                    // (grantor `c`, active grantee `c`) — a function of `obs(a).grows[g]`.
+                    assert_maps_equal!(obs(step(s, t), a).grows, obs(step(u, t), a).grows, g => {
+                        assert(obs(s, a).grows.dom().contains(g) == (s.grants.dom().contains(g)
+                            && s.grants[g].grantor == a));
+                        assert(obs(u, a).grows.dom().contains(g) == (u.grants.dom().contains(g)
+                            && u.grants[g].grantor == a));
+                        assert(obs(s, a).grows.dom().contains(g) ==> obs(s, a).grows[g] == s.grants[g]);
+                        assert(obs(u, a).grows.dom().contains(g) ==> obs(u, a).grows[g] == u.grants[g]);
+                        assert(obs(s, a).grows.dom().contains(g) == obs(u, a).grows.dom().contains(g));
+                        if obs(s, a).grows.dom().contains(g) {
+                            assert(obs(s, a).grows[g] == obs(u, a).grows[g]);
+                        }
+                    });
+                    // ---- frame maps ---- the drain restricted to `a`'s frames is `obs(a)`'s frame
+                    // maps with `c`'s dropped (or empty when `a == c`) — a function of `obs(a)`.
+                    frame_maps_destroyed(s.maps, s.owner, a, c);
+                    frame_maps_destroyed(u.maps, u.owner, a, c);
+                    assert(obs(s, a).frame_maps == obs(u, a).frame_maps);
+                    assert(obs(step(s, t), a).frame_maps == obs(step(u, t), a).frame_maps);
+                    // ---- read-caps ---- a held grant survives iff grantor `≠ c` (and not an active
+                    // self-grant when `a == c`) — a function of `obs(a).read_caps[g]`; `owner` fixed.
+                    assert_maps_equal!(obs(step(s, t), a).read_caps, obs(step(u, t), a).read_caps, g => {
+                        assert(obs(s, a).read_caps.dom().contains(g) == (s.grants.dom().contains(g)
+                            && s.grants[g].grantee == a));
+                        assert(obs(u, a).read_caps.dom().contains(g) == (u.grants.dom().contains(g)
+                            && u.grants[g].grantee == a));
+                        assert(obs(s, a).read_caps.dom().contains(g) == obs(u, a).read_caps.dom().contains(g));
+                        if obs(s, a).read_caps.dom().contains(g) {
+                            assert(obs(s, a).read_caps[g] == obs(u, a).read_caps[g]);
+                            assert(s.grants[g].grantor == u.grants[g].grantor
+                                && s.grants[g].active == u.grants[g].active
+                                && s.grants[g].grantee == u.grants[g].grantee);
+                        }
+                    });
+                    assert(obs(step(s, t), a) == obs(step(u, t), a));
+                } else {
+                    // Neither destroy fires: both states are unchanged and already obs(a)-agree.
+                    assert(obs(step(s, t), a) == obs(step(u, t), a));
+                }
             },
         }
     }
