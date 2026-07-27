@@ -49,13 +49,16 @@ pub type GrantRef = u32;
 /// on map — is a personality/guest-memory concern deferred to a later milestone; the
 /// core models the machine-frame accounting the safety property actually turns on.
 pub type Frame = u32;
-/// A handle returned by [`System::map`], naming one live mapping.
+/// A handle returned by [`System::map`], naming one live mapping in the grantee's **own** maptrack.
 ///
-/// A bare slot index, reclaimed by [`System::unmap`] and reused by the next map
-/// (there is no generation counter). A stale handle therefore acts on whatever
-/// mapping later reused the slot — but [`System::unmap`] requires the caller to be
-/// the mapping's grantee, so a domain can only ever confuse *itself* this way, never
-/// another domain. Guests must not reuse freed handles, as in Xen.
+/// The handle is **per-domain** (Xen's per-domain maptrack): it is an index into the grantee's
+/// private handle namespace, assigned as the lowest free handle *among that domain's own live
+/// mappings*, and reclaimed by [`System::unmap`] for reuse by that domain's next map (no generation
+/// counter). Because the namespace is per-domain, a domain can only ever name its **own** mappings —
+/// one domain can never address another's handle, and a domain's handle numbers depend only on its
+/// own map/unmap history, never on what other domains do. (The mappings are physically kept in one
+/// flat table for cross-checking refcounts against reality, but that storage slot is not the
+/// handle.) Guests must not reuse freed handles, as in Xen.
 pub type GrantHandle = u32;
 
 /// What a successful [`System::unmap`] released: the frame the mapping was over and
@@ -101,19 +104,26 @@ struct DomainGrants {
     entries: Vec<GrantEntry>,
 }
 
-/// One live mapping — the grantee's side of an active grant. Slots are reused once
-/// inactive, so the table stays bounded by peak concurrent maps.
+/// One live mapping — the grantee's side of an active grant. Carries its grantee's **per-domain
+/// handle** (`handle`), the identity by which that grantee names it in [`System::unmap`]; the
+/// physical position in [`System::maps`] is mere storage and is *not* the handle. Storage slots are
+/// reused once inactive, so the flat table stays bounded by peak concurrent maps system-wide, and a
+/// domain's handle namespace stays bounded by *its own* peak concurrent maps.
 #[derive(Debug, Clone, Copy, Default)]
 struct Mapping {
     active: bool,
     grantee: DomId,
+    /// The grantee's per-domain handle for this mapping (its private [`GrantHandle`] namespace).
+    handle: GrantHandle,
     grantor: DomId,
     gref: GrantRef,
     writable: bool,
 }
 
-/// The whole-system grant state: every domain's grant table plus the global table
-/// of live mappings, so refcounts can be cross-checked against reality.
+/// The whole-system grant state: every domain's grant table plus one flat table of live mappings.
+/// The flat table lets refcounts be cross-checked against reality in a single pass; the *handle*
+/// namespace is per-domain (each mapping carries its grantee's handle), so a handle is a domain's
+/// private name for a mapping, decoupled from where it physically sits here.
 #[derive(Clone)]
 pub struct System {
     domains: Vec<DomainGrants>,
@@ -137,8 +147,9 @@ pub enum GrantError {
     /// The mapping domain is not the grant's grantee, or a writable map/copy was
     /// requested against a read-only grant.
     PermissionDenied,
-    /// A domain tried to unmap a handle it does not own.
-    NotYours,
+    // (There is no cross-domain "not yours" unmap error: a `GrantHandle` names a mapping in the
+    // caller's *own* per-domain handle namespace, so a domain can only ever unmap its own mappings —
+    // naming a handle it does not hold is simply a `BadHandle`, not a distinct rejection.)
     /// The reference count would overflow.
     Overflow,
 }
@@ -255,13 +266,7 @@ impl System {
             *maps = m;
             *writable_maps = w;
         }
-        let handle = self.alloc_handle(Mapping {
-            active: true,
-            grantee,
-            grantor,
-            gref,
-            writable,
-        });
+        let handle = self.alloc_handle(grantee, grantor, gref, writable);
         self.check_invariants();
         Ok(handle)
     }
@@ -270,16 +275,15 @@ impl System {
     /// released (frame and writability) so a caller integrating grant tables with the
     /// page-type counts can mirror exactly the reverse of what the map acquired.
     pub fn unmap(&mut self, grantee: DomId, handle: GrantHandle) -> Result<Unmapped, GrantError> {
-        let mapping = *self
+        // Find `grantee`'s own mapping named by `handle` (its per-domain handle namespace). If it
+        // holds none, the handle names nothing it owns — a plain `BadHandle`; a domain can only ever
+        // name its own mappings, so there is no cross-domain "not yours" case.
+        let slot = self
             .maps
-            .get(handle as usize)
+            .iter()
+            .position(|m| m.active && m.grantee == grantee && m.handle == handle)
             .ok_or(GrantError::BadHandle)?;
-        if !mapping.active {
-            return Err(GrantError::BadHandle);
-        }
-        if mapping.grantee != grantee {
-            return Err(GrantError::NotYours);
-        }
+        let mapping = self.maps[slot];
         // The frame comes from the grant entry, which an active mapping always backs
         // onto (the dangling-map invariant), so this pattern always matches.
         let mut frame = 0;
@@ -295,7 +299,7 @@ impl System {
             *maps = m;
             *writable_maps = w;
         }
-        self.maps[handle as usize].active = false;
+        self.maps[slot].active = false;
         self.check_invariants();
         Ok(Unmapped {
             frame,
@@ -382,12 +386,15 @@ impl System {
     /// construction, so none can error.
     pub fn drain_maps_of(&mut self, grantee: DomId) -> Vec<Unmapped> {
         let mut released = Vec::new();
-        for handle in 0..self.maps.len() as GrantHandle {
-            let held = self.maps[handle as usize];
-            if held.active && held.grantee == grantee {
-                let u = self.unmap(grantee, handle).unwrap();
-                released.push(u);
-            }
+        // Collect the grantee's own handles first (each `unmap` mutates `maps`), then release each.
+        let handles: Vec<GrantHandle> = self
+            .maps
+            .iter()
+            .filter(|m| m.active && m.grantee == grantee)
+            .map(|m| m.handle)
+            .collect();
+        for handle in handles {
+            released.push(self.unmap(grantee, handle).unwrap());
         }
         released
     }
@@ -551,21 +558,32 @@ impl System {
         }
     }
 
-    /// Number of map-handle slots the system currently holds (active or reclaimable). The
-    /// handle namespace `[0, handle_slots)` a state inspector iterates to read every live
-    /// mapping by handle — the handle layout is behaviourally live ([`Self::unmap`] acts
-    /// on a specific handle), so a faithful state key must include it.
-    pub fn handle_slots(&self) -> usize {
-        self.maps.len()
+    /// One past `grantee`'s highest live handle — the bound of `grantee`'s **per-domain** handle
+    /// namespace `[0, handle_slots(grantee))` a state inspector iterates to read every mapping
+    /// `grantee` holds by handle. The handle layout is behaviourally live ([`Self::unmap`] acts on a
+    /// specific handle in the caller's *own* namespace), so a faithful state key must include it,
+    /// keyed by domain. Returns 0 if the grantee holds no live mapping.
+    pub fn handle_slots(&self, grantee: DomId) -> usize {
+        self.maps
+            .iter()
+            .filter(|m| m.active && m.grantee == grantee)
+            .map(|m| m.handle as usize + 1)
+            .max()
+            .unwrap_or(0)
     }
 
-    /// The live mapping at `handle`, if any: `(grantee, grantor, gref, writable)`. `None`
-    /// for a reclaimed or out-of-range slot.
-    pub fn mapping_at(&self, handle: GrantHandle) -> Option<(DomId, DomId, GrantRef, bool)> {
-        match self.maps.get(handle as usize) {
-            Some(m) if m.active => Some((m.grantee, m.grantor, m.gref, m.writable)),
-            _ => None,
-        }
+    /// The mapping `grantee` holds at its handle `handle`, if any: `(grantor, gref, writable)`.
+    /// `None` if `grantee` holds no live mapping under that handle. (The grantee is the namespace's
+    /// owner, so it is the `grantee` argument, not a returned field.)
+    pub fn mapping_at(
+        &self,
+        grantee: DomId,
+        handle: GrantHandle,
+    ) -> Option<(DomId, GrantRef, bool)> {
+        self.maps
+            .iter()
+            .find(|m| m.active && m.grantee == grantee && m.handle == handle)
+            .map(|m| (m.grantor, m.gref, m.writable))
     }
 
     /// Number of domains.
@@ -659,14 +677,40 @@ impl System {
 
     // ─── internals ────────────────────────────────────────────────────────────
 
-    fn alloc_handle(&mut self, mapping: Mapping) -> GrantHandle {
+    /// Record a new mapping for `grantee` and return its **per-domain** handle: the lowest handle
+    /// not currently held by one of `grantee`'s live mappings — so the handle depends only on
+    /// `grantee`'s own map/unmap history, never on any other domain's. The mapping is physically
+    /// placed in the lowest reclaimed flat slot (or appended); that position is storage only, never
+    /// the handle, so it keeps the flat table bounded without leaking into `grantee`'s namespace.
+    fn alloc_handle(
+        &mut self,
+        grantee: DomId,
+        grantor: DomId,
+        gref: GrantRef,
+        writable: bool,
+    ) -> GrantHandle {
+        let mut handle: GrantHandle = 0;
+        while self
+            .maps
+            .iter()
+            .any(|m| m.active && m.grantee == grantee && m.handle == handle)
+        {
+            handle += 1;
+        }
+        let mapping = Mapping {
+            active: true,
+            grantee,
+            handle,
+            grantor,
+            gref,
+            writable,
+        };
         if let Some(i) = self.maps.iter().position(|m| !m.active) {
             self.maps[i] = mapping;
-            i as GrantHandle
         } else {
             self.maps.push(mapping);
-            (self.maps.len() - 1) as GrantHandle
         }
+        handle
     }
 
     fn domain(&self, dom: DomId) -> Result<&DomainGrants, GrantError> {
@@ -746,13 +790,18 @@ mod tests {
     }
 
     #[test]
-    fn a_domain_cannot_unmap_a_handle_it_does_not_own() {
+    fn a_handle_names_only_the_callers_own_maptrack() {
         let mut s = sys();
         s.grant_access(0, 0, 1, 9, false).unwrap();
         let h = s.map(1, 0, 0, false).unwrap();
-        assert_eq!(s.unmap(2, h), Err(GrantError::NotYours));
+        // Handles are per-domain: `h` names a mapping in domain 1's handle namespace. Domain 2
+        // naming the same number reaches its *own* namespace, where it holds nothing — so a
+        // cross-domain unmap is not a `NotYours` rejection but a plain `BadHandle`. Cross-domain
+        // handle confusion is unrepresentable, which is stronger than catching it.
+        assert_eq!(s.unmap(2, h), Err(GrantError::BadHandle));
         // The real owner still can.
         assert!(s.unmap(1, h).is_ok());
+        assert!(s.invariants_hold());
     }
 
     #[test]

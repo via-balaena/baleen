@@ -11,7 +11,9 @@
 //!
 //! > **`RefcountMismatch`** (`hv-core/src/grant.rs`, `first_violation`): for every active grant
 //! > entry `(d,g)`, the recorded scalars equal the cardinality of a *filtered subsequence* of
-//! > the global live-mapping table:
+//! > the flat live-mapping table (`self.maps`; the count filters by `grantor`/`gref` only — it reads
+//! > neither the grantee nor the per-domain handle a mapping carries, so it is unaffected by how
+//! > handles are named):
 //! >   `maps          == |{ live m : m.grantor==d ∧ m.gref==g }|`
 //! >   `writable_maps == |{ live m : m.grantor==d ∧ m.gref==g ∧ m.writable }|`
 //!
@@ -57,11 +59,12 @@ use vstd::prelude::*;
 
 verus! {
 
-/// One live mapping — the grantee's side of an active grant. Mirror of
-/// `hv_core::grant::Mapping`, projected to exactly the fields `RefcountMismatch` reads
-/// (`active`, `grantor`, `gref`, `writable`; the real struct also carries `grantee`, which no
-/// refcount predicate reads). ids are `nat` (the reduction of §2.1: only sizes matter, ids are
-/// compared structurally — so unbounded `nat` is the honest ∀-size domain).
+/// One live mapping — the grantee's side of an active grant. Mirror of `hv_core::grant::Mapping`,
+/// projected to exactly the fields `RefcountMismatch` reads (`active`, `grantor`, `gref`,
+/// `writable`); the real struct also carries a `grantee` and its per-domain `handle`, which no
+/// refcount predicate reads (the count filters by grantor/gref only). ids are `nat` (the reduction
+/// of §2.1: only sizes matter, ids are compared structurally — so unbounded `nat` is the honest
+/// ∀-size domain).
 struct Mapping {
     active: bool,
     grantor: nat,

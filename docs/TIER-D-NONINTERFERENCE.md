@@ -249,11 +249,35 @@ real code — the honest bridge↔composition division, `read_closure.rs` fideli
   — the "remove the fix → CE" discipline). This keeps the allocation channel's step consistency
   **checked**, not declared out of scope. Off by default, so the Tier-A/B soundness + saturation
   witnesses keep their exact calibration.
-* **`DomainBusy` (②′-(c), next).** `DomainBusy` (which refuses a destroy while a foreign domain maps
-  `c`'s frames) depends, with a *fourth* domain as that mapper, on state neither `a` nor the actor
-  observes — so at ≥4 domains step consistency for the destroy channel rests on the instantiation's
-  over-approximation of `DomainBusy` (§5g). It was masked behind (b); with (a)+(b) closed it is the
-  remaining read-closure fidelity edge.
+* **Grant-handle identity (②′-(d), RESOLVED — the per-domain maptrack).** With destroy enabled the
+  next counterexample was `GrantUnmap{handle}`: a domain holding a writable *and* a read-only map of
+  one grant, mapped in opposite order, has an identical held-map *set* but `GrantUnmap{handle:0}`
+  drops different maps, diverging the grantor's `writable_maps`. The handle layout is behaviourally
+  live (`state_key` always kept it), but `obs` had flattened it to a set. Making `obs` handle-indexed
+  is faithful **only if handles are per-domain**: `hv-core`'s grant map table was a *global* slot
+  pool (`System.maps`), so a slot index leaked the global allocation order — another domain's
+  map/unmap activity — a spurious A←B covert channel that broke local respect. **Resolution
+  (strongest foundation — fix the model, not the observation):** the grant **handle namespace is now
+  per-domain** (Xen-faithful — each grantee names its mappings in its own namespace). Each `Mapping`
+  carries a per-domain `handle`, assigned as the lowest free handle *among that grantee's own live
+  mappings* (`alloc_handle` scans only that domain's maps), so a domain's handle numbers depend on
+  its own history alone, never on another domain's. The mappings stay in **one flat table**
+  (`System.maps`) for single-pass refcount checking — the physical slot is storage, not the handle —
+  which is deliberately why CBMC stays tractable: a nested per-domain `Vec<Vec<_>>` blows up the Kani
+  grant harness (8 GB / 8 min), whereas the flat table + a handle field verifies in ~6 s, and the
+  refcount content is untouched (a per-grant-entry count over the flat table that reads neither
+  grantee nor handle). `obs` records `a`'s held maps indexed by `a`'s own handle; local respect *and*
+  step consistency then both hold over four domains with dynamic p2m + grants + create + destroy
+  (`step_consistency_holds_per_domain_handles_with_destroy`). Cross-domain handle confusion becomes
+  unrepresentable (the `NotYours` error is gone). All Kani harnesses and Verus proofs (incl.
+  `refcount_mismatch.rs`) stand verbatim.
+* **`DomainBusy` (②′-(c), next — now genuinely unmasked).** `DomainBusy` (which refuses a destroy
+  while a foreign domain maps `c`'s frames) depends, with a *fourth* domain as that mapper, on state
+  neither `a` nor the actor observes — so at ≥4 domains step consistency for the destroy channel
+  rests on the instantiation's over-approximation of `DomainBusy` (§5g). It was masked behind (b) and
+  (d); with those closed it is the remaining read-closure fidelity edge — and, unlike (a)/(b)/(d), it
+  is a *design* question (refuse-with-availability-channel vs force-unmap-to-match-the-proven-model),
+  not an observation refinement.
 
 At ≤3 domains **without dynamic p2m** the sweep is clean (the committed `ni_cfg3` has no allocation),
 and the deep three-domain sweep runs in `deep-verify.yml`.
