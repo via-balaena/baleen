@@ -3,13 +3,17 @@
 
 # Tier D — non-interference (the property definition + the bridge spike)
 
-*Status: **COMPLETE at the model level — both directions (integrity and confidentiality).** Property
-definition decided and validated on real code (the enumerator bridge); every transition class proven
-∀-N (five per-transition local-respect lemmas); the **unwinding theorem**
-(`noninterference_theorem.rs`) assembles them into whole-system non-interference; the last mile
-(`step_consistency.rs`) reduces the confidentiality premise to the read direction; and the
-**read-closure** (`read_closure.rs`) discharges that via `obs⁺` and the extended relation `⇝⁺` —
-closing both directions (§5e–§5f). This is the deepest and last tier of the true-diamond program — the
+*Status: **Both directions established at the model level; the generic premises are now being
+DISCHARGED for a concrete instantiation (§5g, closing the review's GAP-C).** Property definition
+decided and validated on real code (the enumerator bridge); every transition class proven ∀-N (five
+per-transition local-respect lemmas); the **unwinding theorem** (`noninterference_theorem.rs`)
+assembles them into whole-system non-interference; the last mile (`step_consistency.rs`) reduces the
+confidentiality premise to the read direction; and the **read-closure** (`read_closure.rs`) discharges
+that via `obs⁺` and the extended relation `⇝⁺` (§5e–§5f). **§5g (`noninterference_instantiation.rs`)
+then turns the meta-theorem's `local_respect()`/`step_consistent()` *premises* into discharged
+theorems over a concrete carrier — four of the five transition classes done, DomainDestroy the
+follow-on — closing the "paper composition" GAP-C and forcing two `obs` corrections (see §2.1 + §5g).**
+This is the deepest and last tier of the true-diamond program — the
 "are we checking the **right** things" capstone. Tiers A–C prove the invariants hold in every
 reachable state, ∀-N; Tier D proves those invariants **collectively imply real isolation**. Read
 alongside `hv-sim/src/noninterference.rs` (the enumerator bridge), the five `hv-verify/verus/
@@ -80,6 +84,18 @@ like violations; the user's exact warning):
   (`ControlEdgeOrphaned` etc.). Keeping authority in `obs(a)` would flag every legitimate
   delegation as interference. So authority delegation is governed by Tier C; `obs(a)` is `a`'s
   *resource* surface.
+
+  > **Correction (2026-07-27, forced by the instantiation — §5g).** This exclusion is **too
+  > strong** for the *confidentiality* direction. Discharging `step_consistent` as a machine-checked
+  > theorem (`noninterference_instantiation.rs`) requires that a domain observe **its own incoming**
+  > authority — `may_create[a]` (creation) and its controllers `controls[·][a]` (affinity). Reason:
+  > `DomainCreate` flips `life[a]` iff `may_create[creator]`, and `SchedSetAffinity` on `a`'s vCPU
+  > fires iff `controls[caller][a]`; under the authority-*excluding* `obs`, those bits are in neither
+  > `obs(a)` nor `obs(actor)`, so two runs agreeing on the documented observation diverge in `a`'s
+  > view — **Theorem B is *false* for the documented `obs`**, and Verus rejects it (validated by a
+  > probe, and reproducible by deleting the field from `Obs`). What stays correct: excluding `a`'s
+  > authority *over others* (outgoing power). The fix is narrow: `obs(a)` carries `a`'s own *incoming*
+  > authority (its create bit, who controls it) — a resource-like fact about `a`'s slot.
 
 ### 2.2 `b ⇝ a` — the authorized-channel relation
 
@@ -359,6 +375,47 @@ theorem (`noninterference_theorem.rs`) yields **full non-interference: integrity
 confidentiality**. Non-vacuity: dropping the ownership component of the read-closure, or the
 grantor guard, makes Verus reject. **The confidentiality direction is closed; Tier D is complete at
 the model level in both directions.**
+
+## 5g. The concrete instantiation — discharging the premises (closing GAP-C)
+
+*Status: **four of the five transition classes done; DomainDestroy is the follow-on.***
+
+§5d's assembly (`noninterference_theorem.rs`) proves the unwinding theorem over *uninterpreted*
+`obs`/`step`/`actor`/`interferes`, taking `local_respect()` and `step_consistent()` as **premises**.
+The per-transition lemmas (§5–§5c) and the read-closure (§5f) each discharge a *fragment* of those
+premises — but over their **own** independent `uninterp` symbols. The composition ("the five lemmas
+give `local_respect()`; §5e+§5f give `step_consistent()`") lived only in these docs; `step_consistent()`
+was a bare `requires` never discharged for any concrete system. This is the adversarial review's
+**GAP-C** ("a paper composition").
+
+`hv-verify/verus/noninterference_instantiation.rs` closes it. It defines a **concrete** transition
+system — a composite `Sys` state and *interpreted* `obs`/`step`/`actor`/`interferes` — and proves
+`local_respect()` **and** `step_consistent()` as **theorems** (`local_respect_holds`,
+`step_consistent_holds`), then re-runs the unwinding induction over the concrete definitions
+(`ni_theorem_a`, `ni_theorem_b`) with **no free premise**. So the top-level conclusion — `obs(a)` over
+any run depends only on principals authorized to affect `a`, integrity *and* confidentiality — now
+stands as a closed Verus obligation. Four classes are modeled: creation, signal, consent (memory) +
+the confidentiality read-closure, and authority. The `DomainDestroy` cascade (§5c) is a focused
+follow-on (it touches four `obs` components at once + the intransitive teardown-reach).
+
+**The honest division (altitude discipline).** The instantiation closes the *composition* gap; it
+does **not** re-derive that the carrier mirrors the real `Hypervisor` — that remains the enumerator
+bridge's job (§3–§4, `local_respect_holds_on_real_code`), which checks the same `obs`/channel
+relation on the real code at bounded size. So the chain is now three machine-checked links —
+**fragments mirror real code (bridge) → fragments compose to the premises (instantiation, ∀-N) →
+premises imply whole-run NI (meta-theorem)** — with no prose seam between them.
+
+**Findings the machine-check forced** (the value of doing this deductively):
+1. **`obs` must carry a domain's own incoming authority** — see the §2.1 correction. `step_consistent`
+   is *false* for creation/affinity under the documented (authority-excluding) `obs`; Verus rejects
+   it. Load-bearing (non-vacuity validated by a probe).
+2. **The read-closure carries `owner(frame)`** — a domain mapping a grant it holds succeeds iff the
+   grantor still owns the frame (`StaleGrant`), so `obs⁺` must expose that owner, else
+   `step_consistent` fails for the read direction (non-vacuity validated by a probe). This is §5f's
+   `obs⁺` made load-bearing, not decorative.
+3. **Teardown-reach extends to the read direction** (recorded for the DomainDestroy arc): destroying
+   `a`'s *grantor* alters `obs⁺(a)`, so the intransitive reach term needs a read-direction addend the
+   original §2.4 (pre-`obs⁺`) lacked.
 
 ## 6. Honest scope, cost read, and the fork
 
