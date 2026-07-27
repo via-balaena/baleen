@@ -230,22 +230,30 @@ instantiation keeps the raw owner, sound *there* because its abstract model has 
 no grant-creation step; the bridge carries the tighter boolean because it runs against the dynamic
 real code — the honest bridge↔composition division, `read_closure.rs` fidelity note, §5g.)
 
-Two honest edges remain in the read-closure's real-code fidelity, tracked under ②′:
-
-* **Allocation contention (②′-(b), open).** Even with the boolean, a four-domain (and a
-  three-domain-with-p2m) sweep finds a `P2mAllocate{mfn}` counterexample: whether the actor's
-  allocation of a shared machine frame *succeeds* depends on whether another domain already grabbed
-  that frame — a race for a shared resource, invisible to grantor and grantee, that flips the
-  StaleGrant boolean. This is the storage-channel analogue of the pCPU-occupancy covert channel
-  §2.1 already abstracts: `hv-core::allocate(owner, mfn)` lets a guest name an arbitrary machine
-  frame first-come-first-owns, whereas a real hypervisor *mediates* machine-frame assignment
-  (guests request via gfn; the host maps gfn→mfn from disjoint per-domain pools — the gfn=mfn fence,
-  design-lesson #14e). So the contention is a model looseness, resolved by abstracting/mediating
-  allocation rather than treating it as a real Baleen channel. (Modeling in progress.)
-* **`DomainBusy` (②′-(c), unreached).** `DomainBusy` (which refuses a destroy while a foreign domain
-  maps `c`'s frames) depends, with a *fourth* domain as that mapper, on state neither `a` nor the
-  actor observes — so at ≥4 domains step consistency for the destroy channel rests on the
-  instantiation's over-approximation of `DomainBusy` (§5g). It sits behind (b) in the sweep.
+* **Allocation contention (②′-(b), RESOLVED — the mediated allocator).** Even with the boolean, a
+  four-domain (and a three-domain-with-p2m) sweep finds a `P2mAllocate{mfn}` counterexample: whether
+  the actor's allocation of a shared machine frame *succeeds* depends on whether another domain
+  already grabbed that frame — a race for a shared resource, invisible to grantor and grantee, that
+  flips the StaleGrant boolean. **This is a model looseness, not a real Baleen channel.**
+  `hv-core::allocate(owner, mfn)` lets a guest name an arbitrary machine frame first-come-first-owns,
+  whereas a real hypervisor *mediates* machine-frame assignment (guests request via gfn; the host
+  maps gfn→mfn from disjoint per-domain pools — the gfn=mfn fence, design-lesson #14e). The
+  contention is the storage-side analogue of the pCPU-occupancy covert channel §2.1 already
+  abstracts. **Resolution: model the mediation** — the enumerator's `mediated_frames` flag emits
+  `P2mAllocate{mfn}` only for `mfn`'s partition-owner (`mfn % domains == caller`), so each guest
+  draws from its own disjoint pool and no two domains race for one frame. Under it, step consistency
+  **holds** over four domains with dynamic p2m + grants + create/destroy, non-vacuously (tens of
+  millions of key-classes: `step_consistency_holds_with_a_mediated_allocator`). The mediation is
+  *load-bearing*, not a config that is trivially safe: turn `mediated_frames` off and the same config
+  breaks with a `P2mAllocate` counterexample (`an_unmediated_allocator_breaks_step_consistency`, deep
+  — the "remove the fix → CE" discipline). This keeps the allocation channel's step consistency
+  **checked**, not declared out of scope. Off by default, so the Tier-A/B soundness + saturation
+  witnesses keep their exact calibration.
+* **`DomainBusy` (②′-(c), next).** `DomainBusy` (which refuses a destroy while a foreign domain maps
+  `c`'s frames) depends, with a *fourth* domain as that mapper, on state neither `a` nor the actor
+  observes — so at ≥4 domains step consistency for the destroy channel rests on the instantiation's
+  over-approximation of `DomainBusy` (§5g). It was masked behind (b); with (a)+(b) closed it is the
+  remaining read-closure fidelity edge.
 
 At ≤3 domains **without dynamic p2m** the sweep is clean (the committed `ni_cfg3` has no allocation),
 and the deep three-domain sweep runs in `deep-verify.yml`.

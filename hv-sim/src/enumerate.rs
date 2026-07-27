@@ -91,6 +91,18 @@ pub struct Config {
     /// deep hierarchy sweep (design-lesson #50). With it off, every `P2mLink` maps `execute =
     /// false`, exactly the pre-II-1a behaviour.
     pub drive_execute: bool,
+    /// Model a **host-mediated frame allocator** (Tier D / ②′-b): emit `P2mAllocate{mfn}` only for
+    /// the domain that owns `mfn`'s partition (`mfn % domains`), so each guest draws frames from its
+    /// own **disjoint pool** and two domains never race for one machine frame. Off by default
+    /// (same rationale as [`Self::async_agent`]/[`Self::drive_execute`]: it restricts the reachable
+    /// set, so the Tier-A/B soundness + saturation witnesses keep their calibration with it off). A
+    /// dedicated NI **step-consistency** config turns it on: Baleen's `P2mAllocate{mfn}` lets a
+    /// guest name an arbitrary machine frame first-come-first-owns, but a real hypervisor mediates
+    /// machine-frame assignment (guests request via gfn; the host maps gfn→mfn from disjoint pools —
+    /// the gfn=mfn fence, design-lesson #14e), so the guest-chosen-mfn *contention* is a model
+    /// looseness. With it off, allocation is unconstrained, exactly the prior behaviour. This is the
+    /// storage-side analogue of abstracting the pcpu-occupancy channel (`obs`'s §2.1 exclusion).
+    pub mediated_frames: bool,
     /// Maximum hypercall depth from the initial state to explore.
     pub depth: u32,
     /// Safety cap: stop after this many distinct states (a partial result).
@@ -128,6 +140,7 @@ impl Config {
             delegate: false,
             async_agent: false,
             drive_execute: false,
+            mediated_frames: false,
             depth: 5,
             max_states: 1_500_000,
             symmetry: false,
@@ -309,7 +322,12 @@ pub(crate) fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
         }
         if cfg.p2m {
             for mfn in 0..cfg.frames as u32 {
-                v.push((caller, HvCall::P2mAllocate { mfn }));
+                // A host-mediated allocator hands each guest frames from its own disjoint pool, so
+                // only `mfn`'s partition-owner may allocate it (no two domains race for one machine
+                // frame). Unmediated (the default): any caller may allocate any frame.
+                if !cfg.mediated_frames || mfn as usize % cfg.domains == caller as usize {
+                    v.push((caller, HvCall::P2mAllocate { mfn }));
+                }
                 v.push((caller, HvCall::P2mFree { mfn }));
                 v.push((caller, HvCall::P2mUnpin { mfn }));
                 for &level in &cfg.levels {
@@ -2415,6 +2433,7 @@ mod tests {
         Config {
             p2m: true,
             drive_execute: true,
+            mediated_frames: false,
             domains: 1,
             frames: 2,
             levels: vec![PtLevel::L1, PtLevel::L2],

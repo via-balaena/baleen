@@ -749,6 +749,7 @@ mod tests {
             delegate: false,
             async_agent: false,
             drive_execute: false,
+            mediated_frames: false,
             depth,
             max_states: 200_000,
             symmetry: false,
@@ -781,6 +782,7 @@ mod tests {
             delegate: false,
             async_agent: false,
             drive_execute: false,
+            mediated_frames: false,
             depth,
             max_states: 400_000,
             symmetry: false,
@@ -1155,5 +1157,109 @@ mod tests {
             obs_plus(&owned_by_2, 1),
             "obs⁺(grantee) failed to distinguish a valid grant from a stale one"
         );
+    }
+
+    fn ni_cfg4_mediated(depth: u32) -> Config {
+        // Lean: create + p2m + one grant, no teardown — the allocation-contention channel needs
+        // only create (bring domains live) + allocate + grant, so dropping `destroy` and extra grant
+        // slots keeps the committed sweep debug-fast while still exercising the read-closure.
+        Config {
+            domains: 4,
+            ports: 0,
+            grants: 1,
+            vcpus: 0,
+            pcpus: 0,
+            frames: 2,
+            levels: vec![],
+            handles: 1,
+            evtchn: false,
+            grant: true,
+            sched: false,
+            p2m: true,
+            create: true,
+            destroy: false,
+            delegate: false,
+            async_agent: false,
+            drive_execute: false,
+            mediated_frames: true,
+            depth,
+            max_states: 2_000_000,
+            symmetry: false,
+        }
+    }
+
+    /// **Step consistency holds with a host-mediated allocator (②′-(b), the read-closure's last
+    /// real-code fidelity edge).** With `mediated_frames` on — each domain draws frames from its own
+    /// disjoint pool (`P2mAllocate{mfn}` emitted only for `mfn % domains == caller`), modelling the
+    /// host that assigns machine frames rather than letting guests race for them — step consistency
+    /// **holds** over four domains with dynamic p2m, grants, and create/destroy, non-vacuously (tens
+    /// of millions of key-classes). This is where the unmediated model has a counterexample:
+    /// `P2mAllocate{mfn}` whose success depends on whether an *invisible* peer already grabbed the
+    /// shared frame (see [`an_unmediated_allocator_breaks_step_consistency`]). Baleen's
+    /// guest-chosen-`mfn` allocator is a model looseness vs a real gfn→mfn-mediating hypervisor (the
+    /// gfn=mfn fence, design-lesson #14e); the contention is the storage-side analogue of the
+    /// pcpu-occupancy channel `obs` already abstracts (§2.1). See `docs/TIER-D-NONINTERFERENCE.md`.
+    #[test]
+    fn step_consistency_holds_with_a_mediated_allocator() {
+        let out = check_step_consistency(&ni_cfg4_mediated(3));
+        assert!(
+            out.violation.is_none(),
+            "step-consistency violation under a mediated allocator: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(
+            out.witnessed_classes > 100_000,
+            "mediated sc sweep near-vacuous: only {} witnessed classes over {} states",
+            out.witnessed_classes,
+            out.states
+        );
+    }
+
+    /// **Non-vacuity — the mediation is load-bearing (remove the fix → counterexample).** Turn
+    /// `mediated_frames` off and the *same* four-domain config breaks step consistency: some
+    /// `P2mAllocate{mfn}` succeeds in one state and fails in another that the actor and observer
+    /// cannot distinguish, because an unobserved third domain already owns the contended frame —
+    /// flipping a grantee's StaleGrant read-cap. This is the enumerator's confirmation that
+    /// guest-chosen-`mfn` allocation contention is a real channel *in the model as written*, and
+    /// that mediating it (not merely the (a) boolean read-cap) is what closes the read-closure's
+    /// real-code fidelity. The CE transition is a `P2mAllocate`. Ignored by default (the CE needs
+    /// four live domains + an allocation + a grant, so it lives at depth 4 — ~25s); run in
+    /// deep-verify, like the other deep sweeps.
+    #[test]
+    #[ignore = "deep — the unmediated contention CE (depth 4); run in deep-verify.yml"]
+    fn an_unmediated_allocator_breaks_step_consistency() {
+        use hv_core::HvCall;
+        let cfg = Config {
+            mediated_frames: false,
+            ..ni_cfg4_mediated(4)
+        };
+        let out = check_step_consistency(&cfg);
+        let v = out
+            .violation
+            .expect("unmediated allocation should break step consistency (the ②′-(b) contention)");
+        assert!(
+            matches!(
+                v.transition,
+                Transition::Guest {
+                    call: HvCall::P2mAllocate { .. },
+                    ..
+                }
+            ),
+            "expected a P2mAllocate counterexample, got {:?}",
+            v.transition
+        );
+    }
+
+    /// Deeper mediated sc sweep — ignored by default (larger reachable set), run in deep-verify.
+    #[test]
+    #[ignore = "deep mediated step-consistency sweep — run in deep-verify.yml"]
+    fn step_consistency_holds_with_a_mediated_allocator_deep() {
+        let out = check_step_consistency(&ni_cfg4_mediated(5));
+        assert!(
+            out.violation.is_none(),
+            "step-consistency violation under a mediated allocator (deep): {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 1_000_000);
     }
 }
