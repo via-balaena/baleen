@@ -61,6 +61,36 @@
 //! opened toward `c`), so `b` controlling `c` reaches `a` through `c`. This is the classic
 //! intransitive-non-interference structure, and the bridge is what *found* it (the check
 //! flags it precisely when the term is omitted — see `docs/TIER-D-NONINTERFERENCE.md` §4).
+//!
+//! ## The confidentiality dual — step consistency and the read direction
+//!
+//! Local respect ([`check`]) is the **integrity** half: an unauthorized actor can't *affect*
+//! `obs(a)`. The **confidentiality** half — can `a` *learn* anything unauthorized? — is
+//! **step consistency** ([`check_step_consistency`]), the counterpart of
+//! `noninterference_instantiation.rs::step_consistent_holds`: `obs⁺(a)` after a step is a
+//! *function of* `(obs⁺(a), obs⁺(actor))` before it (two states `a` and the actor can't tell
+//! apart go to the same successor). It needs no channel relation — it is pure determinism.
+//!
+//! It is checked over a wider surface [`obs_plus`] (`obs⁺`) with two additions the integrity
+//! `obs` deliberately omits:
+//!
+//! * the **read-closure** — the grants `a` is a *grantee* of, with each grantor, frame, and the
+//!   frame's owner: what `a` can *read* through a grant it holds. This is where the
+//!   **`DomainDestroy` read direction** lives — destroying `a`'s grantor `c` revokes `c`'s
+//!   outgoing grants (`grant::revoke_all`), dropping `a`'s read-cap. (These read-caps are
+//!   *not* in the local-respect `obs`: a grantor freely *creating* an offer to `a` moves them,
+//!   and that is not integrity interference — a domain can't stop others revealing themselves
+//!   to it. So the read direction is confidentiality, not integrity.)
+//! * `a`'s own **authority** (`may_create[a]`, the `controls` rows) — a guard reads it, so
+//!   step consistency is *false* without it. The bridge surfaces this exactly as the
+//!   instantiation's `step_consistent` did (its **finding #1**): strip authority from `obs⁺`
+//!   and the sweep finds a `DomainCreate` (or destroy/affinity) counterexample.
+//!
+//! Over three domains the read direction is live and step consistency **holds**, non-vacuously
+//! (see the tests). The one honest edge — a fourth domain mapping `c`'s frame makes
+//! `DomainBusy` (which refuses the destroy) depend on state neither `a` nor the actor observes,
+//! so step consistency there rests on the instantiation's over-approximation of `DomainBusy`;
+//! at ≤3 domains no such fourth mapper exists, so the sweep is clean.
 
 use std::collections::HashMap;
 
@@ -323,6 +353,74 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
     k
 }
 
+/// `obs⁺(a)` — `a`'s **read-closure** observation: [`obs`] extended with the grants `a` is a
+/// *grantee* of, across every grantor's table, each with its grantor, frame, read-only flag, and
+/// the frame's current **owner**. This is the confidentiality surface `read_closure.rs` proved
+/// step-consistency over: what `a` can *learn* through a grant it holds (a cross-domain map/copy
+/// reads the grantor's frame ownership — the `StaleGrant` check), which the *read direction* of the
+/// `DomainDestroy` cascade moves (destroying `a`'s grantor revokes `c`'s outgoing grants —
+/// `grant::revoke_all` — dropping `a`'s read-cap). The `owner` component is the one the
+/// instantiation's `step_consistent` forced.
+///
+/// This is deliberately **not** the local-respect surface: a grantor freely *creating* an offer to
+/// `a` changes these read-caps, and that is not integrity interference (a domain cannot stop others
+/// revealing themselves to it), so the read direction is a *confidentiality* property, checked by
+/// [`check_step_consistency`] — not [`check`]'s local respect. See `docs/TIER-D-NONINTERFERENCE.md`.
+pub fn obs_plus(hv: &Hypervisor, a: Dom) -> Vec<u64> {
+    obs_plus_impl(hv, a, true)
+}
+
+/// [`obs_plus`] with the authority projection toggleable — so the non-vacuity test can drop it and
+/// watch step consistency *break* (the real-code form of the instantiation's finding #1).
+fn obs_plus_impl(hv: &Hypervisor, a: Dom, authority: bool) -> Vec<u64> {
+    let g = hv.grant();
+    let p = hv.p2m();
+    let n = hv.domain_count() as Dom;
+    let mut k = obs(hv, a);
+
+    // `a`'s **own authority** — excluded from the local-respect `obs` (it is `a`'s power over
+    // *others*, not `a`'s protected state), but the confidentiality surface must carry it, or step
+    // consistency is *false*: a guard reads it, so two `obs`-equal states with different authority
+    // fire the guarded transition differently. Exactly the instantiation's forced corrections —
+    // `may_create[a]` (creation), `controls[·][a]` (who controls `a`; affinity/destroy of `a`), and
+    // `controls[a][·]` (whom `a` controls; `a`'s own destroy authority — the outgoing analogue).
+    if authority {
+        k.push(0xD_0007);
+        k.push(hv.may_create(a) as u64);
+        for b in 0..n {
+            k.push(hv.controls(b, a) as u64); // incoming: who controls a
+        }
+        for c in 0..n {
+            k.push(hv.controls(a, c) as u64); // outgoing: whom a controls
+        }
+    }
+
+    k.push(0xD_0006);
+    let mut rcaps: Vec<[u64; 5]> = Vec::new();
+    for grantor in 0..n {
+        for gref in 0..g.entry_count(grantor) as u32 {
+            if let Some((grantee, frame, ro, ..)) = g.grant_entry(grantor, gref) {
+                if grantee == a {
+                    let owner = p.owner_of(frame).map_or(u64::MAX, u64::from);
+                    rcaps.push([
+                        u64::from(grantor),
+                        u64::from(gref),
+                        u64::from(frame),
+                        ro as u64,
+                        owner,
+                    ]);
+                }
+            }
+        }
+    }
+    rcaps.sort_unstable();
+    k.push(rcaps.len() as u64);
+    for rc in rcaps {
+        k.extend(rc);
+    }
+    k
+}
+
 /// A local-respect counterexample: actor `actor` had no authorized channel to observer
 /// `observer`, yet `transition` changed `obs(observer)`.
 #[derive(Clone, Debug)]
@@ -485,6 +583,118 @@ pub fn check(cfg: &Config, ch: Channels) -> NiOutcome {
         states: states.len(),
         checks,
         unauthorized_checks,
+        violation: None,
+    }
+}
+
+/// A step-consistency counterexample: two reachable states agree on `obs⁺(observer)` and
+/// `obs⁺(actor)`, yet `transition` drives them to *different* `obs⁺(observer)`. The witness that
+/// the observation is **not** a function of the observed inputs — an unobserved dependence.
+#[derive(Clone, Debug)]
+pub struct ScViolation {
+    /// The acting principal.
+    pub actor: Dom,
+    /// The observer whose successor observation was not determined.
+    pub observer: Dom,
+    /// The transition applied to both states.
+    pub transition: Transition,
+    /// Traces to the two pre-states that share an `obs⁺(observer)`/`obs⁺(actor)` but diverge.
+    pub trace_a: Vec<Transition>,
+    pub trace_b: Vec<Transition>,
+}
+
+/// The result of a step-consistency sweep.
+#[derive(Clone, Debug)]
+pub struct ScOutcome {
+    /// Distinct reachable states swept.
+    pub states: usize,
+    /// `(state, transition, observer)` triples checked.
+    pub checks: u64,
+    /// How many checks landed in an already-populated `(obs⁺(observer), obs⁺(actor))` class — the
+    /// cases where consistency has teeth (a second genuinely distinct state had to agree). A sweep
+    /// with none proved nothing.
+    pub witnessed_classes: u64,
+    /// The first step-consistency violation, or `None` if the property holds.
+    pub violation: Option<ScViolation>,
+}
+
+/// Run the **step-consistency** sweep over `cfg` — the confidentiality dual of [`check`], and the
+/// real-code counterpart of `noninterference_instantiation.rs`'s `step_consistent_holds`. For every
+/// transition and every observer `a ≠ actor`, it verifies that `obs⁺(a)` after the step is a
+/// **function of** `(obs⁺(a), obs⁺(actor))` before it: two reachable states that `a` and the actor
+/// cannot tell apart are driven to the same successor observation. (This is exactly the unwinding
+/// *step-consistency* condition; unlike local respect it needs no channel relation — it is a pure
+/// determinism property.) This is where the `DomainDestroy` **read direction** lives: destroying
+/// `a`'s grantor revokes `a`'s read-cap, and step consistency asks that two `obs⁺(a)`-equal states
+/// lose it *together*.
+///
+/// Implemented by grouping: for each `(transition, a)`, map each pre-state to the key
+/// `(obs⁺(a), obs⁺(actor))` and require every state in a key-class to yield the same
+/// `obs⁺(step, a)`. `O(states × transitions × observers)` — no quadratic pairing. Returns the first
+/// key-class that maps to two successors, with both reproducing traces.
+pub fn check_step_consistency(cfg: &Config) -> ScOutcome {
+    check_step_consistency_with(cfg, obs_plus)
+}
+
+/// A step-consistency equivalence class: `(obs⁺(observer), obs⁺(actor))` before → the observed
+/// `(obs⁺(observer) after, reproducing trace)`. Every state in a class must share the successor.
+type ScClass = HashMap<(Vec<u64>, Vec<u64>), (Vec<u64>, Vec<Transition>)>;
+
+/// [`check_step_consistency`] over an arbitrary observation projection — so the non-vacuity test
+/// can supply an authority-stripped `obs⁺` and watch the property fail.
+fn check_step_consistency_with(
+    cfg: &Config,
+    proj: impl Fn(&Hypervisor, Dom) -> Vec<u64>,
+) -> ScOutcome {
+    let universe = transitions(cfg);
+    let states = reachable(cfg);
+    let n = cfg.domains as Dom;
+    let mut checks = 0u64;
+    let mut witnessed_classes = 0u64;
+
+    for &transition in &universe {
+        let actor = transition_actor(&transition);
+        for a in 0..n {
+            if a == actor {
+                continue;
+            }
+            // key: (obs⁺(a), obs⁺(actor)) before → value: (obs⁺(a) after, trace).
+            let mut class: ScClass = HashMap::new();
+            for (hv, trace) in &states {
+                let key = (proj(hv, a), proj(hv, actor));
+                let mut h = hv.clone();
+                let _: Result<TransitionOutcome, _> = h.apply(transition);
+                let after = proj(&h, a);
+                checks += 1;
+                match class.get(&key) {
+                    None => {
+                        class.insert(key, (after, trace.clone()));
+                    }
+                    Some((prev_after, prev_trace)) => {
+                        witnessed_classes += 1;
+                        if *prev_after != after {
+                            return ScOutcome {
+                                states: states.len(),
+                                checks,
+                                witnessed_classes,
+                                violation: Some(ScViolation {
+                                    actor,
+                                    observer: a,
+                                    transition,
+                                    trace_a: prev_trace.clone(),
+                                    trace_b: trace.clone(),
+                                }),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ScOutcome {
+        states: states.len(),
+        checks,
+        witnessed_classes,
         violation: None,
     }
 }
@@ -720,5 +930,125 @@ mod tests {
             out.violation.unwrap()
         );
         assert!(out.unauthorized_checks > 1_000);
+    }
+
+    // ===================================================================================
+    // Step consistency (the confidentiality dual) — validating the `DomainDestroy` read
+    // direction on real code (the counterpart of `step_consistent_holds`, `obs⁺`).
+    // ===================================================================================
+
+    /// How many grants `a` is a *grantee* of (across every grantor's table) — the size of `a`'s
+    /// read-closure. Destroying `a`'s grantor (`grant::revoke_all`) drops this.
+    fn reads_count(hv: &Hypervisor, a: Dom) -> usize {
+        let g = hv.grant();
+        let n = hv.domain_count() as Dom;
+        (0..n)
+            .map(|grantor| {
+                (0..g.entry_count(grantor) as u32)
+                    .filter(|&gref| {
+                        matches!(g.grant_entry(grantor, gref), Some((grantee, ..)) if grantee == a)
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    /// **Step consistency holds on real code — the confidentiality dual, incl. the read direction.**
+    /// Over the three-domain universe (where the intransitive read flow is live), `obs⁺(a)` after
+    /// any step is a function of `(obs⁺(a), obs⁺(actor))` before it: two states `a` and the actor
+    /// cannot distinguish are driven to the same successor observation. This is the real-code form
+    /// of `noninterference_instantiation.rs::step_consistent_holds` — and it is **non-vacuous**
+    /// (tens of thousands of key-classes hold two or more genuinely distinct states that must, and
+    /// do, agree). The `DomainDestroy` **read direction** is inside this sweep: destroying `a`'s
+    /// grantor drops `a`'s read-cap, and the sweep confirms two `obs⁺(a)`-equal states lose it
+    /// together.
+    #[test]
+    fn step_consistency_holds_on_real_code() {
+        let out = check_step_consistency(&ni_cfg3(3));
+        assert!(
+            out.violation.is_none(),
+            "step-consistency violation: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(
+            out.witnessed_classes > 1_000,
+            "step-consistency sweep near-vacuous: only {} witnessed classes over {} states",
+            out.witnessed_classes,
+            out.states
+        );
+    }
+
+    /// **The read direction is genuinely exercised (non-vacuity of the sweep for it).** Over the
+    /// swept product, some `DomainDestroy` by an actor `b` shrinks a *third* domain `a`'s
+    /// read-closure — `a` reads from the destroyed `c` (a grant `c` offered `a`), and `revoke_all`
+    /// drops it. So the step-consistency sweep is not vacuously true for the read direction: it
+    /// really does test that destroying `a`'s grantor moves `obs⁺(a)`, and does so consistently.
+    #[test]
+    fn the_destroy_read_direction_is_exercised() {
+        use hv_core::HvCall;
+        let cfg = ni_cfg3(4);
+        let states = reachable(&cfg);
+        let universe = transitions(&cfg);
+        let n = cfg.domains as Dom;
+        let mut read_moves = 0u64;
+        for (hv, _) in &states {
+            for &t in &universe {
+                if !matches!(
+                    t,
+                    Transition::Guest {
+                        call: HvCall::DomainDestroy { .. },
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+                let actor = transition_actor(&t);
+                for a in 0..n {
+                    if a == actor {
+                        continue;
+                    }
+                    let before = reads_count(hv, a);
+                    let mut h = hv.clone();
+                    if h.apply(t).is_ok() && reads_count(&h, a) < before {
+                        read_moves += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            read_moves > 0,
+            "the DomainDestroy read direction was never exercised — the step-consistency sweep \
+             is vacuous for it (no destroy shrank a third domain's read-closure)"
+        );
+    }
+
+    /// **Non-vacuity — the read-closure `obs⁺` must carry the observer's own authority (finding
+    /// #1, on real code).** Strip authority (`may_create[a]`, the `controls` rows) back out of
+    /// `obs⁺` and step consistency **breaks**: a guarded transition (create / destroy / affinity)
+    /// reads authority the projection no longer shows, so two now-"equal" states fire it
+    /// differently. This is the enumerator's independent confirmation of the correction the
+    /// instantiation's `step_consistent` forced — the confidentiality theorem is *false* under the
+    /// authority-excluding observation.
+    #[test]
+    fn dropping_authority_from_obs_plus_breaks_step_consistency() {
+        let out = check_step_consistency_with(&ni_cfg3(3), |hv, a| obs_plus_impl(hv, a, false));
+        assert!(
+            out.violation.is_some(),
+            "stripping authority from obs⁺ should break step consistency (finding #1), but it held"
+        );
+    }
+
+    /// **Step consistency, green deeper on three domains (deep sweep).** Ignored by default (the
+    /// larger reachable set takes longer); run in the deep-verification workflow.
+    #[test]
+    #[ignore = "deep step-consistency sweep — run in deep-verify.yml"]
+    fn step_consistency_holds_three_domains_deep() {
+        let out = check_step_consistency(&ni_cfg3(5));
+        assert!(
+            out.violation.is_none(),
+            "step-consistency violation (deep): {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 100_000);
     }
 }

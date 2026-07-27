@@ -191,6 +191,36 @@ The teardown-reach row is the intransitive finding of §2.4, surfaced empiricall
 the three-domain config and would be invisible in two domains (no third observer). The bridge is
 what *made the definition honest*.
 
+### 4a. The confidentiality dual — step consistency and the `DomainDestroy` read direction (green)
+
+Local respect (above) is the **integrity** half. The **confidentiality** half — *step consistency*,
+the counterpart of §5g's `step_consistent_holds` — is now also swept on real code
+(`noninterference::check_step_consistency`): `obs⁺(a)` after a step is a **function of**
+`(obs⁺(a), obs⁺(actor))` before it (two states `a` and the actor cannot distinguish go to the same
+successor). It runs over `obs⁺` = `obs` plus (i) the **read-closure** — the grants `a` is a
+*grantee* of, with each grantor, frame, and the frame's owner — and (ii) `a`'s own **authority**.
+
+This is where the **`DomainDestroy` read direction** (§5g finding #3) is validated on real code:
+destroying `a`'s grantor `c` runs `grant::revoke_all(c)`, dropping `a`'s read-cap, and the sweep
+confirms two `obs⁺(a)`-equal states lose it *together* (test `the_destroy_read_direction_is_exercised`
+shows the flow is live; `step_consistency_holds_on_real_code` shows it holds, non-vacuously, over
+tens of thousands of multi-state classes). Two findings the sweep independently reproduces:
+
+* **The read-closure is *not* a local-respect surface.** A grantor freely *creating* an offer to `a`
+  moves `a`'s read-caps, and that is not integrity interference (a domain cannot stop others revealing
+  themselves to it). So the read direction is confidentiality, not integrity — it belongs to step
+  consistency, and adding read-caps to the *local-respect* `obs` would wrongly flag every grant.
+* **`obs⁺` must carry the observer's own authority** (§5g finding #1): strip `may_create[a]` / the
+  `controls` rows back out and step consistency *breaks* on a `DomainCreate` (test
+  `dropping_authority_from_obs_plus_breaks_step_consistency`) — the enumerator's confirmation that the
+  confidentiality theorem is false under the authority-excluding observation.
+
+One honest edge: `DomainBusy` (which refuses a destroy while a foreign domain maps `c`'s frames)
+depends, with a *fourth* domain as that mapper, on state neither `a` nor the actor observes — so at
+≥4 domains step consistency for the destroy channel rests on the instantiation's over-approximation
+of `DomainBusy` (§5g). At ≤3 domains no fourth mapper exists, so the sweep is clean; the deep
+three-domain sweep runs in `deep-verify.yml`.
+
 ## 5. The Verus spike — signal-channel local respect, ∀-N (green)
 
 To measure the **deductive** cost (the axis where the "person-months, research-grade" caveat might
