@@ -53,6 +53,21 @@
 //! frame-owner-stable hypotheses from `read_cap_stable`, makes Verus reject the proof — the closure
 //! contents and the extended channel terms are each load-bearing (recorded in `README.md`).
 //!
+//! ## Real-code fidelity — this model keeps the raw owner; the bridge keeps the boolean
+//!
+//! `read_view` (and the instantiation's `ReadCap`) exposes the frame's raw `owner`. That is sound
+//! **here** because this abstract model has *static* frame ownership — no modeled transition
+//! re-owns a frame, and grants are not *created* by a step (only mapped/drained). So the raw owner
+//! is a stable, faithful super-observable, and proving step consistency over it is *stronger* than
+//! over the boolean it derives. The **enumerator bridge** (`hv-sim::obs_plus`) runs against the real
+//! `Hypervisor`, where ownership is *dynamic* (`P2mAllocate`/`P2mFree`) and grants are *created*
+//! (`GrantAccess`, which needs no ownership). There the raw owner leaks a *third* domain's identity
+//! into `a`'s read-cap and breaks step consistency, so the bridge records only the faithful boolean
+//! `owner == grantor` — the `StaleGrant` status `a` actually learns. The two agree on what matters:
+//! `read_succeeds` is `owner == grantor` either way. The bridge finding a tighter observable than
+//! this model needs is the bridge doing its job — tying the composition proof to what runs
+//! (`docs/TIER-D-NONINTERFERENCE.md` §4a/§5g; design-lessons #55/#57).
+//!
 //! Run: `verus --crate-type=lib hv-verify/verus/read_closure.rs` (exit 0 = all proven).
 
 use vstd::prelude::*;

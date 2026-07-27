@@ -75,7 +75,8 @@
 //! `obs` deliberately omits:
 //!
 //! * the **read-closure** — the grants `a` is a *grantee* of, with each grantor, frame, and the
-//!   frame's owner: what `a` can *read* through a grant it holds. This is where the
+//!   **StaleGrant status** (`owner_of(frame) == grantor`, the boolean `a`'s `grant_map` reads —
+//!   *not* the owner's identity): what `a` can *read* through a grant it holds. This is where the
 //!   **`DomainDestroy` read direction** lives — destroying `a`'s grantor `c` revokes `c`'s
 //!   outgoing grants (`grant::revoke_all`), dropping `a`'s read-cap. (These read-caps are
 //!   *not* in the local-respect `obs`: a grantor freely *creating* an offer to `a` moves them,
@@ -355,12 +356,22 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
 
 /// `obs⁺(a)` — `a`'s **read-closure** observation: [`obs`] extended with the grants `a` is a
 /// *grantee* of, across every grantor's table, each with its grantor, frame, read-only flag, and
-/// the frame's current **owner**. This is the confidentiality surface `read_closure.rs` proved
-/// step-consistency over: what `a` can *learn* through a grant it holds (a cross-domain map/copy
-/// reads the grantor's frame ownership — the `StaleGrant` check), which the *read direction* of the
-/// `DomainDestroy` cascade moves (destroying `a`'s grantor revokes `c`'s outgoing grants —
-/// `grant::revoke_all` — dropping `a`'s read-cap). The `owner` component is the one the
-/// instantiation's `step_consistent` forced.
+/// the **StaleGrant status** `owner_of(frame) == grantor`. This is the confidentiality surface
+/// `read_closure.rs` proved step-consistency over: what `a` can *learn* through a grant it holds (a
+/// cross-domain map/copy succeeds iff the grantor still owns the frame — the `StaleGrant` check in
+/// `hypervisor::grant_map`), which the *read direction* of the `DomainDestroy` cascade moves
+/// (destroying `a`'s grantor revokes `c`'s outgoing grants — `grant::revoke_all` — dropping `a`'s
+/// read-cap). The ownership component is what the instantiation's `step_consistent` forced.
+///
+/// **The observable is the boolean, not the owner's identity.** `a` never reads *who* owns the
+/// frame — only whether its map succeeds. The Verus instantiation (`noninterference_instantiation.rs`,
+/// `read_closure.rs`) carries the raw `owner`, which is sound *there* because that abstract model
+/// has **static** frame ownership (no transition re-owns a frame) — so the raw owner is a stable,
+/// faithful super-observable. The real code has **dynamic** ownership (`P2mAllocate`/`GrantAccess`
+/// of an unowned frame), under which the raw owner leaks a third domain's identity into `a`'s
+/// read-cap and breaks step consistency; the bridge therefore records the tighter, faithful boolean.
+/// The bridge surfacing an observable the abstract model does not need is the bridge doing its job —
+/// tying the composition proof to what actually runs (`docs/TIER-D-NONINTERFERENCE.md` §4a/§5g).
 ///
 /// This is deliberately **not** the local-respect surface: a grantor freely *creating* an offer to
 /// `a` changes these read-caps, and that is not integrity interference (a domain cannot stop others
@@ -401,13 +412,22 @@ fn obs_plus_impl(hv: &Hypervisor, a: Dom, authority: bool) -> Vec<u64> {
         for gref in 0..g.entry_count(grantor) as u32 {
             if let Some((grantee, frame, ro, ..)) = g.grant_entry(grantor, gref) {
                 if grantee == a {
-                    let owner = p.owner_of(frame).map_or(u64::MAX, u64::from);
+                    // The **StaleGrant status** — the boolean `owner_of(frame) == grantor` — is
+                    // exactly what `a` learns by mapping/copying (`hypervisor::grant_map` returns
+                    // `Ok` iff it holds, `Err(StaleGrant)` otherwise). NOT the owner's *identity*:
+                    // `a` never reads who owns the frame, only whether its map succeeds. Exposing
+                    // the raw owner over-approximates the observable and leaks a *third* domain's
+                    // identity into `a`'s read-cap when a grant names a frame that domain owns —
+                    // which, under dynamic frame ownership (`P2mAllocate`/`GrantAccess` of an
+                    // unowned frame), breaks step consistency (a peer's invisible allocation flips
+                    // the owner). The boolean is the faithful confidentiality surface.
+                    let owns = (p.owner_of(frame) == Some(grantor)) as u64;
                     rcaps.push([
                         u64::from(grantor),
                         u64::from(gref),
                         u64::from(frame),
                         ro as u64,
-                        owner,
+                        owns,
                     ]);
                 }
             }
@@ -1050,5 +1070,90 @@ mod tests {
             out.violation.unwrap()
         );
         assert!(out.witnessed_classes > 100_000);
+    }
+
+    /// **The read-cap records the StaleGrant *status*, not the owner's identity (the read-closure
+    /// real-code fidelity refinement).** `a`'s cross-domain map/copy of a grant it holds learns
+    /// exactly whether the grantor still owns the frame (`Ok` vs `Err(StaleGrant)` in
+    /// `hypervisor::grant_map`) — never *who* owns it. So `obs⁺(a)`'s read-cap carries the boolean
+    /// `owner == grantor`, not the raw owner. This pins the refinement directly (no sweep, so it is
+    /// independent of the allocation-contention edge): two states differing *only* in which **third**
+    /// domain owns a granted frame — invisible to both grantor and grantee — yield **equal**
+    /// `obs⁺(grantee)`. The raw-owner form leaked that identity and broke step consistency (the
+    /// depth-4 `GrantAccess` counterexample the four-domain sweep found). The boolean still
+    /// distinguishes a *valid* grant from a *stale* one — which is what `a` genuinely observes.
+    #[test]
+    fn read_cap_records_stale_status_not_owner_identity() {
+        use hv_core::HvCall;
+        // dom0 = grantor, dom1 = grantee/observer, dom2 & dom3 = candidate third-party owners.
+        fn stale_owned_by(third_owner: Dom) -> Hypervisor {
+            let mut h = Hypervisor::new(4, 1, 1, 0, 0, 1); // 4 domains, 1 frame
+            for t in 1..4u16 {
+                // dom0 boots live + privileged; bring the peers up so they can own a frame.
+                h.dispatch(
+                    0,
+                    HvCall::DomainCreate {
+                        target: t,
+                        may_create: false,
+                    },
+                )
+                .unwrap();
+            }
+            // dom0 offers dom1 a grant naming frame 0 — offering requires no ownership.
+            h.dispatch(
+                0,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 1,
+                    frame: 0,
+                    readonly: false,
+                },
+            )
+            .unwrap();
+            // A *third* domain grabs frame 0 (invisible to dom0/dom1): the grant is now stale.
+            h.dispatch(third_owner, HvCall::P2mAllocate { mfn: 0 })
+                .unwrap();
+            h
+        }
+        let owned_by_2 = stale_owned_by(2);
+        let owned_by_3 = stale_owned_by(3);
+        // The boolean collapses the third party's identity: dom1 observes the same obs⁺ either way.
+        assert_eq!(
+            obs_plus(&owned_by_2, 1),
+            obs_plus(&owned_by_3, 1),
+            "obs⁺(grantee) leaked which third domain owns the granted frame"
+        );
+
+        // Non-vacuity: the boolean is not constant — a grant the grantor still backs is observably
+        // different (valid vs stale is exactly what `a` learns by mapping).
+        let mut valid = Hypervisor::new(4, 1, 1, 0, 0, 1);
+        for t in 1..4u16 {
+            valid
+                .dispatch(
+                    0,
+                    HvCall::DomainCreate {
+                        target: t,
+                        may_create: false,
+                    },
+                )
+                .unwrap();
+        }
+        valid.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap(); // the grantor owns the frame
+        valid
+            .dispatch(
+                0,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 1,
+                    frame: 0,
+                    readonly: false,
+                },
+            )
+            .unwrap();
+        assert_ne!(
+            obs_plus(&valid, 1),
+            obs_plus(&owned_by_2, 1),
+            "obs⁺(grantee) failed to distinguish a valid grant from a stale one"
+        );
     }
 }
