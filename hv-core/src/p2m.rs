@@ -433,9 +433,81 @@ impl System {
         Ok(())
     }
 
+    /// **Would an acquire on `mfn` succeed, and if not why** — the acquire guard as a *pure
+    /// query*, with `ty = None` for a bare [`Self::get`] and `Some(ty)` for a typed
+    /// [`Self::get_type`]. Returns exactly what the corresponding mutating call would return.
+    ///
+    /// This exists as a **named seam** because the guard's *outcome* is observable to a caller who
+    /// does not own the frame: `hypervisor::grant_map` acquires on the **grantor's** frame, so the
+    /// grantee learns this predicate from its own map's `Ok`/`Err`. The Tier-D confidentiality
+    /// surface must therefore record it (`hv-sim::noninterference::obs_plus`), and recording it
+    /// means reading it from the same code the acquire runs — re-deriving the condition from
+    /// [`Self::refs`]/[`Self::type_refs`]/… in the observer would be a seam that the shipped path
+    /// does not call, exactly the fidelity gap design-lesson #55 (GAP-A) was about. Both
+    /// [`Self::get`] and [`Self::get_type`] route through it, so it cannot drift from them.
+    ///
+    /// Pure: takes `&self` and mutates nothing.
+    pub fn can_acquire(&self, mfn: Mfn, ty: Option<PageType>) -> Result<(), P2mError> {
+        Self::acquire_check(self.frame(mfn)?, ty)
+    }
+
+    /// The acquire guard itself, over a borrowed frame — the single definition
+    /// [`Self::get`], [`Self::get_type`] and [`Self::can_acquire`] all share.
+    fn acquire_check(frame: &Frame, ty: Option<PageType>) -> Result<(), P2mError> {
+        let Frame::Allocated {
+            refs,
+            writable_refs,
+            executable_refs,
+            pagetable_refs,
+            pt_level,
+            ..
+        } = frame
+        else {
+            return Err(P2mError::WrongState);
+        };
+        // Any incompatible live type blocks the acquire. For a writable request that is
+        // any page-table reference (write-xor-pagetable) *or* any executable reference
+        // (write-xor-execute — the W^X guard, so a writable ref cannot join an executable
+        // one). For a page-table request it is any writable reference *or* a page table
+        // already live at another level; an executable reference does NOT block it (a
+        // read-execute leaf may point at a page table, exactly as a read-only one may).
+        // A bare existence reference asserts no type, so nothing blocks it.
+        if let Some(ty) = ty {
+            let (conflict, err) = match ty {
+                PageType::Writable => {
+                    if *executable_refs > 0 {
+                        (true, P2mError::WxConflict)
+                    } else {
+                        (*pagetable_refs > 0, P2mError::TypePinned)
+                    }
+                }
+                PageType::PageTable(level) => (
+                    *writable_refs > 0 || (*pagetable_refs > 0 && *pt_level != level),
+                    P2mError::TypePinned,
+                ),
+            };
+            if conflict {
+                return Err(err);
+            }
+        }
+        // Both counts are overflow-checked before either is written, so a rejected call
+        // mutates nothing — and the overflow is part of the observable outcome, so the
+        // query has to model it too.
+        refs.checked_add(1).ok_or(P2mError::Overflow)?;
+        if let Some(ty) = ty {
+            let slot = match ty {
+                PageType::Writable => *writable_refs,
+                PageType::PageTable(_) => *pagetable_refs,
+            };
+            slot.checked_add(1).ok_or(P2mError::Overflow)?;
+        }
+        Ok(())
+    }
+
     /// Take a bare existence reference on an allocated frame (Xen's `get_page`): pins
     /// it against being freed, without asserting any type.
     pub fn get(&mut self, mfn: Mfn) -> Result<(), P2mError> {
+        Self::acquire_check(self.frame(mfn)?, None)?;
         match self.frame_mut(mfn)? {
             Frame::Allocated { refs, .. } => {
                 *refs = refs.checked_add(1).ok_or(P2mError::Overflow)?;
@@ -483,37 +555,17 @@ impl System {
     /// guard makes both writable-xor-pagetable and level-exclusivity hold by
     /// construction: a frame is only ever referenced as one type, at one level.
     pub fn get_type(&mut self, mfn: Mfn, ty: PageType) -> Result<(), P2mError> {
+        // The guard itself lives in `acquire_check`, the seam `can_acquire` also reads, so the
+        // observable predicate and the acquire that enforces it cannot drift apart (#55).
+        Self::acquire_check(self.frame(mfn)?, Some(ty))?;
         match self.frame_mut(mfn)? {
             Frame::Allocated {
                 refs,
                 writable_refs,
-                executable_refs,
                 pagetable_refs,
                 pt_level,
                 ..
             } => {
-                // Any incompatible live type blocks the acquire. For a writable request that is
-                // any page-table reference (write-xor-pagetable) *or* any executable reference
-                // (write-xor-execute — the W^X guard, so a writable ref cannot join an executable
-                // one). For a page-table request it is any writable reference *or* a page table
-                // already live at another level; an executable reference does NOT block it (a
-                // read-execute leaf may point at a page table, exactly as a read-only one may).
-                let (conflict, err) = match ty {
-                    PageType::Writable => {
-                        if *executable_refs > 0 {
-                            (true, P2mError::WxConflict)
-                        } else {
-                            (*pagetable_refs > 0, P2mError::TypePinned)
-                        }
-                    }
-                    PageType::PageTable(level) => (
-                        *writable_refs > 0 || (*pagetable_refs > 0 && *pt_level != level),
-                        P2mError::TypePinned,
-                    ),
-                };
-                if conflict {
-                    return Err(err);
-                }
                 // Bump the existence and typed counts together, overflow-checked before
                 // either is written so a rejected call mutates nothing. A page-table
                 // reference taken from zero also stamps the frame's level.
