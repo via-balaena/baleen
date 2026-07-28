@@ -842,7 +842,7 @@ fn rung3(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
     // The whole point: the table's answer is a DIFFERENT address from the one the device issued.
     let translation_is_real = landed1
         .as_ref()
-        .is_some_and(|r| r.pa != asked1 && r.writable);
+        .is_some_and(|r| r.pa != asked1 && r.writable());
     let phase1 = bound_a && translation_is_real && p1.translated() && e1.is_none();
 
     // ── Phase 2: CONFINEMENT — an IPA this domain does not own ───────────────────────────────────
@@ -855,7 +855,7 @@ fn rung3(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
     // ── Phase 3: PERMISSION — the emitter's read-only leaf, enforced against a DEVICE ────────────
     let asked3 = ipa_a_ro + slot(3);
     let landed3 = walk(l1_a, asked3);
-    let read_only = landed3.as_ref().is_some_and(|r| !r.writable);
+    let read_only = landed3.as_ref().is_some_and(|r| !r.writable());
     let (p3, e3) = attempt_stage2(bar0, asked3, landed3.as_ref().map(|r| r.pa), None);
     let phase3 = read_only && p3.refused() && fault_at(&e3, smmu::EVT_F_PERMISSION, sid, asked3);
 
@@ -1102,7 +1102,7 @@ fn rung4(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
     let names_a = derived1.is_some_and(|b| b.s2ttb == l1_a && b.vmid == vmid_a);
     let translation_is_real = landed1
         .as_ref()
-        .is_some_and(|r| r.pa != asked1 && r.writable);
+        .is_some_and(|r| r.pa != asked1 && r.writable());
     let phase1 =
         denied_at_boot && names_a && translation_is_real && p1.translated() && e1.is_none();
 

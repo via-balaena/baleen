@@ -53,6 +53,16 @@
 //!     p2m model  --(1)-->  leaf map  --(2)-->  descriptor words  --(3)-->  hardware
 //! ```
 //!
+//! **Arrow (2) had a seam inside it that nothing crossed until the device-path composition.** The
+//! bit-level encoding of one descriptor was proven, and the emitted table was read back at boot —
+//! but *through the same derivation `encode` used*, so the step from "the leaf map says frame `m`"
+//! to "an address in frame `m`'s window arrives at frame `m`'s bytes" was never written down.
+//! [`arm64::walk`] and [`arm64::window_reach`] are that step, as two independent readings, and
+//! `hv-verify::device_path_composition` proves they agree for every address. It also composes them
+//! with [`smmu`] into the SMMU arc's headline sentence — *a device assigned to `d` reaches exactly
+//! the frames `d`'s `p2m` authorizes, and nothing else* — which until then was a citation across
+//! three separately-proven links. See `docs/SMMU-DEVICE-PATH-COMPOSITION.md`.
+//!
 //! 1. **model → leaf map** ([`leafmap`]). Checked by `hv-sim`'s enumerator at **every reachable
 //!    state** of its configs (828,325 states on the deep grant↔p2m sweep) and by `hv-fuzz` after
 //!    every dispatch, via [`check`]. The properties are stated there, including which of them is a

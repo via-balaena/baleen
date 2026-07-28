@@ -712,22 +712,18 @@ pub(crate) fn unbind_stream(sid: u32) -> bool {
 
 // ─── Rung 4b: the table is DERIVED from the model, after every dispatch ──────────────────────────
 
-/// Record the Stage-2 tables domain `dom`'s image was emitted at, from the `VTTBR_EL2` value its
-/// CPU would be given.
+/// Record the Stage-2 tables domain `dom`'s image was emitted at.
 ///
 /// Called by [`crate::stage2::build_stage2_from_p2m`] itself — the emission seam, not its callers —
-/// so a domain whose image is built can never be a domain the device side has not heard of, and the
-/// binding is obtained the way rung 3 established: read back out of the `VTTBR_EL2` value through
-/// [`hv_s2::arm64::vttbr_table`]/[`vttbr_vmid`](hv_s2::arm64::vttbr_vmid), so *"the device walks the
-/// same table as the domain's CPU, under the same VMID"* holds by construction rather than by two
-/// derivations agreeing (`docs/SMMU-TRANSLATION.md` §2b).
-pub(crate) fn register_domain_binding(dom: hv_core::hypervisor::DomId, vttbr: u64) {
-    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS};
-    let binding = st::Stage2Binding {
-        s2ttb: vttbr_table(vttbr),
-        vmid: vttbr_vmid(vttbr, BALEEN_VMID_BITS),
-        regime: BALEEN_STAGE2,
-    };
+/// so a domain whose image is built can never be a domain the device side has not heard of.
+///
+/// **It no longer derives anything.** The binding arrives already minted by
+/// [`hv_s2::smmu::stage2_handles`] from the same `Layout` the encoder was handed, alongside the
+/// `VTTBR_EL2` the CPU is given. Until the device-path composition this function computed the
+/// `S2TTB` itself, by reading it back out of the register value — a second derivation of the table
+/// base, boot-witnessed and proven nowhere, and unsound above 2⁴⁸ because the two register fields
+/// are not the same width (`docs/SMMU-DEVICE-PATH-COMPOSITION.md` §3b).
+pub(crate) fn register_domain_binding(dom: hv_core::hypervisor::DomId, binding: st::Stage2Binding) {
     let mut smmu = SMMU.borrow_mut();
     if let Some(slot) = smmu.binding_of.get_mut(dom as usize) {
         *slot = Some(binding);
