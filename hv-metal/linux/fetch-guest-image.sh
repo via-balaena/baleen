@@ -196,10 +196,20 @@ chmod 0755 "$stage/init"
 
 # `cpio -o -H newc` is the format the kernel's initramfs unpacker reads. Run from inside the stage so
 # the archive holds relative paths (`./init`, not `/tmp/xxx/init`), or the kernel unpacks nothing and
-# panics with "No working init found".
-( cd "$stage" && find . -print | cpio -o -H newc --quiet 2>/dev/null || ( cd "$stage" && find . -print | cpio -o -H newc ) ) \
-    | gzip -9 > "$work/custom-initramfs.gz"
-echo "fetch-guest-image: initramfs OK — $(wc -c < "$work/custom-initramfs.gz" | tr -d ' ') bytes"
+# panics with "No working init found". `--quiet` is accepted by both GNU cpio (Linux) and BSD cpio
+# (macOS) — checked, because this script has to run in both places.
+#
+# ONE invocation, no `||` fallback: a fallback that re-ran cpio would APPEND to the same stdout after
+# a partial write, so a failure would yield a silently corrupt archive instead of an error. `pipefail`
+# is in force here (unlike inside `slice`), so a cpio or gzip failure fails the script.
+( cd "$stage" && find . -print | cpio -o -H newc --quiet ) | gzip -9 > "$work/custom-initramfs.gz"
+
+# The minirootfs alone is ~4 MB compressed, so anything small means cpio produced a stub — the failure
+# mode that would otherwise surface as an unexplained "No working init found" inside the guest.
+initramfs_bytes="$(wc -c < "$work/custom-initramfs.gz" | tr -d ' ')"
+[ "$initramfs_bytes" -gt 1000000 ] || die \
+    "the initramfs is only $initramfs_bytes bytes — cpio produced a stub, not an archive"
+echo "fetch-guest-image: initramfs OK — $initramfs_bytes bytes"
 
 # ─── 3. publish ──────────────────────────────────────────────────────────────────────────────────
 # Written last and together, so an interrupted run leaves the previous (working) pair in place rather
