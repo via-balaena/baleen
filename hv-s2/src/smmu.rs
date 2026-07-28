@@ -56,9 +56,17 @@
 //! Rung 2 is **linear** stream tables only (`STRTAB_BASE_CFG.FMT == 0`). SMMUv3's 2-level format
 //! exists for machines with a large `SIDSIZE` where a linear table would be prohibitive; baleen sizes
 //! its table to cover PCIe bus 0 and lets the architecture's own range check abort everything above,
-//! which is *stronger* than a sparse 2-level table and much less code. The stage-2 STE fields
-//! (`S2TTB`, `S2VMID`, `S2T0SZ` …) that bind a stream to a domain's [`arm64`](crate::arm64) tables are
-//! rung 3; nothing here translates.
+//! which is *stronger* than a sparse 2-level table and much less code.
+//!
+//! ## Rung 3 — and where the module's claim changes
+//!
+//! Everything above is rung 2, and it **confines nothing**: the entry it binds is a bypass entry, so
+//! a permitted device still puts its own addresses on memory. The second half of this module (from
+//! [`Stage2Binding`] down) is rung 3, which binds a stream to a **domain** — `STE.Config = 0b110`,
+//! `S2TTB` at that domain's own [`arm64`](crate::arm64) Stage-2 tables, `S2VMID` its VMID — so the
+//! device is held to exactly the relation the domain's CPU is held to. The ∀-address refinement
+//! covers that walk verbatim (it constrains the *table*, not the *walker*); what is proven here is
+//! the **binding**, whose failure mode is not a fault but a wrong domain's memory.
 
 /// Words in one Stream Table Entry. SMMUv3 STEs are 64 bytes — 8 × `u64` — in both the linear and
 /// 2-level formats.
@@ -199,6 +207,10 @@ pub enum StreamTableError {
     /// [`MAX_LOG2SIZE`]. Refusing here is what keeps [`StreamVerdict::OutOfRange`]'s
     /// configured-larger-than-allocated case unreachable in a table this module built.
     TableTooSmall,
+    /// The **binding** could not be encoded (rung 3) — see [`SteError`]. Kept as a distinct arm
+    /// rather than folded into a generic failure so that "this StreamID is not in the table" and
+    /// "this domain's table cannot be named by an STE" stay different facts.
+    BadBinding(SteError),
 }
 
 /// Words of storage a linear stream table of `2^log2size` entries needs.
@@ -418,6 +430,215 @@ pub fn permitted_stream_count(words: &[u64], log2size: u32) -> usize {
     }
 }
 
+// ─── Rung 3: binding a stream to a DOMAIN — `STE.Config = 0b110`, `S2TTB`, `S2VMID` ──────────────
+//
+// Rung 2 ends at "nothing reaches memory unless this hypervisor bound its StreamID". It confines
+// nothing: the entry it binds is a BYPASS entry, and a bypassing device places its own addresses
+// directly on memory. Rung 3 is where the device path gets a constraint at all, and the constraint
+// is the one the CPU path already has — the domain's own [`crate::arm64`] Stage-2 tables, under the
+// domain's VMID.
+//
+// **The new surface, stated precisely.** The ∀-address refinement carries over verbatim: it
+// constrains the TABLE, not the WALKER, so a device walking a domain's table is covered by
+// construction. What is NOT covered by anything before this rung is the **binding** — that the entry
+// for StreamID X names domain D's table under D's VMID and nothing else. That is the exact analogue
+// of the `VTTBR_EL2` install, and the failure mode is not a fault but a *wrong domain's memory*.
+
+/// `STE.S2VMID` (word 2, bits `[15:0]`).
+const STE2_S2VMID_MASK: u64 = 0xffff;
+/// `STE.S2T0SZ` (word 2, bits `[37:32]`).
+const STE2_S2T0SZ_SHIFT: u32 = 32;
+/// `STE.S2SL0` (word 2, bits `[39:38]`).
+const STE2_S2SL0_SHIFT: u32 = 38;
+/// `STE.S2IR0` (word 2, bits `[41:40]`).
+const STE2_S2IR0_SHIFT: u32 = 40;
+/// `STE.S2OR0` (word 2, bits `[43:42]`).
+const STE2_S2OR0_SHIFT: u32 = 42;
+/// `STE.S2SH0` (word 2, bits `[45:44]`).
+const STE2_S2SH0_SHIFT: u32 = 44;
+/// `STE.S2TG` (word 2, bits `[47:46]`).
+const STE2_S2TG_SHIFT: u32 = 46;
+/// `STE.S2PS` (word 2, bits `[50:48]`).
+const STE2_S2PS_SHIFT: u32 = 48;
+/// `STE.S2AA64` (word 2, bit 51) — the stage-2 tables are AArch64 (VMSAv8-64) format. Clear would
+/// mean AArch32 LPAE, which [`crate::arm64`] does not emit, so this bit is not optional.
+const STE2_S2AA64: u64 = 1 << 51;
+/// `STE.S2PTW` (word 2, bit 54) — fault rather than proceed if a stage-2 table walk lands on
+/// Device memory. A walk that reads MMIO as descriptors is a walker following attacker-shaped bytes;
+/// set, because the alternative is "whatever that device returned is now a page table".
+const STE2_S2PTW: u64 = 1 << 54;
+/// `STE.S2S` (word 2, bit 57) — stall on a stage-2 fault. **Left clear**: baleen has no
+/// fault-resumption path (EL2's handler is `-> !` by design), a stalled transaction would wedge the
+/// device, and QEMU's SMMUv3 rejects the bit outright.
+#[allow(dead_code)]
+const STE2_S2S: u64 = 1 << 57;
+/// `STE.S2R` (word 2, bit 58) — **record** stage-2 faults on the event queue.
+///
+/// Load-bearing for the witness rather than for the isolation: with it clear a denied transaction is
+/// still denied, but silently, and every rung-3 denial would have to be inferred from a sentinel that
+/// did not change instead of attributed to a fault record naming its class and address
+/// (design-lesson #70(d)).
+const STE2_S2R: u64 = 1 << 58;
+/// `STE.S2TTB` (word 3, bits `[51:4]`) — the stage-2 start-level table's physical base.
+const STE3_S2TTB_MASK: u64 = 0x000f_ffff_ffff_fff0;
+
+/// Which domain's memory a stream reaches: the domain's stage-2 table, its VMID, and the regime both
+/// walkers read that table under.
+///
+/// A `Stage2Binding` is the device-side twin of a `VTTBR_EL2` value plus its `VTCR_EL2` — and it is
+/// spelled as one value for the same reason the regime is: the three parts are only meaningful
+/// together, and a mismatch between any two of them is a device reaching memory the table never
+/// authorized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage2Binding {
+    /// Physical base of the domain's start-level stage-2 table — the same table `VTTBR_EL2` carries
+    /// for that domain's CPU.
+    pub s2ttb: u64,
+    /// The domain's VMID — the same value `VTTBR_EL2[55:48]` carries, obtained by reading it back
+    /// out of that register's value ([`crate::arm64::vttbr_vmid`]) so it is masked to the width the
+    /// CPU actually tags with. `u16` because that is exactly what `STE.S2VMID` holds.
+    pub vmid: u16,
+    /// The translation regime, shared with the CPU ([`crate::arm64::Stage2Regime`]).
+    pub regime: crate::arm64::Stage2Regime,
+}
+
+/// Why a stage-2 STE could not be built. Every variant is a **refusal to encode**, never a
+/// truncation: each of these fields silently drops bits if written oversized, and a truncated
+/// `S2TTB` names a *different table*, i.e. a different domain's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SteError {
+    /// The regime is not one a walker can be configured with
+    /// ([`crate::arm64::Stage2Regime::valid`]).
+    BadRegime,
+    /// The granule is one whose `STE.S2TG` encoding this crate does not state — see
+    /// [`stage2_ste`]'s note. Only 4 KiB is emitted.
+    GranuleNotEmitted,
+    /// `s2ttb` is not aligned as the regime requires
+    /// ([`crate::arm64::Stage2Regime::table_align`]), so the field would name a different table.
+    UnalignedTable,
+    /// `s2ttb` has bits above the field, so the field would name a different table.
+    TableAddressTooLarge,
+}
+
+/// **The stage-2 STE for a binding** — `Config = 0b110` (stage 1 bypass, stage 2 translate).
+///
+/// This is the emit seam. [`decode_stage2_binding`] is the decode seam, written from the field
+/// definitions rather than from this function, so the round-trip proofs in
+/// `hv-verify::smmu_stream_table` are statements about two independent readings of the architecture
+/// (design-lesson #36).
+///
+/// **The granule refusal is deliberate, and it is a `#71` guard.** `VTCR_EL2.TG0` encodes
+/// 4 K/64 K/16 K as `0b00/0b01/0b10`; `STE.S2TG`'s encoding for the two large granules is *not*
+/// something this crate has verified against the hardware it runs on. At baleen's 4 KiB granule both
+/// fields are `0b00`, so a copied-across encoding would be indistinguishable from a correct one — a
+/// check whose inputs cannot discriminate. Rather than ship an unverified mapping under a proof that
+/// would then be proving the wrong thing, the encoder **refuses** every granule but 4 KiB, and the
+/// refusal is itself proven total.
+pub fn stage2_ste(b: &Stage2Binding) -> Result<[u64; STE_WORDS], SteError> {
+    use crate::arm64::Granule;
+
+    if !b.regime.valid() {
+        return Err(SteError::BadRegime);
+    }
+    if !matches!(b.regime.granule, Granule::K4) {
+        return Err(SteError::GranuleNotEmitted);
+    }
+    // Order matters only for which error a doubly-wrong address reports; both refuse.
+    if b.s2ttb >> 52 != 0 {
+        return Err(SteError::TableAddressTooLarge);
+    }
+    // The regime's alignment is at least 64 bytes, so this subsumes the field's own 16-byte
+    // granularity: an address that survives it loses no bits to `STE3_S2TTB_MASK`.
+    if !b.s2ttb.is_multiple_of(b.regime.table_align()) {
+        return Err(SteError::UnalignedTable);
+    }
+    let mut ste = [0u64; STE_WORDS];
+    ste[0] = STE_V | ((CONFIG_S2 as u64) << STE_CONFIG_SHIFT);
+    ste[1] = STE_SHCFG_INCOMING;
+    ste[2] = (u64::from(b.vmid) & STE2_S2VMID_MASK)
+        | (b.regime.t0sz() << STE2_S2T0SZ_SHIFT)
+        | (b.regime.start_level.sl0() << STE2_S2SL0_SHIFT)
+        | (b.regime.walk_inner << STE2_S2IR0_SHIFT)
+        | (b.regime.walk_outer << STE2_S2OR0_SHIFT)
+        | (b.regime.walk_shareability << STE2_S2SH0_SHIFT)
+        // 4 KiB — the only granule this encoder emits (see the note above).
+        | (0b00 << STE2_S2TG_SHIFT)
+        | (b.regime.pa_size.ps() << STE2_S2PS_SHIFT)
+        | STE2_S2AA64
+        | STE2_S2PTW
+        | STE2_S2R;
+    ste[3] = b.s2ttb & STE3_S2TTB_MASK;
+    Ok(ste)
+}
+
+/// Read an STE back as the binding it expresses — **the decode seam**.
+///
+/// `None` unless the entry really is a stage-2 translating entry whose fields name a regime this
+/// crate recognizes. Total over arbitrary words, because the entry the SMMU walks is memory, and
+/// "memory this hypervisor did not write" is exactly the case a fail-closed reading must cover.
+#[must_use]
+pub fn decode_stage2_binding(ste: &[u64]) -> Option<Stage2Binding> {
+    use crate::arm64::{Granule, PaSize, Stage2Regime, StartLevel};
+
+    if ste.len() < STE_WORDS {
+        return None;
+    }
+    if decode(ste[0]) != StreamVerdict::Stage2Only {
+        return None;
+    }
+    let w2 = ste[2];
+    if w2 & STE2_S2AA64 == 0 {
+        return None;
+    }
+    // Only the 4 KiB encoding is emitted, so only it is read back (see `stage2_ste`).
+    if (w2 >> STE2_S2TG_SHIFT) & 0b11 != 0b00 {
+        return None;
+    }
+    let regime = Stage2Regime {
+        granule: Granule::K4,
+        ipa_bits: 64 - (((w2 >> STE2_S2T0SZ_SHIFT) & 0x3f) as u32),
+        start_level: StartLevel::from_sl0((w2 >> STE2_S2SL0_SHIFT) & 0b11)?,
+        pa_size: PaSize::from_ps((w2 >> STE2_S2PS_SHIFT) & 0b111)?,
+        walk_shareability: (w2 >> STE2_S2SH0_SHIFT) & 0b11,
+        walk_inner: (w2 >> STE2_S2IR0_SHIFT) & 0b11,
+        walk_outer: (w2 >> STE2_S2OR0_SHIFT) & 0b11,
+    };
+    if !regime.valid() {
+        return None;
+    }
+    Some(Stage2Binding {
+        s2ttb: ste[3] & STE3_S2TTB_MASK,
+        vmid: (w2 & STE2_S2VMID_MASK) as u16,
+        regime,
+    })
+}
+
+/// The binding `sid` reaches memory through, or `None` if it reaches none.
+///
+/// The device-path analogue of "which `VTTBR_EL2` is installed", and the predicate the
+/// stream→domain binding property is stated over: after binding `sid` to domain `D`, this must
+/// answer `D` for `sid` and `None` for every other StreamID.
+#[must_use]
+pub fn stage2_binding_at(words: &[u64], log2size: u32, sid: u32) -> Option<Stage2Binding> {
+    let off = entry_offset(words.len(), log2size, sid)?;
+    decode_stage2_binding(&words[off..off + STE_WORDS])
+}
+
+/// Bind `sid` to a domain: install the stage-2 STE for `b`.
+///
+/// Refuses — writing nothing — for the same reasons [`bind`] does, plus every [`SteError`]. Both
+/// classes are fail-closed and for one reason: a partially-written or truncated binding is not a
+/// weaker permission, it is a **different domain's memory**.
+pub fn bind_stage2(
+    words: &mut [u64],
+    log2size: u32,
+    sid: u32,
+    b: &Stage2Binding,
+) -> Result<(), StreamTableError> {
+    let ste = stage2_ste(b).map_err(StreamTableError::BadBinding)?;
+    bind(words, log2size, sid, ste)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +712,96 @@ mod tests {
         // constructor produces and which therefore has no other test.
         assert_eq!(decode(STE_V), StreamVerdict::ConfigAbort);
         assert_eq!(decode(STE_V | (0b011 << 1)), StreamVerdict::ConfigAbort);
+    }
+
+    /// The rung-3 binding: a domain's table, a domain's VMID, the CPU's own regime.
+    fn binding(s2ttb: u64, vmid: u16) -> Stage2Binding {
+        Stage2Binding {
+            s2ttb,
+            vmid,
+            regime: crate::arm64::BALEEN_STAGE2,
+        }
+    }
+
+    #[test]
+    fn a_stage2_bind_names_exactly_one_domain() {
+        let mut t = table();
+        let d = binding(0x4010_0000, 1);
+        bind_stage2(&mut t, LOG2, 8, &d).unwrap();
+        assert_eq!(verdict(&t, LOG2, 8), StreamVerdict::Stage2Only);
+        assert!(verdict(&t, LOG2, 8).permits());
+        // The whole point of rung 3: permitted, and NOT unconfined.
+        assert!(!verdict(&t, LOG2, 8).stage2_unconfined());
+        assert_eq!(stage2_binding_at(&t, LOG2, 8), Some(d));
+        // Every other stream still reaches nothing at all.
+        assert_eq!(stage2_binding_at(&t, LOG2, 9), None);
+        assert_eq!(verdict(&t, LOG2, 9), StreamVerdict::Invalid);
+        assert_eq!(permitted_stream_count(&t, LOG2), 1);
+    }
+
+    #[test]
+    fn rebinding_replaces_the_domain_completely() {
+        let mut t = table();
+        bind_stage2(&mut t, LOG2, 8, &binding(0x4010_0000, 1)).unwrap();
+        let other = binding(0x4020_0000, 2);
+        bind_stage2(&mut t, LOG2, 8, &other).unwrap();
+        assert_eq!(stage2_binding_at(&t, LOG2, 8), Some(other));
+        assert_eq!(permitted_stream_count(&t, LOG2), 1);
+        // …and unbinding is still the true inverse.
+        unbind(&mut t, LOG2, 8).unwrap();
+        assert_eq!(stage2_binding_at(&t, LOG2, 8), None);
+        assert!(denies_every_stream(&t, LOG2));
+    }
+
+    #[test]
+    fn a_binding_that_cannot_be_named_exactly_is_refused() {
+        let mut t = table();
+        // Under-aligned: the field would name a DIFFERENT table.
+        assert_eq!(
+            bind_stage2(&mut t, LOG2, 8, &binding(0x4010_0040, 1)),
+            Err(StreamTableError::BadBinding(SteError::UnalignedTable))
+        );
+        // Beyond the field.
+        assert_eq!(
+            bind_stage2(&mut t, LOG2, 8, &binding(1 << 52, 1)),
+            Err(StreamTableError::BadBinding(SteError::TableAddressTooLarge))
+        );
+        // A granule whose `S2TG` encoding this crate does not state.
+        let mut regime = crate::arm64::BALEEN_STAGE2;
+        regime.granule = crate::arm64::Granule::K64;
+        regime.ipa_bits = 43;
+        regime.start_level = crate::arm64::StartLevel::L1;
+        assert!(
+            regime.valid(),
+            "the regime itself is fine — the ENCODING is not"
+        );
+        assert_eq!(
+            stage2_ste(&Stage2Binding {
+                s2ttb: 0x4010_0000,
+                vmid: 1,
+                regime
+            }),
+            Err(SteError::GranuleNotEmitted)
+        );
+        // Every refusal left the table denying.
+        assert!(denies_every_stream(&t, LOG2));
+    }
+
+    #[test]
+    fn the_stage2_entry_carries_the_fields_the_smmu_reads() {
+        let ste = stage2_ste(&binding(0x4010_0000, 1)).unwrap();
+        // Config = 0b110, valid.
+        assert_eq!(ste[0], 1 | (0b110 << 1));
+        // Word 2's stage-2 configuration is the same 19-bit picture `VTCR_EL2[18:0]` paints, at
+        // bit 32 — the agreement `hv-verify` proves for every regime.
+        let vtcr =
+            crate::arm64::vtcr_el2(&crate::arm64::BALEEN_STAGE2, crate::arm64::BALEEN_VMID_BITS)
+                .unwrap();
+        assert_eq!((ste[2] >> 32) & 0x7_ffff, vtcr & 0x7_ffff);
+        assert_eq!(ste[2] & 0xffff, 1, "S2VMID");
+        assert_ne!(ste[2] & (1 << 58), 0, "S2R: faults must be RECORDED");
+        assert_eq!(ste[2] & (1 << 57), 0, "S2S: never stall");
+        assert_eq!(ste[3], 0x4010_0000);
     }
 
     #[test]

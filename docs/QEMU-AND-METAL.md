@@ -64,23 +64,31 @@ microarchitectural. It does **not** model:
 
 3. **DMA / SMMU (IOMMU) isolation — CORRECTED 2026-07-28, and the correction matters.** The Stage-2
    proof and its QEMU refinement cover **CPU-initiated** accesses; a device performing DMA bypasses
-   Stage-2 entirely unless the SMMU is configured, and that remains a *separate* isolation mechanism
+   Stage-2 entirely unless the SMMU is configured, and it is a *separate* isolation mechanism
    `hv-core` does not model. What this section used to say beyond that — that QEMU "barely stresses"
    the SMMU and gives only false comfort — **was wrong, and it went unchallenged for several arcs.**
    QEMU `virt` with `iommu=smmuv3` instantiates a real SMMUv3 at `0x9050000` that is EL2-reachable,
    coexists with `virtualization=on`, and **implements stage-2** (`IDR0 = 0x0d44101b`, `S1P|S2P`, read
-   first-hand from the device). Two rungs of genuine DMA isolation are now witnessed on it: rung 1
-   (PR #91) closes the pre-enable `GBPA` bypass window, and rung 2 installs an all-deny stream table
-   with a five-phase witness in which a real bus master's DMA gets *through* a deliberately-configured
-   STE and is *aborted* without one (`docs/SMMU-STREAM-TABLE.md`).
+   first-hand from the device). Three rungs of genuine DMA isolation are now witnessed on it: rung 1
+   (PR #91) closes the pre-enable `GBPA` bypass window; rung 2 (PR #92) installs an all-deny stream
+   table with a five-phase witness in which a real bus master's DMA gets *through* a
+   deliberately-configured STE and is *aborted* without one (`docs/SMMU-STREAM-TABLE.md`); and rung 3
+   **translates** — the device is bound to a domain's own `p2m`-derived Stage-2 tables, and QEMU
+   models the walk faithfully enough that the DMA lands at the address the *table* names rather than
+   the one the device issued, faults `F_TRANSLATION` on an IPA the domain does not own, and faults
+   `F_PERMISSION` on a leaf the emitter marked read-only (`docs/SMMU-TRANSLATION.md`).
 
    The honest residue is narrower than the old text and worth stating precisely: QEMU is a
    **functional** model of the SMMU, so it validates the *configuration logic* (which StreamID gets
-   which entry, in which order, with which invalidation) and not the silicon. It is also *more
-   forgiving* in places — it aligns `STRTAB_BASE` down to the table size itself, so a mis-aligned base
-   that would be truncated to a different table on hardware works fine here. That is why the
-   architectural alignment is pinned by a compile-time assertion rather than trusted to the boot test.
-   "QEMU cannot validate SMMU isolation at all" is not a claim this project can make any more.
+   which entry, pointing at which tables, in which order, with which invalidation) and not the
+   silicon. It is also *more forgiving* in places — it aligns `STRTAB_BASE` down to the table size
+   itself, so a mis-aligned base that would be truncated to a different table on hardware works fine
+   here. That is why the architectural alignment is pinned by a compile-time assertion rather than
+   trusted to the boot test. Two rung-3 mutations likewise produced **no** behavioural change, and are
+   recorded as platform findings rather than as passing checks: a wrong `STE.S2VMID` (VMID tagging is
+   not exhibited by cold walks) and a removed `CMD_TLBI_NSNH_ALL`. "QEMU cannot validate SMMU
+   isolation at all" is not a claim this project can make any more; "a green QEMU run witnesses the
+   SMMU's *VMID tagging* or its *TLB maintenance*" is not one it can make either.
 
 4. **Errata and IMPLEMENTATION-DEFINED behavior.** QEMU implements one clean interpretation of the
    architecture; real SoCs carry silicon errata and IMPDEF corners (feature registers, cache line

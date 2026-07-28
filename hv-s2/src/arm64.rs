@@ -857,6 +857,404 @@ pub fn vttbr(l1_pa: u64, vmid: u64) -> u64 {
     l1_pa | (vmid << 48)
 }
 
+/// The start-level table base a `VTTBR_EL2` value names — `BADDR`, bits `[47:0]`.
+///
+/// The **decode seam** for [`vttbr`], and it exists for rung 3: the SMMU is handed a domain's table
+/// through `STE.S2TTB`, and the only way to say "the *same* table the CPU walks" without a second
+/// derivation is to read it back out of the `VTTBR_EL2` value the CPU would be given. A wrong answer
+/// here is a device bound to some other domain's memory, so it is a seam, not an accessor.
+#[must_use]
+pub const fn vttbr_table(vttbr: u64) -> u64 {
+    vttbr & 0x0000_ffff_ffff_ffff
+}
+
+/// The `VMID` a `VTTBR_EL2` value carries, **masked to the width the regime tags with**.
+///
+/// The masking is the point, not tidiness: this is how the device side gets its VMID, so the value
+/// an STE is given is by construction the value the CPU is actually tagging with — see [`VmidBits`].
+#[must_use]
+pub const fn vttbr_vmid(vttbr: u64, bits: VmidBits) -> u16 {
+    (((vttbr >> 48) as u32) & (bits.count() - 1)) as u16
+}
+
+// ─── The stage-2 translation REGIME — one derivation, two walkers (SMMU arc, rung 3) ─────────────
+//
+// Everything above this line is about the *table*. This section is about the **parameters a walker
+// reads it under**: granule, input-address size, start level, output-address size, and the
+// attributes the walk's own fetches use. Until rung 3 there was exactly one walker (the CPU, via
+// `VTCR_EL2`) and those parameters could live as a magic constant in `hv-metal`. Rung 3 points the
+// SMMU at the *same* tables, and the SMMU takes its parameters from the **STE**, not from
+// `VTCR_EL2`.
+//
+// Two walkers reading one table under DIFFERENT parameters is not a degraded translation — it is a
+// different translation. A start level one off makes the walker read leaf descriptors as table
+// descriptors; a granule one off makes it index with the wrong field of the address. Either way the
+// device reaches memory the table never authorized, which is exactly the failure this arc exists to
+// exclude. So the parameters become ONE derivation ([`Stage2Regime`]) with two INDEPENDENT
+// encodings — `VTCR_EL2` here, `STE` word 2 in [`crate::smmu`] — and `hv-verify` proves the two
+// decode to the same regime (design-lesson #36, and GAP-A's repair of exactly this shape).
+
+/// The translation granule — the leaf page size, and with it the number of address bits each level
+/// of the walk consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Granule {
+    /// 4 KiB pages, 9 bits per level. **The only granule baleen emits**, and the only one whose
+    /// `STE.S2TG` encoding this crate is willing to state (see [`crate::smmu::stage2_ste`]).
+    K4,
+    /// 16 KiB pages, 11 bits per level.
+    K16,
+    /// 64 KiB pages, 13 bits per level.
+    K64,
+}
+
+impl Granule {
+    /// Bits of the address consumed by the page offset: `log2(granule)`.
+    #[must_use]
+    pub const fn page_bits(self) -> u32 {
+        match self {
+            Self::K4 => 12,
+            Self::K16 => 14,
+            Self::K64 => 16,
+        }
+    }
+
+    /// Bits of the address resolved by ONE level of the walk — a table holds `granule / 8`
+    /// descriptors, so this is `page_bits - 3`.
+    #[must_use]
+    pub const fn level_bits(self) -> u32 {
+        self.page_bits() - 3
+    }
+
+    /// `VTCR_EL2.TG0` — **the AArch64 `TG0` encoding**: `0b00` = 4 KiB, `0b01` = 64 KiB, `0b10` =
+    /// 16 KiB. Note the order: 64 KiB before 16 KiB. `STE.S2TG` is a *different* field with its own
+    /// encoding, which is the whole reason this type exists rather than a raw 2-bit value being
+    /// copied from one register to the other.
+    #[must_use]
+    pub const fn tg0(self) -> u64 {
+        match self {
+            Self::K4 => 0b00,
+            Self::K64 => 0b01,
+            Self::K16 => 0b10,
+        }
+    }
+
+    /// The inverse of [`tg0`](Self::tg0). `None` for the reserved `0b11`.
+    #[must_use]
+    pub const fn from_tg0(v: u64) -> Option<Self> {
+        match v {
+            0b00 => Some(Self::K4),
+            0b01 => Some(Self::K64),
+            0b10 => Some(Self::K16),
+            _ => None,
+        }
+    }
+}
+
+/// The level the walk starts at. Numbered as the architecture does: level 0 is the coarsest, level 3
+/// resolves the leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartLevel {
+    L0,
+    L1,
+    L2,
+    L3,
+}
+
+impl StartLevel {
+    /// The level as a number, so the span arithmetic reads like the architecture's.
+    #[must_use]
+    pub const fn number(self) -> u32 {
+        match self {
+            Self::L0 => 0,
+            Self::L1 => 1,
+            Self::L2 => 2,
+            Self::L3 => 3,
+        }
+    }
+
+    /// `VTCR_EL2.SL0` / `STE.S2SL0` — the two fields share this encoding (`0b00` = level 2, `0b01` =
+    /// level 1, `0b10` = level 0, `0b11` = level 3), and it is deliberately NOT the level number.
+    #[must_use]
+    pub const fn sl0(self) -> u64 {
+        match self {
+            Self::L2 => 0b00,
+            Self::L1 => 0b01,
+            Self::L0 => 0b10,
+            Self::L3 => 0b11,
+        }
+    }
+
+    /// The inverse of [`sl0`](Self::sl0). Total — every 2-bit value names a level.
+    #[must_use]
+    pub const fn from_sl0(v: u64) -> Option<Self> {
+        match v {
+            0b00 => Some(Self::L2),
+            0b01 => Some(Self::L1),
+            0b10 => Some(Self::L0),
+            0b11 => Some(Self::L3),
+            _ => None,
+        }
+    }
+
+    /// How many address bits a walk starting here can resolve at `granule`: the page offset plus one
+    /// level's worth of index for each level from here to the leaf.
+    ///
+    /// This is what makes "the start level must match the input-address size" checkable rather than
+    /// conventional — see [`Stage2Regime::valid`].
+    #[must_use]
+    pub const fn span(self, granule: Granule) -> u32 {
+        granule.page_bits() + (3 - self.number()) * granule.level_bits() + granule.level_bits()
+    }
+}
+
+/// The output (physical) address size, as the shared `PARange` encoding both `VTCR_EL2.PS` and
+/// `STE.S2PS` use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaSize {
+    B32,
+    B36,
+    B40,
+    B42,
+    B44,
+    B48,
+    B52,
+}
+
+impl PaSize {
+    /// The 3-bit `PARange` encoding, shared by `VTCR_EL2.PS` and `STE.S2PS`.
+    #[must_use]
+    pub const fn ps(self) -> u64 {
+        match self {
+            Self::B32 => 0b000,
+            Self::B36 => 0b001,
+            Self::B40 => 0b010,
+            Self::B42 => 0b011,
+            Self::B44 => 0b100,
+            Self::B48 => 0b101,
+            Self::B52 => 0b110,
+        }
+    }
+
+    /// The inverse of [`ps`](Self::ps). `None` for the reserved `0b111`.
+    #[must_use]
+    pub const fn from_ps(v: u64) -> Option<Self> {
+        match v {
+            0b000 => Some(Self::B32),
+            0b001 => Some(Self::B36),
+            0b010 => Some(Self::B40),
+            0b011 => Some(Self::B42),
+            0b100 => Some(Self::B44),
+            0b101 => Some(Self::B48),
+            0b110 => Some(Self::B52),
+            _ => None,
+        }
+    }
+}
+
+/// How many bits of `VMID` the CPU regime tags TLB entries with — `VTCR_EL2.VS`.
+///
+/// **Deliberately not part of [`Stage2Regime`], and the reason is a finding rather than a
+/// preference.** The STE's `S2VMID` field is *always* 16 bits and the entry has no `VS` — so the
+/// width is a property of the CPU's configuration that an STE cannot carry, and a `Stage2Regime`
+/// containing it could not round-trip through an entry. The first draft did contain it, and the
+/// ∀-regime agreement proof failed on exactly that: a 16-bit-VMID regime encoded into an STE decodes
+/// back as an 8-bit one, so "the two walkers share one regime" was false as stated.
+///
+/// The coupling it was there to enforce — a hypervisor tagging 8-bit on the CPU must not hand the
+/// SMMU a 16-bit VMID, or two domains alias under truncation — is instead enforced at the
+/// *derivation*: [`vttbr_vmid`] masks to this width, and the metal obtains the VMID it binds by
+/// reading it back out of the domain's `VTTBR_EL2`. A value that does not fit cannot be obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmidBits {
+    B8,
+    B16,
+}
+
+impl VmidBits {
+    /// `VTCR_EL2.VS` — `0` = 8-bit VMIDs, `1` = 16-bit.
+    #[must_use]
+    pub const fn vs(self) -> u64 {
+        match self {
+            Self::B8 => 0,
+            Self::B16 => 1,
+        }
+    }
+
+    /// The number of distinct VMIDs the regime can express.
+    #[must_use]
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::B8 => 1 << 8,
+            Self::B16 => 1 << 16,
+        }
+    }
+}
+
+/// The full parameter set of an AArch64 **stage-2** translation regime — the thing a walker needs
+/// besides the table itself.
+///
+/// One value, two encodings: [`vtcr_el2`] for the CPU and [`crate::smmu::stage2_ste`] for the SMMU.
+/// Neither is derived from the other; `hv-verify` proves they agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage2Regime {
+    /// Leaf page size.
+    pub granule: Granule,
+    /// Input-address (IPA) size in bits — `T0SZ = 64 - ipa_bits`.
+    pub ipa_bits: u32,
+    /// The level the walk starts at.
+    pub start_level: StartLevel,
+    /// Output-address size.
+    pub pa_size: PaSize,
+    /// `SH0`/`S2SH0` — shareability of the walk's own table fetches. `0b11` = inner-shareable.
+    pub walk_shareability: u64,
+    /// `IRGN0`/`S2IR0` — inner cacheability of the walk's own fetches. `0b01` = write-back
+    /// write-allocate.
+    pub walk_inner: u64,
+    /// `ORGN0`/`S2OR0` — outer cacheability of the walk's own fetches.
+    pub walk_outer: u64,
+}
+
+impl Stage2Regime {
+    /// Whether this regime is one a walker can actually be configured with.
+    ///
+    /// The interesting clause is the **start level**: a walk starting at a level that cannot span
+    /// `ipa_bits` resolves the wrong address bits at the wrong level, and one that could have started
+    /// lower means the top level's table is mostly empty — the architecture pins the pairing, and
+    /// this is where the pairing becomes checkable. Baleen emits a single table per level (no
+    /// **concatenated** start-level tables), so the requirement is exact: the start level must span
+    /// the IPA size, and the next level down must NOT.
+    #[must_use]
+    pub const fn valid(&self) -> bool {
+        let span = self.start_level.span(self.granule);
+        let lower = span - self.granule.level_bits();
+        // `T0SZ` is a 6-bit field and the architecture bounds stage-2 input sizes; the low bound is
+        // what stops a "regime" whose start level is below the page offset.
+        self.ipa_bits <= 48
+            && self.ipa_bits > self.granule.page_bits()
+            && self.ipa_bits <= span
+            && self.ipa_bits > lower
+            && self.walk_shareability <= 0b11
+            && self.walk_inner <= 0b11
+            && self.walk_outer <= 0b11
+    }
+
+    /// `T0SZ` / `S2T0SZ` — the shared "input size" encoding, as a *shrink* from 64 bits.
+    #[must_use]
+    pub const fn t0sz(&self) -> u64 {
+        64 - self.ipa_bits as u64
+    }
+
+    /// The alignment the start-level table's base must have — and therefore the alignment `VTTBR_EL2`
+    /// and `STE.S2TTB` must be handed.
+    ///
+    /// The start-level table holds one descriptor per address bit the start level resolves that the
+    /// IPA size actually uses, so its size (and hence its alignment) follows from the regime rather
+    /// than from a convention. An under-aligned base is *truncated* by both registers rather than
+    /// rejected — the same silent failure `STRTAB_BASE` has (design-lesson #72) — so the requirement
+    /// is stated here, where both consumers can check against it.
+    #[must_use]
+    pub const fn table_align(&self) -> u64 {
+        let lower = self.start_level.span(self.granule) - self.granule.level_bits();
+        // Entries needed at the start level: one per distinct value of the address bits above what
+        // the next level down resolves. 8 bytes each.
+        let entries = 1u64 << (self.ipa_bits - lower);
+        let size = entries * 8;
+        // The architecture floors the table (and so its alignment) at 64 bytes.
+        if size < 64 {
+            64
+        } else {
+            size
+        }
+    }
+}
+
+/// **The regime baleen runs.** 4 KiB granule, 39-bit IPA, start level 1, 40-bit output, inner-shareable
+/// write-back walks, 8-bit VMIDs.
+///
+/// This is the single declaration of what used to be `hv-metal`'s `VTCR_EL2 = 0x8002_3559` literal.
+/// It is here rather than there because rung 3 gave it a **second consumer**: the SMMU walks the same
+/// tables under the STE's copy of these parameters, and a second literal would be a second
+/// derivation of the thing that must not differ.
+pub const BALEEN_STAGE2: Stage2Regime = Stage2Regime {
+    granule: Granule::K4,
+    ipa_bits: 39,
+    start_level: StartLevel::L1,
+    pa_size: PaSize::B40,
+    walk_shareability: 0b11,
+    walk_inner: 0b01,
+    walk_outer: 0b01,
+};
+
+/// The VMID width baleen tags with — 8 bits (`VTCR_EL2.VS = 0`), as every phase since M5 Arc 2 has.
+/// See [`VmidBits`] for why this is not inside [`BALEEN_STAGE2`].
+pub const BALEEN_VMID_BITS: VmidBits = VmidBits::B8;
+
+/// `VTCR_EL2.RES1` — bit 31, one on every implementation.
+const VTCR_RES1: u64 = 1 << 31;
+
+/// The `VTCR_EL2` value for `regime` — the **CPU's** encoding of it.
+///
+/// `None` for a regime no walker can be configured with ([`Stage2Regime::valid`]). Refusing rather
+/// than encoding a truncated field is the same ruling as [`crate::smmu::strtab_base_cfg`]'s: a
+/// silently-narrowed input size is a walker that reads a different table than the one intended.
+///
+/// `DS` (bit 32) stays clear, so the classic (non-LPA2) descriptor format the [`encode`] leaf
+/// encodings assume is in force; `HA`/`HD` stay clear (no hardware access-flag management).
+/// A `const fn` so the metal can resolve its `VTCR_EL2` at **compile time** from the shared regime:
+/// a regime that cannot be encoded must break the build, not degrade into a runtime fallback that
+/// configures the CPU with something nobody chose.
+#[must_use]
+pub const fn vtcr_el2(regime: &Stage2Regime, vmid_bits: VmidBits) -> Option<u64> {
+    if !regime.valid() {
+        return None;
+    }
+    Some(
+        VTCR_RES1
+            | (regime.pa_size.ps() << 16)
+            | (vmid_bits.vs() << 19)
+            | (regime.granule.tg0() << 14)
+            | (regime.walk_shareability << 12)
+            | (regime.walk_outer << 10)
+            | (regime.walk_inner << 8)
+            | (regime.start_level.sl0() << 6)
+            | regime.t0sz(),
+    )
+}
+
+/// Read a `VTCR_EL2` value back as a regime — the **decode seam**, written against the field
+/// definitions and not derived from [`vtcr_el2`].
+///
+/// `None` if the value is not one this crate would have emitted: a reserved granule or `PARange`, a
+/// missing `RES1`, an `LPA2` (`DS`) regime whose descriptor format the encoder does not speak, or an
+/// input size the start level cannot span. Keeping the decode independent is what makes the
+/// round-trip proof — and the STE-agrees-with-`VTCR` proof — statements about two seams rather than
+/// one seam told twice.
+#[must_use]
+pub fn decode_vtcr_el2(v: u64) -> Option<(Stage2Regime, VmidBits)> {
+    if v & VTCR_RES1 == 0 || v & (1 << 32) != 0 {
+        return None;
+    }
+    let regime = Stage2Regime {
+        granule: Granule::from_tg0((v >> 14) & 0b11)?,
+        ipa_bits: 64 - ((v & 0x3f) as u32),
+        start_level: StartLevel::from_sl0((v >> 6) & 0b11)?,
+        pa_size: PaSize::from_ps((v >> 16) & 0b111)?,
+        walk_shareability: (v >> 12) & 0b11,
+        walk_outer: (v >> 10) & 0b11,
+        walk_inner: (v >> 8) & 0b11,
+    };
+    let vmid_bits = if (v >> 19) & 1 == 0 {
+        VmidBits::B8
+    } else {
+        VmidBits::B16
+    };
+    if regime.valid() {
+        Some((regime, vmid_bits))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1105,6 +1503,60 @@ mod tests {
     fn vttbr_carries_the_vmid() {
         assert_eq!(vttbr(0x4010_0000, 1), 0x0001_0000_4010_0000);
         assert_eq!(vttbr(0x4010_0000, 2), 0x0002_0000_4010_0000);
+    }
+
+    /// **The golden `VTCR_EL2`.** `0x8002_3559` is the literal `hv-metal` ran from Arc 4 until rung 3
+    /// moved the parameters here. Pinned as a value, not re-derived from the encoder, so that
+    /// factoring the constant into a `Stage2Regime` cannot have changed one bit of what the CPU is
+    /// configured with — the refactor is required to be *behaviour-nil* on the CPU path.
+    #[test]
+    fn the_deployed_regime_encodes_to_the_vtcr_the_metal_has_always_run() {
+        assert_eq!(
+            vtcr_el2(&BALEEN_STAGE2, BALEEN_VMID_BITS),
+            Some(0x8002_3559)
+        );
+        assert_eq!(
+            decode_vtcr_el2(0x8002_3559),
+            Some((BALEEN_STAGE2, BALEEN_VMID_BITS))
+        );
+    }
+
+    #[test]
+    fn the_regime_pins_the_start_level_to_the_input_size() {
+        // 39-bit IPA at a 4 KiB granule is exactly a level-1 start: level 2 spans only 30 bits, and
+        // level 0 would leave the top table with a single live entry.
+        assert_eq!(StartLevel::L1.span(Granule::K4), 39);
+        assert_eq!(StartLevel::L2.span(Granule::K4), 30);
+        assert_eq!(StartLevel::L0.span(Granule::K4), 48);
+        assert!(BALEEN_STAGE2.valid());
+        let mut wrong = BALEEN_STAGE2;
+        wrong.start_level = StartLevel::L2;
+        assert!(!wrong.valid(), "a start level that cannot span the IPA");
+        assert_eq!(vtcr_el2(&wrong, BALEEN_VMID_BITS), None);
+        wrong.start_level = StartLevel::L0;
+        assert!(!wrong.valid(), "a start level with a level to spare");
+    }
+
+    #[test]
+    fn the_start_level_table_alignment_is_derived_not_conventional() {
+        // The metal's `Table` is 4 KiB aligned; the regime is what says it must be.
+        assert_eq!(BALEEN_STAGE2.table_align(), 4096);
+        let mut narrow = BALEEN_STAGE2;
+        narrow.ipa_bits = 31;
+        assert!(narrow.valid());
+        // A 31-bit IPA needs only two level-1 entries — but the architecture floors the table at 64 B.
+        assert_eq!(narrow.table_align(), 64);
+    }
+
+    #[test]
+    fn the_granule_and_level_encodings_are_not_the_numbers_they_name() {
+        // The two traps this type exists to keep out of raw 2-bit copies.
+        assert_eq!(Granule::K64.tg0(), 0b01);
+        assert_eq!(Granule::K16.tg0(), 0b10);
+        assert_eq!(StartLevel::L1.sl0(), 0b01);
+        assert_eq!(StartLevel::L0.sl0(), 0b10);
+        assert_eq!(Granule::from_tg0(0b11), None);
+        assert_eq!(PaSize::from_ps(0b111), None);
     }
 
     /// A representative encoded fixture: `(leaves, layout, l1, l2_code, l2_data, l3_data)`.

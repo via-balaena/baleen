@@ -272,7 +272,16 @@ pub extern "C" fn rust_main() -> ! {
     //      differ only in one 64-byte entry. The FIRST of them is the through-STE positive control
     //      (bind the device's own StreamID to a bypass entry; the DMA must LAND), because an
     //      ∀-StreamID deny is satisfied trivially by a device that never reaches the table at all.
-    //      Translation proper (`STE.S2TTB` at the `p2m`-derived tables + the domain's VMID) is rung 3.
+    //
+    //      RUNG 3 follows it in the same boot: the device is bound to a DOMAIN — `STE.Config = 0b110`
+    //      with `S2TTB` at the very Stage-2 tables `build_stage2_from_p2m` emitted for that domain
+    //      from the proven `p2m`, under its VMID — so for the first time the hypervisor constrains
+    //      WHERE a permitted device may write. One proven `p2m`, two consumers. Its control is
+    //      stronger than rung 2's and again comes first: the DMA must land at the address the TABLE
+    //      names and NOT at the address the device asked for, both read back. Then confinement (an
+    //      IPA the domain does not own faults), permission (the emitter's read-only leaf refuses the
+    //      DEVICE's write), and the binding itself (the same device, the same address, an STE naming
+    //      the other domain, reaches nothing of the first domain's).
     dmawitness::witness(&mut uart);
 
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven

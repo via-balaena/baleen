@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # SMMUv3 — closing the DMA window, then the stream table (the SMMU arc, rungs 1–2)
+//! # SMMUv3 — closing the DMA window, the stream table, then translation (the SMMU arc, rungs 1–3)
 //!
 //! Stage-2 constrains the **CPU** and says nothing about **bus masters**. Every isolation property
 //! baleen proves — the p2m refinement, the VMID-tagged address spaces, the whole Tier-D
@@ -48,11 +48,17 @@
 //! written, and `GBPA.ABORT` covers everything before that — so there is no instant, from reset to
 //! translating, in which a bus master would be let through.
 //!
-//! **Not here (rung 3):** translation proper — `STE.Config = 0b110` with `S2TTB` pointing at the
-//! `p2m`-derived Stage-2 tables under the domain's `S2VMID`, which is where `hv-s2`'s existing
-//! ∀-address refinement starts carrying the device path for free (the theorem constrains the *table*,
-//! not the *walker*). Everything rung 2 permits, it permits **unconfined** — a bypass STE is a path
-//! witness, never an isolation configuration.
+//! ## What rung 3 adds: the device is bound to a DOMAIN
+//!
+//! Everything rung 2 permits, it permits **unconfined** — a bypass STE is a path witness, never an
+//! isolation configuration. [`bind_stream_stage2`] is the configuration: `STE.Config = 0b110` with
+//! `S2TTB` pointing at the `p2m`-derived Stage-2 tables `crate::stage2` emitted for a domain, under
+//! that domain's `S2VMID`, both read back out of the `VTTBR_EL2` value the domain's CPU would be
+//! given. `hv-s2`'s ∀-address refinement then carries the device path for free (the theorem
+//! constrains the *table*, not the *walker*), and this module keeps only the new hardware
+//! obligation: a second invalidation ([`CMD_TLBI_NSNH_ALL`]) so a stream rebound to a different
+//! domain cannot be answered from translations cached for the previous one. See
+//! `docs/SMMU-TRANSLATION.md`.
 //!
 //! ## Unsafe
 //!
@@ -149,12 +155,28 @@ const CR2_RECINVSID: u32 = 1 << 1;
 
 /// Command opcodes (`CMD_*[7:0]`).
 const CMD_CFGI_STE: u64 = 0x03;
+/// `CMD_TLBI_NSNH_ALL` — invalidate every non-secure, non-hyp TLB entry, all VMIDs.
+///
+/// The device path's analogue of `enable_stage2`'s `tlbi vmalls12e1is`, and rung 3's reason for
+/// existing: an STE rebound to a *different* domain's tables while the SMMU still holds translations
+/// cached from the previous one would answer with the old domain's memory. The blunt all-VMIDs form
+/// is chosen deliberately over `CMD_TLBI_S2_IPA` — baleen rebinds whole streams rather than editing
+/// live tables, so there is no per-address invalidation to be precise about, and a *narrower*
+/// invalidation that missed would be indistinguishable from correct behaviour on a machine that
+/// caches nothing.
+const CMD_TLBI_NSNH_ALL: u64 = 0x30;
 const CMD_SYNC: u64 = 0x46;
 
 /// Event-record types this module names. `C_BAD_STE` is what a zeroed (`V == 0`) entry produces and
 /// is therefore the deny witness's expected reason; `C_BAD_STREAMID` is the out-of-range arm.
 pub(crate) const EVT_C_BAD_STREAMID: u8 = 0x02;
 pub(crate) const EVT_C_BAD_STE: u8 = 0x04;
+/// `F_TRANSLATION` — a stage-2 walk found no descriptor for the address the device asked for. The
+/// rung-3 confinement arm's expected reason: the domain's table does not map that IPA.
+pub(crate) const EVT_F_TRANSLATION: u8 = 0x10;
+/// `F_PERMISSION` — the walk found a descriptor and its `S2AP` refused the access. The rung-3
+/// permission arm: the proven emitter's read-only leaf governs the DEVICE too.
+pub(crate) const EVT_F_PERMISSION: u8 = 0x13;
 
 fn read32(off: u64) -> u32 {
     // SAFETY: a documented SMMUv3 register offset inside the `virt` machine's 128 KiB SMMU window —
@@ -592,6 +614,38 @@ pub(crate) fn bind_stream_bypass(sid: u32) -> bool {
     synced && permits_only_this
 }
 
+/// **Bind `sid` to a DOMAIN** — install the stage-2 STE for `binding` (SMMU rung 3).
+///
+/// The device now reaches memory only through the domain's own `p2m`-derived Stage-2 tables, under
+/// the domain's VMID: one proven `p2m`, two consumers. Where [`bind_stream_bypass`] permits a device
+/// to place its own addresses on memory, this constrains every one of them to the same relation the
+/// domain's CPU is held to.
+///
+/// Returns whether the entry was written, both invalidations completed, and the table reads back —
+/// **through the decode seam, not from the caller's copy** — as binding exactly this StreamID, to
+/// exactly this table, under exactly this VMID. That last clause is the check that can fail: a bind
+/// that truncated the table pointer or the VMID would satisfy "the stream is permitted" and fail
+/// this.
+pub(crate) fn bind_stream_stage2(sid: u32, binding: &st::Stage2Binding) -> bool {
+    let mut smmu = SMMU.borrow_mut();
+    if st::bind_stage2(&mut smmu.strtab.0, STRTAB_LOG2SIZE, sid, binding).is_err() {
+        return false;
+    }
+    publish();
+    // Both invalidations, in this order: the configuration cache (which STE this stream uses) and
+    // then the stage-2 TLB (what that STE's tables translated to last time).
+    let synced = invalidate_ste(&mut smmu, sid) && invalidate_s2_tlb(&mut smmu);
+    let reads_back = st::stage2_binding_at(&smmu.strtab.0, STRTAB_LOG2SIZE, sid) == Some(*binding);
+    let only_this = st::permitted_stream_count(&smmu.strtab.0, STRTAB_LOG2SIZE) == 1;
+    synced && reads_back && only_this
+}
+
+/// Invalidate every cached stage-2 translation. See [`CMD_TLBI_NSNH_ALL`].
+fn invalidate_s2_tlb(smmu: &mut Smmu) -> bool {
+    submit(smmu, CMD_TLBI_NSNH_ALL, 0);
+    sync(smmu)
+}
+
 /// Restore `sid`'s entry to the all-zero deny, and confirm the whole table denies again.
 pub(crate) fn unbind_stream(sid: u32) -> bool {
     let mut smmu = SMMU.borrow_mut();
@@ -609,6 +663,15 @@ pub(crate) struct SmmuEvent {
     pub(crate) kind: u8,
     /// The StreamID the faulting transaction carried.
     pub(crate) sid: u32,
+    /// The **input address** the faulting transaction carried (record word 2), i.e. the address the
+    /// device asked for.
+    ///
+    /// Only meaningful for the translation-fault classes (`F_TRANSLATION`, `F_PERMISSION`); a
+    /// configuration fault such as `C_BAD_STE` is raised before any address is translated. Collected
+    /// because it is the sharpest attribution rung 3 can get: the SMMU stating *which address* it
+    /// refused turns "the sentinel did not change" into "the walk of this domain's table refused
+    /// exactly the address the device put on the bus" (design-lesson #70(d)).
+    pub(crate) addr: u64,
     /// `EVENTQ_PROD` as read from the device, so a caller can tell "the queue produced nothing" from
     /// "the queue produced something this code failed to decode".
     pub(crate) prod: u32,
@@ -648,11 +711,14 @@ pub(crate) fn take_event() -> Option<SmmuEvent> {
     }
     let idx = (smmu.eventq_cons as usize) & (EVENTQ_ENTRIES - 1);
     let word0 = smmu.eventq.0[idx * 4];
+    // Word 2 of a 32-byte fault record is the transaction's input address (`InputAddr`).
+    let word2 = smmu.eventq.0[idx * 4 + 2];
     smmu.eventq_cons = smmu.eventq_cons.wrapping_add(1) & queue_mask(EVENTQ_LOG2SIZE);
     write32(SMMU_EVENTQ_CONS, smmu.eventq_cons);
     Some(SmmuEvent {
         kind: (word0 & 0xff) as u8,
         sid: (word0 >> 32) as u32,
+        addr: word2,
         prod,
     })
 }

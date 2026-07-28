@@ -363,14 +363,39 @@ boot_and_check "dma-control" "" \
 #   * OUT-OF-RANGE STREAMID — with the entry still saying BYPASS, announcing a 1-entry table puts the
 #     StreamID outside the range: ABORTED with C_BAD_STREAMID. The range check is what makes "size
 #     the table to bus 0" a stronger denial than a zeroed entry rather than a coverage gap.
+#
+# Rung 3 (TRANSLATION) runs in the same boot again, and needs one machine change: `-m 2048`. Its
+# control asserts the DMA landed where the TABLE says and NOT at the address the device asked for —
+# and the second half is only a check if that address is real memory. The addresses the device issues
+# are guest IPAs (`0x8000_0000 +`), which QEMU `virt`'s default 128 MiB does not back; on such a
+# machine "the device did not write there" would be true whatever the SMMU did. The metal seeds and
+# reads back every observed address before each transfer, so a wrong `-m` fails loudly rather than
+# passing vacuously — but the right `-m` is here.
+#
+#   * TRANSLATION POSITIVE CONTROL — StreamID bound to a domain's OWN Stage-2 tables (S2TTB = the
+#     table VTTBR_EL2 carries, S2VMID = the domain's VMID); the device asks for an IPA and the data
+#     arrives at a DIFFERENT physical address, the one a walk of the emitted descriptors names.
+#   * CONFINEMENT — an IPA the domain does not own: ABORTED, F_TRANSLATION naming that address.
+#   * PERMISSION — the read-only leaf hv-s2 emitted refuses the DEVICE's write (F_PERMISSION), so the
+#     proven emitter's permission bits govern the device path too.
+#   * STREAM-TO-DOMAIN BINDING — the same device, the same IPA, an STE naming the OTHER domain:
+#     aborted, and the first domain's memory untouched; that STE then reaches the other domain's own
+#     frame, and rebinding reaches the first's again.
+#   * RESTORED — unbound, and the table denies every StreamID again.
 MACHINE_EXTRA=",iommu=smmuv3"
+EXTRA_QEMU="-m 2048 -device edu,dma_mask=0xffffffffff"
 boot_and_check "smmu" "--features smmu" \
     "hv-metal alive" \
     "smmu rung1 DEFAULT-DENY OK" \
     "smmu rung2 THROUGH-STE POSITIVE CONTROL OK" \
     "smmu rung2 STREAM-TABLE DEFAULT-DENY OK" \
     "smmu rung2 STREAMID-SPECIFIC OK" \
-    "smmu rung2 OUT-OF-RANGE STREAMID OK"
+    "smmu rung2 OUT-OF-RANGE STREAMID OK" \
+    "smmu rung3 TRANSLATION POSITIVE CONTROL OK" \
+    "smmu rung3 CONFINEMENT OK" \
+    "smmu rung3 PERMISSION OK" \
+    "smmu rung3 STREAM-TO-DOMAIN BINDING OK" \
+    "smmu rung3 RESTORED OK"
 EXTRA_QEMU=""
 MACHINE_EXTRA=""
 
