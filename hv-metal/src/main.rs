@@ -264,7 +264,15 @@ pub extern "C" fn rust_main() -> ! {
     //      device's bus mastering, then proves it with a real bus master (QEMU's `edu`): its DMA over a
     //      sentinel is aborted. On a machine with no SMMU the same code is the POSITIVE CONTROL — the
     //      DMA must LAND, without which the abort result would be vacuous (design-lesson #66).
-    //      Translation through the `p2m`-derived tables + the ∀-StreamID stream-table deny is rung 2.
+    //
+    //      RUNG 2 follows in the same boot: a linear stream table covering every StreamID on PCIe
+    //      bus 0, every entry zeroed (`STE.V = 0` = deny), installed BEFORE `CR0.SMMUEN` so no
+    //      instant exists in which a bus master is admitted — the ∀-StreamID default-deny, proven
+    //      over the builder in `hv-verify::smmu_stream_table` and witnessed here in five phases that
+    //      differ only in one 64-byte entry. The FIRST of them is the through-STE positive control
+    //      (bind the device's own StreamID to a bypass entry; the DMA must LAND), because an
+    //      ∀-StreamID deny is satisfied trivially by a device that never reaches the table at all.
+    //      Translation proper (`STE.S2TTB` at the `p2m`-derived tables + the domain's VMID) is rung 3.
     dmawitness::witness(&mut uart);
 
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven

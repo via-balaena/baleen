@@ -139,9 +139,13 @@ hardware; platform tension).
   today (the proof covers CPU-initiated accesses only). New invariants + a new seam + Verus proofs
   for "a device assigned to VM-A cannot DMA into VM-B," then the implementation refined against it.
   Audit the DMA boundary as its own isolation surface.
-- **Flags:** forwarding = *plumbing*; passthrough = **extends the proof** *and* is the first phase
-  that genuinely **needs real hardware** — QEMU cannot validate SMMU/DMA isolation
-  (`docs/QEMU-AND-METAL.md`).
+- **Flags:** forwarding = *plumbing*; passthrough = **extends the proof**. It was also listed here as
+  the first phase that genuinely **needs real hardware**, on the premise that QEMU cannot validate
+  SMMU/DMA isolation. **That premise was false and is retracted** (2026-07-28): QEMU `virt` emulates a
+  stage-2-capable SMMUv3 that EL2 can drive, and two rungs of DMA default-deny are witnessed on it —
+  `GBPA.ABORT` before any bus master exists (PR #91), then an ∀-StreamID all-deny stream table with a
+  through-STE positive control (`docs/SMMU-STREAM-TABLE.md`). What hardware still buys is evidence on
+  *silicon*, not the arc itself; see `docs/QEMU-AND-METAL.md` item 3 for the narrowed residue.
 
 ### M8 — GPU acceleration: near-bare-metal disposables (the big pillar)
 - **See-it:** a disposable runs something GPU-heavy at near-native speed.
@@ -248,15 +252,17 @@ as the proofs.
   virtio-GPU acceleration, not passthrough. The honest cost: a large trusted host GPU driver and a
   genuinely hard GPU-memory confidentiality property. Highest value, highest risk.
 - **IOMMU / DMA isolation (M7)** — the security substrate for real device passthrough. It **extends
-  the proof** (new `hv-core` model + Verus) and is the first thing that **needs real hardware**. For
+  the proof** (new `hv-core` model + Verus). It is *no longer* blocked on hardware — the SMMU arc is
+  live and two rungs deep under QEMU (see M7 above). For
   the *described* workflow (a password stick, a backup drive) *forwarding may cover it entirely* — so
   the hard controller-passthrough tier might be optional for your actual use.
 
 ## Platform reality (name the fork)
 
 The Apple-Silicon dev machine is ideal for **M3–M6** (isolation, disposables, vault, input/GUI,
-near-metal CPU/RAM) — same-architecture, no cross-emulation, fast loop. But **M7 (DMA/IOMMU) and M8
-(accelerated GPU) pull toward x86 hardware with a standard open GPU**, the same territory Qubes
+near-metal CPU/RAM) — same-architecture, no cross-emulation, fast loop. **M7's SMMU substrate turned out to develop here too** (QEMU emulates a
+stage-2 SMMUv3; see the M7 section). But **M8 (accelerated GPU), and M7's controller passthrough on
+silicon, pull toward x86 hardware with a standard open GPU**, the same territory Qubes
 lives in — because Apple gates EL2 and Apple's GPU has no passthrough/virtualization path a
 hypervisor can use. So: build and demo the thesis on ARM through M6; expect a real-hardware, likely
 x86, phase for the two hard pillars. `hv-core` doesn't change across the fork (that is the whole
@@ -271,7 +277,7 @@ point of the `hv-hal` fence); only the metal layer does.
 | M4 Stage-2 gen | *refines* — real `p2m`→Stage-2 emitted + negative-isolation test PASSED; `GuestMemory` realized+honored (ARM); Audit #2 SOUND (`docs/AUDIT-2-P2M-STAGE2.md`) | no (QEMU-sound) |
 | M5 disposables + vault | *refines* (lifecycle + non-interference cashed in) | no (QEMU-sound) |
 | M6 input/GUI domain | *extends* (focus-integrity) + plumbing | no |
-| M7 DMA / IOMMU | **extends** (new `hv-core` DMA-isolation proof) | **yes** |
+| M7 DMA / IOMMU | **extends**; rungs 1–2 = SMMU default-deny, boot-witnessed + ∀-StreamID Kani over the stream-table builder (`docs/SMMU-STREAM-TABLE.md`). A `hv-core` DMA-isolation model is still absent | no for the *configuration* logic; **yes** for silicon |
 | M8 GPU memory | **extends** (GPU-memory non-interference) + big trusted driver | **yes** |
 
 Two standing caveats carry through every layer: the proofs cover the **model**, and the metal

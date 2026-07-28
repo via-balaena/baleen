@@ -1356,3 +1356,280 @@ mod stage2_device_region {
         );
     }
 }
+
+/// **∀-StreamID stream-table default-deny** — the SMMU arc, rung 2.
+///
+/// The device path's isolation decision is made in one place: the SMMUv3 **stream table**. A
+/// transaction carries a StreamID, the SMMU indexes the table with it, and the entry decides abort /
+/// bypass / translate. The property the rung is about is a universal one —
+///
+/// > ∀ StreamID: unless this hypervisor deliberately bound it, the transaction aborts
+///
+/// — over a space (2³² StreamIDs, 2⁶⁴ entry words) that no boot test and no enumerator reaches. These
+/// harnesses close it on the shipped [`hv_s2::smmu`] builder.
+///
+/// **Bounded axis, stated plainly** (ledger item B): the *table size* here is small and concrete —
+/// `log2size <= 2`, i.e. at most four entries — while the StreamID and the entry words are fully
+/// symbolic. So this is "∀ values, bounded size", the same shape as the `DOMS=3 / FRAMES=4` grant
+/// proofs. The size axis is closed differently and more weakly: the builder's own refusals
+/// (`TableTooSmall`, `SidOutOfRange`) are size-generic code, and `denies_every_stream` is run on the
+/// *real* table by the metal on every SMMU boot.
+///
+/// **And what these do NOT prove, which is the thing worth saying loudest:** every theorem here is
+/// about the bytes the builder writes, not about the SMMU that reads them. A green Kani run is fully
+/// compatible with "the device never reached the stream table at all", which is precisely how an
+/// ∀-StreamID deny passes vacuously. The hardware arrow is discharged by the metal's *through-STE
+/// positive control* — the same device, the same boot, aborted with a zeroed STE and landing with a
+/// bypass STE — and by nothing here.
+#[cfg(kani)]
+mod smmu_stream_table {
+    use hv_s2::smmu::{
+        bind, bypass_ste, decode, deny_ste, strtab_base, strtab_base_cfg, table_words, unbind,
+        verdict, StreamTableError, StreamVerdict, BUS0_LOG2SIZE, MAX_LOG2SIZE, STE_WORDS,
+    };
+
+    /// The largest table the harnesses instantiate: 4 entries (32 words). Symbolic `log2size` ranges
+    /// over `0..=2`, so every configured size that fits this storage is covered at once.
+    const MAX_HARNESS_LOG2: u32 = 2;
+    const WORDS: usize = (1 << MAX_HARNESS_LOG2) * STE_WORDS;
+
+    /// A symbolic table size this storage can actually hold.
+    fn any_log2() -> u32 {
+        let n: u32 = kani::any();
+        kani::assume(n <= MAX_HARNESS_LOG2);
+        n
+    }
+
+    /// **Deny by default, ∀ StreamID, at the size actually deployed.** The harnesses in this module
+    /// otherwise run on a 4-entry table — small enough to keep the symbolic-index reasoning cheap, and
+    /// honest about it. But the *deployed* table is `2^BUS0_LOG2SIZE` = 256 entries, and a property
+    /// proven only at a size nothing ships is a property about nothing shipped. This one closes that
+    /// exactly: `hv_s2::smmu::BUS0_LOG2SIZE` is the same constant `hv-metal` allocates and configures
+    /// from, so the size proven here and the size deployed cannot drift.
+    /// The verdict is asserted **by reason**, not merely as `!permits()`. A table whose storage were
+    /// smaller than its configured size would also deny every StreamID — via `OutOfRange` — so a bare
+    /// `!permits()` here would pass just as happily on a mis-sized table, which is the
+    /// `an_under_allocated_table_…` failure wearing this harness as a disguise. Requiring `Invalid`
+    /// (i.e. `STE.V == 0`, the zeroed entry) inside the range and `OutOfRange` only outside it is what
+    /// makes this a statement about the deny-by-default entry rather than about an allocation mistake.
+    #[kani::proof]
+    fn the_deployed_stream_table_denies_every_streamid() {
+        let words = [0u64; (1 << BUS0_LOG2SIZE) * STE_WORDS];
+        let sid: u32 = kani::any();
+        let v = verdict(&words, BUS0_LOG2SIZE, sid);
+        assert!(
+            !v.permits(),
+            "the deployed 256-entry stream table must deny every StreamID before anything is bound"
+        );
+        if (sid as u64) < (1u64 << BUS0_LOG2SIZE) {
+            assert!(
+                v == StreamVerdict::Invalid,
+                "in-range StreamIDs must be denied by a zeroed ENTRY, not by a mis-sized table"
+            );
+        } else {
+            assert!(v == StreamVerdict::OutOfRange);
+        }
+    }
+
+    /// **Deny by default, ∀ StreamID.** A zeroed stream table — which is what `.bss` already holds,
+    /// and what `init_deny` restores — permits *no* StreamID, for every one of the 2³² values a
+    /// transaction can carry and every table size the storage supports.
+    ///
+    /// The `assert` is on `permits()`, not on a particular verdict, so the three denial arms
+    /// (`OutOfRange`, `Invalid`, `ConfigAbort`) are covered by one statement and a future fourth
+    /// cannot slip past by being a new variant.
+    #[kani::proof]
+    fn zeroed_stream_table_denies_every_streamid() {
+        let words = [0u64; WORDS];
+        let log2 = any_log2();
+        let sid: u32 = kani::any();
+        let v = verdict(&words, log2, sid);
+        assert!(
+            !v.permits(),
+            "a zeroed stream table must deny every StreamID"
+        );
+        // By reason, for the same reason as the deployed-size harness above: an in-range
+        // StreamID must be denied by its zeroed ENTRY, so this cannot pass on a table too small for
+        // the size it was handed.
+        if (sid as u64) < (1u64 << log2) {
+            assert!(v == StreamVerdict::Invalid);
+        } else {
+            assert!(v == StreamVerdict::OutOfRange);
+        }
+    }
+
+    /// **Binding is StreamID-specific, ∀ other StreamID.** After binding exactly one StreamID to a
+    /// bypass STE, every *other* StreamID is still denied — and the bound one is permitted.
+    ///
+    /// The second assertion is the non-vacuity half and it is not optional: without it the harness
+    /// passes if `bind` writes nothing at all, which is the exact failure mode ⑦ found in the Verus
+    /// `Obs` split (a green proof over a surface that cannot exhibit the flow). This is also the
+    /// machine-checked form of the metal's third phase — a permissive STE at a *neighbouring*
+    /// StreamID does not admit the device.
+    #[kani::proof]
+    fn binding_one_stream_leaves_every_other_denied() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let bound: u32 = kani::any();
+        kani::assume((bound as u64) < (1u64 << log2));
+
+        assert!(bind(&mut words, log2, bound, bypass_ste()).is_ok());
+        assert!(
+            verdict(&words, log2, bound).permits(),
+            "the deliberately bound StreamID must be permitted — otherwise the deny below is vacuous"
+        );
+
+        let other: u32 = kani::any();
+        kani::assume(other != bound);
+        assert!(
+            !verdict(&words, log2, other).permits(),
+            "binding one StreamID must not permit any other"
+        );
+    }
+
+    /// **`unbind` is a true inverse, ∀ StreamID.** After binding and unbinding, the table denies
+    /// every StreamID again — including the one that was bound. This is what makes the metal's
+    /// bypass→deny transition a *restoration* of the default rather than a different state that
+    /// merely happens to abort.
+    #[kani::proof]
+    fn unbind_restores_deny_for_every_streamid() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let bound: u32 = kani::any();
+        kani::assume((bound as u64) < (1u64 << log2));
+
+        assert!(bind(&mut words, log2, bound, bypass_ste()).is_ok());
+        assert!(unbind(&mut words, log2, bound).is_ok());
+
+        let sid: u32 = kani::any();
+        assert!(
+            !verdict(&words, log2, sid).permits(),
+            "an unbound stream table must deny every StreamID"
+        );
+    }
+
+    /// **An out-of-range bind writes nothing, ∀ StreamID beyond the table.** The refusal is not
+    /// merely reported: the storage is unchanged, so a mis-sized StreamID cannot authorise some
+    /// *other* stream by wrapping or truncating into it.
+    ///
+    /// Checked over a symbolic word index rather than a loop, so it is a statement about every word
+    /// of the table with no unwinding.
+    #[kani::proof]
+    fn an_out_of_range_bind_changes_no_word() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let sid: u32 = kani::any();
+        kani::assume((sid as u64) >= (1u64 << log2));
+
+        assert!(bind(&mut words, log2, sid, bypass_ste()) == Err(StreamTableError::SidOutOfRange));
+
+        let i: usize = kani::any();
+        kani::assume(i < WORDS);
+        assert!(words[i] == 0, "a refused bind must not write any word");
+    }
+
+    /// **A bind touches only its own entry, ∀ word outside it.** The 8 words of `sid`'s STE change;
+    /// nothing else does. A bind that wrote past its entry would silently validate the *next*
+    /// StreamID — a fail-open the `zeroed_…` harness above cannot see, because it runs on a table
+    /// nobody has bound.
+    #[kani::proof]
+    fn a_bind_touches_only_its_own_entry() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let bound: u32 = kani::any();
+        kani::assume((bound as u64) < (1u64 << log2));
+        let off = (bound as usize) * STE_WORDS;
+
+        assert!(bind(&mut words, log2, bound, bypass_ste()).is_ok());
+
+        let i: usize = kani::any();
+        kani::assume(i < WORDS);
+        kani::assume(i < off || i >= off + STE_WORDS);
+        assert!(words[i] == 0, "a bind must not write outside its own STE");
+    }
+
+    /// **A table configured larger than it was allocated denies everything, ∀ StreamID.** This is the
+    /// one way a linear stream table fails *open* on real hardware: `STRTAB_BASE_CFG.LOG2SIZE` says
+    /// 2ⁿ entries, the allocation holds fewer, and the SMMU fetches STEs from whatever follows it.
+    /// The builder refuses to model that as anything but a denial — and [`bind`] refuses to create
+    /// it, so the metal cannot reach the state in the first place.
+    #[kani::proof]
+    fn an_under_allocated_table_denies_every_streamid() {
+        // Storage for one entry, configured for two or four.
+        let mut words = [0u64; STE_WORDS];
+        let log2: u32 = kani::any();
+        kani::assume(log2 >= 1 && log2 <= MAX_HARNESS_LOG2);
+
+        let sid: u32 = kani::any();
+        assert!(
+            verdict(&words, log2, sid) == StreamVerdict::OutOfRange,
+            "an under-allocated stream table must deny every StreamID"
+        );
+        assert!(bind(&mut words, log2, sid, bypass_ste()) == Err(StreamTableError::TableTooSmall));
+    }
+
+    /// **The decode seam, ∀ 2⁶⁴ entry words.** An STE permits *iff* it is valid (`V`) **and** its
+    /// `Config[2]` is set — the architecture's own rule, stated as a biconditional so neither
+    /// direction can rot: no invalid entry permits (isolation), and no valid non-abort entry is
+    /// spuriously denied (which would make the through-STE control impossible and the deny vacuous).
+    ///
+    /// This runs over every word value, not just the two the constructors emit, so it covers entries
+    /// the SMMU might see from memory this hypervisor did not write — the exact case a table built
+    /// from stale or corrupt storage presents.
+    #[kani::proof]
+    fn an_ste_permits_iff_valid_and_not_configured_to_abort() {
+        let word0: u64 = kani::any();
+        let valid = word0 & 1 != 0;
+        let not_abort = word0 & (1 << 3) != 0;
+        assert!(
+            decode(word0).permits() == (valid && not_abort),
+            "an STE permits exactly when V is set and Config[2] is set"
+        );
+    }
+
+    /// **The emit seam meets the decode seam.** The two constructors decode to exactly the verdicts
+    /// their names claim. Kept as a proof rather than a unit test because it is the joint the whole
+    /// rung hangs on: `deny_ste` is what the fail-closed default *is*, and `bypass_ste` is what makes
+    /// the positive control a control. Written against `decode`, which is derived from the field
+    /// definitions and not from the constructors (design-lesson #36).
+    #[kani::proof]
+    fn the_constructors_decode_to_their_names() {
+        assert!(decode(deny_ste()[0]) == StreamVerdict::Invalid);
+        assert!(!decode(deny_ste()[0]).permits());
+        assert!(decode(bypass_ste()[0]) == StreamVerdict::Bypass);
+        assert!(decode(bypass_ste()[0]).permits());
+        // The bypass STE permits but confines nothing: it is a path witness, never an isolation
+        // configuration. Pinned here so a later edit cannot quietly promote it to one.
+        assert!(decode(bypass_ste()[0]).stage2_unconfined());
+    }
+
+    /// **The register encodings, ∀ size and ∀ address.** `STRTAB_BASE_CFG` announces the linear
+    /// format and exactly the `log2size` the table was built for — a mismatch here is a table whose
+    /// range check differs between the builder's belief and the hardware's, which is the
+    /// configured-larger-than-allocated fail-open arriving by a different road. And `STRTAB_BASE`
+    /// carries the address bits the field holds and nothing else, for every address.
+    #[kani::proof]
+    fn the_register_encodings_match_the_table_they_describe() {
+        let log2: u32 = kani::any();
+        match strtab_base_cfg(log2) {
+            None => assert!(log2 > MAX_LOG2SIZE && table_words(log2).is_none()),
+            Some(cfg) => {
+                assert!(
+                    cfg & 0x3f == log2,
+                    "STRTAB_BASE_CFG.LOG2SIZE must be log2size"
+                );
+                assert!(
+                    (cfg >> 16) & 0b11 == 0,
+                    "STRTAB_BASE_CFG.FMT must be linear"
+                );
+                assert!(table_words(log2).is_some());
+            }
+        }
+
+        let pa: u64 = kani::any();
+        assert!(
+            strtab_base(pa) == pa & 0x000f_ffff_ffff_ffc0,
+            "STRTAB_BASE must carry exactly the ADDR field's bits"
+        );
+    }
+}

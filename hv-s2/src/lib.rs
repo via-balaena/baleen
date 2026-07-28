@@ -20,6 +20,14 @@
 //!   permission*, which has nothing to do with descriptor bits, so this layer is where the theorem
 //!   lives — and proving it once serves an x86 EPT backend as well as AArch64 Stage-2 (ARM stays
 //!   co-equal, and `hv-hal` stays neutral — the standing constraint).
+//! - [`smmu`] — **the device path's first table** (SMMU arc, rung 2). The layers above answer *"which
+//!   frames does a domain's CPU reach?"*; a DMA-capable device never consults `VTTBR_EL2` at all, and
+//!   the SMMU decides *its* fate by indexing a **stream table** with the transaction's StreamID. Same
+//!   shape of job, same reasons to be here: a pure table builder out of `hv-metal`'s `unsafe`, with
+//!   the ∀-StreamID default-deny proven over it (`hv-verify::smmu_stream_table`) and the hardware
+//!   arrow discharged separately by the metal's through-STE positive control. Rung 2 is *deny only* —
+//!   binding a stream to a domain's [`arm64`] tables (`STE.S2TTB` + `S2VMID`) is rung 3, and is where
+//!   the device path joins the CPU path on one proven `p2m`.
 //! - [`arm64`] — **AArch64-specific.** The bit-format: leaf map → Stage-2 descriptor values,
 //!   written into caller-provided table storage. Pure — it touches no hardware and performs no
 //!   MMIO; publishing (the barriers and TLB maintenance) stays in `hv-metal`.
@@ -100,6 +108,7 @@
 pub mod arm64;
 pub mod check;
 pub mod leafmap;
+pub mod smmu;
 
 pub use check::{
     check_all, check_authorized, check_authorized_with, OutOfDomain, Verdict, Violation,

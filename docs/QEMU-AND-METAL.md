@@ -62,11 +62,25 @@ microarchitectural. It does **not** model:
    stronger effective ordering and frequently will **not** expose the bug. This is the classic
    "worked in emulation, hung on silicon" — concurrency and barrier bugs pass QEMU and fail metal.
 
-3. **DMA / SMMU (IOMMU) isolation.** The Stage-2 proof and its QEMU refinement cover **CPU-initiated**
-   accesses. A device performing DMA can bypass Stage-2 entirely unless the SMMU is configured — a
-   *separate* isolation mechanism that QEMU's `virt` machine barely stresses. DMA isolation is a
-   place real hypervisor isolation genuinely breaks, and emulation gives false comfort. It is also a
-   mechanism `hv-core` does not model at all yet.
+3. **DMA / SMMU (IOMMU) isolation — CORRECTED 2026-07-28, and the correction matters.** The Stage-2
+   proof and its QEMU refinement cover **CPU-initiated** accesses; a device performing DMA bypasses
+   Stage-2 entirely unless the SMMU is configured, and that remains a *separate* isolation mechanism
+   `hv-core` does not model. What this section used to say beyond that — that QEMU "barely stresses"
+   the SMMU and gives only false comfort — **was wrong, and it went unchallenged for several arcs.**
+   QEMU `virt` with `iommu=smmuv3` instantiates a real SMMUv3 at `0x9050000` that is EL2-reachable,
+   coexists with `virtualization=on`, and **implements stage-2** (`IDR0 = 0x0d44101b`, `S1P|S2P`, read
+   first-hand from the device). Two rungs of genuine DMA isolation are now witnessed on it: rung 1
+   (PR #91) closes the pre-enable `GBPA` bypass window, and rung 2 installs an all-deny stream table
+   with a five-phase witness in which a real bus master's DMA gets *through* a deliberately-configured
+   STE and is *aborted* without one (`docs/SMMU-STREAM-TABLE.md`).
+
+   The honest residue is narrower than the old text and worth stating precisely: QEMU is a
+   **functional** model of the SMMU, so it validates the *configuration logic* (which StreamID gets
+   which entry, in which order, with which invalidation) and not the silicon. It is also *more
+   forgiving* in places — it aligns `STRTAB_BASE` down to the table size itself, so a mis-aligned base
+   that would be truncated to a different table on hardware works fine here. That is why the
+   architectural alignment is pinned by a compile-time assertion rather than trusted to the boot test.
+   "QEMU cannot validate SMMU isolation at all" is not a claim this project can make any more.
 
 4. **Errata and IMPLEMENTATION-DEFINED behavior.** QEMU implements one clean interpretation of the
    architecture; real SoCs carry silicon errata and IMPDEF corners (feature registers, cache line
@@ -108,10 +122,11 @@ Same move that keeps the proofs honest — name the abstraction:
 - **Sequence QEMU-first anyway.** The bugs QEMU *does* catch (functional logic errors in Stage-2
   generation, ABI decode, trap handling) are the ones hit first and most often, and iterating on
   silicon is slow. QEMU-first is correct; the only error is declaring victory there.
-- **Plan a real-hardware phase for the rest.** Its specific job is the four things QEMU cannot see:
-  weak-memory correctness, DMA/SMMU isolation, timing behavior, and errata. Some of those (timing
-  side-channels, DMA) require *additional design work*, not just testing — constant-time discipline,
-  SMMU configuration — because they are mechanisms the current model does not yet contain.
+- **Plan a real-hardware phase for the rest.** Its specific job is weak-memory correctness, timing
+  behavior, errata — and the *silicon* half of DMA isolation, which is a narrower job than this
+  document used to claim (see item 3: the SMMU **configuration** logic is validatable here, and is
+  being validated). Timing side-channels still require *additional design work* rather than testing,
+  because they are mechanisms the current model does not contain.
 
 ## The one-line summary
 

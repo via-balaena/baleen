@@ -19,7 +19,9 @@ publish = false
 # `src/exceptions.rs` and `rust_main`.
 selftest = []
 
-# `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rung 1). It is a separate binary rather
+# `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rungs 1–2: `GBPA.ABORT` before any bus
+# master exists, then a stream table whose every entry denies, and the five-phase witness that the
+# device really does reach it). It is a separate binary rather
 # than a runtime probe for a concrete reason: reading the SMMUv3 register window on a machine QEMU
 # started WITHOUT `iommu=smmuv3` takes a synchronous external abort (unassigned MMIO on `virt` faults,
 # it does not read as zero — measured, after assuming otherwise), and EL2's fault handler is `-> !` by

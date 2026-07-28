@@ -72,7 +72,7 @@ fn main() {
                  ci     fmt --check, clippy -D warnings, test, then doc\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
-                 metal-lint fmt --check + clippy -D warnings for hv-metal (both feature configs)"
+                 metal-lint fmt --check + clippy -D warnings for hv-metal (all four feature configs)"
             );
             exit(2);
         }
@@ -244,6 +244,12 @@ fn metal_lint() -> bool {
         ],
     ) && metal_clippy(&[])
         && metal_clippy(&["--features", "selftest"])
+        // Every feature config that has code of its own, or that config's code is linted by nobody.
+        // `smmu` and `real-linux` were both unlinted until the SMMU arc put a stream table, two
+        // queues and a five-phase witness behind `smmu` — a feature gate is exactly where a
+        // dead-code or clippy finding hides, since the default build cannot see it.
+        && metal_clippy(&["--features", "smmu"])
+        && metal_clippy(&["--features", "real-linux"])
 }
 
 /// Run clippy over `hv-metal` for the bare-metal target with `extra` cargo args, denying warnings.
