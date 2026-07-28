@@ -94,8 +94,15 @@ const METAL_TARGET: &str = "aarch64-unknown-none-softfloat";
 const METAL_BIN: &str = "hv-metal/target/aarch64-unknown-none-softfloat/release/hv-metal";
 
 // ─── M5 Arc 5e: the real-Linux capstone runner ──────────────────────────────────────────────────
-// The guest-RAM load layout — MUST match `hv-metal/src/linux.rs`'s constants and `hv-metal/linux/
-// guest.dts`. QEMU `-device loader` deposits the three blobs at these PAs before hv-metal boots.
+// The guest-RAM load layout — MUST match `hv-metal/src/stage2.rs`'s `LINUX_RAM_BASE`/`LINUX_RAM_END`
+// (what the emitter maps), `hv-metal/src/linux.rs`'s `DTB_ADDR`, and `hv-metal/linux/guest.dts`.
+// QEMU `-device loader` deposits the three blobs at these PAs before hv-metal boots.
+//
+// These three cannot be DERIVED from hv-metal: it is a workspace-excluded crate that does not link
+// for the host, so xtask cannot depend on it. ⑭ made the contract one declaration everywhere it
+// could reach and bound this last seam at RUN time instead — `LINUX_MARKERS` asserts hv-metal's
+// banner *with its addresses in it*, and the boot only reaches userspace if the initrd address
+// agrees too. That is a real check, not a comment: see the two entries in `LINUX_MARKERS`.
 const LINUX_KERNEL_ADDR: u64 = 0x4800_0000; // Image (also DTB /memory base)
 const LINUX_DTB_ADDR: u64 = 0x4b00_0000; // DTB (hv-metal points guest x0 here)
 const LINUX_INITRD_ADDR: u64 = 0x4c00_0000; // initramfs (DTB /chosen linux,initrd-*)
@@ -261,8 +268,14 @@ fn qemu_linux(check: bool) -> bool {
 /// * **`linux guest issued PSCI SYSTEM_OFF …`** — the whole round trip, and the reason the boot
 ///   terminates rather than parking: busybox `poweroff -f` -> the kernel's PSCI -> `HVC` -> EL2.
 const LINUX_MARKERS: &[&str] = &[
-    // hv-metal, before the guest runs.
-    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest",
+    // hv-metal, before the guest runs. The ADDRESSES in this line are load-bearing, not decoration:
+    // they are hv-metal's view of the memory contract, and the three constants below are xtask's.
+    // `hv-metal` is workspace-EXCLUDED (it cannot link for the host), so no compile-time derivation
+    // can bind the two — ⑭ folded the contract into one declaration everywhere it *could* reach, and
+    // this marker is what binds the remaining cross-crate seam. Change `LINUX_KERNEL_ADDR` or
+    // `LINUX_DTB_ADDR` without changing hv-metal and this goes red here rather than hanging a guest.
+    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest \
+     (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x80000000)",
     "baleen: linux model built — 448 super-span leaves (896 MiB of guest RAM) across 56 L2-pinned tables",
     "448 super-span 2 MiB block(s) emitted and decoded; device window 32 MiB",
     // The kernel, behind the proven emitter.

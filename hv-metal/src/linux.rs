@@ -47,57 +47,47 @@ use hv_core::p2m::{Mfn, PtLevel};
 use hv_core::{HvCall, Hypervisor};
 
 use crate::pl011::Pl011;
-use crate::stage2::{self, LINUX_RAM_BASE, LINUX_RAM_END};
+use crate::stage2::{self, HCR_EL2_VM, LINUX_RAM_BASE, LINUX_RAM_END, VTCR_EL2};
 
 /// The control domain.
 const DOM0: DomId = 0;
 
-// ─── the memory contract (must match xtask's `-device loader` addresses) ─────────────────────────
+// ─── the memory contract ─────────────────────────────────────────────────────────────────────────
+//
+// FOUR places have to agree about where guest RAM is: the emitter's window, this file, the DTB's
+// `/memory` node, and xtask's `-device loader` addresses. Three of them are now ONE declaration —
+// `crate::stage2::LINUX_RAM_BASE`/`LINUX_RAM_END`, which is what `build_stage2_from_p2m` actually
+// maps. This file used to keep its own `GUEST_RAM_BASE`/`GUEST_RAM_END` literals, and by the time ⑭
+// found them they reached nothing but a `writeln!` — a value in a diagnostic and in no boolean, the
+// shape design-lesson #74 names.
+//
+// The FOURTH — xtask's loader addresses — is in a crate that cannot depend on `hv-metal` (this crate
+// is workspace-excluded; it does not link for the host), so it CANNOT be folded in at compile time.
+// It is bound at RUN time instead: the banner below prints these addresses, and
+// `xtask::LINUX_MARKERS` asserts that whole line, so the gate fails if this file and xtask disagree.
+// See `docs/ARC-5-M5-GUEST-INTERFACE.md` §5f.
 
-/// Guest RAM base — where the kernel `Image` is loaded and where the DTB's `/memory` starts.
-const GUEST_RAM_BASE: u64 = 0x4800_0000;
-/// Guest RAM limit (exclusive) — top of the 896 MiB window (`-m 1024` → QEMU RAM ends at 0x8000_0000).
-const GUEST_RAM_END: u64 = 0x8000_0000;
-/// Kernel `Image` load address (2 MiB-aligned, at the base of guest RAM). `ELR_EL2` entry.
-const KERNEL_ENTRY: u64 = 0x4800_0000;
-/// Flattened device tree (DTB) load address — handed to the kernel in `x0`.
+use crate::stage2::{LINUX_RAM_BASE as GUEST_RAM_BASE, LINUX_RAM_END as GUEST_RAM_END};
+
+/// Kernel `Image` load address — the base of guest RAM, per the arm64 boot protocol. `ELR_EL2` entry.
+const KERNEL_ENTRY: u64 = GUEST_RAM_BASE;
+/// Flattened device tree (DTB) load address — handed to the kernel in `x0`. The one address here
+/// with no authoritative source under the fence: it names a spot inside guest RAM that xtask's
+/// `-device loader` writes to, so it is asserted at run time (see the note above) rather than
+/// derived.
 const DTB_ADDR: u64 = 0x4b00_0000;
 
-/// Low peripheral window mapped as device memory (GICv3 dist 0x0800_0000 + redist 0x080a_0000,
-/// PL011 0x0900_0000 all fall inside): `0x0800_0000 .. 0x0a00_0000` (32 MiB).
-const DEV_BASE: u64 = 0x0800_0000;
-const DEV_END: u64 = 0x0a00_0000;
-
-// ─── AArch64 Stage-2 descriptor encodings (4 KiB granule; 2 MiB blocks at L2) ────────────────────
-// Independently the same field layout `stage2.rs` uses, plus a Device-nGnRnE attribute for the
-// pass-through peripheral window. Re-derived from the Arm ARM (VMSAv8-64 Stage-2 descriptor format).
-
-/// L1/L2 table descriptor (points at the next-level table): low bits 0b11.
-const DESC_TABLE: u64 = 0b11;
-/// L2 block (2 MiB leaf): low bits 0b01.
-const DESC_BLOCK: u64 = 0b01;
-/// 2 MiB block output-address mask (bits [47:21]).
-const ADDR_2M: u64 = 0x0000_ffff_ffe0_0000;
-/// Next-table output-address mask (bits [47:12]).
-const ADDR_4K: u64 = 0x0000_ffff_ffff_f000;
-
-/// `AF=1` (bit 10) and `S2AP=RW` (bits [7:6] = 0b11), shared by every leaf we emit.
-const LEAF_AF_RW: u64 = (1 << 10) | (0b11 << 6);
-/// Normal, Inner+Outer Write-Back cacheable (`MemAttr=0b1111`, bits [5:2]) + Inner-Shareable
-/// (`SH=0b11`, bits [9:8]) — the guest-RAM attribute, executable (no XN, the kernel runs from it).
-const BLOCK_NORMAL_RWX: u64 = DESC_BLOCK | LEAF_AF_RW | (0b1111 << 2) | (0b11 << 8);
-/// Device-nGnRnE (`MemAttr=0b0000`), execute-never (bit 54) — the GIC/PL011 pass-through attribute.
-const BLOCK_DEVICE: u64 = DESC_BLOCK | LEAF_AF_RW | (1 << 54);
-
-/// `VTCR_EL2` — identical to the synthetic path (`guest.rs`): 4 KiB granule, 39-bit IPA (T0SZ=25),
-/// start level 1 (so L1 is indexed by IPA[38:30]), Normal WB IS walks, 40-bit PS, `DS=0`.
-const VTCR_EL2: u64 =
-    (1 << 31) | (0b010 << 16) | (0b11 << 12) | (0b01 << 10) | (0b01 << 8) | (0b01 << 6) | 25;
-/// `HCR_EL2.VM` — bit 0, enable Stage-2 for EL1&0. OR'd onto the Arc-3 base (`RW`); `IMO` stays 0.
-const HCR_EL2_VM: u64 = 1 << 0;
-/// The VMID stamped into `VTTBR_EL2[55:48]`. One guest, so any nonzero VMID; 1, as the single-domain
-/// synthetic phases use.
-const GUEST_VMID: u64 = 1;
+// The Stage-2 descriptor encodings, the device window and the translation regime used to be declared
+// HERE, alongside a 40-line identity mapper. M5 Arc 6b deleted the mapper and moved the emission to
+// `crate::stage2` — but only the mapper actually went: TEN constants (`DEV_BASE`, `DEV_END`,
+// `DESC_TABLE`, `DESC_BLOCK`, `ADDR_2M`, `ADDR_4K`, `LEAF_AF_RW`, `BLOCK_NORMAL_RWX`,
+// `BLOCK_DEVICE`, `GUEST_VMID`) outlived their last use, under a comment claiming they were gone.
+// Nothing could catch that: `main.rs` carried a CRATE-WIDE `allow(dead_code)` for `real-linux`, the
+// only configuration that compiles this file, so this was the one module no build ever linted for
+// dead code (⑭). They are gone now, and the allow is per-item.
+//
+// The device window is `crate::stage2::windows().device_base`/`device_len`; the leaf attributes are
+// `hv_s2`'s emit seams; `VTCR_EL2`/`HCR_EL2_VM` are `crate::stage2`'s.
 
 /// `SPSR_EL2` to `eret` into the kernel: EL1h (`M[3:0]=0b0101`, uses `SP_EL1`), AArch64, `DAIF`
 /// masked — the arm64 boot protocol enters with interrupts off; the kernel unmasks them itself.
@@ -373,10 +363,12 @@ __linux_sync_entry:
 
 extern "C" {
     fn __linux_sync_entry() -> !;
-    /// Reused from `exceptions.rs`: report `(EC/ELR/FAR/ESR)` for slot index `w0` and park.
-    fn handle_exception(vector: u64) -> !;
     static __linux_vectors: u8;
 }
+// `handle_exception` (the diagnostic reporter the vector stubs above `bl` into) is deliberately NOT
+// declared here. It is `#[no_mangle]` in `exceptions.rs` and reached only from `global_asm!`, so the
+// linker resolves it and a Rust `extern` declaration adds nothing — while being, to the compiler, an
+// unused item. It was one of the things the crate-wide `allow(dead_code)` was hiding (⑭).
 
 /// The saved GPR frame the sync trampoline hands the Rust handler: `x[i]` = `x<i>` for `i` in 0..=30.
 #[repr(C)]

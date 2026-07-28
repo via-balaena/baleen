@@ -1570,27 +1570,11 @@ __guest_disposable_tpl_end:
 
 // ─── Stage-2 enable parameters (the descriptor building lives in `stage2.rs`) ─────────────────
 
-/// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
-/// WBWA Inner-Shareable table walks, 40-bit PS, RES1 bit 31. `DS=0` (bit 32 clear) so the classic
-/// (non-LPA2) descriptor format the `stage2` encodings assume is in force. Behaviourally unchanged
-/// from Arc 4 — the *value* is the same; what changed (SMMU rung 3) is where it comes from.
-///
-/// **It is no longer a literal, because it no longer has one consumer.** The SMMU walks the very same
-/// Stage-2 tables for a bound device, and it takes these parameters from the **STE**, not from
-/// `VTCR_EL2`. Two walkers over one table under different parameters is not a degraded translation
-/// but a different one — a start level one off reads leaf descriptors as table descriptors — so the
-/// parameters are one declaration ([`hv_s2::arm64::BALEEN_STAGE2`]) with two independent encodings,
-/// and `hv-verify` proves the two agree. Resolved at compile time: a regime the encoder refuses must
-/// break the build rather than fall back to some other configuration.
-const VTCR_EL2: u64 =
-    match hv_s2::arm64::vtcr_el2(&hv_s2::arm64::BALEEN_STAGE2, hv_s2::arm64::BALEEN_VMID_BITS) {
-        Some(v) => v,
-        None => panic!("the deployed stage-2 regime cannot be encoded into VTCR_EL2"),
-    };
-
-/// `HCR_EL2.VM` — bit 0, enables Stage-2 for EL1&0. OR'd onto the Arc-3 `HCR_EL2` (RW=bit 31);
-/// `FWB` (bit 46) stays 0 so the `stage2` `MemAttr=0b1111` Normal-WB encoding is in force.
-const HCR_EL2_VM: u64 = 1 << 0;
+// `VTCR_EL2` and `HCR_EL2_VM` used to be declared here. They now live in `crate::stage2`, beside the
+// windows the same emission is shaped by, because this was not the only path that programs them:
+// `linux.rs` kept a hand-written `VTCR_EL2` literal while this file's doc claimed the value "is no
+// longer a literal, because it no longer has one consumer" (⑭). One declaration, every consumer.
+use crate::stage2::{HCR_EL2_VM, VTCR_EL2};
 
 // ─── global guest state ───────────────────────────────────────────────────────────────────────
 
@@ -6581,6 +6565,17 @@ fn expect(hv: &mut Hypervisor, caller: DomId, call: HvCall, what: &str, uart: &m
 /// into the test configuration, emit real Stage-2 from that `p2m`, seed the read-only frame through the
 /// fence, load + enter the guest. Everything after the `eret` happens in the trap handler; this never
 /// returns.
+// THE ONE `dead_code` ALLOW IN THIS CRATE (⑭), and it is deliberately on the ROOT rather than on the
+// items underneath it. Under `real-linux` `main` calls `linux::run` instead of this, so this whole
+// subtree — `setup_model`, `load_guest`, `PEER_DOM`, `F_SUP_ROOT`, … — is unreachable in that build.
+//
+// `allow(dead_code)` makes rustc treat an item as a LIVE ROOT for reachability, so allowing this one
+// entry point silences everything reachable FROM it and nothing else. Measured: allowing all five
+// flagged items and allowing just this one give the identical result, and with only this one, a
+// constant added to this file that `run` cannot reach is STILL reported. That is the property worth
+// having — the allow says "this entry point is displaced", not "stop looking at this file", which is
+// what the crate-wide version it replaced actually said.
+#[cfg_attr(feature = "real-linux", allow(dead_code))]
 pub(crate) fn run(uart: &mut Pl011) -> ! {
     // SAFETY: single-CPU, one-time; no guest has run yet, so no handler is touching the cell.
     *GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());

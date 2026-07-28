@@ -33,10 +33,20 @@
 
 #![no_std]
 #![no_main]
-// Under `real-linux` (M5 Arc 5e) the synthetic `guest` phases are replaced wholesale by `linux::run`,
-// so its functions are legitimately unused in that build; the default/`selftest` builds (the ones CI
-// lints) still exercise every one, so this narrows the allow to exactly the capstone config.
-#![cfg_attr(feature = "real-linux", allow(dead_code))]
+// NOTE (⑭): there was a CRATE-WIDE `#![cfg_attr(feature = "real-linux", allow(dead_code))]` here,
+// justified as "the synthetic `guest` phases are replaced wholesale by `linux::run`, so its functions
+// are legitimately unused in that build; the default/`selftest` builds (the ones CI lints) still
+// exercise every one." That is true of `guest.rs` — and false of `linux.rs`, which is
+// `#[cfg(feature = "real-linux")]`. The allow fired in the ONLY configuration that compiles
+// `linux.rs`, making it the one module in this crate that NO build linted for dead code. Ten dead
+// constants accumulated there under a comment asserting they had been removed.
+//
+// So the allow is now a SINGLE one, on `guest::run` — the one entry point `linux::run` displaces.
+// `allow(dead_code)` marks an item as a live root for reachability, so allowing the root silences
+// exactly the subtree under it: measured, dead code elsewhere in `guest.rs` is still caught, and
+// `linux.rs` is linted like every other module. A blanket allow is a lint gate whose inputs cannot
+// discriminate (design-lesson #71); allowing the root says "this entry point is displaced", which is
+// the true statement.
 
 mod blk;
 mod cell;
