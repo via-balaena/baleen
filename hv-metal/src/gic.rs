@@ -37,6 +37,18 @@ const ICC_SRE_EL2_SRE: u64 = 1 << 0;
 const ICC_SRE_EL2_ENABLE: u64 = 1 << 3;
 /// `ICH_HCR_EL2.En` (bit 0) — enable the virtual CPU interface (the list registers become active).
 const ICH_HCR_EL2_EN: u64 = 1 << 0;
+/// `ICH_HCR_EL2.UIE` (bit 1) — **Underflow Interrupt Enable.** While set, the GIC asserts the EL2
+/// **maintenance interrupt** ([`MAINT_INTID`]) whenever *zero or one* list register is in a non-Invalid
+/// state, i.e. the LR bank has run down and can accept more. This is the hardware's "refill me" signal,
+/// and it is what lets the software pending set drain into the bank **while the guest is still running**
+/// (III-1) rather than only at the next EL2 exit.
+///
+/// **It is level-based, so it must be armed only while there is something to refill with.** With `UIE`
+/// set and the pending set empty, an idle guest (0 LRs occupied) satisfies the underflow condition
+/// permanently and the maintenance interrupt re-asserts immediately after every EOI — an interrupt storm
+/// that livelocks EL2. [`set_underflow_interrupt`] is therefore driven from the emptiness of the pending
+/// set, never enabled once and left on.
+const ICH_HCR_EL2_UIE: u64 = 1 << 1;
 /// `HCR_EL2.IMO` (bit 4) — route physical IRQ to EL2 **and** enable the virtual IRQ to EL1 (the
 /// mechanism by which a pending list-register interrupt is presented to the guest).
 const HCR_EL2_IMO: u64 = 1 << 4;
@@ -104,15 +116,67 @@ pub(crate) fn enable_el2() {
     }
 }
 
+/// Arm or disarm the **underflow maintenance interrupt** ([`ICH_HCR_EL2_UIE`]) — read-modify-write so
+/// the virtual-interface enable and every other `ICH_HCR_EL2` control is preserved (III-1).
+///
+/// Call with `true` exactly while the software pending set is non-empty and with `false` the moment it
+/// drains; see [`ICH_HCR_EL2_UIE`] for why leaving it armed over an empty set storms. The write needs no
+/// `isb` for correctness of the *state* — but one is issued anyway so the arming is in effect before a
+/// following `eret` hands the CPU to a guest that may immediately underflow the bank.
+pub(crate) fn set_underflow_interrupt(armed: bool) {
+    // SAFETY: `ICH_HCR_EL2` is an EL2 control register for the virtual CPU interface. Read-modify-write
+    // of the single UIE bit preserves `En` (and any IMPDEF bits); `isb` orders it before a dependent
+    // `eret`. No memory effect.
+    unsafe {
+        if armed {
+            asm!(
+                "mrs {t}, ICH_HCR_EL2",
+                "orr {t}, {t}, {uie}",
+                "msr ICH_HCR_EL2, {t}",
+                "isb",
+                t = out(reg) _,
+                uie = in(reg) ICH_HCR_EL2_UIE,
+                options(nomem, nostack, preserves_flags),
+            );
+        } else {
+            asm!(
+                "mrs {t}, ICH_HCR_EL2",
+                "bic {t}, {t}, {uie}",
+                "msr ICH_HCR_EL2, {t}",
+                "isb",
+                t = out(reg) _,
+                uie = in(reg) ICH_HCR_EL2_UIE,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+/// Whether the **underflow maintenance interrupt** is currently armed (`ICH_HCR_EL2.UIE`) — the
+/// read-back the III-1 witness uses to assert the arming is driven by the pending set's emptiness and
+/// not left latched on. (`selftest`-only; the real paths only ever *set* it.)
+#[cfg(feature = "selftest")]
+pub(crate) fn underflow_interrupt_armed() -> bool {
+    let hcr: u64;
+    // SAFETY: `ICH_HCR_EL2` is readable at EL2; read-only here, no memory effect.
+    unsafe {
+        asm!("mrs {h}, ICH_HCR_EL2", h = out(reg) hcr, options(nomem, nostack, preserves_flags));
+    }
+    hcr & ICH_HCR_EL2_UIE != 0
+}
+
 /// Inject virtual interrupt `intid`: place a *pending* Group-1 virtual interrupt in the **first free**
 /// list register (M5 Arc 8b). Up to [`num_list_registers`] distinct interrupts can be simultaneously
 /// pending, each in its own LR, so a new injection never overwrites one the guest has not yet taken.
 /// The hardware CPU interface presents them to the guest (as a taken IRQ if `PSTATE.I` is unmasked, or
 /// via `ICC_IAR1_EL1` if it polls).
 ///
-/// Returns `false` if the bank is full — the caller **must not** treat that as delivered. A software
-/// pending queue (+ `ICH_HCR_EL2.UIE` maintenance-interrupt refill) is the general answer and is
-/// deferred residue; today the metal has too few interrupt sources to fill the bank.
+/// Returns `false` if the bank is full. This is the **raw LR allocator**, and a `false` here is no
+/// longer a delivery failure: since III-1 its caller
+/// (`guest::ArmVcpu::inject_interrupt`) records the vINT in the vCPU's software **pending set** and arms
+/// [`set_underflow_interrupt`], so the vINT is delivered when the bank next runs down. Callers that
+/// bypass that wrapper (the LR-bank witness) still treat `false` as "the bank is full", which is all
+/// this function claims.
 #[must_use]
 pub(crate) fn inject(intid: u32) -> bool {
     let lr = LR_STATE_PENDING
@@ -266,9 +330,25 @@ const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 /// interrupt the guest's `CNTV` raises; the guest also sees it as vINTID 27 after we inject.
 pub(crate) const VTIMER_INTID: u32 = 27;
 
-/// Initialize the physical GICv3 enough to receive the virtual-timer PPI at EL2: enable the distributor
-/// (affinity routing + Group 1), wake this CPU's redistributor, and enable PPI [`VTIMER_INTID`] as a
-/// Group 1 interrupt at a deliverable priority. MMIO at EL2 (MMU-off, direct physical addressing).
+/// The GIC **maintenance interrupt** — PPI 9 = INTID 25 on QEMU `virt` (`ARCH_GIC_MAINT_IRQ`). The
+/// virtual CPU interface raises it at EL2 when a condition enabled in `ICH_HCR_EL2` holds; III-1 enables
+/// exactly one such condition, [`ICH_HCR_EL2_UIE`] (bank underflow), and uses it to refill the list
+/// registers from the software pending set while the guest runs.
+///
+/// **This INTID is a QEMU `virt` platform fact, not architectural** — the maintenance signal is wired to
+/// a PPI by the SoC integrator, so a real-hardware port must take it from the device tree
+/// (`interrupts` on the `interrupt-controller` node) rather than from this constant.
+pub(crate) const MAINT_INTID: u32 = 25;
+
+/// Initialize the physical GICv3 enough to receive the EL2-bound PPIs: enable the distributor (affinity
+/// routing + Group 1), wake this CPU's redistributor, and enable PPI [`VTIMER_INTID`] (the guest's
+/// virtual timer) **and** PPI [`MAINT_INTID`] (the GIC maintenance interrupt — III-1's LR-refill signal)
+/// as Group 1 interrupts at a deliverable priority. MMIO at EL2 (MMU-off, direct physical addressing).
+///
+/// Enabling the maintenance PPI here is safe *without* enabling III-1's refill machinery: the interrupt
+/// only fires for a condition selected in `ICH_HCR_EL2`, and the sole condition this port ever sets is
+/// `UIE`, which [`set_underflow_interrupt`] arms only while a pending set is non-empty. So on any path
+/// that never overflows an LR bank, this enable is inert.
 pub(crate) fn init_physical_vtimer() {
     // SAFETY: the GICD/GICR windows are device memory on the `virt` machine, addressed directly at EL2
     // (MMU off). Each write targets a documented GICv3 register at its fixed offset; the reads poll the
@@ -288,17 +368,26 @@ pub(crate) fn init_physical_vtimer() {
             core::hint::spin_loop();
         }
 
-        // PPI 27 in the SGI/PPI frame: Group 1, a deliverable priority, then enable it.
+        // PPIs 27 (vtimer) and 25 (GIC maintenance — III-1) in the SGI/PPI frame: Group 1, a
+        // deliverable priority, then enable both. Both are PPIs of this redistributor, so one
+        // `IGROUPR0`/`ISENABLER0` word covers them; `IPRIORITYR` is byte-addressed per INTID.
         let igroupr0 = (GICR_SGI_BASE + 0x0080) as *mut u32;
-        let g = core::ptr::read_volatile(igroupr0) | (1 << VTIMER_INTID);
+        let g = core::ptr::read_volatile(igroupr0) | (1 << VTIMER_INTID) | (1 << MAINT_INTID);
         core::ptr::write_volatile(igroupr0, g);
         // IPRIORITYR is byte-addressed per INTID; write a mid priority (below the PMR mask 0xff).
         core::ptr::write_volatile(
             (GICR_SGI_BASE + 0x0400 + VTIMER_INTID as u64) as *mut u8,
             0x80,
         );
-        // ISENABLER0: set the enable bit for INTID 27.
-        core::ptr::write_volatile((GICR_SGI_BASE + 0x0100) as *mut u32, 1 << VTIMER_INTID);
+        core::ptr::write_volatile(
+            (GICR_SGI_BASE + 0x0400 + MAINT_INTID as u64) as *mut u8,
+            0x80,
+        );
+        // ISENABLER0: set the enable bits for INTID 27 and INTID 25.
+        core::ptr::write_volatile(
+            (GICR_SGI_BASE + 0x0100) as *mut u32,
+            (1 << VTIMER_INTID) | (1 << MAINT_INTID),
+        );
     }
 }
 
@@ -347,6 +436,34 @@ pub(crate) fn eoi_physical(intid: u32) {
     // SAFETY: writing `ICC_EOIR1_EL1` at EL2 completes a physical interrupt; no memory effect.
     unsafe {
         asm!("msr ICC_EOIR1_EL1, {i}", i = in(reg) intid as u64, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Whether the GIC has the **maintenance interrupt** ([`MAINT_INTID`]) asserted as pending at this CPU's
+/// redistributor (`GICR_ISPENDR0` bit 25) — read WITHOUT acknowledging it (III-1's witness).
+///
+/// This is the difference between "we set `UIE`" and "the hardware agrees the bank has underflowed and is
+/// asking to be refilled". `set_underflow_interrupt` only writes an EL2 control bit; whether the GIC turns
+/// that into an actual interrupt request is the part the metal cannot assert by inspecting its own
+/// bookkeeping, so it is read back from the interrupt controller instead. Reading the pending state rather
+/// than `ICC_IAR1_EL1` keeps this side-effect-free — an ack would take the interrupt and leave it active.
+#[cfg(feature = "selftest")]
+pub(crate) fn maint_is_pending() -> bool {
+    // SAFETY: `GICR_ISPENDR0` is a documented redistributor register in the SGI/PPI frame — device memory
+    // on the `virt` machine, addressed directly at EL2 (MMU off). Read-only; aliases no Rust memory.
+    unsafe {
+        core::ptr::read_volatile((GICR_SGI_BASE + 0x0200) as *const u32) & (1 << MAINT_INTID) != 0
+    }
+}
+
+/// Clear a stale pending [`MAINT_INTID`] at the redistributor (`GICR_ICPENDR0`), so the III-1 witness
+/// leaves no phantom maintenance interrupt for the first real phase to field. (`selftest`-only.)
+#[cfg(feature = "selftest")]
+pub(crate) fn clear_maint_pending() {
+    // SAFETY: `GICR_ICPENDR0` is the documented clear-pending register in the SGI/PPI frame; writing a
+    // 1 clears that INTID's pending state. Device memory at EL2, aliases no Rust memory.
+    unsafe {
+        core::ptr::write_volatile((GICR_SGI_BASE + 0x0280) as *mut u32, 1 << MAINT_INTID);
     }
 }
 

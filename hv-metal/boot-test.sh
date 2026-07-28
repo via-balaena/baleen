@@ -251,6 +251,7 @@ boot_and_check "selftest" "--features selftest" \
     "selftest: BootCell exclusion OK (second borrow refused while live, accepted after drop" \
     "selftest: I1 IRQ-mask check OK (masked DAIF accepted, unmasked rejected, live EL2 context masked)" \
     "selftest: vGIC LR-bank ownership OK" \
+    "selftest: vGIC pending-overflow OK" \
     "selftest: Stage-2 encoding verified" \
     "1 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB" \
     "guest HVC serviced: nr=0 arg=100 -> result=100" \
