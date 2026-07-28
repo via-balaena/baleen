@@ -58,12 +58,70 @@ unmodified kernel unchanged:
   kernel's `MIGRATE_INFO_TYPE` probe) return `NOT_SUPPORTED` and the kernel continues.
 
 The one input this environment cannot produce is the **kernel `Image`** (no aarch64 Linux
-cross-toolchain here), so the target is kernel-gated on a user-supplied/approved `Image` in
-`$BALEEN_LINUX_DIR` — an official signed Alpine `virt` kernel, decompressed from its EFI-zboot wrapper.
+cross-toolchain here), so it comes from `$BALEEN_LINUX_DIR` — an official Alpine `virt` kernel,
+decompressed from its EFI-zboot wrapper. `hv-metal/linux/fetch-guest-image.sh` builds it; see §5f.
 **No isolation content** (the thesis is proven on the un-forgeable synthetic guests); this demonstrates
 the proven interface carries an unmodified kernel. The guest CPU is a stable `cortex-a72` baseline, not
 `-cpu max` — `max` advertises features (S1PIE, SME, GCS, pauth) whose EL1 use traps to EL2 for a
 hypervisor to enable, which this minimal EL2 deliberately does not.
+
+## 5f — the capstone becomes a gate (⑬)
+
+For several arcs this boot was a **local result**: kernel-gated on a hand-made `$BALEEN_LINUX_DIR`
+that one laptop could produce, run by a command that asserted nothing (`qemu-linux` returned QEMU's
+exit status), and deliberately outside CI. That is a demonstration nobody can re-run. It is now the
+`real-linux boot (QEMU)` job.
+
+**This carries no isolation content**, and it is not a rung. It was deferred for exactly that reason.
+Its whole justification is sequencing: the two-real-guests capstone would otherwise land the same way
+— an anecdote rather than something a gate re-runs.
+
+**Reproducing the artifacts.** `hv-metal/linux/fetch-guest-image.sh` downloads two VERSION-PINNED
+official Alpine URLs, verifies each against a SHA-256 recorded in the script, unwraps the EFI-zboot
+`vmlinuz-virt` into the raw arm64 `Image` the boot protocol wants, and builds the initramfs from the
+official minirootfs plus the checked-in `hv-metal/linux/guest-init.sh` as `/init`. So what any of this
+trusts is a set of fixed 256-bit hashes; `dl-cdn.alpinelinux.org` is an *availability* dependency, not
+a *trust* one. The `Image` is bit-reproducible (a byte slice plus gunzip of upstream's own bytes) and
+is therefore pinned too, so a cached copy is checked rather than believed; the cpio archive is not
+(it records mtimes and uids), so its *inputs* are pinned instead. There is one recipe: CI runs the
+same script a developer with an empty `$BALEEN_LINUX_DIR` runs.
+
+**What the job asserts.** `cargo xtask qemu-linux-test` runs the same QEMU line as the demo — one
+`linux_qemu_args`, so the gate cannot pass against a boot the demo does not perform — with the serial
+output captured, requiring every marker in `LINUX_MARKERS` and none in `LINUX_FORBIDDEN`. The per-marker
+reasoning lives on those constants. Two are worth repeating here:
+
+- **`node   0: [mem 0x0000000048000000-0x000000007fffffff]`** is the memory contract in one string.
+  It is the kernel reporting the window it read from *our* DTB, and it must equal `LINUX_RAM_BASE..
+  LINUX_RAM_END` (what the emitter maps) and xtask's `-device loader` addresses (where the blobs
+  land). Four places that have to agree, previously kept in agreement by hand.
+- **`baleen: LINUX GUEST TRAP`** is forbidden. `handle_linux_sync` prints it for any lower-EL
+  synchronous exception that is not an `HVC` — i.e. for every Stage-2 abort — so an emitter
+  mis-mapping lands there. It is what makes this an assertion about the emitter rather than about
+  Linux.
+
+**Probed load-bearing before the job was written** (design-lessons #65, #70): ten mutations, ten red —
+the DTB's `/memory` base; the emitted RAM window (`LINUX_RAM_END`); the pass-through device window;
+xtask's initramfs load address; the kernel entry address; read-only guest-RAM leaves (this is the one
+that produces `LINUX GUEST TRAP`, `EC=0x20` at `0x4800_0000`); the wait cap on a boot that does not
+finish; absent artifacts; a flipped checksum pin; and a substituted `Image` under a matching stamp.
+
+**The failure mode this accepts.** As a required check, a mirror outage blocks merges. That is the
+price of the alternative being decorative. What is deliberately not done is letting a fetch failure
+pass green — a job that goes green when it could not obtain the kernel would stay green if the kernel
+were deleted (design-lesson #71).
+
+**Measured cost (PR #97, the job's first run): 49 s end to end on a COLD cache** — 11 s of apt, 3 s to
+fetch/checksum/unwrap both artifacts, 15 s for the boot including the hv-metal cross-build. About what
+the synthetic `metal boot (QEMU)` job costs (42 s), so being required is cheap. The cache is an outage
+hedge rather than a speed one.
+
+**Reproduced independently on the runner**, which is the part worth keeping: the x86-64 Linux runner's
+unwrap produced `Image` sha256 `8b216f74…` — byte-identical to the macOS/arm64 laptop's — and all
+eleven markers appeared under the runner's **QEMU 8.2**, a different QEMU generation from the local
+11.0.3. Two hosts, two architectures, two QEMU generations, one result. (The cpio archive differs in
+size between them, 4029394 vs 4021398 bytes, exactly as the non-reproducibility note above predicts —
+and it does not matter, because its inputs are what is pinned.)
 
 ## Scope and honesty
 

@@ -13,3 +13,8 @@ Cargo.lock
 # hv-metal bare-metal build artifacts (standalone crate, its own workspace)
 /hv-metal/target
 /hv-metal/Cargo.lock
+
+# The real-Linux guest artifacts (kernel Image + initramfs), where CI's `real-linux boot (QEMU)` job
+# points $BALEEN_LINUX_DIR. Built by hv-metal/linux/fetch-guest-image.sh; ~40 MB, never committed —
+# the recipe is the artifact (see docs/ARC-5-M5-GUEST-INTERFACE.md §5f).
+/.baleen-linux

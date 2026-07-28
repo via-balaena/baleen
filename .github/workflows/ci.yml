@@ -155,6 +155,100 @@ jobs:
       - name: hv-metal boots to the serial markers under QEMU
         run: cargo xtask qemu-test
 
+  # The REAL-Linux boot (M5 Arc 5e / Arc 6b), gated. An unmodified Alpine aarch64 kernel boots as an
+  # EL1 guest behind the PROVEN Stage-2 emitter, reaches userspace out of its initramfs, and powers
+  # off through hv-metal's PSCI handler — the one guest in this repository that is not synthetic.
+  #
+  # Why this job exists, stated honestly: it carries NO isolation content. The thesis is proven on the
+  # un-forgeable synthetic guests (`metal boot (QEMU)`, above), and this arc only demonstrates that the
+  # already-proven interface carries a real kernel. It was deferred for arcs for exactly that reason.
+  # What it buys is that the demonstration becomes RE-RUNNABLE BY ANYONE rather than a result from one
+  # laptop — which is also what the two-real-guests capstone will need, or it would land the same way.
+  #
+  # WHAT IT ASSERTS, and why the assertions could fail. `cargo xtask qemu-linux-test` runs the same
+  # QEMU line as the `qemu-linux` demo (one derivation — see `linux_qemu_args`) with the serial output
+  # captured, and requires every marker in `LINUX_MARKERS` and none in `LINUX_FORBIDDEN`. Those lists
+  # carry the reasoning per marker; the two loudest are `node 0: [mem 0x48000000-0x7fffffff]` (the
+  # kernel reporting the RAM window it got from our DTB, which must equal what the emitter mapped and
+  # where xtask's `-device loader` put the blobs — four places, one string) and the FORBIDDEN
+  # `LINUX GUEST TRAP`, which `handle_linux_sync` prints for any Stage-2 abort, so an emitter
+  # mis-mapping lands there. Probed load-bearing before this job was written: nine mutations (DTB
+  # /memory base, the emitted RAM window, the device window, the initramfs load address, the kernel
+  # entry, read-only RAM leaves, the wait cap, absent artifacts, a flipped checksum pin), nine red.
+  #
+  # WHERE THE KERNEL COMES FROM. Not committed (40 MB of binaries would make git history the trust
+  # base) and not a release asset (which needs the regeneration recipe documented anyway, so it is the
+  # recipe plus a hosting step). `hv-metal/linux/fetch-guest-image.sh` builds both artifacts from two
+  # VERSION-PINNED official Alpine URLs, each verified against a SHA-256 in the script, and unwraps the
+  # EFI-zboot `vmlinuz-virt` into the raw arm64 `Image` the boot protocol wants. So what this job
+  # trusts is two fixed 256-bit hashes: `dl-cdn.alpinelinux.org` is an AVAILABILITY dependency, not a
+  # TRUST dependency — the same posture as the SHA-pinned actions above. The script is also what
+  # populates a developer's `$BALEEN_LINUX_DIR`, so there is one recipe, not a workflow copy of one.
+  #
+  # THE FAILURE MODE THIS ACCEPTS. As a required check, a dl-cdn outage blocks merges. That is the
+  # price of the alternative being decorative — an advisory job makes the capstone barely count. The
+  # cache below makes an outage a days-wide window rather than an instant one. What is deliberately
+  # NOT done is letting a fetch failure pass green: a job that goes green when it could not obtain the
+  # kernel would stay green if the kernel were deleted.
+  real-linux-boot:
+    name: real-linux boot (QEMU)
+    runs-on: ubuntu-latest
+    # MEASURED on this job's first run (PR #97), not guessed — and it is cheap: **49 s end to end on a
+    # COLD cache**. Breakdown: 11 s apt (qemu/dtc/cpio) · 3 s to fetch, checksum and unwrap both
+    # artifacts (the runner's link to dl-cdn is fast; the cache below is an outage hedge, not a speed
+    # one) · 15 s for the boot step itself, which includes the hv-metal cross-build and dtc. So a real
+    # kernel under CROSS-ARCH TCG costs about what the synthetic `metal boot (QEMU)` job costs (42 s),
+    # and this is affordable as a required check. Locally, on native-arch TCG, the whole task is 2.3 s.
+    #
+    # 15 minutes matches `metal boot (QEMU)` and is ~18x the measured cost. It is only a backstop: a
+    # HUNG boot is caught by the inner wait cap (`LINUX_WAIT_SECS_DEFAULT`, 300 s), which kills QEMU
+    # and dumps the serial log — a diagnosable failure rather than a job that ran out of wall clock.
+    timeout-minutes: 15
+    env:
+      BALEEN_LINUX_DIR: ${{ github.workspace }}/.baleen-linux
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install stable toolchain + bare-metal target
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-none-softfloat
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: hv-metal
+
+      # `qemu-system-arm` provides `qemu-system-aarch64`; `device-tree-compiler` provides `dtc`, which
+      # xtask shells out to for the guest DTB; `cpio` builds the initramfs.
+      - name: Install QEMU, dtc and cpio
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-arm device-tree-compiler cpio
+
+      # Keyed on the recipe itself — both scripts, whose contents include every pinned hash — so
+      # changing a pin necessarily changes the key and cannot be satisfied by a stale entry. The
+      # script re-verifies the restored `Image` against `IMAGE_SHA256` regardless, so a cache hit is
+      # checked rather than believed.
+      - name: Cache the guest kernel + initramfs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ github.workspace }}/.baleen-linux
+          key: baleen-linux-guest-${{ hashFiles('hv-metal/linux/fetch-guest-image.sh', 'hv-metal/linux/guest-init.sh') }}
+
+      # A separate step from the boot so a mirror outage is diagnosable at a glance as a fetch
+      # failure, rather than looking like the hypervisor broke.
+      - name: Fetch the guest kernel + initramfs (checksum-pinned)
+        run: hv-metal/linux/fetch-guest-image.sh
+
+      - name: A real Linux kernel boots behind the proven emitter
+        run: cargo xtask qemu-linux-test
+
   # Supply-chain gate: refuse a dependency carrying a security advisory, a disallowed
   # license, an untrusted source, or a wildcard version. The shipping workspace has zero
   # external deps today, so this stays green now and blocks the first bad dep from landing
