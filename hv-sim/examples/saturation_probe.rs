@@ -10,6 +10,7 @@ use hv_sim::enumerate::{enumerate, state_key, Config};
 fn base() -> Config {
     Config {
         domains: 2,
+        devices: 0,
         ports: 2,
         grants: 2,
         vcpus: 1,
@@ -24,6 +25,7 @@ fn base() -> Config {
         create: false,
         destroy: false,
         delegate: false,
+        device: false,
         async_agent: false,
         drive_execute: false,
         mediated_frames: false,
@@ -135,7 +137,7 @@ fn main() {
     // ── Direct proof that a grant's `maps` refcount is unbounded once a frame is owned:
     //    allocate frame 0, grant it, then map it N times — each remap a fresh state_key. ──
     println!("\n=== direct: grant `maps` is unbounded once the frame is owned ===");
-    let mut hv = Hypervisor::new(2, 2, 8, 1, 1, 2);
+    let mut hv = Hypervisor::new(2, 2, 8, 1, 1, 2, 2);
     hv.dispatch(
         0,
         HvCall::DomainCreate {

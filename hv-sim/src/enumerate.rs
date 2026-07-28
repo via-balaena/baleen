@@ -58,6 +58,10 @@ pub struct Config {
     pub vcpus: usize,
     pub pcpus: usize,
     pub frames: usize,
+    /// DMA-capable devices in the system — the [`hv_core::device`] axis. Kept small for the
+    /// same reason `frames` is: the device property is per-device local, so two suffice to
+    /// distinguish "this device moved" from "all devices moved".
+    pub devices: usize,
     /// Page-table levels to try when pinning/typing (a subset of L1..L4).
     pub levels: Vec<PtLevel>,
     /// Grant-map handles to try unmapping (`0..handles`).
@@ -70,6 +74,13 @@ pub struct Config {
     pub create: bool,
     pub destroy: bool,
     pub delegate: bool,
+    /// Drive **device assignment** ([`HvCall::DeviceAssign`] / [`HvCall::DeviceRelease`], the
+    /// SMMU arc's rung 4). Off by default for the same reason as [`Self::async_agent`] and
+    /// [`Self::drive_execute`]: it is an orthogonal state axis that shifts the reachable-state
+    /// counts, so the existing Tier-B saturation witnesses keep their exact calibration with it
+    /// off, and the device property gets a dedicated config. With it off the assignment table
+    /// stays empty in every reachable state — exactly the pre-rung-4 behaviour.
+    pub device: bool,
     /// Drive the **async EL2 agent** transition ([`Transition::RaiseVcpuVirq`], the Arc 7b
     /// vtimer path) as well as the guest hypercalls. Unlike the others this is not an op
     /// *group* over `HvCall` — it is the one transition that is not guest-issued at all — so it
@@ -144,6 +155,7 @@ impl Config {
             grants: 2,
             vcpus: 1,
             pcpus: 1,
+            devices: 0,
             frames: 2,
             levels: vec![PtLevel::L1, PtLevel::L2],
             handles: 3,
@@ -154,6 +166,7 @@ impl Config {
             create: false,
             destroy: false,
             delegate: false,
+            device: false,
             async_agent: false,
             drive_execute: false,
             mediated_frames: false,
@@ -444,6 +457,22 @@ pub(crate) fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                 }
             }
         }
+        if cfg.device {
+            // Every (caller, dev, other) triple for both assign and release. The `other` loop
+            // is what reaches the interesting states: the authority-denied paths (a caller
+            // that controls neither `to` nor `from`, including the **self**-assign that
+            // `DeviceAssign` uniquely refuses), the exclusivity refusal (a second domain
+            // reaching for a held device), the idempotent re-assign, and the release of a
+            // device some other domain holds. Without the full cross product the sweep would
+            // only ever see a domain assigning to itself, which is exactly the case the model
+            // denies.
+            for dev in 0..cfg.devices as u16 {
+                for other in 0..doms {
+                    v.push((caller, HvCall::DeviceAssign { dev, to: other }));
+                    v.push((caller, HvCall::DeviceRelease { dev, from: other }));
+                }
+            }
+        }
     }
     v
 }
@@ -546,7 +575,9 @@ pub(crate) fn coverage(t: &Transition) -> Coverage {
             | HvCall::DomainCreate { .. }
             | HvCall::DomainDestroy { .. }
             | HvCall::ControlGrant { .. }
-            | HvCall::ControlRevoke { .. } => Coverage::Enumerated,
+            | HvCall::ControlRevoke { .. }
+            | HvCall::DeviceAssign { .. }
+            | HvCall::DeviceRelease { .. } => Coverage::Enumerated,
         },
         // The async EL2 agent — driven by `transitions` under `cfg.async_agent`.
         Transition::RaiseVcpuVirq { .. } => Coverage::Enumerated,
@@ -610,6 +641,8 @@ struct Snapshot {
     may_create: Vec<bool>,
     /// Per `(holder, target)`.
     control: Vec<Control>,
+    /// Per device: the domain holding it, if any (the SMMU arc's rung-4 assignment relation).
+    assign: Vec<Option<u16>>,
 }
 
 #[derive(Clone, Copy)]
@@ -707,6 +740,11 @@ impl Snapshot {
         }
         let edges = p.link_edges();
 
+        let dv = hv.device();
+        let assign = (0..dv.device_count() as u16)
+            .map(|dev| dv.holder_of(dev))
+            .collect();
+
         let live = (0..n_dom as u16).map(|d| hv.is_live(d)).collect();
         let may_create = (0..n_dom as u16).map(|d| hv.may_create(d)).collect();
         let mut control = Vec::with_capacity(n_dom * n_dom);
@@ -733,6 +771,7 @@ impl Snapshot {
             live,
             may_create,
             control,
+            assign,
         }
     }
 }
@@ -901,6 +940,17 @@ fn snapshot_key(sn: &Snapshot) -> Vec<u64> {
             k.push(tag);
         }
     }
+    // Device assignment is behaviourally live for the plainest of reasons: it gates its own
+    // transitions (a held device refuses a second assignee; a release requires the named
+    // holder), *and* it is what teardown must sweep — so two states differing only in who
+    // holds a device have different successors and must never merge (design-lesson #7). Like
+    // the control matrix, it stores a bare `DomId`, so the permutation below must relabel it.
+    for a in &sn.assign {
+        k.push(match a {
+            Some(d) => 1 + u64::from(*d),
+            None => 0,
+        });
+    }
 
     k
 }
@@ -1036,6 +1086,12 @@ fn permute(sn: &Snapshot, g: &Perm) -> Snapshot {
         live: sn.live.clone(),
         may_create: sn.may_create.clone(),
         control: sn.control.clone(),
+        // Device assignment stores domain ids, which Phase 1 holds fixed, so it is carried
+        // through unchanged — exactly like `control`. Permuting *device* ids as well would be
+        // sound (the core branches on no literal device id either) and would shrink each orbit
+        // further, but it buys nothing the device configs need and every unexercised reduction
+        // is a soundness obligation, so it is deliberately not added.
+        assign: sn.assign.clone(),
     }
 }
 
@@ -1147,6 +1203,7 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
         cfg.vcpus,
         cfg.pcpus,
         cfg.frames,
+        cfg.devices,
     );
 
     // With symmetry reduction, dedup on the orbit representative (the canonical key over the
@@ -1287,6 +1344,12 @@ mod tests {
             create: true,
             destroy: true,
             delegate: true,
+            device: true,
+            // The device group emits per *device*, so a group switched on over an empty device
+            // set emits nothing — and the census below would then fail with a confusing
+            // "variant not emitted" rather than the truth. Sized here, at the one config that
+            // must emit everything.
+            devices: 1,
             async_agent: true,
             ..Config::tiny()
         }
@@ -1992,8 +2055,8 @@ mod tests {
     /// owned by domain 0 and the same frame owned by domain 1 are different states.
     #[test]
     fn state_key_separates_distinguishable_states() {
-        let mut a = Hypervisor::new(2, 1, 1, 1, 1, 2);
-        let mut b = Hypervisor::new(2, 1, 1, 1, 1, 2);
+        let mut a = Hypervisor::new(2, 1, 1, 1, 1, 2, 2);
+        let mut b = Hypervisor::new(2, 1, 1, 1, 1, 2, 2);
         // Domain 1 boots Dead, so bring it up before it can own a frame; dom0 already
         // owns frame 0 in `a`. (Creation itself makes the two states differ in liveness,
         // which is also part of what `state_key` must distinguish.)
@@ -2010,10 +2073,13 @@ mod tests {
         assert_ne!(state_key(&a), state_key(&b));
         // ...but two paths to the *same* state share a key (a frame allocated then freed
         // equals one never allocated — modulo the handle/runtime fields we exclude).
-        let mut c = Hypervisor::new(2, 1, 1, 1, 1, 2);
+        let mut c = Hypervisor::new(2, 1, 1, 1, 1, 2, 2);
         c.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
         c.dispatch(0, HvCall::P2mFree { mfn: 0 }).unwrap();
-        assert_eq!(state_key(&c), state_key(&Hypervisor::new(2, 1, 1, 1, 1, 2)));
+        assert_eq!(
+            state_key(&c),
+            state_key(&Hypervisor::new(2, 1, 1, 1, 1, 2, 2))
+        );
     }
 
     /// The `saturated` flag is *sound* — the property the Tier-B all-depths theorems rest on.
@@ -2126,6 +2192,7 @@ mod tests {
             cfg.vcpus,
             cfg.pcpus,
             cfg.frames,
+            cfg.devices,
         );
         let mut seen: std::collections::HashSet<StateKey> = std::collections::HashSet::new();
         let mut all = Vec::new();
@@ -2294,7 +2361,7 @@ mod tests {
         // Separation: two states that are NOT related by any id-permutation must keep
         // distinct canonical keys. dom0 owning frame 0 typed as a page table is not symmetric
         // to dom0 owning it as a writable page (page type is not an id we permute).
-        let mut a = Hypervisor::new(2, 2, 2, 1, 1, 2);
+        let mut a = Hypervisor::new(2, 2, 2, 1, 1, 2, 2);
         a.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
         a.dispatch(
             0,
@@ -2304,7 +2371,7 @@ mod tests {
             },
         )
         .unwrap();
-        let mut b = Hypervisor::new(2, 2, 2, 1, 1, 2);
+        let mut b = Hypervisor::new(2, 2, 2, 1, 1, 2, 2);
         b.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
         let gp = group(&Config {
             p2m: true,
@@ -2519,6 +2586,157 @@ mod tests {
         expect_saturated(&wx_cfg(16));
     }
 
+    // ---------------------------------------------------------------------------------------
+    // SMMU rung 4a — device assignment, ∀-N
+    // ---------------------------------------------------------------------------------------
+
+    /// The device axis, sized to the property rather than to the machine.
+    ///
+    /// **Three domains** because the authority structure is what the sweep is about: dom0 can
+    /// create 1 and 2 and controls both, so the *authorized* assign, the **Denied self-assign**
+    /// (1 reaching for a device on its own behalf — the one refusal that makes
+    /// `DeviceAssign` different from every other control op), and the Denied peer-assign are all
+    /// reachable. `delegate` on, so a device can also be assigned by a *delegated* controller
+    /// and the assignment must survive that controller's edge being revoked (it does: the device
+    /// belongs to the assignee, not the assigner).
+    ///
+    /// **One device**, because exclusivity is per-device and already reachable with one (dom0
+    /// assigns it to 1, then reaches for it on behalf of 2 → `Busy`). A second device would
+    /// square the assignment state space and witness nothing the first does not.
+    ///
+    /// **No memory, no channels, no vCPUs**: this config's whole content is the interaction of
+    /// assignment with the *lifecycle*, and carrying the other subsystems would trade saturation
+    /// depth for states that say nothing about devices. What the assignment relation must survive
+    /// is create/destroy/recreate cycling, and that is exactly what is left on.
+    fn device_cfg(depth: u32) -> Config {
+        Config {
+            domains: 3,
+            devices: 1,
+            device: true,
+            create: true,
+            destroy: true,
+            delegate: true,
+            ports: 1,
+            grants: 1,
+            vcpus: 0,
+            pcpus: 0,
+            frames: 1,
+            levels: vec![],
+            depth,
+            max_states: 2_000_000,
+            ..Config::tiny()
+        }
+    }
+
+    /// **Device assignment preserves every invariant over the whole reachable set** (CI-shallow).
+    ///
+    /// The load-bearing one is [`CrossViolation::DeadDomainReferenced`], which since rung 4 reads
+    /// the assignment relation as a third kind of inbound reference: a `Dead` slot with a device
+    /// still assigned to it is a violation, so any reachable interleaving of assign and destroy
+    /// in which teardown's sweep did not run is a counterexample here. That is the ∀-N form of
+    /// "a reborn tenant does not inherit a bus master".
+    ///
+    /// **Non-vacuity is checked, not assumed** (#13f/#50): with the device group off, the same
+    /// config must reach strictly fewer states — otherwise assignment would be changing nothing
+    /// and a clean sweep would be evidence of nothing.
+    #[test]
+    fn device_assignment_preserves_the_invariants() {
+        let on = expect_no_violation(&device_cfg(7));
+        let mut off_cfg = device_cfg(7);
+        off_cfg.device = false;
+        let off = enumerate(&off_cfg);
+        assert!(
+            on.states > off.states,
+            "driving device assignment reached no new states ({} vs {}) — the sweep would be vacuous",
+            on.states,
+            off.states
+        );
+    }
+
+    /// **The all-depths device theorem** (deep): the config's entire reachable set is explored —
+    /// the frontier empties rather than the depth budget running out — with no violation. So for
+    /// *every* reachable state at *every* depth, no `Dead` slot has a device assigned to it. The
+    /// size generalization is the same Tier-B locality argument the other per-resource invariants
+    /// use (design-lesson #50): assignment is a per-device local relation, so a config with one
+    /// device and the full authority structure is the general case, not a sample of it.
+    #[test]
+    #[ignore = "deep exhaustive sweep — run on demand with --release --ignored"]
+    fn device_assignment_saturates() {
+        expect_saturated(&device_cfg(20));
+    }
+
+    /// The sweep is **reached**, not merely never contradicted.
+    ///
+    /// A clean `device_assignment_preserves_the_invariants` is consistent with two very different
+    /// worlds: teardown clears assignments, or no reachable state ever has an assigned device to
+    /// clear. This walks the BFS itself and requires a state in which a device is held by a
+    /// domain *other than* the one that could not lose it — i.e. that the destroy sweep had real
+    /// work at least once. Without it the ∀-N result above is a check that could not have failed
+    /// (design-lessons #70/#71).
+    #[test]
+    fn the_destroy_sweep_has_real_work_to_do() {
+        let cfg = device_cfg(7);
+        let universe = ops(&cfg);
+        let init = Hypervisor::new(
+            cfg.domains,
+            cfg.ports,
+            cfg.grants,
+            cfg.vcpus,
+            cfg.pcpus,
+            cfg.frames,
+            cfg.devices,
+        );
+        let mut seen: HashSet<StateKey> = HashSet::new();
+        seen.insert(state_key(&init));
+        let mut frontier = vec![init];
+        // Was there a state where a *destroyable* domain held the device, and did destroying it
+        // actually clear the assignment?
+        let mut swept = false;
+        for _ in 0..cfg.depth {
+            let mut next = Vec::new();
+            for hv in &frontier {
+                for &(caller, call) in &universe {
+                    let mut h = hv.clone();
+                    let _: Result<HvOutcome, _> = h.dispatch(caller, call);
+                    if !h.invariants_hold() {
+                        continue;
+                    }
+                    if let Some(holder) = h.device().holder_of(0) {
+                        // Destroy the holder from a domain that controls it (dom0 created it).
+                        let mut d = h.clone();
+                        if d.dispatch(
+                            0,
+                            HvCall::DomainDestroy {
+                                target: holder,
+                                now: NOW,
+                            },
+                        )
+                        .is_ok()
+                        {
+                            assert_eq!(
+                                d.device().holder_of(0),
+                                None,
+                                "destroying domain {holder} left device 0 assigned to it"
+                            );
+                            swept = true;
+                        }
+                    }
+                    if seen.insert(state_key(&h)) {
+                        next.push(h);
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            swept,
+            "no reachable state had a destroyable domain holding the device — the sweep was never exercised"
+        );
+    }
+
     #[test]
     fn reduction_hides_no_reachable_orbit_frames() {
         assert_reduction_hides_no_orbit(&sym_frame_cfg());
@@ -2544,6 +2762,7 @@ mod tests {
             cfg.vcpus,
             cfg.pcpus,
             cfg.frames,
+            cfg.devices,
         );
         let grp = group(cfg);
         let key = |hv: &Hypervisor| canonical_key(&Snapshot::from_hv(hv), &grp);

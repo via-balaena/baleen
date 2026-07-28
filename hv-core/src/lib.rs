@@ -27,6 +27,7 @@
 // still zero `unsafe`.
 extern crate alloc;
 
+pub mod device;
 pub mod evtchn;
 pub mod grant;
 pub mod hypervisor;

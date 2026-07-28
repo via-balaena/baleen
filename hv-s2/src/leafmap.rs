@@ -295,7 +295,7 @@ mod tests {
 
     /// A hypervisor sized like the metal's bring-up config.
     fn hv() -> Hypervisor {
-        Hypervisor::new(4, 4, 4, 2, 2, CAP)
+        Hypervisor::new(4, 4, 4, 2, 2, CAP, 0)
     }
 
     fn ok(hv: &mut Hypervisor, dom: DomId, call: HvCall) {
