@@ -718,6 +718,26 @@ pub enum DeriveError {
     TableTooSmall,
 }
 
+/// Which domain, if any, holds the device that presents `sid`.
+///
+/// Split out of [`intended_binding`] so the *relation lookup* is one derivation shared by the
+/// specification seam, the composition theorem's statement and any future consumer — rather than a
+/// search each of them writes for itself (design-lesson #14c).
+///
+/// At most one device can match once [`derive_stream_table`] has accepted the map (it refuses a
+/// non-injective one), so the first match is the only match.
+#[must_use]
+pub fn holder_of_stream(devices: &DeviceSystem, stream_of: &[u32], sid: u32) -> Option<DomId> {
+    let mut dev = 0usize;
+    while dev < devices.device_count() {
+        if stream_of.get(dev).copied() == Some(sid) {
+            return devices.holder_of(dev as DevId);
+        }
+        dev += 1;
+    }
+    None
+}
+
 /// **What the relation says StreamID `sid` must reach** — the *specification* seam.
 ///
 /// Written as a search over the relation, deliberately **not** derived from
@@ -736,17 +756,8 @@ pub fn intended_binding(
     binding_of: &[Option<Stage2Binding>],
     sid: u32,
 ) -> Option<Stage2Binding> {
-    let mut dev = 0usize;
-    while dev < devices.device_count() {
-        if stream_of.get(dev).copied() == Some(sid) {
-            if let Some(holder) = devices.holder_of(dev as DevId) {
-                return binding_of.get(holder as usize).copied().flatten();
-            }
-            return None;
-        }
-        dev += 1;
-    }
-    None
+    let holder = holder_of_stream(devices, stream_of, sid)?;
+    binding_of.get(holder as usize).copied().flatten()
 }
 
 /// **Derive the whole stream table from the assignment relation.** The device-axis twin of
@@ -858,6 +869,116 @@ pub fn table_refines_the_relation(
                 && verdict(words, log2size, sid).permits() == want.is_some()
         }),
     }
+}
+
+// ─── The COMPOSITION: the join, and what a device actually reaches ────────────────────────────────
+//
+// Everything above stops at the STE. `crate::arm64` starts at a table base. Between them sat the
+// arc's headline sentence — *a device assigned to `d` reaches exactly the frames `d`'s `p2m`
+// authorizes, at exactly the emitter's permissions, and nothing else* — held together by a citation
+// across three separately-proven links (`docs/SMMU-DEVICE-PATH-COMPOSITION.md` §1).
+//
+// The two functions below are the join and the composition. Both are tiny, and that is the point:
+// once the pieces are named, the sentence is a theorem about four lines of code rather than a
+// paragraph relating four documents.
+
+/// The two handles one emitted Stage-2 image is consumed through: the CPU's `VTTBR_EL2` and the
+/// device's [`Stage2Binding`].
+///
+/// Spelled as one value because they must name the **same table**: a `Stage2Handles` is the only
+/// way to obtain either, so there is no arrangement of the code in which one is derived and the
+/// other is derived differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stage2Handles {
+    /// What the domain's CPU is given.
+    pub vttbr: u64,
+    /// What the domain's devices are bound to.
+    pub binding: Stage2Binding,
+}
+
+/// **The join — both consumers' handles, from the one [`Layout`](crate::arm64::Layout) the emitter
+/// was handed.**
+///
+/// Before this existed, `hv-metal` computed `VTTBR_EL2` from `layout.l1_pa` and then recovered the
+/// STE's `S2TTB` **back out of that register value**. The recovery is proven to round-trip
+/// (`the_vttbr_seam_recovers_the_table_and_the_vmid`) — but only *under* the assumption
+/// `pa >> 48 == 0`, which nothing discharged; above the field both registers truncate, identically,
+/// so both walkers would agree while walking a table [`encode`](crate::arm64::encode) never wrote.
+/// That is §2(d), and this function is where it closes: `binding.s2ttb` **is** `layout.l1_pa`, and
+/// a base neither register can name exactly is refused rather than truncated.
+///
+/// The VMID still comes through [`vttbr_vmid`](crate::arm64::vttbr_vmid), because the *masking* is
+/// the content there (rung 3 §2b): the device is handed the value the CPU actually tags with, at
+/// the width the CPU actually tags at, and never a wider one that would alias two domains.
+pub fn stage2_handles(
+    layout: &crate::arm64::Layout,
+    vmid: u64,
+) -> Result<Stage2Handles, HandleError> {
+    use crate::arm64::{vttbr, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS, MAX_TABLE_PA};
+    // **The two fields are not the same width, and this is where that stops mattering.**
+    // `STE.S2TTB` carries bits [51:4]; `VTTBR_EL2.BADDR` carries bits [47:0]. A base between 2⁴⁸
+    // and 2⁵² is therefore *nameable by the STE and truncated by the VTTBR* — the device and the
+    // CPU pointed at two different tables, which is the exact failure rung 3 exists to exclude.
+    // It was invisible while `hv-metal` derived the `S2TTB` out of the VTTBR value (that
+    // pre-truncated), and this function's whole purpose is to stop deriving it that way. Found by
+    // `the_two_consumers_are_pointed_at_one_table` on its first run.
+    if layout.l1_pa >= MAX_TABLE_PA {
+        return Err(HandleError::VttbrNarrowerThanSte {
+            l1_pa: layout.l1_pa,
+        });
+    }
+    let v = vttbr(layout.l1_pa, vmid);
+    let binding = Stage2Binding {
+        // The table the emitter wrote into, NOT a value recovered from a register encoding.
+        s2ttb: layout.l1_pa,
+        vmid: vttbr_vmid(v, BALEEN_VMID_BITS),
+        regime: BALEEN_STAGE2,
+    };
+    // Refuse at the join rather than at derivation time: a base the STE cannot carry exactly names
+    // a *different table*, and the honest moment to say so is when the handles are minted.
+    stage2_ste(&binding).map_err(HandleError::Ste)?;
+    Ok(Stage2Handles { vttbr: v, binding })
+}
+
+/// Why a domain's two Stage-2 handles could not be minted. Both arms are **refusals**, never
+/// truncations, for the reason [`SteError`]'s are: a truncated table base is not a weaker
+/// permission, it is a different domain's memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandleError {
+    /// The STE cannot name the table exactly — see [`SteError`].
+    Ste(SteError),
+    /// The table base is nameable by `STE.S2TTB` (bits `[51:4]`) but **not** by `VTTBR_EL2.BADDR`
+    /// (bits `[47:0]`), so the device and the CPU would be pointed at two different tables.
+    ///
+    /// The two fields having different widths is a fact about the architecture that no document in
+    /// this repository had noticed; the "one regime, two walkers" round-trip cannot see it, because
+    /// it quantifies over bases the harness has already assumed representable. Found by proof, and
+    /// named here rather than folded into [`SteError`] so the asymmetry has somewhere to be read.
+    VttbrNarrowerThanSte {
+        /// The offending base.
+        l1_pa: u64,
+    },
+}
+
+/// **Where a transaction carrying `sid` at address `ipa` actually lands** — the composition, and
+/// the function the arc's headline sentence is stated over.
+///
+/// It is the device path with nothing left out and nothing cited: decode the STE the derivation
+/// published ([`stage2_binding_at`], the *decode* seam), then walk the descriptor words that STE
+/// names ([`walk`](crate::arm64::walk)). `None` at either step is a transaction that reaches no
+/// memory — an unbound stream, or an address the domain's tables do not map.
+///
+/// `fetch(table_pa, index)` reads one descriptor, exactly as in [`walk`](crate::arm64::walk): the
+/// metal supplies a volatile read of physical memory, the proofs an array read.
+pub fn device_reach(
+    words: &[u64],
+    log2size: u32,
+    sid: u32,
+    ipa: u64,
+    fetch: impl Fn(u64, u64) -> u64,
+) -> Option<crate::arm64::Reach> {
+    let binding = stage2_binding_at(words, log2size, sid)?;
+    crate::arm64::walk(binding.s2ttb, ipa, fetch)
 }
 
 #[cfg(test)]
@@ -1190,6 +1311,163 @@ mod tests {
         assert!(!table_refines_the_relation(
             &bypassed, LOG2, &d, &STREAMS, &b
         ));
+    }
+
+    // ─── The join (the device-path composition) ──────────────────────────────────────────────────
+
+    /// A layout shaped like the metal's, for the join tests.
+    fn join_layout(l1_pa: u64) -> crate::arm64::Layout {
+        crate::arm64::Layout {
+            l1_pa,
+            l2_code_pa: l1_pa + 0x1000,
+            l2_data_pa: l1_pa + 0x2000,
+            l3_data_pa: l1_pa + 0x3000,
+            l2_sup_pa: l1_pa + 0x4000,
+            l2_dev_pa: l1_pa + 0x5000,
+            guest_image_pa: Some(0x4040_0000),
+            data_ipa_base: 0x8000_0000,
+            data_pa_base: 0x4060_0000,
+            frame_size: 0x1000,
+            sup_ipa_base: 0xC000_0000,
+            sup_pa_base: 0x8000_0000,
+            sup_frames: 1,
+            device_base: 0,
+            device_len: 0,
+            sup_wx_exempt: false,
+        }
+    }
+
+    /// **GOLDEN — the join is behaviour-nil on the CPU path.** The `VTTBR_EL2` the metal hands the
+    /// CPU is byte-for-byte what it computed before the composition rung, and the binding is
+    /// exactly what the old two-step derivation (`vttbr` then `vttbr_table`/`vttbr_vmid`) produced.
+    /// Pinned literally, the way rung 3's `VTCR_EL2` refactor was pinned to `0x8002_3559`.
+    #[test]
+    fn the_join_is_behaviour_nil_on_the_cpu_path() {
+        use crate::arm64::{vttbr, vttbr_table, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS};
+        let l = join_layout(0x4010_0000);
+        let h = stage2_handles(&l, 1).unwrap();
+
+        assert_eq!(h.vttbr, 0x0001_0000_4010_0000, "VMID 1 | the L1 table PA");
+        assert_eq!(
+            h.vttbr,
+            vttbr(l.l1_pa, 1),
+            "…which is what the metal computed"
+        );
+        // The old derivation, spelled out: this is the code `register_domain_binding` used to run.
+        assert_eq!(
+            h.binding,
+            Stage2Binding {
+                s2ttb: vttbr_table(vttbr(l.l1_pa, 1)),
+                vmid: vttbr_vmid(vttbr(l.l1_pa, 1), BALEEN_VMID_BITS),
+                regime: BALEEN_STAGE2,
+            },
+            "the binding must be exactly what the two-derivation version produced"
+        );
+        // …and the new one is not derived that way at all: it is the Layout's own table base.
+        assert_eq!(h.binding.s2ttb, l.l1_pa);
+    }
+
+    /// **THE FINDING: `STE.S2TTB` and `VTTBR_EL2.BADDR` are not the same width.** The STE carries
+    /// bits `[51:4]`; the VTTBR carries `[47:0]`. So a table base in between is nameable by the
+    /// device's field and **truncated** by the CPU's — the two consumers pointed at two different
+    /// tables, which is the exact failure rung 3 exists to exclude.
+    ///
+    /// It was invisible while the metal derived the `S2TTB` *out of* the VTTBR value (that
+    /// pre-truncated, so the two agreed on the wrong table), and it is invisible to rung 3's
+    /// round-trip harness, which assumes a representable base. `stage2_handles` refuses.
+    #[test]
+    fn a_base_the_ste_can_name_but_the_vttbr_cannot_is_refused() {
+        let wide = 1u64 << 48;
+        // The STE is perfectly happy with it — that is the asymmetry.
+        assert!(stage2_ste(&Stage2Binding {
+            s2ttb: wide,
+            vmid: 1,
+            regime: crate::arm64::BALEEN_STAGE2,
+        })
+        .is_ok());
+        // The join is not.
+        assert_eq!(
+            stage2_handles(&join_layout(wide), 1),
+            Err(HandleError::VttbrNarrowerThanSte { l1_pa: wide })
+        );
+        // And an under-aligned base is refused by the STE's own field.
+        assert_eq!(
+            stage2_handles(&join_layout(0x4010_0040), 1),
+            Err(HandleError::Ste(SteError::UnalignedTable))
+        );
+    }
+
+    /// The composition itself, on a table the derivation built: an assigned device reaches its
+    /// domain's frame, an unassigned StreamID reaches nothing. The unit-test twin of the Kani
+    /// non-vacuity harness — a green boot must not be the only evidence this path is live.
+    #[test]
+    fn an_assigned_device_reaches_its_domains_frame_and_others_reach_nothing() {
+        use crate::arm64::{encode, frame_ipa, frame_pa, Reach, Tables, TABLE_ENTRIES};
+        use crate::leafmap::Perm;
+        let l = join_layout(0x4010_0000);
+        let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = (
+            [0u64; TABLE_ENTRIES],
+            [0u64; TABLE_ENTRIES],
+            [0u64; TABLE_ENTRIES],
+            [0u64; TABLE_ENTRIES],
+            [0u64; TABLE_ENTRIES],
+            [0u64; TABLE_ENTRIES],
+        );
+        let leaves = [Some(Perm::Rw), Some(Perm::Ro), None];
+        assert_eq!(l.validate(), Ok(()));
+        encode(
+            &leaves,
+            &[None],
+            &l,
+            Tables {
+                l1: &mut l1,
+                l2_code: &mut l2c,
+                l2_data: &mut l2d,
+                l3_data: &mut l3,
+                l2_sup: &mut l2s,
+                l2_dev: &mut l2dv,
+            },
+        );
+        let fetch = |pa: u64, i: u64| {
+            let i = i as usize;
+            if pa == l.l1_pa {
+                l1[i]
+            } else if pa == l.l2_data_pa {
+                l2d[i]
+            } else if pa == l.l3_data_pa {
+                l3[i]
+            } else {
+                0
+            }
+        };
+
+        let mut t = table();
+        let mut d = devices();
+        d.assign(0, 1).unwrap();
+        let b = [
+            None,
+            Some(stage2_handles(&l, 1).unwrap().binding),
+            None,
+            None,
+        ];
+        derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b).unwrap();
+
+        assert_eq!(
+            device_reach(&t, LOG2, STREAMS[0], frame_ipa(&l, 0), fetch),
+            Some(Reach {
+                pa: frame_pa(&l, 0),
+                perm: Perm::Rw,
+                xn: true
+            })
+        );
+        // The read-only frame keeps its permission across the whole path.
+        assert_eq!(
+            device_reach(&t, LOG2, STREAMS[0], frame_ipa(&l, 1), fetch).map(|r| r.perm),
+            Some(Perm::Ro)
+        );
+        // An unmapped frame, and an unassigned device's StreamID: nothing.
+        assert!(device_reach(&t, LOG2, STREAMS[0], frame_ipa(&l, 2), fetch).is_none());
+        assert!(device_reach(&t, LOG2, STREAMS[1], frame_ipa(&l, 0), fetch).is_none());
     }
 
     #[test]

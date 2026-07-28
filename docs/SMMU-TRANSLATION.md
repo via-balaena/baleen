@@ -29,6 +29,15 @@ memory" as prose relating two different objects. With the shared table there is 
 `hv-s2`'s ∀-address refinement covers the device path **verbatim** — the theorem constrains the
 *table*, not the *walker*.
 
+> **⚠ "Verbatim" was doing more work than it should have, and the composition rung is what cashed
+> it.** The claim is true as far as it goes — one table, one refinement — but "the device is
+> confined to the domain's memory" was still a *citation* joining three separately-proven links,
+> and nothing had ever written down the step from "the leaf map says frame `m`" to "an address in
+> frame `m`'s window arrives at frame `m`'s bytes". Writing it down found four silent preconditions
+> of the emitter and two real defects. The sentence is now a theorem —
+> `hv-verify::device_path_composition` — and `docs/SMMU-DEVICE-PATH-COMPOSITION.md` is what this
+> paragraph should be read against.
+
 Two arms fall out of that choice for free, and neither is available to a device-private design:
 
 * an IPA the domain does not own has **no descriptor**, so the device takes a translation fault;
@@ -206,9 +215,14 @@ platform, and the guard has to move somewhere the platform is not.
 
 ## 6. What rung 3 does **not** claim
 
-* **It does not extend the ∀-address refinement.** That theorem carries over verbatim because it
-  constrains the table; nothing here re-proves or strengthens it. The new machine-checked surface is
-  the binding, and it is honest to say the *proof* content of this rung is thinner than rung 2's.
+* ~~**It does not extend the ∀-address refinement.** That theorem carries over verbatim because it
+  constrains the table; nothing here re-proves or strengthens it.~~ True of rung 3, and the place
+  the arc's headline sentence quietly became a citation. **CLOSED by the device-path composition**
+  (`docs/SMMU-DEVICE-PATH-COMPOSITION.md`): the walk from a domain's table base to a frame's bytes
+  is now a proven pure function, the three links are composed into one theorem over ∀ StreamID and
+  ∀ address, and writing it out found four unstated preconditions of the emitter plus two real
+  defects — including that this rung's own "by construction" argument was sound only because the
+  metal *pre-truncated* the table base (`STE.S2TTB` is 52 bits; `VTTBR_EL2.BADDR` is 48).
 * **The two consumers are not simultaneous.** The device and the CPU consume the *same tables built by
   the same function from the same `p2m`*, but the witness drives the device while no vCPU of that
   domain is running. A guest-observed version — the guest reading, at the same IPA, the bytes a device

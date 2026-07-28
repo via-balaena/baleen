@@ -2564,3 +2564,591 @@ mod smmu_stream_derivation {
         );
     }
 }
+
+/// **The device-path composition** — the SMMU arc's headline sentence as one theorem rather than a
+/// citation across three separately-proven links.
+///
+/// > A device assigned to `d` reaches exactly the frames `d`'s `p2m` authorizes, at exactly the
+/// > emitter's permissions, and nothing else.
+///
+/// Rungs 1–4b each proved one link and none composed them, so the sentence above was carried by
+/// prose — `docs/SMMU-TRANSLATION.md`'s "carries over verbatim", which is a citation doing the work
+/// of a theorem (design-lesson #78). These harnesses drive the shipped path end to end: the model's
+/// device relation → the derived stream table's **bytes** → the STE's decode seam → a **walk of the
+/// emitted descriptor words** → the frame and permission `hv-core` authorized.
+///
+/// The two axes are priced separately and deliberately (design-lesson #79 — no silent caps):
+/// [`the_walk_lands_where_the_windows_say`] and
+/// [`a_device_reaches_exactly_the_memory_its_domain_reaches`] quantify over **every one of 2⁶⁴
+/// addresses** with a bounded number of *mapped* frames, which is the direction that says nothing
+/// else is reachable; [`a_device_never_reaches_an_unauthorized_frame`] quantifies over the **frame
+/// index and the model's edge set**, which is the direction that says what is reachable is
+/// authorized. Neither axis is dropped; they are carried by different harnesses because a symbolic
+/// address and a symbolic edge population priced together do not terminate.
+///
+/// See `docs/SMMU-DEVICE-PATH-COMPOSITION.md`.
+#[cfg(kani)]
+mod device_path_composition {
+    use hv_core::device::System as DeviceSystem;
+    use hv_core::p2m::{DomId, Mfn};
+    use hv_s2::arm64::{
+        encode, frame_ipa, frame_pa, vttbr_table, vttbr_vmid, walk, window_reach, Layout, Reach,
+        Tables, BALEEN_STAGE2, BALEEN_VMID_BITS, MAX_TABLE_PA, TABLE_ENTRIES,
+    };
+    use hv_s2::smmu::{
+        derive_stream_table, device_reach, holder_of_stream, stage2_handles, HandleError,
+        Stage2Binding, SteError, STE_WORDS,
+    };
+    use hv_s2::{leaf_map_from_edges, Maps, Perm};
+
+    /// Domains, and therefore Stage-2 table **sets** — two, because the isolation content of the
+    /// whole arc is "the *other* domain's memory", which needs a second set of tables to be wrong
+    /// about.
+    const NDOM: usize = 2;
+    /// Devices. Two, as rung 4b: aliasing and "one holder swept, another spared" both need a pair.
+    const NDEV: usize = 2;
+    /// Base-span frames the harnesses make symbolic. The address axis stays fully symbolic, so the
+    /// frames past this bound are covered in the direction that matters — their addresses are holes,
+    /// and the theorem requires the walk to fault there.
+    const SYM_BASE: usize = 3;
+    /// The same for super-span frames.
+    const SYM_SUP: usize = 2;
+    /// A four-entry stream table, as rungs 3 and 4b: the StreamID axis is what is symbolic, and the
+    /// size axis is closed by the builder's size-generic offset (rung 2, proven at the deployed
+    /// `BUS0_LOG2SIZE` too) plus the metal's per-derivation read-back of the real 256-entry table.
+    const LOG2: u32 = 2;
+    const STRTAB_WORDS: usize = (1 << LOG2) * STE_WORDS;
+
+    /// The `DevId → StreamID` map. Concrete for the reason rung 4b measured: a symbolic *map* makes
+    /// the derivation write at a symbolic offset, which is the single most expensive thing CBMC can
+    /// be asked to do here. The quantification that carries the meaning — ∀ StreamID *queried*, ∀
+    /// assignment vector — stays symbolic.
+    const STREAMS: [u32; NDEV] = [0, 2];
+
+    /// Table storage for one domain's Stage-2 set, at PAs that differ per set exactly as
+    /// `hv-metal`'s `STAGE2_SETS` do.
+    struct Set {
+        base: u64,
+        /// Emit without the device pass-through window. Set only by the authorization harness,
+        /// where the window costs sixteen `encode` iterations and bears on nothing the model says.
+        no_device_window: bool,
+        l1: [u64; TABLE_ENTRIES],
+        l2_code: [u64; TABLE_ENTRIES],
+        l2_data: [u64; TABLE_ENTRIES],
+        l3_data: [u64; TABLE_ENTRIES],
+        l2_sup: [u64; TABLE_ENTRIES],
+        l2_dev: [u64; TABLE_ENTRIES],
+    }
+
+    impl Set {
+        fn new(base: u64) -> Self {
+            Set {
+                base,
+                no_device_window: false,
+                l1: [0; TABLE_ENTRIES],
+                l2_code: [0; TABLE_ENTRIES],
+                l2_data: [0; TABLE_ENTRIES],
+                l3_data: [0; TABLE_ENTRIES],
+                l2_sup: [0; TABLE_ENTRIES],
+                l2_dev: [0; TABLE_ENTRIES],
+            }
+        }
+
+        fn layout(&self) -> Layout {
+            Layout {
+                l1_pa: self.base,
+                l2_code_pa: self.base + 0x1000,
+                l2_data_pa: self.base + 0x2000,
+                l3_data_pa: self.base + 0x3000,
+                l2_sup_pa: self.base + 0x4000,
+                l2_dev_pa: self.base + 0x5000,
+                // The metal's synthetic windows. Every domain is emitted at the SAME guest IPA
+                // layout — what differs between two domains is which leaves are mapped, which is
+                // exactly why "the wrong domain's tables" is a live hazard rather than an obvious
+                // address mismatch.
+                guest_image_pa: Some(0x4020_0000),
+                data_ipa_base: 0x8000_0000,
+                data_pa_base: 0x4040_0000,
+                frame_size: 0x1000,
+                sup_ipa_base: 0xC000_0000,
+                sup_pa_base: 0x4060_0000,
+                sup_frames: SYM_SUP as u64,
+                device_base: 0x0800_0000,
+                device_len: if self.no_device_window {
+                    0
+                } else {
+                    0x0200_0000
+                },
+                sup_wx_exempt: false,
+            }
+        }
+
+        fn emit(&mut self, leaves: &[Option<Perm>], supers: &[Option<Perm>]) {
+            let l = self.layout();
+            encode(
+                leaves,
+                supers,
+                &l,
+                Tables {
+                    l1: &mut self.l1,
+                    l2_code: &mut self.l2_code,
+                    l2_data: &mut self.l2_data,
+                    l3_data: &mut self.l3_data,
+                    l2_sup: &mut self.l2_sup,
+                    l2_dev: &mut self.l2_dev,
+                },
+            );
+        }
+
+        /// One descriptor read out of this set, or `None` if the PA is not one of its tables.
+        fn fetch(&self, table_pa: u64, index: u64) -> Option<u64> {
+            let i = index as usize;
+            match table_pa.checked_sub(self.base) {
+                Some(0x0000) => Some(self.l1[i]),
+                Some(0x1000) => Some(self.l2_code[i]),
+                Some(0x2000) => Some(self.l2_data[i]),
+                Some(0x3000) => Some(self.l3_data[i]),
+                Some(0x4000) => Some(self.l2_sup[i]),
+                Some(0x5000) => Some(self.l2_dev[i]),
+                _ => None,
+            }
+        }
+    }
+
+    const SET0_PA: u64 = 0x4001_0000;
+    const SET1_PA: u64 = 0x4002_0000;
+
+    /// The whole machine's physical memory, as far as a walker is concerned: both domains' table
+    /// sets. Anything else reads as zero — an invalid descriptor, hence a fault, which is the
+    /// conservative answer and the one that makes a *missing* mapping visible as a disagreement.
+    fn fetch(sets: &[Set; NDOM], table_pa: u64, index: u64) -> u64 {
+        if let Some(w) = sets[0].fetch(table_pa, index) {
+            return w;
+        }
+        if let Some(w) = sets[1].fetch(table_pa, index) {
+            return w;
+        }
+        0
+    }
+
+    fn any_perm() -> Option<Perm> {
+        let k: u8 = kani::any();
+        kani::assume(k < 4);
+        match k {
+            0 => None,
+            1 => Some(Perm::Ro),
+            2 => Some(Perm::Rw),
+            _ => Some(Perm::Rx),
+        }
+    }
+
+    /// A device system in an arbitrary state, built by real `assign` calls so the vector is a
+    /// reachable one (the rung-4a idiom, design-lesson #13f).
+    fn symbolic_devices() -> DeviceSystem {
+        let mut s = DeviceSystem::new(NDOM, NDEV);
+        for dev in 0..NDEV as u16 {
+            if kani::any::<bool>() {
+                let to: u16 = kani::any();
+                kani::assume((to as usize) < NDOM);
+                assert!(s.assign(dev, to).is_ok());
+            }
+        }
+        s
+    }
+
+    // ─── (1) the missing link: a walk of the words agrees with the layout, ∀ address ─────────────
+
+    /// **∀ IPA: a walk of the descriptor words [`encode`] wrote lands exactly where the layout's
+    /// windows say, or faults exactly where they say.**
+    ///
+    /// This is the link nothing had: `stage2_encoding` proves individual descriptors round-trip and
+    /// `verify_encoding` checks the emitted table at boot *through the same derivation `encode`
+    /// used*, so the step from "the leaf map says frame `m`" to "an address in frame `m`'s window
+    /// arrives at frame `m`'s bytes" had never been written down, let alone proven.
+    ///
+    /// **It failed the first time it was run**, and the counterexample
+    /// (`ipa = 0x0020_0000_C000_1007`) is now a comment in [`walk`]: every level indexes with nine
+    /// bits, so an address beyond the tables' 512 GiB reach wrapped back into the super window and
+    /// resolved to real memory. The walk `hv-metal` had used as its DMA-landing expectation since
+    /// rung 3 had the same shape.
+    #[kani::proof]
+    fn the_walk_lands_where_the_windows_say() {
+        let mut set = Set::new(SET0_PA);
+        let l = set.layout();
+        // Non-vacuity, and the premise the rest of the harness stands on: the deployed shape is one
+        // the emitter accepts.
+        assert!(l.validate().is_ok());
+
+        let mut leaves = [None; SYM_BASE];
+        for slot in leaves.iter_mut() {
+            *slot = any_perm();
+        }
+        let mut supers = [None; SYM_SUP];
+        for slot in supers.iter_mut() {
+            *slot = any_perm();
+        }
+        set.emit(&leaves, &supers);
+
+        let ipa: u64 = kani::any();
+        let walked = walk(l.l1_pa, ipa, |pa, i| set.fetch(pa, i).unwrap_or(0));
+        assert!(
+            walked == window_reach(&l, &leaves, &supers, ipa),
+            "a walk of the emitted words must land exactly where the layout says"
+        );
+    }
+
+    // ─── (2) the join: one derivation of the table both consumers are pointed at ─────────────────
+
+    /// **∀ table base and ∀ VMID: the CPU's `VTTBR_EL2` and the device's `S2TTB` name the table the
+    /// emitter wrote into — or the handles are refused.**
+    ///
+    /// The premise `the_vttbr_seam_recovers_the_table_and_the_vmid` *assumes* (`pa >> 48 == 0`) is
+    /// discharged here rather than assumed: above the field both registers truncate **identically**,
+    /// so the two-walkers round-trip cannot see it, and both would walk a table `encode` never
+    /// wrote. [`stage2_handles`] refuses instead, and `Layout::validate` refuses one rung earlier.
+    #[kani::proof]
+    fn the_two_consumers_are_pointed_at_one_table() {
+        let l1_pa: u64 = kani::any();
+        let vmid: u64 = kani::any();
+        kani::assume(vmid < 256);
+        let mut set = Set::new(SET0_PA);
+        let mut l = set.layout();
+        l.l1_pa = l1_pa;
+
+        match stage2_handles(&l, vmid) {
+            Ok(h) => {
+                assert!(
+                    h.binding.s2ttb == l.l1_pa,
+                    "the device must be bound to the table the emitter was handed"
+                );
+                assert!(
+                    vttbr_table(h.vttbr) == h.binding.s2ttb,
+                    "and the CPU must be given the same one"
+                );
+                assert!(vttbr_vmid(h.vttbr, BALEEN_VMID_BITS) == h.binding.vmid);
+                assert!(h.binding.regime == BALEEN_STAGE2);
+            }
+            Err(e) => {
+                // The only refusals are bases one of the two registers cannot carry exactly —
+                // never a truncation. The middle arm is the finding: `STE.S2TTB` is 52 bits and
+                // `VTTBR_EL2.BADDR` is 48, so a base between them is nameable by one consumer and
+                // not the other.
+                assert!(matches!(
+                    e,
+                    HandleError::Ste(SteError::UnalignedTable)
+                        | HandleError::Ste(SteError::TableAddressTooLarge)
+                        | HandleError::VttbrNarrowerThanSte { .. }
+                ));
+                assert!(l1_pa >= MAX_TABLE_PA || l1_pa % BALEEN_STAGE2.table_align() != 0);
+            }
+        }
+        // Non-vacuity: the shape the metal actually emits mints handles.
+        assert!(stage2_handles(&set.layout(), 1).is_ok());
+        let _ = set.fetch(0, 0);
+    }
+
+    // ─── (3) THE COMPOSITION, ∀ StreamID and ∀ address ───────────────────────────────────────────
+
+    /// **THE RUNG'S THEOREM. ∀ StreamID and ∀ IPA: the memory a device reaches is exactly the memory
+    /// the domain the model assigned it to reaches — and if the model assigned it to no one, none.**
+    ///
+    /// Every step is the shipped one and none is cited: the relation is `hv-core`'s, the table is
+    /// [`derive_stream_table`]'s bytes, the STE is read back through the decode seam, and the
+    /// address is resolved by **walking the descriptor words** the emitter wrote — through two
+    /// domains' table sets at once, so "the wrong domain's memory" is a reachable outcome the
+    /// theorem has to exclude rather than an unrepresentable one.
+    #[kani::proof]
+    fn a_device_reaches_exactly_the_memory_its_domain_reaches() {
+        let mut sets = [Set::new(SET0_PA), Set::new(SET1_PA)];
+        let mut leaves = [[None; SYM_BASE]; NDOM];
+        let mut supers = [[None; SYM_SUP]; NDOM];
+        let mut binding_of = [None; NDOM];
+
+        for d in 0..NDOM {
+            for slot in leaves[d].iter_mut() {
+                *slot = any_perm();
+            }
+            for slot in supers[d].iter_mut() {
+                *slot = any_perm();
+            }
+            let l = sets[d].layout();
+            assert!(l.validate().is_ok());
+            let leaf = leaves[d];
+            let sup = supers[d];
+            sets[d].emit(&leaf, &sup);
+            // The metal registers a domain's binding from the emission itself, through the same
+            // `Layout`. `vmid = d + 1` mirrors `hv-metal::stage2::set_vmid`.
+            binding_of[d] = Some(
+                stage2_handles(&l, d as u64 + 1)
+                    .expect("deployed shape")
+                    .binding,
+            );
+        }
+
+        let devices = symbolic_devices();
+        let mut strtab = [0u64; STRTAB_WORDS];
+        kani::assume(
+            derive_stream_table(&mut strtab, LOG2, &devices, &STREAMS, &binding_of).is_ok(),
+        );
+
+        let sid: u32 = kani::any();
+        let ipa: u64 = kani::any();
+        let reached = device_reach(&strtab, LOG2, sid, ipa, |pa, i| fetch(&sets, pa, i));
+
+        let intended: Option<Reach> = match holder_of_stream(&devices, &STREAMS, sid) {
+            Some(d) => window_reach(
+                &sets[d as usize].layout(),
+                &leaves[d as usize],
+                &supers[d as usize],
+                ipa,
+            ),
+            None => None,
+        };
+        assert!(
+            reached == intended,
+            "a device must reach exactly the memory of the domain the model assigned it to"
+        );
+    }
+
+    // ─── (4) the other axis: what it reaches is AUTHORIZED ───────────────────────────────────────
+
+    /// Frames in the symbolic model. Smaller than `stage2_refinement`'s world (4) and measured:
+    /// the model axis and the descriptor-word axis priced together are what makes this the
+    /// expensive harness, and three frames still express owner / grantee / third party.
+    const FRAMES: usize = 3;
+    /// Live page-table edges.
+    const EDGES: usize = 2;
+
+    fn auth_idx(grantor: DomId, grantee: DomId, frame: Mfn, writable: bool) -> u32 {
+        (((grantor as u32 * NDOM as u32 + grantee as u32) * FRAMES as u32 + frame) * 2)
+            + u32::from(writable)
+    }
+
+    /// **∀ StreamID, ∀ frame and ∀ model edge set: a device never reaches a frame its holder is not
+    /// authorized for.** The arc's headline sentence, end to end and in the isolation direction —
+    /// `hv-core`'s edges and grants at one end, the descriptor words a bus master walks at the other.
+    ///
+    /// The quantification is over the **frame index** rather than the whole address space, because
+    /// the edge population and a symbolic address priced together do not terminate. The address axis
+    /// is [`a_device_reaches_exactly_the_memory_its_domain_reaches`]'s, and it is the direction that
+    /// says nothing *else* is reachable; this one says what is reachable is authorized. Declared
+    /// rather than dropped (design-lesson #79).
+    #[kani::proof]
+    fn a_device_never_reaches_an_unauthorized_frame() {
+        // The model world: ownership, grants, and an edge set — P1 and P2 assumed exactly as
+        // `stage2_refinement` assumes them, because they are the same premises.
+        let mut owners = [None; FRAMES];
+        for slot in owners.iter_mut() {
+            if kani::any::<bool>() {
+                let d: DomId = kani::any();
+                kani::assume((d as usize) < NDOM);
+                *slot = Some(d);
+            }
+        }
+        let auth: u128 = kani::any();
+        let owner_of = |m: Mfn| -> Option<DomId> {
+            if (m as usize) < FRAMES {
+                owners[m as usize]
+            } else {
+                None
+            }
+        };
+        let authorizes = |g: DomId, d: DomId, f: Mfn, w: bool| -> bool {
+            auth & (1u128 << auth_idx(g, d, f, w)) != 0
+        };
+        let mut edges = [(0u32, 0u32, 0u32, false, false, false); EDGES];
+        for e in edges.iter_mut() {
+            let parent: Mfn = kani::any();
+            let child: Mfn = kani::any();
+            kani::assume((parent as usize) < FRAMES);
+            kani::assume((child as usize) < FRAMES);
+            *e = (parent, kani::any(), child, kani::any(), true, kani::any());
+        }
+        for (parent, _slot, child, writable, _leaf, _execute) in edges.iter().copied() {
+            // P2: an active edge's child is allocated.
+            kani::assume(owner_of(child).is_some());
+            // P1: `UnauthorizedForeignLink`.
+            if let (Some(co), Some(po)) = (owner_of(child), owner_of(parent)) {
+                if co != po {
+                    kani::assume(authorizes(co, po, child, writable));
+                }
+            }
+        }
+
+        // The emitted images: one per domain, from the model, through the shipped emitter.
+        let mut sets = [Set::new(SET0_PA), Set::new(SET1_PA)];
+        sets[0].no_device_window = true;
+        sets[1].no_device_window = true;
+        let mut leaves = [[None; FRAMES]; NDOM];
+        let mut binding_of = [None; NDOM];
+        for d in 0..NDOM {
+            let mut sup = [None; SYM_SUP];
+            let mut base = [None; FRAMES];
+            let ok = leaf_map_from_edges(
+                &edges,
+                owner_of,
+                |_p| Some(hv_s2::Span::Base),
+                d as DomId,
+                Maps {
+                    base: &mut base,
+                    sup: &mut sup,
+                },
+            )
+            .is_ok();
+            kani::assume(ok);
+            leaves[d] = base;
+            let l = sets[d].layout();
+            sets[d].emit(&base, &sup);
+            binding_of[d] = Some(
+                stage2_handles(&l, d as u64 + 1)
+                    .expect("deployed shape")
+                    .binding,
+            );
+        }
+
+        let devices = symbolic_devices();
+        let mut strtab = [0u64; STRTAB_WORDS];
+        kani::assume(
+            derive_stream_table(&mut strtab, LOG2, &devices, &STREAMS, &binding_of).is_ok(),
+        );
+
+        let sid: u32 = kani::any();
+        let m: Mfn = kani::any();
+        kani::assume((m as usize) < FRAMES);
+        let l = sets[0].layout();
+        let ipa = frame_ipa(&l, m);
+
+        if let Some(r) = device_reach(&strtab, LOG2, sid, ipa, |pa, i| fetch(&sets, pa, i)) {
+            let d = holder_of_stream(&devices, &STREAMS, sid)
+                .expect("an unassigned stream reaches nothing");
+            assert!(
+                r.pa == frame_pa(&l, m),
+                "a device that reaches a frame's IPA must land on that frame's bytes"
+            );
+            // …and that frame is one the model authorizes for the domain the device belongs to,
+            // **at the permission the device got**. Stated pointwise for the frame actually
+            // reached rather than by calling `check_authorized_with` over the whole map: the
+            // whole-map statement is `stage2_refinement`'s theorem over this very function, and
+            // re-asserting it here would duplicate what a lower layer proves (design-lesson #80)
+            // — while costing, measured, more than the rest of the harness put together.
+            let owner = owner_of(m);
+            assert!(
+                owner == Some(d) || owner.is_some_and(|o| authorizes(o, d, m, r.writable())),
+                "a bus master reached a frame its holder neither owns nor holds a grant for"
+            );
+            assert!(
+                leaves[d as usize][m as usize].is_some(),
+                "and it is a frame that domain's own leaf map maps"
+            );
+        }
+    }
+
+    // ─── (5) the clauses without which the four above are green over an empty set ────────────────
+
+    /// **Non-vacuity, and it is the trap for a composition specifically.** Every theorem above is a
+    /// biconditional or an implication, and all of them hold vacuously if no device ever reaches
+    /// anything. So: at the deployed configuration, with one device assigned, there **exists** a
+    /// StreamID and an address the device really does reach, at the permission the emitter emitted.
+    #[kani::proof]
+    fn the_composition_is_not_vacuous() {
+        let mut sets = [Set::new(SET0_PA), Set::new(SET1_PA)];
+        let leaves = [Some(Perm::Rw), Some(Perm::Ro), None];
+        let supers = [None; SYM_SUP];
+        let mut binding_of = [None; NDOM];
+        for d in 0..NDOM {
+            let l = sets[d].layout();
+            sets[d].emit(&leaves, &supers);
+            binding_of[d] = Some(
+                stage2_handles(&l, d as u64 + 1)
+                    .expect("deployed shape")
+                    .binding,
+            );
+        }
+        let mut devices = DeviceSystem::new(NDOM, NDEV);
+        assert!(devices.assign(0, 1).is_ok());
+        let mut strtab = [0u64; STRTAB_WORDS];
+        assert!(derive_stream_table(&mut strtab, LOG2, &devices, &STREAMS, &binding_of).is_ok());
+
+        let l = sets[1].layout();
+        // The writable frame: reached, at the frame's own PA, read/write, execute-never.
+        let r = device_reach(&strtab, LOG2, STREAMS[0], frame_ipa(&l, 0), |pa, i| {
+            fetch(&sets, pa, i)
+        });
+        assert!(
+            r == Some(Reach {
+                pa: frame_pa(&l, 0),
+                perm: Perm::Rw,
+                xn: true
+            }),
+            "the assigned device must really reach its domain's writable frame"
+        );
+        // The read-only frame: reached, and NOT writable — the permission crosses the seam.
+        let ro = device_reach(&strtab, LOG2, STREAMS[0], frame_ipa(&l, 1), |pa, i| {
+            fetch(&sets, pa, i)
+        });
+        assert!(ro.map(|r| r.perm) == Some(Perm::Ro));
+        // The unmapped frame: a hole.
+        assert!(
+            device_reach(&strtab, LOG2, STREAMS[0], frame_ipa(&l, 2), |pa, i| {
+                fetch(&sets, pa, i)
+            })
+            .is_none()
+        );
+        // The other device's StreamID: assigned to no one, reaches nothing anywhere.
+        assert!(
+            device_reach(&strtab, LOG2, STREAMS[1], frame_ipa(&l, 0), |pa, i| {
+                fetch(&sets, pa, i)
+            })
+            .is_none()
+        );
+    }
+
+    /// **The theorem can fail, and the way it fails is the isolation content** (design-lesson #71 —
+    /// a check that could not have failed reads as evidence when it is none). Bind the stream to the
+    /// *other* domain's tables — one field of one entry — and the device lands on the wrong domain's
+    /// memory at the same issued address, or on nothing at all.
+    #[kani::proof]
+    fn binding_the_wrong_domain_reaches_the_wrong_memory() {
+        let mut sets = [Set::new(SET0_PA), Set::new(SET1_PA)];
+        // Domain 0 maps frame 0; domain 1 does not map it at all.
+        let a_leaves = [Some(Perm::Rw), None, None];
+        let b_leaves = [None, Some(Perm::Rw), None];
+        let supers = [None; SYM_SUP];
+        sets[0].emit(&a_leaves, &supers);
+        sets[1].emit(&b_leaves, &supers);
+        let a: Stage2Binding = stage2_handles(&sets[0].layout(), 1)
+            .expect("deployed")
+            .binding;
+        let b: Stage2Binding = stage2_handles(&sets[1].layout(), 2)
+            .expect("deployed")
+            .binding;
+        assert!(a.s2ttb != b.s2ttb, "two sets must be two tables");
+
+        let l = sets[0].layout();
+        let ipa = frame_ipa(&l, 0);
+        let mut right = [0u64; STRTAB_WORDS];
+        let mut wrong = [0u64; STRTAB_WORDS];
+        let mut devices = DeviceSystem::new(NDOM, NDEV);
+        assert!(devices.assign(0, 0).is_ok());
+        assert!(
+            derive_stream_table(&mut right, LOG2, &devices, &STREAMS, &[Some(a), Some(b)]).is_ok()
+        );
+        // The same relation, derived against a binding map that names the wrong tables.
+        assert!(
+            derive_stream_table(&mut wrong, LOG2, &devices, &STREAMS, &[Some(b), Some(a)]).is_ok()
+        );
+
+        assert!(
+            device_reach(&right, LOG2, STREAMS[0], ipa, |pa, i| fetch(&sets, pa, i))
+                == Some(Reach {
+                    pa: frame_pa(&l, 0),
+                    perm: Perm::Rw,
+                    xn: true
+                })
+        );
+        assert!(
+            device_reach(&wrong, LOG2, STREAMS[0], ipa, |pa, i| fetch(&sets, pa, i)).is_none(),
+            "bound to the wrong domain's tables, the device must not reach its own domain's frame"
+        );
+    }
+}

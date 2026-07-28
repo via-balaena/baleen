@@ -258,10 +258,11 @@ pub fn encode(
     l1[data_l1] = (layout.l2_data_pa & desc::ADDR_4K) | desc::TABLE;
     l2_data[data_l2] = (layout.l3_data_pa & desc::ADDR_4K) | desc::TABLE;
 
-    // Clear the WHOLE L3 (not a live frame count) — the no-stale-leaf property.
-    for slot in l3_data.iter_mut() {
-        *slot = 0;
-    }
+    // Clear the WHOLE L3 (not a live frame count) — the no-stale-leaf property. Written as one
+    // whole-table assignment rather than a slot loop: identical semantics, and it is a *bulk* store
+    // both to the compiler and to the symbolic executor the proofs run under (measured — see
+    // `docs/SMMU-DEVICE-PATH-COMPOSITION.md` §4a: the three clears were this rung's entire cost).
+    *l3_data = [0; TABLE_ENTRIES];
     for (m, leaf) in leaves.iter().enumerate().take(TABLE_ENTRIES) {
         if let Some(perm) = leaf {
             // Base leaves follow the model's execute bit strictly — never exempt (only the super
@@ -278,10 +279,8 @@ pub fn encode(
     // keeps super leaves from ever overlapping base ones; `Layout::validate` enforces it.
     let sup_l1 = ((layout.sup_ipa_base >> 30) & 0x1ff) as usize;
     l1[sup_l1] = (layout.l2_sup_pa & desc::ADDR_4K) | desc::TABLE;
-    // Clear the WHOLE table — the same no-stale-leaf totality the `L3` gets.
-    for slot in l2_sup.iter_mut() {
-        *slot = 0;
-    }
+    // Clear the WHOLE table — the same no-stale-leaf totality the `L3` gets, and the same bulk form.
+    *l2_sup = [0; TABLE_ENTRIES];
     for (m, leaf) in supers.iter().enumerate().take(TABLE_ENTRIES) {
         if let Some(perm) = leaf {
             // The W^X-exemption affects ONLY writable super leaves: `sup_wx_exempt` turns a `Rw`
@@ -300,9 +299,7 @@ pub fn encode(
 
     // Device pass-through region (M5 Arc 6b): identity 2 MiB Device-nGnRnE, execute-never blocks.
     // Infrastructure, like the image block — no `p2m` edge describes MMIO.
-    for slot in l2_dev.iter_mut() {
-        *slot = 0;
-    }
+    *l2_dev = [0; TABLE_ENTRIES];
     if layout.device_len > 0 {
         let dev_l1 = ((layout.device_base >> 30) & 0x1ff) as usize;
         l1[dev_l1] = (layout.l2_dev_pa & desc::ADDR_4K) | desc::TABLE;
@@ -318,6 +315,42 @@ pub fn encode(
 /// Bytes one 2 MiB block covers — the granule the image, super and device regions are all built
 /// from. Derived from the table geometry so it cannot drift (design-lesson #14c).
 pub const BLOCK_SIZE: u64 = 0x20_0000;
+
+/// Bytes one `L3` page descriptor covers: 4 KiB, the granule this module emits leaves at.
+///
+/// **Derived from the block, not restated**, for the #14c reason the block itself is: one `L2` slot
+/// is one `L3` table's worth of pages, so a change to either has to move both. It is also the
+/// granule [`Layout::validate`] requires of `Layout::frame_size` — `encode` writes a *page*
+/// descriptor for a base leaf and a *block* for a super one, so a `Layout` at any other granule
+/// would have its descriptor kind and its address arithmetic describing different mappings.
+pub const PAGE_SIZE: u64 = BLOCK_SIZE / TABLE_ENTRIES as u64;
+
+/// Bytes a whole `L1` entry covers — 1 GiB. The unit a region must not straddle: [`encode`] writes
+/// one `L1` entry per region and indexes that region's `L2` with `(addr >> 21) & 0x1ff`, which
+/// **wraps** at this boundary rather than reaching the next `L1` entry.
+pub const L1_ENTRY_SIZE: u64 = BLOCK_SIZE * TABLE_ENTRIES as u64;
+
+/// The input-address space one emitted table set covers: 512 `L1` entries of 1 GiB — **512 GiB**.
+///
+/// A property of the table *shape*, not of a register field, and the ceiling a walker must fault
+/// above: [`encode`] writes exactly one 512-entry `L1`, and every level of the walk indexes with
+/// nine bits, so an address beyond this **wraps back into the same tables** rather than reaching
+/// anything new. `walk` therefore refuses it and [`Layout::validate`] refuses a window that
+/// straddles it. That an address above the addressable space faults is also what the hardware does:
+/// the deployed regime's `T0SZ` gives a 39-bit input address, and the two numbers are pinned equal
+/// at compile time below (design-lesson #14c — the table geometry and the declared regime are one
+/// fact, not two).
+pub const ADDRESSABLE: u64 = L1_ENTRY_SIZE * TABLE_ENTRIES as u64;
+
+// The declared regime's input-address size IS the geometry above. If a future regime change moved
+// one without the other, every emitted table would cover an address range the walkers do not agree
+// on — so it is a build error rather than a comment.
+const _: () = assert!(1u64 << BALEEN_STAGE2.ipa_bits == ADDRESSABLE);
+
+/// The largest address `VTTBR_EL2.BADDR` and `STE.S2TTB` can both carry — bits `[47:0]`. A table
+/// base above it is *truncated* by both registers, so both walkers would walk a table [`encode`]
+/// never wrote, and would agree with each other while doing it.
+pub const MAX_TABLE_PA: u64 = 1 << 48;
 
 // ─── the inverse: decoding, so the emitted table can be read back and checked ────────────────────
 //
@@ -443,6 +476,164 @@ pub fn decode_table(d: u64) -> Option<u64> {
     Some(d & desc::ADDR_4K)
 }
 
+// ─── The WALK — what a walker actually reaches, and what the layout says it should ───────────────
+//
+// Everything above answers "what does one descriptor mean?". Neither half of this crate had ever
+// answered the question a *walker* asks: **given `l1_pa` and an IPA, which byte does the hardware
+// touch, at what permission?** `verify_encoding` comes closest and is not it — it re-derives its
+// expectation exactly as `encode` derives the descriptor, so the two agree even when both are
+// wrong about the address arithmetic (design-lesson #36, seen from the failure side).
+//
+// That gap is why the SMMU arc's headline sentence was a citation: the step from "the leaf map
+// says frame `m`" to "a device that issues frame `m`'s IPA lands on frame `m`'s bytes" was the one
+// nobody had written down. [`walk`] is one reading of it (the descriptor words) and
+// [`window_reach`] is a second, independent one (the layout's windows); `hv-verify` proves they
+// agree for every IPA, and `docs/SMMU-DEVICE-PATH-COMPOSITION.md` §2 records the four silent
+// preconditions writing them down exposed.
+
+/// Where one IPA lands, and under what access — the result of a walk.
+///
+/// `perm` is the `S2AP` **access** ([`Perm::Ro`]/[`Perm::Rw`], never `Rx`) and `xn` the execute
+/// bit, the same split [`Decoded`] makes and for the same reason: the pair spans all four
+/// combinations the hardware can express while `Perm` alone keeps W+X unrepresentable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Reach {
+    /// The exact output byte — the leaf's PA with the offset within the leaf applied.
+    pub pa: u64,
+    /// The access the leaf grants.
+    pub perm: Perm,
+    /// Whether the leaf is execute-never.
+    pub xn: bool,
+}
+
+impl Reach {
+    /// Whether a write through this mapping is permitted. Named rather than open-coded so a
+    /// witness asking "did the DMA have permission to land here?" reads the same seam the emitter
+    /// wrote through.
+    #[must_use]
+    pub fn writable(self) -> bool {
+        self.perm.writable()
+    }
+}
+
+/// **Walk the emitted Stage-2 tables** rooted at `l1_pa` for `ipa`, reading descriptors through
+/// `fetch(table_pa, index)`. `None` is a translation fault — the address reaches nothing.
+///
+/// **Generic over the fetch, which is the whole point of it living here.** `hv-metal` supplies a
+/// volatile read of physical memory (a raw dereference is exactly what the metal is for); the
+/// proofs and the unit tests supply an array read. So the walk the boot witness asserts against and
+/// the walk the composition theorem is stated over are the *same function*, rather than two walks
+/// that have to be kept in step.
+///
+/// Concrete to the deployed regime — start level 1, 4 KiB granule, three levels — with the 2 MiB
+/// block arm for the super and device windows. A regime change would make this walk disagree with
+/// the hardware's, which is exactly why [`BALEEN_STAGE2`] is one declaration; a `Layout` whose
+/// granule is not the emitted one is refused by [`Layout::validate`].
+pub fn walk(l1_pa: u64, ipa: u64, fetch: impl Fn(u64, u64) -> u64) -> Option<Reach> {
+    // **The input-address ceiling, and it is not a formality.** Every level below indexes with nine
+    // bits of the address and ignores everything above bit 38, so without this an address beyond
+    // the tables' reach would **wrap back into the same tables** and resolve to a real mapping —
+    // a walker reaching authorized memory from an address the layout never mapped. The hardware
+    // takes a translation fault there (the regime's `T0SZ`), and so does this.
+    //
+    // Found by proof: `the_walk_lands_where_the_windows_say` produced exactly this counterexample
+    // (`ipa = 0x0020_0000_C000_1007` aliasing the super window) the first time it was run, against
+    // a walk transcribed from the one `hv-metal` had been using since rung 3.
+    if ipa >= ADDRESSABLE {
+        return None;
+    }
+    let l2_pa = decode_table(fetch(l1_pa, (ipa >> 30) & 0x1ff))?;
+    let l2_desc = fetch(l2_pa, (ipa >> 21) & 0x1ff);
+    // A block at `L2` is a 2 MiB leaf — the super window, the guest image and the device window.
+    // Tested before the table arm because the two encodings differ only in their low bits.
+    if let Some(block) = decode_block(l2_desc) {
+        return Some(Reach {
+            pa: block.pa | (ipa & (BLOCK_SIZE - 1)),
+            perm: block.perm,
+            xn: block.xn,
+        });
+    }
+    let l3_pa = decode_table(l2_desc)?;
+    let page = decode_page(fetch(l3_pa, (ipa >> 12) & 0x1ff))?;
+    Some(Reach {
+        pa: page.pa | (ipa & (PAGE_SIZE - 1)),
+        perm: page.perm,
+        xn: page.xn,
+    })
+}
+
+/// **What the `Layout` says `ipa` must reach** — the specification seam, written from the windows
+/// and the leaf maps with no reference to descriptor encoding at all.
+///
+/// Deliberately not derived from [`encode`] or from [`walk`], for the reason [`decode`](decode_page)
+/// is not derived from the emitters (design-lesson #36): the composition theorem then relates
+/// **three** independent readings — this one says what should be reachable, `encode` writes the
+/// words, `walk` reads them back.
+///
+/// `None` means the address is a hole: outside every window, or inside one at a frame the leaf map
+/// did not authorize. Assumes a layout [`Layout::validate`] has accepted — the four preconditions
+/// it now checks are exactly the ones that would make this function and `encode` describe different
+/// mappings.
+pub fn window_reach(
+    layout: &Layout,
+    leaves: &[Option<Perm>],
+    supers: &[Option<Perm>],
+    ipa: u64,
+) -> Option<Reach> {
+    // The guest image: one identity 2 MiB block, read-only and EXECUTABLE. Infrastructure, not
+    // model-driven — no `p2m` edge describes the guest's own code.
+    if let Some(image_pa) = layout.guest_image_pa {
+        if ipa >= image_pa && ipa - image_pa < BLOCK_SIZE {
+            return Some(Reach {
+                pa: ipa,
+                perm: Perm::Ro,
+                xn: false,
+            });
+        }
+    }
+    // The base-span window: one `L3` table's worth of `frame_size` frames.
+    let data_span = TABLE_ENTRIES as u64 * layout.frame_size;
+    if ipa >= layout.data_ipa_base && ipa - layout.data_ipa_base < data_span {
+        let off = ipa - layout.data_ipa_base;
+        let m = (off / layout.frame_size) as u32;
+        // Beyond the caller's map is a hole, not an error: `encode` writes nothing there and
+        // clears the whole table, so the descriptor really is dead.
+        let perm = (*leaves.get(m as usize)?)?;
+        let (access, xn) = leaf_access_xn(perm, false);
+        return Some(Reach {
+            pa: frame_pa(layout, m) + off % layout.frame_size,
+            perm: access,
+            xn,
+        });
+    }
+    // The super-span window: `sup_frames` blocks, bounded by the BACKING rather than by the table.
+    let sup_size = super_size(layout);
+    if ipa >= layout.sup_ipa_base && ipa - layout.sup_ipa_base < layout.sup_frames * sup_size {
+        let off = ipa - layout.sup_ipa_base;
+        let m = (off / sup_size) as u32;
+        let perm = (*supers.get(m as usize)?)?;
+        // The one declared W^X relaxation applies here and nowhere else (Phase II-1b).
+        let (access, xn) = leaf_access_xn(perm, layout.sup_wx_exempt);
+        return Some(Reach {
+            pa: super_pa(layout, m) + off % sup_size,
+            perm: access,
+            xn,
+        });
+    }
+    // The device pass-through window: identity, read/write, execute-never.
+    if layout.device_len > 0
+        && ipa >= layout.device_base
+        && ipa - layout.device_base < layout.device_len
+    {
+        return Some(Reach {
+            pa: ipa,
+            perm: Perm::Rw,
+            xn: true,
+        });
+    }
+    None
+}
+
 /// The four tables, read-only — for [`verify_encoding`].
 pub struct TablesRef<'a> {
     /// The `L1` table.
@@ -482,6 +673,57 @@ pub enum EncodingViolation {
         base: u64,
         /// The offending length.
         len: u64,
+    },
+    /// A window's base is not aligned to the granule its descriptors are emitted at, so the
+    /// descriptor [`encode`] writes and the address a walker computes describe different mappings.
+    ///
+    /// **The sharpest case is the data window's IPA.** `encode` writes frame `m`'s descriptor at
+    /// `l3_data[m]`, while a walker reads `l3_data[(ipa >> 12) & 0x1ff]`. Unless `data_ipa_base` is
+    /// 2 MiB-aligned those indices differ by a constant, so frame `m`'s IPA resolves to *another
+    /// frame's* PA and permission — and the frames past the wrap become reachable at addresses
+    /// outside the window [`Layout::validate`] believed disjoint from every other region. Nothing
+    /// faults; `verify_encoding` agrees, because it re-derives the expectation the same way.
+    WindowUnaligned {
+        /// Which window (`"guest image"`, `"data ipa"`, …).
+        window: &'static str,
+        /// The offending base.
+        base: u64,
+        /// The alignment it must have.
+        align: u64,
+    },
+    /// A region's span crosses the `L1` entry its base sits in.
+    ///
+    /// [`encode`] writes **one** `L1` entry per region and indexes that region's `L2` by
+    /// `(addr >> 21) & 0x1ff`, which wraps at 1 GiB instead of reaching the next `L1` entry. So a
+    /// window that straddles the boundary maps its tail into the *low* slots of its own `L2` —
+    /// addresses nothing authorized, reaching real memory. That direction fails **open**.
+    RegionCrossesL1 {
+        /// The `L1` index the region's base falls in.
+        l1_index: usize,
+        /// The span that overruns it.
+        span: u64,
+    },
+    /// A table base cannot be named exactly by `VTTBR_EL2.BADDR` / `STE.S2TTB` — above bits
+    /// `[47:0]`, or under-aligned.
+    ///
+    /// Both registers truncate rather than reject, so **both walkers would walk a table this
+    /// emitter never wrote**, and rung 3's "one regime, two walkers" round-trip cannot see it: the
+    /// CPU and the SMMU truncate identically and therefore agree. The premise
+    /// `the_vttbr_seam_recovers_the_table_and_the_vmid` assumes is discharged here.
+    TableUnnameable {
+        /// Which table.
+        table: &'static str,
+        /// The offending PA.
+        pa: u64,
+    },
+    /// `frame_size` is not the granule this module emits descriptors at ([`PAGE_SIZE`]).
+    ///
+    /// [`encode`] writes an `L3` **page** for a base leaf and an `L2` **block** for a super one,
+    /// while [`frame_pa`]/[`frame_ipa`] scale by `frame_size`. At any other granule the descriptor
+    /// kind and the address arithmetic describe different mappings.
+    GranuleNotEmitted {
+        /// The granule asked for.
+        frame_size: u64,
     },
     /// A device block is missing, or is not a Device-nGnRnE execute-never identity block.
     BadDeviceBlock {
@@ -555,6 +797,28 @@ impl Layout {
         (self.device_len > 0).then_some(((self.device_base >> 30) & 0x1ff) as usize)
     }
 
+    /// One window-alignment check — see [`EncodingViolation::WindowUnaligned`].
+    fn aligned(window: &'static str, base: u64, align: u64) -> Result<(), EncodingViolation> {
+        if base.is_multiple_of(align) {
+            Ok(())
+        } else {
+            Err(EncodingViolation::WindowUnaligned {
+                window,
+                base,
+                align,
+            })
+        }
+    }
+
+    /// One table-base check — see [`EncodingViolation::TableUnnameable`].
+    fn nameable(table: &'static str, pa: u64) -> Result<(), EncodingViolation> {
+        if pa < MAX_TABLE_PA && pa.is_multiple_of(PAGE_SIZE) {
+            Ok(())
+        } else {
+            Err(EncodingViolation::TableUnnameable { table, pa })
+        }
+    }
+
     /// Every region actually present, as `(L1 index, IPA base, PA base, span)`.
     ///
     /// Building the list once and checking it pairwise is what keeps [`validate`](Self::validate)
@@ -607,7 +871,70 @@ impl Layout {
                 len: self.device_len,
             });
         }
+        // ─── REPRESENTABILITY (the device-path composition) ────────────────────────────────────
+        //
+        // Everything below this comment and above the pairwise loop was added by the composition
+        // rung, and every one of the four premises it checks was, until then, *silent*: `encode`
+        // has always assumed them, nothing stated them, and violating any of them mis-maps without
+        // faulting — `verify_encoding` re-derives its expectation exactly as `encode` derives the
+        // descriptor, so the two agree on the wrong answer. Writing `window_reach` and `walk` as
+        // two independent readings is what forced them into the open
+        // (`docs/SMMU-DEVICE-PATH-COMPOSITION.md` §2). They are checked HERE, at the same gate the
+        // metal already halts on, rather than at four separate call sites.
+
+        // (c) The granule. `encode` emits a page at `L3` and a block at `L2`; the address
+        //     derivations scale by `frame_size`. They must be talking about the same size.
+        if self.frame_size != PAGE_SIZE {
+            return Err(EncodingViolation::GranuleNotEmitted {
+                frame_size: self.frame_size,
+            });
+        }
+
+        // (a) Window alignment. The data window's IPA must be block-aligned or the `L3` index a
+        //     walker computes is not the `m` the descriptor was written at; its PA must be
+        //     page-aligned or the descriptor's own address mask drops bits `frame_pa` kept. The
+        //     block-granule windows must be block-aligned for the same two reasons one level up.
+        //
+        //     Written as flat, sequential checks rather than a loop over a chained iterator: the
+        //     `Chain<array::IntoIter, option::IntoIter>` machinery is opaque to the symbolic
+        //     executor the proofs run under, and cost minutes where this costs nothing (§4a).
+        Self::aligned("data ipa", self.data_ipa_base, BLOCK_SIZE)?;
+        Self::aligned("data pa", self.data_pa_base, PAGE_SIZE)?;
+        Self::aligned("super ipa", self.sup_ipa_base, BLOCK_SIZE)?;
+        Self::aligned("super pa", self.sup_pa_base, BLOCK_SIZE)?;
+        if let Some(pa) = self.guest_image_pa {
+            Self::aligned("guest image", pa, BLOCK_SIZE)?;
+        }
+        if self.device_len > 0 {
+            Self::aligned("device", self.device_base, BLOCK_SIZE)?;
+        }
+
+        // (d) The tables must be where both registers can name them. `l1_pa` is the one the
+        //     walkers are handed; the rest are named by table descriptors, whose own output-address
+        //     field (`ADDR_4K`) truncates identically.
+        Self::nameable("l1", self.l1_pa)?;
+        Self::nameable("l2_code", self.l2_code_pa)?;
+        Self::nameable("l2_data", self.l2_data_pa)?;
+        Self::nameable("l3_data", self.l3_data_pa)?;
+        Self::nameable("l2_sup", self.l2_sup_pa)?;
+        Self::nameable("l2_dev", self.l2_dev_pa)?;
+
         let regions = self.regions();
+
+        // (b) No region may straddle its `L1` entry, because `encode` writes exactly one `L1`
+        //     entry per region and the `L2` index wraps rather than carrying into the next.
+        //     The same loop refuses a window that runs past the addressable space entirely: nine
+        //     bits per level means an address beyond it wraps back into these tables rather than
+        //     faulting, so a window up there is not a window at all.
+        for (l1_index, ipa, _pa, span) in regions.into_iter().flatten() {
+            if ipa >= ADDRESSABLE
+                || span > ADDRESSABLE - ipa
+                || ipa % L1_ENTRY_SIZE + span > L1_ENTRY_SIZE
+            {
+                return Err(EncodingViolation::RegionCrossesL1 { l1_index, span });
+            }
+        }
+
         for i in 0..regions.len() {
             for j in (i + 1)..regions.len() {
                 let (Some((l1a, ipa_a, pa_a, span_a)), Some((l1b, ipa_b, pa_b, span_b))) =
@@ -2216,5 +2543,170 @@ mod tests {
         assert_eq!(frame_pa(&l, 3), 0x4060_3000);
         assert_eq!(frame_ipa(&l, 0), 0x8000_0000);
         assert_eq!(frame_ipa(&l, 3), 0x8000_3000);
+    }
+
+    // ─── The representability premises (the device-path composition) ─────────────────────────────
+    //
+    // Each of the four below was a SILENT precondition of `encode` until the composition forced it
+    // into the open, and each test does the same two things: **exhibit the mis-map** the premise
+    // prevents (so the new `validate` arm is demonstrably load-bearing rather than a check that
+    // could not have failed — design-lesson #71), and then show `validate` refuses it.
+
+    /// Emit into a blank set — the `Tables` plumbing, once.
+    fn emit(l: &Layout, t: &mut Blank, leaves: &[Option<Perm>], supers: &[Option<Perm>]) {
+        encode(
+            leaves,
+            supers,
+            l,
+            Tables {
+                l1: &mut t.0,
+                l2_code: &mut t.1,
+                l2_data: &mut t.2,
+                l3_data: &mut t.3,
+                l2_sup: &mut t.4,
+                l2_dev: &mut t.5,
+            },
+        );
+    }
+
+    /// Walk an emitted set for `ipa`, without going through `hv-metal`'s volatile read.
+    fn walk_tables(l: &Layout, t: &Blank, ipa: u64) -> Option<Reach> {
+        walk(l.l1_pa, ipa, |pa, i| {
+            let i = i as usize;
+            if pa == l.l1_pa {
+                t.0[i]
+            } else if pa == l.l2_code_pa {
+                t.1[i]
+            } else if pa == l.l2_data_pa {
+                t.2[i]
+            } else if pa == l.l3_data_pa {
+                t.3[i]
+            } else if pa == l.l2_sup_pa {
+                t.4[i]
+            } else if pa == l.l2_dev_pa {
+                t.5[i]
+            } else {
+                0
+            }
+        })
+    }
+
+    /// **Premise (a): an unaligned data window silently maps frame `m`'s IPA to a *different
+    /// frame's* memory.** `encode` writes frame `m` at `l3_data[m]`; the walker reads
+    /// `l3_data[(ipa >> 12) & 0x1ff]`. Off by one page, those differ by one — so a domain issuing
+    /// frame 0's address lands on frame 1's bytes, at frame 1's permission, with no fault anywhere.
+    #[test]
+    fn an_unaligned_data_window_mismaps_every_frame() {
+        let mut l = layout();
+        l.data_ipa_base = 0x8000_1000; // one page off the block boundary
+        let mut t = tables();
+        // Frame 0 read-only, frame 1 read/write: the mis-map is a *permission* escalation too.
+        let leaves = [Some(Perm::Ro), Some(Perm::Rw)];
+        emit(&l, &mut t, &leaves, &[]);
+
+        let asked = frame_ipa(&l, 0);
+        let landed = walk_tables(&l, &t, asked).expect("it maps — that is the problem");
+        assert_eq!(
+            landed.pa,
+            frame_pa(&l, 1),
+            "frame 0's IPA must land on frame 1's bytes for this test to be about anything"
+        );
+        assert_eq!(landed.perm, Perm::Rw, "…and at frame 1's permission");
+        assert_ne!(
+            Some(landed),
+            window_reach(&l, &leaves, &[], asked),
+            "the walk and the layout disagree — which is exactly what validate now refuses"
+        );
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::WindowUnaligned { .. })
+        ));
+    }
+
+    /// **Premise (b): a super window that crosses its `L1` entry maps memory at an address nothing
+    /// authorized.** `encode` writes one `L1` entry per region and indexes its `L2` with nine bits,
+    /// which wraps: the frames past the boundary land in the *low* slots of the same table.
+    #[test]
+    fn a_super_window_that_crosses_its_l1_entry_maps_an_unauthorized_address() {
+        let mut l = layout();
+        // 2 MiB below a 1 GiB boundary, in the one `L1` entry no other region of this fixture
+        // occupies (the image is at 1, the data window at 2, the device window at 0).
+        l.sup_ipa_base = 0xFFE0_0000;
+        l.sup_frames = 2;
+        let mut t = tables();
+        let supers = [Some(Perm::Rw), Some(Perm::Rw)];
+        emit(&l, &mut t, &[], &supers);
+
+        // Super frame 1 sits at 0x1_0000_0000 — the *next* `L1` entry, which this region never
+        // wrote — so its slot wrapped to index 0 of its own `L2`, which is reached at the bottom of
+        // the region's own `L1` entry: 0xC000_0000, an address the window does not cover.
+        let stray = 0xC000_0000;
+        let landed = walk_tables(&l, &t, stray).expect("the wrapped slot maps real memory");
+        assert_eq!(landed.pa, super_pa(&l, 1));
+        assert!(
+            window_reach(&l, &[], &supers, stray).is_none(),
+            "…at an address the layout says is a hole"
+        );
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::RegionCrossesL1 { .. })
+        ));
+    }
+
+    /// **Premise (c): the granule `encode` emits and the granule the layout scales by must be one
+    /// number.** At any other `frame_size` the descriptor kind (an `L3` page) and the address
+    /// arithmetic (`base + m * frame_size`) describe different mappings.
+    #[test]
+    fn a_granule_the_emitter_does_not_write_is_refused() {
+        let mut l = layout();
+        l.frame_size = 0x4000; // 16 KiB
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::GranuleNotEmitted { frame_size: 0x4000 })
+        ));
+    }
+
+    /// **Premise (d): a table base neither register can name exactly.** `VTTBR_EL2.BADDR` and
+    /// `STE.S2TTB` both *truncate*, so an over-wide base leaves both walkers walking a table
+    /// `encode` never wrote — and agreeing with each other while they do it.
+    #[test]
+    fn a_table_base_no_register_can_name_is_refused() {
+        let mut l = layout();
+        l.l1_pa = 1 << 48;
+        assert!(matches!(
+            l.validate(),
+            Err(EncodingViolation::TableUnnameable { table: "l1", .. })
+        ));
+        let mut m = layout();
+        m.l3_data_pa += 8; // not page-aligned: the table descriptor's own mask drops it
+        assert!(matches!(
+            m.validate(),
+            Err(EncodingViolation::TableUnnameable {
+                table: "l3_data",
+                ..
+            })
+        ));
+    }
+
+    /// **The input-address ceiling.** Nine bits per level means an address past the tables' 512 GiB
+    /// reach wraps back into them; the hardware faults there and so must the walk. This is the
+    /// defect `the_walk_lands_where_the_windows_say` produced on its first run, pinned as a test.
+    #[test]
+    fn an_address_beyond_the_addressable_space_reaches_nothing() {
+        let l = layout();
+        let mut t = tables();
+        let supers = [Some(Perm::Rw)];
+        emit(&l, &mut t, &[], &supers);
+
+        let real = l.sup_ipa_base;
+        assert!(walk_tables(&l, &t, real).is_some(), "the control");
+        // The same address plus a whole addressable space: the nine-bit indices are identical.
+        let aliased = real + ADDRESSABLE;
+        assert_eq!(
+            walk_tables(&l, &t, aliased),
+            None,
+            "an address beyond the tables' reach must fault, not alias back into them"
+        );
+        assert_eq!(window_reach(&l, &[], &supers, aliased), None);
     }
 }

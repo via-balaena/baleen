@@ -516,18 +516,35 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         }
     }
 
-    let vttbr = hv_s2::arm64::vttbr(layout.l1_pa, set_vmid(set));
+    // (5) THE JOIN (the device-path composition) — the CPU's `VTTBR_EL2` and the device's
+    //     `Stage2Binding`, minted together from the **same `Layout` the encoder was just handed**.
+    //
+    //     This used to be two derivations: a `vttbr(layout.l1_pa, ..)` here, and an `S2TTB` that
+    //     `register_domain_binding` read back *out of that register value*. The round-trip is
+    //     proven — but only under a premise nothing discharged, and the two fields are not even the
+    //     same width (`STE.S2TTB` is bits [51:4], `VTTBR_EL2.BADDR` bits [47:0]), so a table base
+    //     between them pointed the two consumers at different tables. Now there is one derivation
+    //     and it refuses rather than truncates (`docs/SMMU-DEVICE-PATH-COMPOSITION.md` §3b).
+    let handles = match hv_s2::smmu::stage2_handles(&layout, set_vmid(set)) {
+        Ok(h) => h,
+        Err(e) => {
+            let mut uart = crate::uart();
+            let _ = writeln!(
+                uart,
+                "baleen: Stage-2 emission: this domain's table base cannot be named exactly by both walkers: {e:?}; halting"
+            );
+            crate::park();
+        }
+    };
 
-    // (5) SMMU rung 4b — tell the DEVICE side which tables this domain's image was emitted at.
-    //     Registered by the emission itself rather than by its callers: the stream table is derived
-    //     from `hv-core`'s device→domain relation after every dispatch, and a domain whose image
-    //     exists but whose binding the device side has never heard of would make that derivation
-    //     refuse. The binding is read back out of the `VTTBR_EL2` value the CPU would be given, so
-    //     the two consumers cannot be pointed at different tables (`docs/SMMU-TRANSLATION.md` §2b).
+    //     Registered by the emission itself rather than by its callers (rung 4b): the stream table
+    //     is derived from `hv-core`'s device→domain relation after every dispatch, and a domain
+    //     whose image exists but whose binding the device side has never heard of would make that
+    //     derivation refuse.
     #[cfg(feature = "smmu")]
-    crate::smmu::register_domain_binding(guest_dom, vttbr);
+    crate::smmu::register_domain_binding(guest_dom, handles.binding);
 
-    vttbr
+    handles.vttbr
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -535,14 +552,13 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
 // ---------------------------------------------------------------------------------------------
 
 /// What a walk of the emitted Stage-2 tables says about one guest IPA.
+///
+/// **`hv-s2`'s, not this file's** (the device-path composition): the walk that produces it is a
+/// proven pure function under the fence, and it is the same function the composition theorem is
+/// stated over — so the boot witness's expectation and the proof cannot be about two different
+/// walks.
 #[cfg(feature = "smmu")]
-pub(crate) struct Resolved {
-    /// The output address — the leaf's PA with the offset within the leaf applied, i.e. the exact
-    /// byte the hardware would touch.
-    pub(crate) pa: u64,
-    /// Whether the leaf grants write access (`S2AP = RW`).
-    pub(crate) writable: bool,
-}
+pub(crate) type Resolved = hv_s2::arm64::Reach;
 
 /// Walk the Stage-2 tables rooted at `l1_pa` for `ipa`, in software, through `hv-s2`'s **decode**
 /// seam.
@@ -555,35 +571,24 @@ pub(crate) struct Resolved {
 /// makes the expectation a third, independent reading (design-lesson #36), and it is the same memory
 /// the SMMU itself walks.
 ///
-/// Concrete to the deployed regime — start level 1, 4 KiB granule, three levels — with the 2 MiB
-/// block arm for the super window. A regime change would make this walk disagree with the hardware's,
-/// which is exactly why [`hv_s2::arm64::BALEEN_STAGE2`] is one declaration.
+/// **What is left here is the raw read, and only that.** The walk itself — the level indexing, the
+/// block/page fork, the offset within the leaf, and the input-address ceiling — moved to
+/// [`hv_s2::arm64::walk`] with the device-path composition, because it *is* the witness's own
+/// statement of where a DMA should land and leaving it here meant the expectation the boot asserts
+/// against was itself unproven. It was also wrong: this walk had no input-address bound, so an
+/// address beyond the tables' 512 GiB reach wrapped back into them and resolved to real memory
+/// (`docs/SMMU-DEVICE-PATH-COMPOSITION.md` §2). Dereferencing a raw pointer is what this crate is
+/// for; deciding what the descriptors mean is not.
 #[cfg(feature = "smmu")]
 pub(crate) fn walk_stage2(l1_pa: u64, ipa: u64) -> Option<Resolved> {
-    /// Read one descriptor. EL2 runs MMU-off/identity, so a table PA is directly addressable — the
-    /// same premise every other access in this file rests on.
-    fn desc_at(table_pa: u64, index: u64) -> u64 {
+    hv_s2::arm64::walk(l1_pa, ipa, |table_pa, index| {
         // SAFETY: `table_pa` came from `VTTBR_EL2`/a table descriptor this hypervisor emitted, so it
         // is the base of one of its own 4 KiB-aligned, 4 KiB-sized tables; `index < 512` bounds the
-        // read to that table. EL2 is identity-mapped. A volatile read of memory no Rust reference
-        // aliases (the tables live behind `BootCell`, which is not claimed here — this reads the
-        // published bytes, deliberately, rather than the typed storage).
+        // read to that table (`walk` masks every index to nine bits). EL2 is identity-mapped. A
+        // volatile read of memory no Rust reference aliases (the tables live behind `BootCell`,
+        // which is not claimed here — this reads the published bytes, deliberately, rather than the
+        // typed storage).
         unsafe { core::ptr::read_volatile((table_pa + index * 8) as *const u64) }
-    }
-
-    let l2_pa = hv_s2::arm64::decode_table(desc_at(l1_pa, (ipa >> 30) & 0x1ff))?;
-    let l2_desc = desc_at(l2_pa, (ipa >> 21) & 0x1ff);
-    if let Some(block) = hv_s2::arm64::decode_block(l2_desc) {
-        return Some(Resolved {
-            pa: block.pa | (ipa & 0x1f_ffff),
-            writable: block.perm == hv_s2::Perm::Rw,
-        });
-    }
-    let l3_pa = hv_s2::arm64::decode_table(l2_desc)?;
-    let page = hv_s2::arm64::decode_page(desc_at(l3_pa, (ipa >> 12) & 0x1ff))?;
-    Some(Resolved {
-        pa: page.pa | (ipa & 0xfff),
-        writable: page.perm == hv_s2::Perm::Rw,
     })
 }
 
