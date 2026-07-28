@@ -73,14 +73,23 @@
 //!   agreeing on the documented observations can disagree on whether the destroy fires, and
 //!   `step_consistent` is *false*. The fix (the outgoing analogue of the finding above): `obs(a)`
 //!   carries `controls[a][·]` (`controls_out`), so the actor observes its own destroy authority.
-//! * **The drain over-approximates `DomainBusy`.** `unwinding_destroy.rs` relies on `DomainBusy`
-//!   *refusing* teardown while a foreign domain maps `c`'s frames — a `c`-frames property invisible
-//!   to `a`/`caller`, which would likewise break `step_consistent`. This carrier instead has the
-//!   drain *clean up* those maps (`drain_pred` drops maps that are `c`'s **or** over a `c`-owned
-//!   frame). The two coincide on `obs(a)` for `a ≠ c` — a map over `c`'s frame is never one of
-//!   `a`'s — so the whole-run NI conclusion is unaffected, and the guard stays a function of the
-//!   actor's `obs`. (It also keeps the `map`-identity trivially preserved: no survivor is over a
-//!   `c`-owned frame, so its witness grant escapes the revoke.)
+//! * **The drain modelled `DomainBusy` away — and ②′-(c) then made the code agree.** When this
+//!   file was written, `hypervisor::domain_destroy` *refused* teardown (`DomainBusy`) while a
+//!   foreign domain mapped `c`'s frames — a `c`-frames property invisible to `a`/`caller`, which
+//!   would break `step_consistent` outright. This carrier instead had the drain *clean up* those
+//!   maps (`drain_pred` drops maps that are `c`'s **or** over a `c`-owned frame), justified as a
+//!   sound over-approximation: the two coincide on `obs(a)` for `a ≠ c` — a map over `c`'s frame is
+//!   never one of `a`'s — so the whole-run NI conclusion was unaffected and the guard stayed a
+//!   function of the actor's `obs`. (It also keeps the `map`-identity trivially preserved: no
+//!   survivor is over a `c`-owned frame, so its witness grant escapes the revoke.)
+//!
+//!   **This is no longer an over-approximation.** ②′-(c) replaced refuse-if-busy with
+//!   force-reclaim (`grant::drain_foreign_maps_of` + `p2m::unlink_all_into`), for exactly the
+//!   reason this carrier had to abstract it away — the refusal was an unobservable-state channel
+//!   (and a DoS besides). The code now *is* the drain this carrier models, so the correspondence
+//!   is exact rather than sound-but-loose. The modelling choice made here to keep the proof
+//!   honest turned out to be the right semantics; the real-code bridge
+//!   (`hv-sim::noninterference`) pins the resulting channel closure directly.
 //!
 //! Run: `verus --crate-type=lib hv-verify/verus/noninterference_instantiation.rs` (exit 0 = all
 //! proven).
@@ -292,7 +301,9 @@ pub enum Trans {
     /// authorization guard (design-lesson #9; `unwinding_control.rs`). The **authority** channel.
     SetAffinity { caller: Dom, vcpu: int, aff: nat },
     /// `DomainDestroy` — `caller` tears down `target` (guarded by `caller == target` or
-    /// `controls[caller][target]`, and by the `DomainBusy` no-foreign-map precondition). The sole
+    /// `controls[caller][target]` — and by nothing else: since ②′-(c) the code force-reclaims
+    /// foreign holds on `target`'s frames rather than refusing over them, which is what this
+    /// carrier already modelled). The sole
     /// **multi-domain** transition: the cascade reaches `target`'s *partners* — `close_all`/
     /// `clear_unbound_into` return/free ports naming `target`; `revoke_grants_to` clears active
     /// grants *to* `target` and `target`'s own outgoing grant rows drop (the read direction);
@@ -425,9 +436,10 @@ pub open spec fn step(s: Sys, t: Trans) -> Sys {
                     ),
                     // frame references: `drain_maps_of(c)` releases every map by `c`, and `c`'s own
                     // frames (freed with `c`) shed their maps too — so a surviving map is neither
-                    // `c`'s nor over a `c`-owned frame. (This drains what `DomainBusy` would instead
-                    // refuse; the two coincide on `obs(a)` for `a ≠ c` — a map over `c`'s frame is
-                    // not one of `a`'s — and this keeps the guard a function of the actor's `obs`.)
+                    // `c`'s nor over a `c`-owned frame. (This is `drain_foreign_maps_of` — what
+                    // `DomainBusy` used to refuse over, and what ②′-(c) made the code actually do.
+                    // It keeps the guard a function of the actor's `obs`; the drain is invisible to
+                    // `obs(a)` for `a ≠ c`, since a map over `c`'s frame is not one of `a`'s.)
                     maps: s.maps.filter(drain_pred(s.owner, c)),
                     ..s
                 }
@@ -778,8 +790,8 @@ pub proof fn wf_step(s: Sys, t: Trans)
 /// dodge `c` symmetrically); the grant filter only shrinks the table (owned frames stay owned);
 /// `vaff`/`vowner` are untouched; and the `map`-identity survives because a drained map's witness
 /// grant is *not* one the grant cascade revokes — its grantee dodged `c` (it survived the map
-/// drain) and its grantor is the frame's owner, which cannot be `c` (the `DomainBusy`
-/// precondition: no foreign domain maps `c`'s frames).
+/// drain) and its grantor is the frame's owner, which cannot be `c` (the drain itself: no map
+/// over a `c`-owned frame survives, which is what `drain_foreign_maps_of` establishes).
 pub proof fn wf_step_destroy(s: Sys, caller: Dom, target: Dom)
     requires
         wf(s),

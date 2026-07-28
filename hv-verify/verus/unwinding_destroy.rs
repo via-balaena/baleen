@@ -32,10 +32,35 @@
 //! So *every* way the cascade reaches `obs(a)` is conditioned on **`a` granted to `c`** or **`a`
 //! holds a port toward `c`** — exactly the non-interference **teardown-reach** term
 //! (`noninterference::Channels::teardown_reach`): `∃c: controls[b][c] ∧ (a→c grant ∨ a→c port)`.
-//! (The *reverse* direction — `a` referencing `c`'s frames — cannot arise past a *proceeding*
-//! destroy: `DomainBusy` refuses teardown while any foreign domain holds a live map of, or a
-//! page-table link into, `c`'s frames — `hypervisor.rs:1178`. So a proceeding destroy leaves
-//! `a`'s held mappings and `a`'s own frames alone.)
+//! (The *reverse* direction — `a` referencing `c`'s frames — is **out of this model's scope, and
+//! since ②′-(c) that is a real divergence from the code, recorded not hidden.** This file was
+//! written when `DomainBusy` *refused* teardown while any foreign domain held a live map of, or a
+//! page-table link into, `c`'s frames, which made the reverse direction unreachable past a
+//! proceeding destroy — so a proceeding destroy provably left `a`'s held mappings alone. Teardown
+//! now **force-reclaims** those holds instead (`grant::drain_foreign_maps_of` +
+//! `p2m::unlink_all_into`), so a destroy *can* now move what `a` borrowed from `c`. Two things
+//! keep this file sound rather than stale:
+//!
+//! * This model's `obs` frame component is the **grant-map** reference population over **`a`'s
+//!   own frames** ([`refs_over`]). The grant half of the reclaim drops maps over frames owned by
+//!   `c`, never by `a`, so it cannot move [`refs_over`] on `a`'s frames — the proof is unaffected.
+//!   And `noninterference_instantiation.rs`'s destroy carrier models exactly this drain
+//!   (`drain_pred` drops maps over `c`-owned frames) rather than the refusal, so the
+//!   *instantiation* already matched force-reclaim before the code did.
+//! * The **page-table** half is genuinely outside this model, which projects grant maps only.
+//!   In the real code `unlink_all_into(c)` severs an edge whose *parent* is one of `a`'s tables,
+//!   which returns that table's self-reference — so `a`'s own frame refcount moves. That is a real
+//!   effect on the real `obs`, and it is precisely why the new term below is stated over both
+//!   borrow kinds (a held map **or** a page-table edge into `c`'s frames).
+//! * The channel that force-reclaim *does* create — `a` observing the loss of a map or edge it
+//!   held over `c`'s frames — lives on the finer real-code observation, where the hv-sim bridge
+//!   found it and where it is named: the **teardown-*borrow*** term
+//!   (`noninterference::Channels::teardown_borrow`), the inbound mirror of the teardown-reach term
+//!   below. That is the integrity twin of finding (3) (the read direction), and the bridge's
+//!   `dropping_teardown_borrow_is_caught` is its non-vacuity witness.
+//!
+//! So: same intransitive shape, one more direction, discovered on the code rather than here —
+//! the bridge doing its job. See `docs/TIER-D-NONINTERFERENCE.md` §4a.)
 //!
 //! ## The finding — the cascade *composes both kinds of channel*
 //!

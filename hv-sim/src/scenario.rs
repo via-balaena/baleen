@@ -1071,8 +1071,8 @@ fn woke(before: Option<sched::RunState>, after: Option<sched::RunState>) -> bool
 }
 
 /// A comparable summary of a finished domain-teardown run. The counts are *observed
-/// outcomes* of the destroy calls issued, so a test can prove both the refuse-if-busy
-/// and the clean-teardown paths are genuinely reached — and that the postcondition
+/// outcomes* of the destroy calls issued, so a test can prove both the force-reclaim
+/// and the plain clean-teardown paths are genuinely reached — and that the postcondition
 /// held every time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DestroyOutcome {
@@ -1088,8 +1088,13 @@ pub struct DestroyOutcome {
     /// a domain destroying a peer it controls only because control was *delegated* to it, not
     /// because it created it.
     pub delegations: u32,
-    /// Destroy calls refused because a foreign domain held a live map (`DomainBusy`).
-    pub busy_refusals: u32,
+    /// Destroy calls that actually **force-reclaimed** a foreign reference into the target's
+    /// frames — a live foreign grant map, a live inward cross-domain page-table entry, or
+    /// both. This counted `DomainBusy` refusals before ②′-(c) turned that refusal into a
+    /// reclaim; non-zero now witnesses the *new* path is genuinely reached, so the
+    /// "teardown always succeeds" postcondition below is not vacuously true of a world where
+    /// no foreign hold ever arises.
+    pub forced_reclaims: u32,
     /// Destroy calls refused because the caller was neither the target nor privileged
     /// (`Denied`) — the authority gate firing.
     pub denials: u32,
@@ -1173,10 +1178,13 @@ fn is_empty_shell(hv: &Hypervisor, target: u16) -> bool {
 /// Every destroy is pinned by predictions in the impl's order: the caller must be `Live`
 /// (the dispatch gate), then the **authority gate** (a caller may destroy a target only if
 /// it *is* the target or is privileged), then target **liveness** (nothing to tear down if
-/// already `Dead`), then the busy precondition ([`grant::System::has_foreign_map`]) —
-/// refuse (`DomainBusy`) iff a foreign domain holds a live map of one of the target's
-/// frames, tear down cleanly otherwise, and every clean teardown must leave an empty shell
-/// (`is_empty_shell`). Every create is pinned likewise: `NotAlive` if the caller is `Dead`,
+/// already `Dead`). There is no busy precondition (②′-(c)): a live authorized caller tears
+/// the target down unconditionally, force-reclaiming any foreign reference into its frames
+/// — a live foreign grant map ([`grant::System::has_foreign_map`]) or a live inward
+/// cross-domain page-table entry ([`p2m::System::has_foreign_link_into`]) — on the way. Every
+/// teardown must leave an empty shell (`is_empty_shell`), and where a foreign hold *did*
+/// stand the live map / edge population must have shrunk, so the reclaim is witnessed rather
+/// than assumed. Every create is pinned likewise: `NotAlive` if the caller is `Dead`,
 /// `Denied` if the caller is unprivileged (only a control domain may create), `AlreadyAlive`
 /// if the target is still `Live`, else a clean `Dead`→`Live` birth. Callers are drawn across
 /// all domains, and a create may mint a *privileged* child — so authority propagates and
@@ -1215,7 +1223,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
         teardowns: 0,
         creations: 0,
         delegations: 0,
-        busy_refusals: 0,
+        forced_reclaims: 0,
         denials: 0,
         chain_denials: 0,
         cascades: 0,
@@ -1455,29 +1463,45 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
                 // Tear a domain down. Predictions pin the outcome exactly, in the impl's
                 // order: the caller must be Live (the dispatch gate — a caller torn down
                 // earlier can no longer act); then per-target authority (does the caller
-                // control this target, or is it the target itself?); then the busy
-                // precondition (does a foreign domain hold one of its frames?). Past the
-                // authority gate the target is provably Live (a control edge needs a live
-                // target), so there is no NotAlive-target path — destroying a Dead peer is
-                // Denied, since no one controls a Dead domain.
+                // control this target, or is it the target itself?). That is the *whole*
+                // gate — since ②′-(c) there is no busy precondition, so a live authorized
+                // caller ALWAYS succeeds, force-reclaiming any foreign reference into the
+                // target's frames on the way. Past the authority gate the target is provably
+                // Live (a control edge needs a live target), so there is no NotAlive-target
+                // path — destroying a Dead peer is Denied, since no one controls a Dead
+                // domain.
                 let target = rng.below(u32::from(DOMAINS)) as u16;
                 let caller_live = hv.is_live(caller);
                 let authorized = caller == target || hv.controls(caller, target);
-                let foreign = hv.grant().has_foreign_map(target);
+                // Foreign references standing *before* the call, in each direction: each is
+                // something the old design would have refused over and the new one must
+                // break. Recorded with the system-wide counts, because *after* teardown the
+                // target owns nothing, so "no foreign reference into the target survives" is
+                // trivially true and witnesses nothing — the honest check is that the map
+                // and edge populations actually shrank.
+                let foreign_map = hv.grant().has_foreign_map(target);
+                let foreign_link = hv.p2m().has_foreign_link_into(target);
+                let maps_before = hv.grant().active_maps();
+                let links_before = hv.p2m().active_links();
                 match hv.dispatch(caller, HvCall::DomainDestroy { target, now }) {
                     Ok(HvOutcome::Done) => {
                         out.teardowns += 1;
-                        // A clean teardown: a live, authorized caller over a target with no
-                        // foreign map, leaving nothing live pointing into it.
-                        if !(caller_live && authorized && !foreign && is_empty_shell(&hv, target)) {
-                            out.postcondition_held = false;
+                        if foreign_map || foreign_link {
+                            out.forced_reclaims += 1;
                         }
-                    }
-                    Err(hv_core::HvError::DomainBusy) => {
-                        out.busy_refusals += 1;
-                        // A busy refusal: a live, authorized caller over a foreign-held
-                        // target. A no-op, so nothing else to check.
-                        if !(caller_live && authorized && foreign) {
+                        // A clean teardown: a live, authorized caller, leaving an empty
+                        // shell. Note the old `!foreign` conjunct is *gone* from the
+                        // prediction — a foreign hold no longer forbids the success. In its
+                        // place: if one stood, the reclaim must have actually happened, i.e.
+                        // the live map / live edge population strictly shrank.
+                        let drained = !foreign_map || hv.grant().active_maps() < maps_before;
+                        let severed = !foreign_link || hv.p2m().active_links() < links_before;
+                        if !(caller_live
+                            && authorized
+                            && drained
+                            && severed
+                            && is_empty_shell(&hv, target))
+                        {
                             out.postcondition_held = false;
                         }
                     }
@@ -2457,20 +2481,21 @@ mod tests {
     }
 
     /// The driver genuinely reaches *every* teardown outcome across the seed space: some
-    /// run tears a domain down cleanly, some refuses because a foreign domain holds a live
-    /// map (`DomainBusy`), and some is denied for want of authority (`Denied`). If any
-    /// stayed zero, the soundness test above would be proving teardown over a path it never
-    /// actually takes.
+    /// run tears a domain down cleanly, some **force-reclaims** a foreign hold on the way
+    /// (②′-(c) — the path that used to be a `DomainBusy` refusal), and some is denied for
+    /// want of authority (`Denied`). If any stayed zero, the soundness test above would be
+    /// proving teardown over a path it never actually takes — in particular, "teardown always
+    /// succeeds" would be vacuous if no foreign hold ever arose to be reclaimed.
     #[test]
-    fn destroy_reaches_the_clean_busy_and_denied_paths() {
+    fn destroy_reaches_the_clean_force_reclaim_and_denied_paths() {
         let outcomes: Vec<_> = (0..256u64).map(|s| run_destroy(s, 256)).collect();
         assert!(
             outcomes.iter().any(|o| o.teardowns > 0),
             "no seed ever tore a domain down — driver too weak"
         );
         assert!(
-            outcomes.iter().any(|o| o.busy_refusals > 0),
-            "no seed ever hit a busy-refusal — the refuse-if-busy path is uncovered"
+            outcomes.iter().any(|o| o.forced_reclaims > 0),
+            "no seed ever force-reclaimed a foreign hold — the reclaim path is uncovered"
         );
         assert!(
             outcomes.iter().any(|o| o.denials > 0),

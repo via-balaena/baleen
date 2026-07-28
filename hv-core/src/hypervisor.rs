@@ -203,12 +203,12 @@ pub enum HvCall {
     /// Tear down domain `target` completely: close its every event-channel port,
     /// offline its every vCPU (closing on-CPU intervals at `now`), unmap its every
     /// grant map, revoke its every grant, unpin and free its every frame — leaving an
-    /// empty but still-existent domain shell. Atomic and all-or-nothing: refused with
-    /// [`HvError::DomainBusy`], mutating nothing, if any *foreign* domain still holds a
-    /// live grant map of one of `target`'s frames (that map holds a page reference
-    /// teardown cannot revoke without yanking it out from under the mapper). `now` is a
-    /// plain operation input, as for the scheduler ops: the core owns no clock, so
-    /// whoever builds the call stamps it. **Authority:** a domain may tear *itself* down,
+    /// empty but still-existent domain shell. **Unconditional past the authority gate:** a
+    /// *foreign* reference into one of `target`'s frames — a live grant map, or a live
+    /// cross-domain page-table entry — does not block teardown, it is *broken* by it (the
+    /// mapper's handle goes stale, its entry becomes a hole), so no domain can veto another's
+    /// destruction. `now` is a plain operation input, as for the scheduler ops: the core owns
+    /// no clock, so whoever builds the call stamps it. **Authority:** a domain may tear *itself* down,
     /// but destroying a *peer* requires the caller *control* that peer
     /// (`controls[caller][target]`); otherwise [`HvError::Denied`], mutating nothing. A
     /// `Dead` domain has no controller, so a peer destroy of one is always `Denied`, never
@@ -297,13 +297,6 @@ pub enum HvError {
     /// Refused at the seam so it can never reference another domain's page. Not a
     /// single subsystem's error: it is the grant↔page-type join that catches it.
     StaleGrant,
-    /// A [`HvCall::DomainDestroy`] was refused because the target is still busy: a
-    /// *foreign* domain holds a live grant map of one of the target's frames. Teardown
-    /// is all-or-nothing and never force-unmaps a live mapping, so it refuses rather
-    /// than tear a page out from under another domain — and mutates nothing. Whole-domain,
-    /// spanning grant tables and page-type accounting, so it belongs to the seam, not one
-    /// subsystem.
-    DomainBusy,
     /// A page-table entry into a frame another domain owns was refused: the caller holds
     /// no grant of that frame from its owner of the permission the entry needs — a
     /// read-write grant for a writable entry, any grant for a read-only one. This covers
@@ -1216,7 +1209,8 @@ impl Hypervisor {
     }
 
     /// Tear a domain down across all four subsystems — the whole-system operation that
-    /// welds every seam. **Atomic, all-or-nothing, refuse-if-busy.**
+    /// welds every seam. **Atomic, and unconditional past the authority gate: it force-reclaims
+    /// rather than refuses.**
     ///
     /// **Authority gate first.** A domain may tear *itself* down, but destroying a *peer*
     /// requires the caller *control* that peer specifically (`controls[caller][target]` — a
@@ -1230,25 +1224,56 @@ impl Hypervisor {
     /// (now orphaned — see [`Self::sweep_orphaned_control_edges`]), so no capability outlives
     /// the domain it named or the delegator that handed it out.
     ///
-    /// Then one precondition gates the rest: no *foreign* domain may hold a live grant map
-    /// of one of `target`'s frames ([`grant::System::has_foreign_map`]). If one does, teardown
-    /// would have to yank a page out from under the mapper, so it refuses with
-    /// [`HvError::DomainBusy`] and mutates nothing. Otherwise every step below succeeds
-    /// by construction — each is a bulk form of an existing invariant-safe transition —
-    /// so there is nothing to roll back.
+    /// Teardown then **always succeeds**: past the authority gate there is no refusal path,
+    /// so there is nothing to roll back. Every step below is a bulk form of an existing
+    /// invariant-safe transition, and each step's precondition is made to hold by the one
+    /// before it.
+    ///
+    /// **Force-reclaim (the `DomainBusy` decision, ②′-(c)).** A *foreign* reference into one
+    /// of `target`'s frames — a live grant map ([`grant::System::has_foreign_map`]) or a live
+    /// cross-domain page-table entry ([`p2m::System::has_foreign_link_into`]) — is not a
+    /// reason to refuse. Teardown *breaks* it: step 2 drains every foreign map and severs
+    /// every inward foreign link before reclaiming the frames. The alternative (refuse with a
+    /// `DomainBusy` error, mutating nothing) was the original design and is dropped, for
+    /// three reasons:
+    ///
+    /// * **It was a denial of service.** A mapper `m` holding one grant map of `c`'s frame
+    ///   kept `c` alive indefinitely, and `c`'s controller had no way to make `m` let go —
+    ///   an unprivileged domain could veto a privileged domain's teardown.
+    /// * **It was a covert channel.** Whether the destroy fired depended on `m`'s map state,
+    ///   which neither the caller nor a third domain `a` holding a grant to `c` can observe —
+    ///   a step-consistency residual at ≥4 domains (`docs/TIER-D-NONINTERFERENCE.md` §4a).
+    ///   Draining closes it *by construction*: the destroy is now a total function of the
+    ///   actor's own observation.
+    /// * **The proofs already model it this way.** `noninterference_instantiation.rs`'s
+    ///   destroy carrier drops every map over a `c`-owned frame (its `drain_pred`), documented
+    ///   as a sound *over-approximation* of `DomainBusy`. Force-reclaim makes the code
+    ///   coincide with the already-proven model instead of merely being covered by it.
+    ///
+    /// What it costs, stated plainly: a foreign mapper loses a page it was using. It never
+    /// loses *safely* — its grant handle goes inactive (a later unmap is `BadHandle`, never a
+    /// double release) and its page-table entry becomes a hole (a fault, never a dangling
+    /// reference to a reclaimed frame). Real hypervisors reclaim a dead domain's memory
+    /// rather than block on its clients; this matches that.
     ///
     /// The order matters, and only for making each step's precondition hold in turn:
     ///
     /// 1. **close** every port (evtchn) and **offline** every vCPU (sched) — stop the
     ///    domain talking and running; peers fall back to `Unbound`, pCPUs are freed.
-    /// 2. **drain** every grant map `target` holds (grant), mirroring each released page
+    /// 2. **force-reclaim** every *foreign* reference into `target`'s frames — drain the
+    ///    foreign grant maps (mirroring each released page reference into the page-type
+    ///    counts) and sever the inward foreign page-table links. Done first, before any
+    ///    grant is revoked, so the invariant coupling links to grants
+    ///    ([`CrossViolation::UnauthorizedForeignLink`]) never sees a link outlive its permit.
+    /// 3. **drain** every grant map `target` holds (grant), mirroring each released page
     ///    reference back into the page-type counts exactly as [`Self::grant_unmap`]
     ///    does — this is the one cross-subsystem step, and it clears `target`'s *own*
     ///    maps (its self-grants included) so the next step's grants are unmapped.
-    /// 3. **revoke** every grant `target` offers (grant) — now all unmapped.
-    /// 4. **unlink** its page-table entries, then **unpin** and **free** every frame it
-    ///    owns (p2m) — every reference into them is gone (own maps drained, page-table
-    ///    entries torn down, pins dropped, foreign maps excluded by the precondition), so
+    /// 4. **revoke** every grant `target` offers (grant) — now all unmapped, foreign maps
+    ///    included.
+    /// 5. **unlink** its page-table entries, then **unpin** and **free** every frame it
+    ///    owns (p2m) — every reference into them is gone (own maps drained, foreign maps
+    ///    drained, page-table entries torn down in *both* directions, pins dropped), so
     ///    each free succeeds.
     ///
     /// What remains is a `Dead`, authority-free, empty shell: domain slots are fixed-size
@@ -1263,7 +1288,7 @@ impl Hypervisor {
     /// as a precise, localized failure message for teardown; the standing invariant is what
     /// actually guarantees it.
     ///
-    /// Provenance: the refuse-if-busy lifecycle (rather than force-unmap, or Xen's
+    /// Provenance: the force-reclaim lifecycle (rather than refuse-if-busy, or Xen's
     /// deferred dying-domain RCU teardown) is a design decision informed by the public
     /// Xen domain-destroy semantics and general OS knowledge — not `xen/`'s GPL
     /// implementation. See `CLEANROOM.md`.
@@ -1293,20 +1318,43 @@ impl Hypervisor {
             self.life[target as usize] == DomainLife::Live,
             "domain_destroy reached a Dead target {target} past the authority gate"
         );
-        // The precondition. Checked before any mutation, so a refusal is a true no-op. No
-        // *foreign* domain may hold one of `target`'s frames — neither a live grant map
-        // nor a live cross-domain page-table entry — since teardown would then have to
-        // yank a page out from under it. (`target`'s own foreign links, into *other*
-        // domains' frames, are fine: `unlink_all` releases them.)
-        if self.grant.has_foreign_map(target) || self.p2m.has_foreign_link_into(target) {
-            return Err(HvError::DomainBusy);
-        }
+        // Past the authority gate there is no refusal: teardown always succeeds.
 
         // 1. Stop it talking and running.
         self.evtchn.close_all(target);
         self.sched.offline_all(target, now);
 
-        // 2. Release every grant map it holds, mirroring each page-reference drop into
+        // 2. Force-reclaim every *foreign* reference into `target`'s frames, so nothing
+        //    outside `target` can keep its memory alive. This is where the old
+        //    refuse-if-busy precondition used to sit; see the doc comment for why breaking
+        //    the reference beats refusing (a DoS and a covert channel, both closed by
+        //    construction). Both halves mirror exactly what a voluntary release would.
+        //
+        //    Grant maps first: each drained map gives back the page reference it took, the
+        //    same mirror the own-map drain below performs. The holder is left with a stale
+        //    (inactive) handle — a later unmap is BadHandle, never a double release.
+        for released in self.grant.drain_foreign_maps_of(target) {
+            let mirror = if released.writable {
+                self.p2m.put_type(released.frame, PageType::Writable)
+            } else {
+                self.p2m.put(released.frame)
+            };
+            debug_assert!(
+                mirror.is_ok(),
+                "teardown could not release a foreign map's page reference: {mirror:?}"
+            );
+        }
+        //    Then the inward foreign page-table links — a foreign leaf onto, or a foreign
+        //    node share of, one of `target`'s frames. Severed before the revoke sweeps
+        //    below, so no surviving cross-domain edge ever outlives the grant that
+        //    authorizes it (`CrossViolation::UnauthorizedForeignLink`).
+        self.p2m.unlink_all_into(target);
+        debug_assert!(
+            !self.grant.has_foreign_map(target) && !self.p2m.has_foreign_link_into(target),
+            "force-reclaim left a foreign reference into domain {target}'s frames"
+        );
+
+        // 3. Release every grant map it holds, mirroring each page-reference drop into
         //    the page-type accounting — the reverse of what the map acquired, exactly as
         //    grant_unmap does for a single mapping. These releases cannot fail: a live
         //    map always took the reference this now returns.
@@ -1322,7 +1370,7 @@ impl Hypervisor {
             );
         }
 
-        // 3. Revoke every grant it offers (all unmapped now), then 4. reclaim its frames:
+        // 4. Revoke every grant it offers (all unmapped now), then 5. reclaim its frames:
         //    tear down its page-table structure (each entry pins its table, so this must
         //    precede unpin/free), drop its pins, and free every frame it owns.
         self.grant.revoke_all(target);
@@ -2456,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_destroy_is_refused_while_a_foreign_map_is_live_and_mutates_nothing() {
+    fn domain_destroy_force_unmaps_a_live_foreign_map_instead_of_refusing() {
         let mut h = hv();
         // Domain 0 owns frame 2, grants it writable to domain 1, which maps it.
         h.dispatch(0, HvCall::P2mAllocate { mfn: 2 }).unwrap();
@@ -2471,28 +2519,70 @@ mod tests {
         )
         .unwrap();
         let handle = map_handle(&mut h, 1, 0, 0, true);
+        assert!(
+            h.grant().has_foreign_map(0),
+            "domain 1 holds domain 0's frame"
+        );
 
-        // Destroying domain 0 must be refused: domain 1 holds a live map of its frame.
-        // Domain 0 tears *itself* down (always authorized), so this isolates the busy
-        // refusal from the authority gate.
+        // Teardown proceeds anyway: domain 1's live map is drained, not a veto. Domain 0
+        // tears *itself* down (always authorized), so this isolates the force-reclaim from
+        // the authority gate. (②′-(c): the old refuse-if-busy `DomainBusy` path is gone.)
         assert_eq!(
             h.dispatch(0, HvCall::DomainDestroy { target: 0, now: 0 }),
-            Err(HvError::DomainBusy)
+            Ok(HvOutcome::Done)
         );
-        // A refusal mutates nothing: the frame, grant, and map all stand.
-        assert_eq!(h.p2m().owner_of(2), Some(0));
-        assert!(h.grant().is_granted(0, 0));
-        assert_eq!(h.grant().map_count(0, 0), Some(1));
-        assert_eq!(h.p2m().current_type(2), Some(PageType::Writable));
-        assert!(h.invariants_hold());
-
-        // Once domain 1 unmaps, the frame is no longer foreign-held and teardown runs.
-        h.dispatch(1, HvCall::GrantUnmap { handle }).unwrap();
-        assert!(h
-            .dispatch(0, HvCall::DomainDestroy { target: 0, now: 0 })
-            .is_ok());
+        // The frame is reclaimed, the grant revoked, the foreign map gone — and every
+        // page reference the map held was mirrored back, or `free` could not have run.
         assert!(!h.p2m().is_allocated(2));
         assert!(!h.grant().is_granted(0, 0));
+        assert!(!h.grant().holds_any_map(1), "domain 1's map was drained");
+        assert!(!h.grant().has_foreign_map(0));
+        assert!(h.is_clean_shell(0));
+        assert!(h.invariants_hold());
+
+        // Domain 1 is left holding a *stale* handle, never a dangling one: unmapping it
+        // names nothing it owns, so it is a plain `BadHandle` — it can neither release a
+        // reference twice nor reach the reclaimed frame.
+        assert_eq!(
+            h.dispatch(1, HvCall::GrantUnmap { handle }),
+            Err(HvError::Grant(grant::GrantError::BadHandle))
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_foreign_mapper_cannot_veto_teardown_by_holding_a_map() {
+        // The DoS the force-reclaim decision removes: an *unprivileged* mapper must not be
+        // able to keep a domain alive against its controller's wishes. Domain 1 (which holds
+        // no control edge over anything) maps domain 2's frame; dom0 destroys domain 2.
+        let mut h = hv();
+        h.dispatch(2, HvCall::P2mAllocate { mfn: 3 }).unwrap();
+        h.dispatch(
+            2,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 3,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        let handle = map_handle(&mut h, 1, 2, 0, true);
+        assert!(h.grant().has_foreign_map(2));
+
+        // dom0 controls domain 2 (it created it), so the destroy is authorized — and
+        // domain 1 gets no say in it.
+        assert_eq!(
+            h.dispatch(0, HvCall::DomainDestroy { target: 2, now: 0 }),
+            Ok(HvOutcome::Done)
+        );
+        assert!(h.is_clean_shell(2));
+        assert!(!h.p2m().is_allocated(3), "domain 2's frame was reclaimed");
+        assert!(!h.grant().holds_any_map(1));
+        assert_eq!(
+            h.dispatch(1, HvCall::GrantUnmap { handle }),
+            Err(HvError::Grant(grant::GrantError::BadHandle))
+        );
         assert!(h.invariants_hold());
     }
 
@@ -3029,19 +3119,57 @@ mod tests {
     }
 
     #[test]
-    fn destroying_a_domain_whose_frame_is_foreign_linked_is_refused() {
+    fn destroying_a_domain_whose_frame_is_foreign_linked_severs_the_link() {
         let mut h = hv();
         foreign_link_stage(&mut h);
         link5(&mut h).unwrap();
-        // Domain 1's frame is mapped into domain 0's table, so domain 1 cannot be torn
-        // down — the same refuse-if-busy rule as a live foreign grant map. Issued by the
-        // privileged control domain (dom0), so the busy refusal is what bites, not authority.
+        assert!(
+            h.p2m().has_foreign_link_into(1),
+            "domain 0's leaf onto frame 5"
+        );
+
+        // Domain 1's frame is mapped into domain 0's table — and that does not stop
+        // teardown: the inward foreign entry is severed, then the frame is reclaimed. The
+        // page-table half of force-reclaim, the exact analogue of draining a foreign grant
+        // map. Issued by dom0, which controls domain 1.
         assert_eq!(
             h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 }),
-            Err(HvError::DomainBusy)
+            Ok(HvOutcome::Done)
         );
-        // But the *linker* (domain 0) can tear itself down: teardown unlinks its foreign
-        // entry, freeing domain 1's frame, and spares domain 1.
+        assert!(h.is_clean_shell(1));
+        assert!(!h.p2m().is_allocated(5), "domain 1's frame was reclaimed");
+        assert!(!h.p2m().has_foreign_link_into(1));
+        // Domain 0 keeps its own table — only the boundary edge went. Both references that
+        // edge held came back: the child's (frame 5 is now free) and the parent's
+        // self-reference (frame 0 is a pinned L1 again, held by the pin alone).
+        assert_eq!(h.p2m().owner_of(0), Some(0));
+        assert_eq!(
+            h.p2m().current_type(0),
+            Some(PageType::PageTable(PtLevel::L1))
+        );
+        assert!(
+            !h.p2m()
+                .link_edges()
+                .iter()
+                .any(|&(parent, slot, ..)| parent == 0 && slot == 0),
+            "the severed entry is a hole, not a dangling edge"
+        );
+        // So domain 0 sees a hole where its entry was — unlinking it again names nothing.
+        assert_eq!(
+            h.dispatch(0, HvCall::P2mUnlink { parent: 0, slot: 0 }),
+            Err(HvError::P2m(p2m::P2mError::WrongState))
+        );
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn a_linkers_own_teardown_still_spares_the_domain_it_borrowed_from() {
+        let mut h = hv();
+        foreign_link_stage(&mut h);
+        link5(&mut h).unwrap();
+        // The *linker* (domain 0) tearing itself down is the outward direction, unchanged by
+        // force-reclaim: teardown unlinks its foreign entry, releasing domain 1's frame, and
+        // spares domain 1 itself.
         assert_eq!(
             h.dispatch(0, HvCall::DomainDestroy { target: 0, now: 0 }),
             Ok(HvOutcome::Done)
@@ -3372,7 +3500,7 @@ mod tests {
     }
 
     #[test]
-    fn sharing_a_node_blocks_revoke_and_the_owners_teardown() {
+    fn sharing_a_node_blocks_revoke_but_not_the_owners_teardown() {
         let mut h = hv();
         foreign_node_stage(&mut h);
         link_node(&mut h, true).unwrap();
@@ -3383,14 +3511,37 @@ mod tests {
             h.dispatch(1, HvCall::GrantEndAccess { gref: 0 }),
             Err(HvError::Grant(grant::GrantError::InUse))
         );
-        // Nor can domain 1 be torn down while a foreign domain shares its node — the
-        // refuse-if-busy precondition covers an inward foreign *node* link exactly as it
-        // does a foreign leaf. dom0 issues it (and controls domain 1), so the busy refusal
-        // bites, not authority.
+        // But teardown is *not* blocked by the same share: force-reclaim severs an inward
+        // foreign *node* link exactly as it does a foreign leaf — level-agnostic, and it
+        // takes only the boundary edge (domain 1's own subtree beneath it is reclaimed by
+        // domain 1's own teardown, not by the severing). dom0 issues it and controls
+        // domain 1. This is the one asymmetry worth naming: a *voluntary* revoke still
+        // refuses while a foreign entry relies on the grant (the mapper is entitled to what
+        // it was lent), but teardown is not a request from the owner — it is the end of the
+        // owner, and the memory goes back.
         assert_eq!(
             h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 }),
-            Err(HvError::DomainBusy)
+            Ok(HvOutcome::Done)
         );
+        assert!(h.is_clean_shell(1));
+        assert!(!h.p2m().is_allocated(5), "the shared node was reclaimed");
+        assert!(!h.p2m().is_allocated(6), "and the leaf beneath it");
+        assert!(!h.p2m().has_foreign_link_into(1));
+        // Domain 0 keeps its own L2 table, with a hole where its share stood.
+        assert_eq!(h.p2m().owner_of(2), Some(0));
+        assert_eq!(
+            h.p2m().current_type(2),
+            Some(PageType::PageTable(PtLevel::L2))
+        );
+        assert_eq!(h.p2m().child_at(2, 0), None);
+        assert!(h.invariants_hold());
+    }
+
+    #[test]
+    fn unlinking_a_shared_node_restores_the_owners_revoke() {
+        let mut h = hv();
+        foreign_node_stage(&mut h);
+        link_node(&mut h, true).unwrap();
 
         // Domain 0 unlinks its share; domain 1's own subtree still stands underneath.
         h.dispatch(0, HvCall::P2mUnlink { parent: 2, slot: 0 })
