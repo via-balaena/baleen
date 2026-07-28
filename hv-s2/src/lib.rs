@@ -25,9 +25,12 @@
 //!   the SMMU decides *its* fate by indexing a **stream table** with the transaction's StreamID. Same
 //!   shape of job, same reasons to be here: a pure table builder out of `hv-metal`'s `unsafe`, with
 //!   the ∀-StreamID default-deny proven over it (`hv-verify::smmu_stream_table`) and the hardware
-//!   arrow discharged separately by the metal's through-STE positive control. Rung 2 is *deny only* —
-//!   binding a stream to a domain's [`arm64`] tables (`STE.S2TTB` + `S2VMID`) is rung 3, and is where
-//!   the device path joins the CPU path on one proven `p2m`.
+//!   arrow discharged separately by the metal's through-STE positive control. Rung 3 adds the other
+//!   half — **binding** a stream to a domain, `STE.Config = 0b110` with `S2TTB` at that domain's own
+//!   [`arm64`] tables under its VMID, which is where the device path joins the CPU path on one proven
+//!   `p2m`. The ∀-address refinement then covers the device walk *verbatim* (it constrains the table,
+//!   not the walker), so what is proven here instead is the binding: that the entry for StreamID X
+//!   names domain D's table under D's VMID and nothing else.
 //! - [`arm64`] — **AArch64-specific.** The bit-format: leaf map → Stage-2 descriptor values,
 //!   written into caller-provided table storage. Pure — it touches no hardware and performs no
 //!   MMIO; publishing (the barriers and TLB maintenance) stays in `hv-metal`.
@@ -97,7 +100,9 @@
 //!   deliberately unconditional on `S2AP` — permission enforcement is Stage-2's job for the
 //!   *guest*, not for the core's own accesses.
 //! - **VMID / table-set binding.** That domain → table set → `VMID` is injective lives in
-//!   `hv-metal`, not here, and is not covered by these properties.
+//!   `hv-metal`, not here, and is not covered by these properties. What *is* covered since the SMMU
+//!   arc's rung 3 is the step after it: given a domain's `VTTBR_EL2`, the STE built for a StreamID
+//!   names that same table under that same VMID, exactly, or is refused ([`smmu::bind_stage2`]).
 //!
 //! ## Zero unsafe
 //!

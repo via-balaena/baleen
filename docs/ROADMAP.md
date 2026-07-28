@@ -142,10 +142,14 @@ hardware; platform tension).
 - **Flags:** forwarding = *plumbing*; passthrough = **extends the proof**. It was also listed here as
   the first phase that genuinely **needs real hardware**, on the premise that QEMU cannot validate
   SMMU/DMA isolation. **That premise was false and is retracted** (2026-07-28): QEMU `virt` emulates a
-  stage-2-capable SMMUv3 that EL2 can drive, and two rungs of DMA default-deny are witnessed on it —
-  `GBPA.ABORT` before any bus master exists (PR #91), then an ∀-StreamID all-deny stream table with a
-  through-STE positive control (`docs/SMMU-STREAM-TABLE.md`). What hardware still buys is evidence on
-  *silicon*, not the arc itself; see `docs/QEMU-AND-METAL.md` item 3 for the narrowed residue.
+  stage-2-capable SMMUv3 that EL2 can drive, and three rungs are witnessed on it — `GBPA.ABORT` before
+  any bus master exists (PR #91); an ∀-StreamID all-deny stream table with a through-STE positive
+  control (`docs/SMMU-STREAM-TABLE.md`); and **translation** — a device bound to a domain's own
+  `p2m`-derived Stage-2 tables, confined to exactly that domain's frames at exactly the emitter's
+  permissions (`docs/SMMU-TRANSLATION.md`). So the *substrate* for passthrough now exists, and what is
+  still missing for M7 is device **assignment** as a modelled concept rather than metal configuration.
+  What hardware still buys is evidence on *silicon*, not the arc itself; see `docs/QEMU-AND-METAL.md`
+  item 3 for the narrowed residue.
 
 ### M8 — GPU acceleration: near-bare-metal disposables (the big pillar)
 - **See-it:** a disposable runs something GPU-heavy at near-native speed.
@@ -253,7 +257,8 @@ as the proofs.
   genuinely hard GPU-memory confidentiality property. Highest value, highest risk.
 - **IOMMU / DMA isolation (M7)** — the security substrate for real device passthrough. It **extends
   the proof** (new `hv-core` model + Verus). It is *no longer* blocked on hardware — the SMMU arc is
-  live and two rungs deep under QEMU (see M7 above). For
+  live and three rungs deep under QEMU, with a device now genuinely confined to one domain's memory
+  (see M7 above). For
   the *described* workflow (a password stick, a backup drive) *forwarding may cover it entirely* — so
   the hard controller-passthrough tier might be optional for your actual use.
 
@@ -277,7 +282,7 @@ point of the `hv-hal` fence); only the metal layer does.
 | M4 Stage-2 gen | *refines* — real `p2m`→Stage-2 emitted + negative-isolation test PASSED; `GuestMemory` realized+honored (ARM); Audit #2 SOUND (`docs/AUDIT-2-P2M-STAGE2.md`) | no (QEMU-sound) |
 | M5 disposables + vault | *refines* (lifecycle + non-interference cashed in) | no (QEMU-sound) |
 | M6 input/GUI domain | *extends* (focus-integrity) + plumbing | no |
-| M7 DMA / IOMMU | **extends**; rungs 1–2 = SMMU default-deny, boot-witnessed + ∀-StreamID Kani over the stream-table builder (`docs/SMMU-STREAM-TABLE.md`). A `hv-core` DMA-isolation model is still absent | no for the *configuration* logic; **yes** for silicon |
+| M7 DMA / IOMMU | **extends**; rungs 1–3 = SMMU default-deny then **translation** — a device bound to a domain's own Stage-2 tables, boot-witnessed, with ∀-StreamID Kani over the stream-table builder and ∀-binding Kani over the stream→domain binding (`docs/SMMU-STREAM-TABLE.md`, `docs/SMMU-TRANSLATION.md`). A `hv-core` DMA-isolation model is still absent | no for the *configuration* logic; **yes** for silicon |
 | M8 GPU memory | **extends** (GPU-memory non-interference) + big trusted driver | **yes** |
 
 Two standing caveats carry through every layer: the proofs cover the **model**, and the metal

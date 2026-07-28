@@ -1572,9 +1572,21 @@ __guest_disposable_tpl_end:
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
 /// WBWA Inner-Shareable table walks, 40-bit PS, RES1 bit 31. `DS=0` (bit 32 clear) so the classic
-/// (non-LPA2) descriptor format the `stage2` encodings assume is in force. Unchanged from Arc 4.
+/// (non-LPA2) descriptor format the `stage2` encodings assume is in force. Behaviourally unchanged
+/// from Arc 4 — the *value* is the same; what changed (SMMU rung 3) is where it comes from.
+///
+/// **It is no longer a literal, because it no longer has one consumer.** The SMMU walks the very same
+/// Stage-2 tables for a bound device, and it takes these parameters from the **STE**, not from
+/// `VTCR_EL2`. Two walkers over one table under different parameters is not a degraded translation
+/// but a different one — a start level one off reads leaf descriptors as table descriptors — so the
+/// parameters are one declaration ([`hv_s2::arm64::BALEEN_STAGE2`]) with two independent encodings,
+/// and `hv-verify` proves the two agree. Resolved at compile time: a regime the encoder refuses must
+/// break the build rather than fall back to some other configuration.
 const VTCR_EL2: u64 =
-    (1 << 31) | (0b010 << 16) | (0b11 << 12) | (0b01 << 10) | (0b01 << 8) | (0b01 << 6) | 25;
+    match hv_s2::arm64::vtcr_el2(&hv_s2::arm64::BALEEN_STAGE2, hv_s2::arm64::BALEEN_VMID_BITS) {
+        Some(v) => v,
+        None => panic!("the deployed stage-2 regime cannot be encoded into VTCR_EL2"),
+    };
 
 /// `HCR_EL2.VM` — bit 0, enables Stage-2 for EL1&0. OR'd onto the Arc-3 `HCR_EL2` (RW=bit 31);
 /// `FWB` (bit 46) stays 0 so the `stage2` `MemAttr=0b1111` Normal-WB encoding is in force.

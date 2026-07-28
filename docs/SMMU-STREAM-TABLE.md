@@ -190,13 +190,18 @@ Two more things worth recording:
   every entry edit and the boot would visibly fail without them (a stale cached STE would make phases
   2 and 3 land), but there is no ∀-argument that every future edit site remembers to.
 
-## 7. Rung 3
+## 7. Rung 3 — **done**, see `docs/SMMU-TRANSLATION.md`
 
 Translation proper: `STE.Config = 0b110` with `S2TTB` pointing at the `p2m`-derived Stage-2 tables
-under the domain's `S2VMID` — where `hv-s2`'s existing ∀-address refinement starts covering the device
-path *for free*, because `encode_leaf_descriptors_follow_the_seam` and `stage2_leaf_authorized.rs`
-constrain the **table**, not the **walker**. The positive control gets stronger there too: the DMA
-must land at the address the *table* says, not the one the device asked for.
+under the domain's `S2VMID` — where `hv-s2`'s existing ∀-address refinement covers the device path
+*for free*, because `encode_leaf_descriptors_follow_the_seam` and `stage2_leaf_authorized.rs`
+constrain the **table**, not the **walker**. The positive control is stronger there too: the DMA must
+land at the address the *table* says, not the one the device asked for, and both addresses are read
+back.
+
+The no-Verus-mirror ruling in §3 **stands**: rung 3 left the table linear and its size a compile-time
+constant. What rung 3 did add is a second consumer for the *translation regime* — the STE's copy of
+what `VTCR_EL2` gives the CPU — which is a new ∀-quantified agreement proof, not a size axis.
 
 ---
 

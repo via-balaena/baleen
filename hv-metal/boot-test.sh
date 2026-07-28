@@ -363,14 +363,54 @@ boot_and_check "dma-control" "" \
 #   * OUT-OF-RANGE STREAMID — with the entry still saying BYPASS, announcing a 1-entry table puts the
 #     StreamID outside the range: ABORTED with C_BAD_STREAMID. The range check is what makes "size
 #     the table to bus 0" a stronger denial than a zeroed entry rather than a coverage gap.
+#
+# Rung 3 (TRANSLATION) runs in the same boot again, and needs one machine change: `-m 2048`. Its
+# control asserts the DMA landed where the TABLE says and NOT at the address the device asked for —
+# and the second half is only a check if that address is real memory. The addresses the device issues
+# are guest IPAs (`0x8000_0000 +`), which QEMU `virt`'s default 128 MiB does not back; on such a
+# machine "the device did not write there" would be true whatever the SMMU did. The metal seeds and
+# reads back every observed address before each transfer, so a wrong `-m` fails loudly rather than
+# passing vacuously — but the right `-m` is here.
+#
+#   * TRANSLATION POSITIVE CONTROL — StreamID bound to a domain's OWN Stage-2 tables (S2TTB = the
+#     table VTTBR_EL2 carries, S2VMID = the domain's VMID); the device asks for an IPA and the data
+#     arrives at a DIFFERENT physical address, the one a walk of the emitted descriptors names.
+#   * CONFINEMENT — an IPA the domain does not own: ABORTED, F_TRANSLATION naming that address.
+#   * PERMISSION — the read-only leaf hv-s2 emitted refuses the DEVICE's write (F_PERMISSION), so the
+#     proven emitter's permission bits govern the device path too.
+#   * STREAM-TO-DOMAIN BINDING — the same device, the same IPA, an STE naming the OTHER domain:
+#     aborted, and the first domain's memory untouched; that STE then reaches the other domain's own
+#     frame, and rebinding reaches the first's again.
+#   * RESTORED — unbound, and the table denies every StreamID again.
+#
+# `-global arm-smmuv3.stage=2` is not decoration either, and it is the difference between this boot
+# and the CI runner's. QEMU advertises `SMMU_IDR0.S2P` only when the SMMU device's `stage` property
+# says so, and the two ends of the version range disagree about who sets it:
+#
+#   * QEMU >= 10.0: `virt`'s `create_smmu()` sets `stage = "nested"` itself, so S1P|S2P are both
+#     advertised — and because the machine sets it AFTER `qdev_new`, it also OVERRIDES this `-global`,
+#     which is why the flag is a harmless no-op there (measured: `stage=1`, `2` and `nested` all give
+#     the identical `IDR0 = 0x0d44101b`).
+#   * QEMU 8.2 (what `ubuntu-24.04` runners ship): `create_smmu()` sets nothing, the property defaults
+#     to stage 1, `IDR0 = 0x0d44101a` — **S2P clear** — and a `Config = 0b110` STE is correctly
+#     rejected with `C_BAD_STE`. Nothing overrides `-global` there, so this is what turns it on.
+#
+# The metal now REQUIRES `IDR0.S2P` before rung 3 runs, so a machine that does not implement stage 2
+# fails loudly and by name rather than reporting a wall of unexplained `C_BAD_STE`.
 MACHINE_EXTRA=",iommu=smmuv3"
+EXTRA_QEMU="-m 2048 -global arm-smmuv3.stage=2 -device edu,dma_mask=0xffffffffff"
 boot_and_check "smmu" "--features smmu" \
     "hv-metal alive" \
     "smmu rung1 DEFAULT-DENY OK" \
     "smmu rung2 THROUGH-STE POSITIVE CONTROL OK" \
     "smmu rung2 STREAM-TABLE DEFAULT-DENY OK" \
     "smmu rung2 STREAMID-SPECIFIC OK" \
-    "smmu rung2 OUT-OF-RANGE STREAMID OK"
+    "smmu rung2 OUT-OF-RANGE STREAMID OK" \
+    "smmu rung3 TRANSLATION POSITIVE CONTROL OK" \
+    "smmu rung3 CONFINEMENT OK" \
+    "smmu rung3 PERMISSION OK" \
+    "smmu rung3 STREAM-TO-DOMAIN BINDING OK" \
+    "smmu rung3 RESTORED OK"
 EXTRA_QEMU=""
 MACHINE_EXTRA=""
 

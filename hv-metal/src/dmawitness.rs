@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # The DMA witness — a real bus master, and whether the SMMU stops it (SMMU arc, rungs 1–2)
+//! # The DMA witness — a real bus master, whether the SMMU stops it, and where it lands (rungs 1–3)
 //!
 //! Every isolation result baleen has is about **CPU** accesses. To say anything about DMA there has to
 //! be a device that actually performs it, so this module builds the smallest possible one and then
@@ -57,12 +57,27 @@
 //!   result rests on [`pcie::stream_id`] being the RequesterID the hardware really presents;
 //! * never write `CR0.SMMUEN`, and every phase reports "aborted" — which is exactly the vacuous deny
 //!   this rung is built to exclude, and exactly what phase 1 catches.
+//!
+//! ## Rung 3: the same idea again, and the sentinel that must NOT change
+//!
+//! Rung 2 could only show the device reaches its STE — everything it permits, it permits unconfined.
+//! [`rung3`] binds the device to a **domain's own Stage-2 tables** and asks the sharper question: not
+//! "did something land?" but "did it land where the **table** says, rather than where the **device**
+//! asked?" Two sentinels at two different addresses, both seeded and read back, and the
+//! discriminator is which one moved. Probed: swap the stage-2 STE for a bypass STE and the two
+//! sentinels swap roles exactly.
 
 use crate::pcie;
 use crate::pl011::Pl011;
 #[cfg(feature = "smmu")]
 use crate::smmu;
 use core::fmt::Write;
+#[cfg(feature = "smmu")]
+use hv_core::hypervisor::DomId;
+#[cfg(feature = "smmu")]
+use hv_core::p2m::{Mfn, PtLevel};
+#[cfg(feature = "smmu")]
+use hv_core::{HvCall, Hypervisor};
 
 /// QEMU `edu` PCI identity (`hw/misc/edu.c`): QEMU's vendor id and the `edu` device id.
 const EDU_VENDOR: u16 = 0x1234;
@@ -284,7 +299,12 @@ pub(crate) fn witness(uart: &mut Pl011) {
     #[cfg(feature = "smmu")]
     {
         let (aborting, s2, idr0, idr1, present) = smmu_state;
-        let ok = present && aborting && device_live && a.aborted();
+        // `s2` is REQUIRED, not merely reported. It was reported-only from rung 1 until rung 3 found
+        // out the hard way: CI's QEMU 8.2 advertises `IDR0.S2P = 0`, the boot printed `stage2=false`
+        // for two rungs, and nothing cared — a check whose result changed nothing (design-lesson
+        // #71). The whole arc rests on the SMMU being able to translate through a domain's own
+        // Stage-2 tables, so a machine that cannot is a machine this witness must not report on.
+        let ok = present && aborting && s2 && device_live && a.aborted();
         if ok {
             let _ = writeln!(
                 uart,
@@ -295,7 +315,7 @@ pub(crate) fn witness(uart: &mut Pl011) {
         } else {
             let _ = writeln!(
                 uart,
-                "baleen: smmu rung1 DEFAULT-DENY FAIL (present={present} aborting={aborting} live={device_live} retired={retired} landed={landed} before={before:#x} after={after:#x}); halting"
+                "baleen: smmu rung1 DEFAULT-DENY FAIL (present={present} aborting={aborting} stage2={s2} idr0={idr0:#010x} live={device_live} retired={retired} landed={landed} before={before:#x} after={after:#x}); halting"
             );
             crate::park();
         }
@@ -495,4 +515,444 @@ fn rung2(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
         );
         crate::park();
     }
+
+    rung3(uart, bdf, bar0);
+}
+
+// ─── SMMU rung 3 — TRANSLATION: the device walks the DOMAIN's own Stage-2 tables ─────────────────
+
+/// The two domains the device is bound to in turn. Two, because the property is not "the device is
+/// translated" but "the device reaches **this** domain's memory and no other" — which a single
+/// domain cannot witness at all.
+#[cfg(feature = "smmu")]
+const DOM0: DomId = 0;
+#[cfg(feature = "smmu")]
+const DOM_A: DomId = 1;
+#[cfg(feature = "smmu")]
+const DOM_B: DomId = 2;
+
+/// A's page table, its writable frame, and its **read-only** frame; B's page table and its writable
+/// frame; and one model frame nobody ever allocates.
+///
+/// Every index is `>= 1` because model frame 0 is the metal's super-span partition
+/// ([`crate::stage2::NUM_SUP_FRAMES`]) and a base leaf there is rejected by the emitter.
+#[cfg(feature = "smmu")]
+const F_A_ROOT: Mfn = 1;
+#[cfg(feature = "smmu")]
+const F_A_RW: Mfn = 2;
+#[cfg(feature = "smmu")]
+const F_A_RO: Mfn = 3;
+#[cfg(feature = "smmu")]
+const F_B_ROOT: Mfn = 4;
+#[cfg(feature = "smmu")]
+const F_B_RW: Mfn = 5;
+/// Allocated by nobody, so no domain's table has a descriptor for it — the confinement arm's target.
+#[cfg(feature = "smmu")]
+const F_HOLE: Mfn = 6;
+
+/// The magic at the address the device **asks for** (the IPA, read as a raw physical address).
+///
+/// Survives ⟹ the transaction did not go there. That is the half rung 2 could not have: a bypassing
+/// device writes to the address it issued, a translated one does not, and the difference is visible
+/// only if both addresses are real memory that can be read back.
+#[cfg(feature = "smmu")]
+const SENT_ASKED: u64 = 0x5A5A_A5A5_5A5A_A5A5;
+/// The magic at the address **the table says** the transaction lands at. Becomes zero when the
+/// device's (zeroed) buffer arrives.
+#[cfg(feature = "smmu")]
+const SENT_TABLE: u64 = 0xBEEF_D00D_BEEF_D00D;
+/// The magic at an address that must **not** be touched — the other domain's landing site for the
+/// very same IPA. Distinct from both of the above so a mix-up is visible rather than plausible.
+#[cfg(feature = "smmu")]
+const SENT_FORBIDDEN: u64 = 0x600D_600D_600D_600D;
+
+/// Read/write a physical address directly. EL2 runs MMU-off/identity, so this is the same premise
+/// every other access in the metal rests on — and the accesses under observation come from a
+/// *device*, so a volatile access is what is wanted: the value can change with no CPU store.
+#[cfg(feature = "smmu")]
+fn poke(pa: u64, v: u64) {
+    // SAFETY: `pa` is either a Stage-2 leaf's output address (obtained by decoding the descriptor
+    // this hypervisor emitted) or a guest IPA inside the model's data window, both of which name
+    // ordinary DRAM on this machine; EL2 is identity-mapped. Aliases no Rust object — the model's
+    // frame backing is reached only through raw addresses.
+    unsafe { core::ptr::write_volatile(pa as *mut u64, v) }
+}
+
+#[cfg(feature = "smmu")]
+fn peek(pa: u64) -> u64 {
+    // SAFETY: as `poke`; read-only.
+    unsafe { core::ptr::read_volatile(pa as *const u64) }
+}
+
+/// One rung-3 DMA attempt: what the device was told, where the table said that would land, and what
+/// every observed address held before and after.
+#[cfg(feature = "smmu")]
+struct Landing {
+    /// Where a walk of the bound domain's tables says `issued` resolves — `None` when that domain's
+    /// table maps it nowhere.
+    landing: Option<u64>,
+    /// A physical address that must be unchanged afterwards: the *other* domain's landing site for
+    /// the same IPA. Present only in the binding phases, where "did not reach A" is the claim.
+    forbidden: Option<u64>,
+    /// Every seeded address read its magic back before the transfer. Without this the "unchanged"
+    /// verdicts are vacuous — an address that is not memory never changes.
+    seeds_took: bool,
+    asked_after: u64,
+    landing_after: Option<u64>,
+    forbidden_after: Option<u64>,
+    retired: bool,
+}
+
+#[cfg(feature = "smmu")]
+impl Landing {
+    /// Every "must not have changed" address still holds its magic.
+    fn nothing_else_moved(&self) -> bool {
+        self.asked_after == SENT_ASKED && self.forbidden_after.is_none_or(|v| v == SENT_FORBIDDEN)
+    }
+
+    /// **The rung's headline verdict**: the transfer ran, it arrived at the address the *table*
+    /// names, and it did not arrive at the address the *device* named.
+    fn translated(&self) -> bool {
+        self.seeds_took
+            && self.retired
+            && self.landing_after == Some(0)
+            && self.nothing_else_moved()
+    }
+
+    /// The transfer ran and reached nothing: not the table's address (if it had one), not the
+    /// device's own, not the other domain's.
+    fn refused(&self) -> bool {
+        self.seeds_took
+            && self.retired
+            && self.landing_after.is_none_or(|v| v == SENT_TABLE)
+            && self.nothing_else_moved()
+    }
+}
+
+/// Seed every observed address, run one DMA at `issued`, and read them all back.
+///
+/// The seeds are three *different* magics and each is read back before the transfer. That read-back
+/// is not paranoia: the address the device asks for is a guest IPA interpreted as a physical address,
+/// and on a machine whose RAM does not extend that far it would be unbacked — in which case "the
+/// device did not write there" would be true no matter what the SMMU did. Failing loudly there is the
+/// difference between a control and a decoration.
+#[cfg(feature = "smmu")]
+fn attempt_stage2(
+    bar0: u64,
+    issued: u64,
+    landing: Option<u64>,
+    forbidden: Option<u64>,
+) -> (Landing, Option<smmu::SmmuEvent>) {
+    poke(issued, SENT_ASKED);
+    if let Some(pa) = landing {
+        poke(pa, SENT_TABLE);
+    }
+    if let Some(pa) = forbidden {
+        poke(pa, SENT_FORBIDDEN);
+    }
+    let seeds_took = peek(issued) == SENT_ASKED
+        && landing.is_none_or(|pa| peek(pa) == SENT_TABLE)
+        && forbidden.is_none_or(|pa| peek(pa) == SENT_FORBIDDEN);
+
+    smmu::drain_events();
+    let retired = trigger_dma(bar0, issued);
+    let event = smmu::take_event();
+
+    (
+        Landing {
+            landing,
+            forbidden,
+            seeds_took,
+            asked_after: peek(issued),
+            landing_after: landing.map(peek),
+            forbidden_after: forbidden.map(peek),
+            retired,
+        },
+        event,
+    )
+}
+
+/// Drive the proven model into two domains with disjoint memory, entirely through the real
+/// `Hypervisor::dispatch` (and through the metal's teardown funnel, so the content obligations stay
+/// discharged) — so the Stage-2 tables the SMMU then walks are a translation of state the *proven
+/// transitions* produced, exactly as the CPU-side phases are.
+#[cfg(feature = "smmu")]
+fn setup_two_domains(hv: &mut Hypervisor, uart: &mut Pl011) {
+    let mut expect = |hv: &mut Hypervisor, caller: DomId, call: HvCall, what: &str| {
+        if let Err(e) = crate::teardown::dispatch(hv, caller, call) {
+            let _ = writeln!(
+                uart,
+                "baleen: smmu rung3 model setup '{what}' failed: {e:?}; halting"
+            );
+            crate::park();
+        }
+    };
+
+    for (dom, root, data, ro) in [
+        (DOM_A, F_A_ROOT, F_A_RW, Some(F_A_RO)),
+        (DOM_B, F_B_ROOT, F_B_RW, None),
+    ] {
+        expect(
+            hv,
+            DOM0,
+            HvCall::DomainCreate {
+                target: dom,
+                may_create: false,
+            },
+            "create domain",
+        );
+        expect(hv, dom, HvCall::P2mAllocate { mfn: root }, "alloc root");
+        expect(hv, dom, HvCall::P2mAllocate { mfn: data }, "alloc data");
+        expect(
+            hv,
+            dom,
+            HvCall::P2mPin {
+                mfn: root,
+                level: PtLevel::L1,
+            },
+            "pin root",
+        );
+        expect(
+            hv,
+            dom,
+            HvCall::P2mLink {
+                parent: root,
+                slot: 0,
+                child: data,
+                writable: true,
+                leaf: true,
+                execute: false,
+            },
+            "link data",
+        );
+        if let Some(ro) = ro {
+            expect(hv, dom, HvCall::P2mAllocate { mfn: ro }, "alloc ro");
+            expect(
+                hv,
+                dom,
+                HvCall::P2mLink {
+                    parent: root,
+                    slot: 1,
+                    child: ro,
+                    writable: false,
+                    leaf: true,
+                    execute: false,
+                },
+                "link ro",
+            );
+        }
+    }
+}
+
+/// **SMMU rung 3 — the device is bound to a DOMAIN, and reaches exactly its memory.**
+///
+/// Rung 2 ends at "nothing reaches memory unless this hypervisor bound its StreamID", and everything
+/// it binds, it binds **unconfined**: a bypass STE places no constraint at all on where a permitted
+/// device writes. Rung 3 is the constraint, and it is deliberately not a *new* one — `STE.S2TTB`
+/// points at the very Stage-2 tables `build_stage2_from_p2m` emitted for a domain from the proven
+/// `p2m`, under that domain's VMID, walked under the same regime `VTCR_EL2` gives the CPU. **One
+/// proven `p2m`, two consumers.**
+///
+/// | phase | STE names | device asks for | required outcome |
+/// |---|---|---|---|
+/// | 1 — translation control | A's tables, VMID 1 | A's writable frame's IPA | lands at **the PA the table says**, not at the IPA |
+/// | 2 — confinement | A's tables | an IPA A does not own | **aborted**, `F_TRANSLATION` naming that address |
+/// | 3 — permission | A's tables | A's **read-only** frame's IPA | **aborted**, `F_PERMISSION` |
+/// | 4 — wrong domain | B's tables, VMID 2 | A's writable frame's IPA | **aborted**, and A's memory untouched |
+/// | 5 — right domain | B's tables | B's writable frame's IPA | lands in **B's** frame |
+/// | 6 — back to A | A's tables | A's writable frame's IPA | lands in A's frame again |
+/// | 7 — restore | nothing (unbound) | A's writable frame's IPA | **aborted**, `C_BAD_STE`; table denies every stream |
+///
+/// **Phase 1 is the control, and it is stronger than rung 2's.** Rung 2's control could only show
+/// that the device reaches its STE; this one shows that *translation happened*, because the address
+/// the device issued and the address the data arrived at are different addresses and both are read
+/// back. "Something landed" would not have been enough — a bypass STE also lands. Two sentinels, and
+/// the discriminator is which one moved.
+///
+/// **Phases 4 and 5 are the isolation content**, and they are the reason the rung needs two domains.
+/// The same device, the same StreamID, the same *issued address* — and whether it reaches memory at
+/// all, and whose, is decided by one field of one entry. That is the `VTTBR_EL2` install seen from
+/// the device side, and a wrong STE there is not a fault but a **wrong domain's memory**.
+///
+/// **Phase 3 is where the proven emitter's permission bits govern the device.** Nothing new was
+/// built for it: the read-only leaf is the one `hv-s2` emits for a model leaf with `writable: false`,
+/// and the SMMU refuses the write for the same reason the CPU would.
+#[cfg(feature = "smmu")]
+fn rung3(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
+    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS};
+    use hv_s2::smmu::Stage2Binding;
+
+    let sid = pcie::stream_id(bdf);
+
+    // (1) THE MODEL, then THE TABLES. Two domains with disjoint memory, driven through the proven
+    //     transitions; two independent Stage-2 table sets emitted from that `p2m` by the same
+    //     `build_stage2_from_p2m` every CPU-side phase uses, each with its own VMID.
+    let mut hv = crate::build_hypervisor();
+    setup_two_domains(&mut hv, uart);
+    let vttbr_a = crate::stage2::build_stage2_from_p2m(&hv, DOM_A, 0);
+    let vttbr_b = crate::stage2::build_stage2_from_p2m(&hv, DOM_B, 1);
+
+    // (2) THE BINDINGS, DERIVED FROM THE VTTBRs — not from the table storage, and not from a second
+    //     computation of where the tables live. `vttbr_table`/`vttbr_vmid` read back the value the
+    //     CPU would be given, so "the device walks the same table as the domain's CPU, under the same
+    //     VMID" holds by construction rather than by agreement between two derivations.
+    let bind_a = Stage2Binding {
+        s2ttb: vttbr_table(vttbr_a),
+        vmid: vttbr_vmid(vttbr_a, BALEEN_VMID_BITS),
+        regime: BALEEN_STAGE2,
+    };
+    let bind_b = Stage2Binding {
+        s2ttb: vttbr_table(vttbr_b),
+        vmid: vttbr_vmid(vttbr_b, BALEEN_VMID_BITS),
+        regime: BALEEN_STAGE2,
+    };
+    let l1_a = bind_a.s2ttb;
+    let l1_b = bind_b.s2ttb;
+
+    // A distinct 64-byte slot per phase, so no phase's evidence is a re-seeding of another's: a
+    // transfer that silently ran twice, or one that landed after its read, cannot hide behind a
+    // freshly-written "before" value (the rung-2 sentinel discipline, applied inside one frame).
+    let slot = |phase: u64| phase * 64;
+    let ipa_a_rw = crate::stage2::frame_ipa(F_A_RW);
+    let ipa_a_ro = crate::stage2::frame_ipa(F_A_RO);
+    let ipa_b_rw = crate::stage2::frame_ipa(F_B_RW);
+    let ipa_hole = crate::stage2::frame_ipa(F_HOLE);
+    // Where a walk of the emitted DESCRIPTORS says an address lands. Never layout arithmetic: the
+    // expectation has to come from the table, or the control asserts only that two copies of the
+    // same derivation agree.
+    let walk = crate::stage2::walk_stage2;
+
+    // ── Phase 1: the TRANSLATION positive control ────────────────────────────────────────────────
+    let bound_a = smmu::bind_stream_stage2(sid, &bind_a);
+    let asked1 = ipa_a_rw + slot(1);
+    let landed1 = walk(l1_a, asked1);
+    let (p1, e1) = attempt_stage2(bar0, asked1, landed1.as_ref().map(|r| r.pa), None);
+    // The whole point: the table's answer is a DIFFERENT address from the one the device issued.
+    let translation_is_real = landed1
+        .as_ref()
+        .is_some_and(|r| r.pa != asked1 && r.writable);
+    let phase1 = bound_a && translation_is_real && p1.translated() && e1.is_none();
+
+    // ── Phase 2: CONFINEMENT — an IPA this domain does not own ───────────────────────────────────
+    let asked2 = ipa_hole + slot(2);
+    let landed2 = walk(l1_a, asked2);
+    let (p2, e2) = attempt_stage2(bar0, asked2, None, None);
+    let phase2 =
+        landed2.is_none() && p2.refused() && fault_at(&e2, smmu::EVT_F_TRANSLATION, sid, asked2);
+
+    // ── Phase 3: PERMISSION — the emitter's read-only leaf, enforced against a DEVICE ────────────
+    let asked3 = ipa_a_ro + slot(3);
+    let landed3 = walk(l1_a, asked3);
+    let read_only = landed3.as_ref().is_some_and(|r| !r.writable);
+    let (p3, e3) = attempt_stage2(bar0, asked3, landed3.as_ref().map(|r| r.pa), None);
+    let phase3 = read_only && p3.refused() && fault_at(&e3, smmu::EVT_F_PERMISSION, sid, asked3);
+
+    // ── Phase 4: the WRONG DOMAIN — same device, same address, B's tables ────────────────────────
+    // The forbidden address is A's landing site for this very IPA: "did not reach A's memory" is the
+    // claim, so it is asserted directly rather than inferred from the absence of a change elsewhere.
+    let bound_b = smmu::bind_stream_stage2(sid, &bind_b);
+    let asked4 = ipa_a_rw + slot(4);
+    let landed4_b = walk(l1_b, asked4);
+    let forbidden4 = walk(l1_a, asked4).map(|r| r.pa);
+    let (p4, e4) = attempt_stage2(bar0, asked4, landed4_b.as_ref().map(|r| r.pa), forbidden4);
+    let phase4 = bound_b
+        && landed4_b.is_none()
+        && forbidden4.is_some()
+        && p4.refused()
+        && fault_at(&e4, smmu::EVT_F_TRANSLATION, sid, asked4);
+
+    // ── Phase 5: the RIGHT domain — B's own frame, through the same STE ──────────────────────────
+    let asked5 = ipa_b_rw + slot(5);
+    let landed5 = walk(l1_b, asked5);
+    let (p5, e5) = attempt_stage2(bar0, asked5, landed5.as_ref().map(|r| r.pa), None);
+    let phase5 =
+        landed5.as_ref().is_some_and(|r| r.pa != asked5) && p5.translated() && e5.is_none();
+
+    // ── Phase 6: rebind to A, and require A's memory to be reachable again ───────────────────────
+    // Without this, phases 2–4 are equally consistent with an SMMU that stopped translating anything.
+    let rebound_a = smmu::bind_stream_stage2(sid, &bind_a);
+    let asked6 = ipa_a_rw + slot(6);
+    let landed6 = walk(l1_a, asked6);
+    let (p6, e6) = attempt_stage2(bar0, asked6, landed6.as_ref().map(|r| r.pa), None);
+    let phase6 = rebound_a && p6.translated() && e6.is_none();
+
+    // ── Phase 7: restore the machine's deny-everything state, and witness it ─────────────────────
+    let unbound = smmu::unbind_stream(sid);
+    let asked7 = ipa_a_rw + slot(7);
+    let landed7 = walk(l1_a, asked7);
+    let (p7, e7) = attempt_stage2(bar0, asked7, landed7.as_ref().map(|r| r.pa), None);
+    let phase7 = unbound
+        && p7.refused()
+        && matches!(&e7, Some(e) if e.kind == smmu::EVT_C_BAD_STE && e.sid == sid);
+
+    if phase1 && phase2 && phase3 && phase4 && phase5 && phase6 && phase7 {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung3 TRANSLATION POSITIVE CONTROL OK: StreamID {sid} bound to domain {DOM_A}'s OWN Stage-2 tables (S2TTB={:#x} = VTTBR_EL2's table, S2VMID={}), the device asked for IPA {asked1:#x} and the DMA landed at PA {:#x} — where the TABLE says, not where the device asked (the sentinel at {asked1:#x} is intact {:#x})",
+            bind_a.s2ttb,
+            bind_a.vmid,
+            p1.landing.unwrap_or(0),
+            p1.asked_after
+        );
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung3 CONFINEMENT OK: the same device, the same STE, asking for IPA {asked2:#x} — a frame domain {DOM_A} does not own, so its table has no descriptor for it — was ABORTED with F_TRANSLATION naming that address ({:#x}); one proven p2m, two consumers",
+            e2.as_ref().map_or(0, |e| e.addr)
+        );
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung3 PERMISSION OK: the READ-ONLY leaf hv-s2 emitted for domain {DOM_A} (IPA {asked3:#x} -> PA {:#x}, S2AP=RO) refused the DEVICE's write with F_PERMISSION — the proven emitter's permission bits govern the device path, not only the CPU's",
+            p3.landing.unwrap_or(0)
+        );
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung3 STREAM-TO-DOMAIN BINDING OK: with StreamID {sid}'s STE naming domain {DOM_B} (S2TTB={:#x} VMID={}) instead, the SAME device asking for the SAME IPA {asked4:#x} was ABORTED and domain {DOM_A}'s memory at PA {:#x} was untouched ({:#x}); the same STE then reached domain {DOM_B}'s own frame at PA {:#x}, and rebinding to {DOM_A} reached A's again — which domain a device's DMA lands in is decided by the STE",
+            bind_b.s2ttb,
+            bind_b.vmid,
+            p4.forbidden.unwrap_or(0),
+            p4.forbidden_after.unwrap_or(0),
+            p5.landing.unwrap_or(0)
+        );
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung3 RESTORED OK: StreamID {sid} unbound, the stream table denies every StreamID again, and the same DMA is back to C_BAD_STE"
+        );
+    } else {
+        let ev = |e: &Option<smmu::SmmuEvent>| match e {
+            Some(e) => (e.kind, e.sid, e.addr),
+            None => (0xff, u32::MAX, u64::MAX),
+        };
+        let l = |r: &Option<crate::stage2::Resolved>| r.as_ref().map_or(u64::MAX, |r| r.pa);
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung3 FAIL (sid={sid} a_ttb={:#x}/{} b_ttb={:#x}/{} | p1 bound={bound_a} walk={:#x} seeds={} retired={} asked_after={:#x} landing_after={:?} evt={:x?} | p2 walk={:#x} seeds={} retired={} landing_after={:?} evt={:x?} | p3 ro={read_only} walk={:#x} seeds={} landing_after={:?} evt={:x?} | p4 bound_b={bound_b} walk_b={:#x} forbidden={:#x} seeds={} forbidden_after={:?} evt={:x?} | p5 walk={:#x} seeds={} landing_after={:?} | p6 rebound={rebound_a} seeds={} landing_after={:?} | p7 unbound={unbound} landing_after={:?} evt={:x?}); halting",
+            bind_a.s2ttb, bind_a.vmid, bind_b.s2ttb, bind_b.vmid,
+            l(&landed1), p1.seeds_took, p1.retired, p1.asked_after, p1.landing_after, ev(&e1),
+            l(&landed2), p2.seeds_took, p2.retired, p2.landing_after, ev(&e2),
+            l(&landed3), p3.seeds_took, p3.landing_after, ev(&e3),
+            l(&landed4_b), forbidden4.unwrap_or(u64::MAX), p4.seeds_took, p4.forbidden_after, ev(&e4),
+            l(&landed5), p5.seeds_took, p5.landing_after,
+            p6.seeds_took, p6.landing_after,
+            p7.landing_after, ev(&e7),
+        );
+        crate::park();
+    }
+}
+
+/// Whether the SMMU recorded exactly this fault class, for this StreamID, naming the page the device
+/// asked for.
+///
+/// **Attributed, not inferred** (design-lesson #70(d)). Comparing the record's input address is what
+/// separates "some transaction of this device faulted" from "the walk of *this* domain's table
+/// refused *this* address" — and it is what makes phases 2 and 4 different facts rather than two
+/// spellings of "the sentinel did not change".
+///
+/// **Exact, not page-granular.** The architecture permits the record's address field to name the
+/// faulting page rather than the byte, and the weaker comparison was written first; this machine
+/// reports the exact address, and the stronger check is the one that can fail — a phase whose
+/// transfer went to a *neighbouring offset in the same frame* would still pass a page comparison, and
+/// every rung-3 phase deliberately uses a different offset in the same frame.
+#[cfg(feature = "smmu")]
+fn fault_at(e: &Option<smmu::SmmuEvent>, kind: u8, sid: u32, asked: u64) -> bool {
+    matches!(e, Some(e) if e.kind == kind && e.sid == sid && e.addr == asked)
 }

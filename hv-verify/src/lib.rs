@@ -1633,3 +1633,333 @@ mod smmu_stream_table {
         );
     }
 }
+
+/// **Stream → domain binding** — the SMMU arc, rung 3.
+///
+/// Rung 2 proved the stream table denies every StreamID nobody bound. It confines nothing: the entry
+/// it binds is a *bypass* entry, and a bypassing device puts its own addresses straight on memory.
+/// Rung 3 binds a stream to a **domain** instead — `STE.Config = 0b110`, `S2TTB` at the domain's own
+/// `p2m`-derived Stage-2 tables, `S2VMID` the domain's VMID — and the property changes shape:
+///
+/// > ∀ StreamID: the memory a device reaches is exactly the memory the domain its STE names reaches.
+///
+/// **What carries over, and what does not.** The ∀-address refinement
+/// (`stage2_leaf_authorized` / `encode_leaf_descriptors_follow_the_seam`) covers the device path
+/// **verbatim and for free**, because it constrains the *table*, not the *walker* — a device walking
+/// a domain's table is covered by construction. So this module deliberately does not re-prove any of
+/// it. What nothing before rung 3 covers is the **binding** itself: that the entry for StreamID X
+/// names domain D's table under D's VMID and nothing else. That is the exact analogue of the
+/// `VTTBR_EL2` install, and its failure mode is not a fault but a *wrong domain's memory* — which is
+/// why every refusal here is fail-closed and every field is proven to round-trip rather than merely
+/// to fit.
+///
+/// **The regime harness is the one that would not have been written by looking at the code.** Two
+/// walkers now read one table: the CPU under `VTCR_EL2`, the SMMU under the STE's own copy of the
+/// same parameters. Under *different* parameters that is not a degraded translation but a different
+/// one — a start level one off reads leaf descriptors as table descriptors. And the two encodings are
+/// NOT the same field layout: `VTCR_EL2.TG0` and `STE.S2TG` order their granules differently, while
+/// at baleen's 4 KiB granule both are `0b00` — a check whose two inputs are equal and so cannot
+/// discriminate (design-lesson #71). The harness therefore ranges over every granule, and the
+/// encoder's refusal to emit the ones whose `S2TG` encoding this crate has not verified is itself
+/// part of what is proven.
+///
+/// **And what none of it proves:** that the SMMU reads those bits the way this crate writes them.
+/// That arrow is the metal's, discharged by rung 3's two-sentinel positive control — the DMA landing
+/// at the address the *table* names and not at the address the *device* named.
+#[cfg(kani)]
+mod smmu_stream_binding {
+    use hv_s2::arm64::{
+        decode_vtcr_el2, vtcr_el2, vttbr, vttbr_table, vttbr_vmid, Granule, PaSize, Stage2Regime,
+        StartLevel, VmidBits, BALEEN_STAGE2, BALEEN_VMID_BITS,
+    };
+    use hv_s2::smmu::{
+        bind_stage2, decode_stage2_binding, stage2_binding_at, stage2_ste, unbind, verdict,
+        Stage2Binding, SteError, StreamTableError, StreamVerdict, STE_WORDS,
+    };
+
+    /// Four entries, as in the rung-2 module: the StreamID axis is what is symbolic here, the size
+    /// axis is closed by the same means (the builder's size-generic refusals, plus the metal running
+    /// `denies_every_stream` on the real 256-entry table every boot).
+    const MAX_HARNESS_LOG2: u32 = 2;
+    const WORDS: usize = (1 << MAX_HARNESS_LOG2) * STE_WORDS;
+
+    fn any_log2() -> u32 {
+        let n: u32 = kani::any();
+        kani::assume(n <= MAX_HARNESS_LOG2);
+        n
+    }
+
+    /// An arbitrary binding at the **deployed** regime: any table base the regime's alignment allows,
+    /// any VMID it can express.
+    fn any_binding() -> Stage2Binding {
+        let s2ttb: u64 = kani::any();
+        kani::assume(s2ttb >> 52 == 0);
+        kani::assume(s2ttb % BALEEN_STAGE2.table_align() == 0);
+        let vmid: u16 = kani::any();
+        Stage2Binding {
+            s2ttb,
+            vmid,
+            regime: BALEEN_STAGE2,
+        }
+    }
+
+    /// An arbitrary translation regime — every granule, start level, output size and VMID width, and
+    /// every input size a 6-bit `T0SZ` can name.
+    fn any_regime() -> Stage2Regime {
+        let g: u8 = kani::any();
+        kani::assume(g < 3);
+        let l: u8 = kani::any();
+        kani::assume(l < 4);
+        let p: u8 = kani::any();
+        kani::assume(p < 7);
+        let ipa_bits: u32 = kani::any();
+        kani::assume(ipa_bits >= 16 && ipa_bits <= 64);
+        let sh: u64 = kani::any();
+        kani::assume(sh <= 0b11);
+        let ir: u64 = kani::any();
+        kani::assume(ir <= 0b11);
+        let or: u64 = kani::any();
+        kani::assume(or <= 0b11);
+        Stage2Regime {
+            granule: if g == 0 {
+                Granule::K4
+            } else if g == 1 {
+                Granule::K16
+            } else {
+                Granule::K64
+            },
+            ipa_bits,
+            start_level: if l == 0 {
+                StartLevel::L0
+            } else if l == 1 {
+                StartLevel::L1
+            } else if l == 2 {
+                StartLevel::L2
+            } else {
+                StartLevel::L3
+            },
+            pa_size: if p == 0 {
+                PaSize::B32
+            } else if p == 1 {
+                PaSize::B36
+            } else if p == 2 {
+                PaSize::B40
+            } else if p == 3 {
+                PaSize::B42
+            } else if p == 4 {
+                PaSize::B44
+            } else if p == 5 {
+                PaSize::B48
+            } else {
+                PaSize::B52
+            },
+            walk_shareability: sh,
+            walk_inner: ir,
+            walk_outer: or,
+        }
+    }
+
+    /// **One regime, two walkers, ∀ regime.** Whenever the STE encoder emits an entry, the parameters
+    /// the SMMU will walk under decode to exactly the parameters `VTCR_EL2` gives the CPU — same
+    /// input size, same start level, same granule, same output size, same walk attributes.
+    ///
+    /// The non-vacuity half is the second assertion: the deployed regime really is encodable, so this
+    /// is not a theorem about an empty set. And the refusal half is the `#71` guard — a granule whose
+    /// `STE.S2TG` encoding is unverified is refused rather than encoded, so there is no regime for
+    /// which the two walkers could silently differ.
+    #[kani::proof]
+    fn the_device_and_the_cpu_walk_under_one_regime() {
+        let regime = any_regime();
+        let width: bool = kani::any();
+        let vmid_bits = if width { VmidBits::B8 } else { VmidBits::B16 };
+        let b = Stage2Binding {
+            s2ttb: 0,
+            vmid: 0,
+            regime,
+        };
+        match stage2_ste(&b) {
+            Ok(ste) => {
+                let device = decode_stage2_binding(&ste).expect("an emitted STE must decode");
+                let cpu = vtcr_el2(&regime, vmid_bits).and_then(decode_vtcr_el2);
+                assert!(
+                    cpu == Some((device.regime, vmid_bits)),
+                    "the SMMU's regime must be the CPU's regime"
+                );
+                assert!(
+                    device.regime == regime,
+                    "and both must be the one asked for"
+                );
+            }
+            Err(SteError::BadRegime) => {
+                assert!(!regime.valid() && vtcr_el2(&regime, vmid_bits).is_none())
+            }
+            Err(SteError::GranuleNotEmitted) => {
+                // The only granules refused are the ones whose STE encoding is unverified — never
+                // the deployed one.
+                assert!(regime.granule != Granule::K4);
+            }
+            Err(_) => assert!(
+                false,
+                "a zero, aligned table base and VMID 0 refuse nothing else"
+            ),
+        }
+        // Non-vacuity: the regime the metal actually runs passes both encoders.
+        assert!(vtcr_el2(&BALEEN_STAGE2, BALEEN_VMID_BITS).is_some());
+        assert!(stage2_ste(&Stage2Binding {
+            s2ttb: 0,
+            vmid: 0,
+            regime: BALEEN_STAGE2
+        })
+        .is_ok());
+    }
+
+    /// **The `VTTBR_EL2` seam round-trips, ∀ table and ∀ VMID.** The metal derives the STE's `S2TTB`
+    /// and `S2VMID` by reading them back out of the `VTTBR_EL2` value the domain's CPU would be
+    /// given, which is how "the device walks the *same* table as the domain's CPU" holds by
+    /// construction instead of by two derivations agreeing. If this seam lost a bit, the device would
+    /// be bound to a table that is not the domain's.
+    #[kani::proof]
+    fn the_vttbr_seam_recovers_the_table_and_the_vmid() {
+        let pa: u64 = kani::any();
+        kani::assume(pa >> 48 == 0);
+        let vmid: u64 = kani::any();
+        kani::assume(vmid < 256);
+        let v = vttbr(pa, vmid);
+        assert!(vttbr_table(v) == pa);
+        assert!(u64::from(vttbr_vmid(v, VmidBits::B8)) == vmid);
+        // …and the masking is what keeps a VMID the CPU does not tag with off the device side: a
+        // 16-bit value seen through an 8-bit regime yields the 8 bits the CPU actually uses.
+        let wide: u64 = kani::any();
+        kani::assume(wide < 65536);
+        assert!(u64::from(vttbr_vmid(vttbr(pa, wide), VmidBits::B8)) == wide & 0xff);
+        assert!(u64::from(vttbr_vmid(vttbr(pa, wide), VmidBits::B16)) == wide);
+    }
+
+    /// **A bound stream names exactly the domain it was given, ∀ table and ∀ VMID.** Every field
+    /// round-trips through the independent decode seam — so no table base is truncated into a
+    /// different table and no VMID is narrowed into another domain's.
+    #[kani::proof]
+    fn a_bound_stream_names_exactly_the_domain_it_was_given() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let sid: u32 = kani::any();
+        kani::assume((sid as u64) < (1u64 << log2));
+        let d = any_binding();
+
+        assert!(bind_stage2(&mut words, log2, sid, &d).is_ok());
+        assert!(stage2_binding_at(&words, log2, sid) == Some(d));
+        // Translating, permitted — and NOT unconfined, which is the whole difference from rung 2.
+        assert!(verdict(&words, log2, sid) == StreamVerdict::Stage2Only);
+        assert!(verdict(&words, log2, sid).permits());
+        assert!(!verdict(&words, log2, sid).stage2_unconfined());
+    }
+
+    /// **Binding a stream to a domain leaves every other stream denied, ∀ other StreamID.** The
+    /// rung-2 property survives translation: giving one device access to one domain's memory gives no
+    /// other device access to anything.
+    #[kani::proof]
+    fn binding_a_stream_to_a_domain_leaves_every_other_denied() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let bound: u32 = kani::any();
+        kani::assume((bound as u64) < (1u64 << log2));
+        assert!(bind_stage2(&mut words, log2, bound, &any_binding()).is_ok());
+
+        let other: u32 = kani::any();
+        kani::assume(other != bound);
+        assert!(!verdict(&words, log2, other).permits());
+        assert!(
+            stage2_binding_at(&words, log2, other).is_none(),
+            "no other stream may reach any domain's memory"
+        );
+    }
+
+    /// **Rebinding replaces the domain completely, ∀ pair of domains.** The metal moves one device
+    /// from one domain's tables to another's inside a single boot; a rebind that left any field of
+    /// the previous binding behind would leave the device walking a mixture — the old table under the
+    /// new VMID, say, which is a table nobody authorized.
+    #[kani::proof]
+    fn rebinding_a_stream_leaves_no_trace_of_the_previous_domain() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let sid: u32 = kani::any();
+        kani::assume((sid as u64) < (1u64 << log2));
+
+        let first = any_binding();
+        let second = any_binding();
+        assert!(bind_stage2(&mut words, log2, sid, &first).is_ok());
+        assert!(bind_stage2(&mut words, log2, sid, &second).is_ok());
+        assert!(stage2_binding_at(&words, log2, sid) == Some(second));
+    }
+
+    /// **`unbind` is still a true inverse, ∀ StreamID.** A domain binding is torn down to the same
+    /// fail-closed default a bypass binding is — the state the whole table starts in.
+    #[kani::proof]
+    fn unbinding_a_domain_binding_restores_the_deny() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let sid: u32 = kani::any();
+        kani::assume((sid as u64) < (1u64 << log2));
+        assert!(bind_stage2(&mut words, log2, sid, &any_binding()).is_ok());
+        assert!(unbind(&mut words, log2, sid).is_ok());
+
+        let any: u32 = kani::any();
+        assert!(!verdict(&words, log2, any).permits());
+        assert!(stage2_binding_at(&words, log2, any).is_none());
+    }
+
+    /// **A binding that cannot be named exactly is refused, and writes nothing — ∀ table base and
+    /// ∀ VMID.**
+    ///
+    /// This is the fail-closed half, and it is where the rung's failure mode is worst: `S2TTB` and
+    /// `S2VMID` both silently drop bits if written oversized, and a truncated table pointer does not
+    /// name a *smaller* permission — it names a **different domain's table**. So an address the field
+    /// cannot carry exactly, or a VMID the CPU regime cannot express, must leave the entry denying
+    /// rather than approximate it.
+    #[kani::proof]
+    fn a_binding_that_cannot_be_named_exactly_is_refused_and_writes_nothing() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let sid: u32 = kani::any();
+        kani::assume((sid as u64) < (1u64 << log2));
+
+        let s2ttb: u64 = kani::any();
+        let vmid: u16 = kani::any();
+        let d = Stage2Binding {
+            s2ttb,
+            vmid,
+            regime: BALEEN_STAGE2,
+        };
+        let exact = s2ttb >> 52 == 0 && s2ttb % BALEEN_STAGE2.table_align() == 0;
+
+        match bind_stage2(&mut words, log2, sid, &d) {
+            Ok(()) => {
+                assert!(exact, "only an exactly-nameable binding may be installed");
+                assert!(stage2_binding_at(&words, log2, sid) == Some(d));
+            }
+            Err(StreamTableError::BadBinding(_)) => {
+                assert!(!exact);
+                let i: usize = kani::any();
+                kani::assume(i < WORDS);
+                assert!(words[i] == 0, "a refused binding must not write any word");
+                assert!(!verdict(&words, log2, sid).permits());
+            }
+            Err(_) => assert!(false, "the StreamID is in range and the storage is sized"),
+        }
+    }
+
+    /// **Nothing decodes as a domain binding unless it really is a stage-2 STE, ∀ 8 arbitrary
+    /// words.** The stream table is memory, and the case a fail-closed reading must cover is memory
+    /// this hypervisor did not write: a stale entry, a corrupt one, one left by firmware. A reader
+    /// that answered "this stream reaches domain D" for such an entry would be inventing an
+    /// authorization.
+    #[kani::proof]
+    fn no_entry_decodes_as_a_binding_unless_it_is_a_stage2_ste() {
+        let ste: [u64; STE_WORDS] = kani::any();
+        if let Some(b) = decode_stage2_binding(&ste) {
+            assert!(hv_s2::smmu::decode(ste[0]) == StreamVerdict::Stage2Only);
+            assert!(b.regime.valid());
+            assert!(b.s2ttb >> 52 == 0);
+        }
+    }
+}

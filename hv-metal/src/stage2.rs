@@ -520,6 +520,63 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
 }
 
 // ---------------------------------------------------------------------------------------------
+// A SOFTWARE WALK of the emitted tables (SMMU arc, rung 3) — where the table says an address lands.
+// ---------------------------------------------------------------------------------------------
+
+/// What a walk of the emitted Stage-2 tables says about one guest IPA.
+#[cfg(feature = "smmu")]
+pub(crate) struct Resolved {
+    /// The output address — the leaf's PA with the offset within the leaf applied, i.e. the exact
+    /// byte the hardware would touch.
+    pub(crate) pa: u64,
+    /// Whether the leaf grants write access (`S2AP = RW`).
+    pub(crate) writable: bool,
+}
+
+/// Walk the Stage-2 tables rooted at `l1_pa` for `ipa`, in software, through `hv-s2`'s **decode**
+/// seam.
+///
+/// **Why this exists, and why it is not layout arithmetic.** Rung 3's positive control has to assert
+/// that a device's DMA landed *where the table says*, and the only honest source for "where the table
+/// says" is the descriptors themselves. Computing the expected PA from [`frame_ipa`]'s inverse would
+/// be asserting the DMA landed where **this file's arithmetic** says — which is the same derivation
+/// the emitter used, so a wrong emission and a wrong expectation would agree. Reading the bytes back
+/// makes the expectation a third, independent reading (design-lesson #36), and it is the same memory
+/// the SMMU itself walks.
+///
+/// Concrete to the deployed regime — start level 1, 4 KiB granule, three levels — with the 2 MiB
+/// block arm for the super window. A regime change would make this walk disagree with the hardware's,
+/// which is exactly why [`hv_s2::arm64::BALEEN_STAGE2`] is one declaration.
+#[cfg(feature = "smmu")]
+pub(crate) fn walk_stage2(l1_pa: u64, ipa: u64) -> Option<Resolved> {
+    /// Read one descriptor. EL2 runs MMU-off/identity, so a table PA is directly addressable — the
+    /// same premise every other access in this file rests on.
+    fn desc_at(table_pa: u64, index: u64) -> u64 {
+        // SAFETY: `table_pa` came from `VTTBR_EL2`/a table descriptor this hypervisor emitted, so it
+        // is the base of one of its own 4 KiB-aligned, 4 KiB-sized tables; `index < 512` bounds the
+        // read to that table. EL2 is identity-mapped. A volatile read of memory no Rust reference
+        // aliases (the tables live behind `BootCell`, which is not claimed here — this reads the
+        // published bytes, deliberately, rather than the typed storage).
+        unsafe { core::ptr::read_volatile((table_pa + index * 8) as *const u64) }
+    }
+
+    let l2_pa = hv_s2::arm64::decode_table(desc_at(l1_pa, (ipa >> 30) & 0x1ff))?;
+    let l2_desc = desc_at(l2_pa, (ipa >> 21) & 0x1ff);
+    if let Some(block) = hv_s2::arm64::decode_block(l2_desc) {
+        return Some(Resolved {
+            pa: block.pa | (ipa & 0x1f_ffff),
+            writable: block.perm == hv_s2::Perm::Rw,
+        });
+    }
+    let l3_pa = hv_s2::arm64::decode_table(l2_desc)?;
+    let page = hv_s2::arm64::decode_page(desc_at(l3_pa, (ipa >> 12) & 0x1ff))?;
+    Some(Resolved {
+        pa: page.pa | (ipa & 0xfff),
+        writable: page.perm == hv_s2::Perm::Rw,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
 // ---------------------------------------------------------------------------------------------
 // Frame-content scrubbing (M5 Arc 5) — the CONTENT half of "a reborn tenant inherits nothing".
 // ---------------------------------------------------------------------------------------------
