@@ -190,6 +190,38 @@ pub const LINUX_RAM_BASE: u64 = 0x4800_0000;
 #[cfg(feature = "real-linux")]
 pub const LINUX_RAM_END: u64 = 0x8000_0000;
 
+// ─── the Stage-2 enable parameters, for EVERY path that enables Stage-2 ──────────────────────────
+
+/// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
+/// WBWA Inner-Shareable table walks, 40-bit PS, RES1 bit 31. `DS=0` (bit 32 clear) so the classic
+/// (non-LPA2) descriptor format this module's encodings assume is in force.
+///
+/// **It is not a literal, because it does not have one consumer.** SMMU rung 3 made that argument for
+/// the device path — the SMMU walks these very tables and takes the parameters from the **STE**, and
+/// two walkers over one table under different parameters is not a degraded translation but a
+/// different one (a start level one off reads leaf descriptors as table descriptors) — so the regime
+/// is one declaration ([`hv_s2::arm64::BALEEN_STAGE2`]) with independent encodings that `hv-verify`
+/// proves agree. Resolved at compile time: a regime the encoder refuses breaks the build rather than
+/// falling back to some other configuration.
+///
+/// **It lives HERE rather than in `guest.rs` because rung 3's argument had a hole (⑭).** The claim
+/// "no longer a literal" was written on `guest.rs`'s copy while `linux.rs` — the real-Linux path,
+/// which is the one that actually programs `VTCR_EL2` for an unmodified kernel — kept a
+/// hand-written literal of its own. The two agreed (`0x8002_3559`), so nothing was broken; they
+/// agreed by *coincidence*, which is the thing the argument was supposed to rule out. Every path
+/// that enables Stage-2 now reads this one constant. Adding a third `msr vtcr_el2` site means using
+/// it, not copying it.
+pub const VTCR_EL2: u64 =
+    match hv_s2::arm64::vtcr_el2(&hv_s2::arm64::BALEEN_STAGE2, hv_s2::arm64::BALEEN_VMID_BITS) {
+        Some(v) => v,
+        None => panic!("the deployed stage-2 regime cannot be encoded into VTCR_EL2"),
+    };
+
+/// `HCR_EL2.VM` — bit 0, enables Stage-2 for EL1&0. OR'd onto the Arc-3 `HCR_EL2` (RW=bit 31);
+/// `FWB` (bit 46) stays 0 so this module's `MemAttr=0b1111` Normal-WB encoding is in force. Shared
+/// for the same reason as [`VTCR_EL2`]: one Stage-2, one set of enable parameters.
+pub const HCR_EL2_VM: u64 = 1 << 0;
+
 extern "C" {
     static __guest_ram_start: u8;
     static __guest_sup_start: u8;
