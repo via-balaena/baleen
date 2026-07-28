@@ -27,6 +27,7 @@ fn base() -> Config {
         async_agent: false,
         drive_execute: false,
         mediated_frames: false,
+        mediated_pcpus: false,
         depth: 5,
         max_states: 6_000_000,
         symmetry: false,
