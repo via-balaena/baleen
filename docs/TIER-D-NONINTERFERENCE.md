@@ -77,6 +77,19 @@ like violations; the user's exact warning):
   *true*. This is the honest **model-fidelity boundary**: Tier D proves *storage-channel* /
   *explicit-flow* non-interference for the model; scheduling timing channels are out of scope, an
   M-level (real-hardware) concern.
+
+  > **Correction (2026-07-27, forced by the ⑥ guard audit — §4b/F4).** "Excluding it keeps the
+  > property *true*" is **wrong for the confidentiality direction**, and the word *abstracts* was
+  > doing work it cannot do. `sched::run` refuses with `SchedError::PcpuBusy` when the named pCPU is
+  > occupied, so occupancy is not merely a *timing* channel — it is an **explicit-flow** one, read
+  > by a guard and reported to the caller as an error. Leaving it out of `obs` does not make step
+  > consistency hold; it makes it **false**, with a depth-5 counterexample on real code
+  > (`unpartitioned_pcpus_break_step_consistency`). It went unseen for so long because no
+  > step-consistency config had ever enabled `sched`. The repair is **partitioning**, not
+  > observation — the same class as ②′-(b)'s mediated allocator: pin each domain to its own pCPU
+  > (`mediated_pcpus`), and a `PcpuBusy` refusal can only name the caller's *own* vCPU, whose
+  > placement `obs(a)` already carries. Read this exclusion as **"abstracted *and* partitioned"**;
+  > the timing-channel scope statement above stands, but it was never sufficient on its own.
 - **Authority is out** (`may_create[a]`, the `controls` matrix — outgoing and incoming). Authority
   is `a`'s *power over others*, not others' ability to corrupt or read `a`. When `b` delegates a
   capability *to* `a`, that changes `a`'s authority but touches **none** of `a`'s resources — and
@@ -357,6 +370,128 @@ real code — the honest bridge↔composition division, `read_closure.rs` fideli
 
 At ≤3 domains **without dynamic p2m** the sweep is clean (the committed `ni_cfg3` has no allocation),
 and the deep three-domain sweep runs in `deep-verify.yml`.
+
+### 4b. ⑥ — the guard-observability audit (the rule of (c)/(e), applied to *every* guard)
+
+②′-(c) and (e) established a rule (design-lesson #62) that is checkable against every guard in the
+system, so ⑥ checks them all. Three had been audited before it — `P2mAllocate` contention (b),
+`DomainBusy` (c), the revoke foreign-link guard (e) — each found the hard way, one at a time. The
+audit found **four more**, and, first, a defect in the checker that had hidden all four.
+
+**F0 — the sweep was checking a strictly weaker property than the obligation it bridges to.**
+`check_step_consistency_with` skipped the `observer == actor` case. The obligation in
+`noninterference_instantiation.rs::step_consistent` quantifies over **every** `a: Dom`, with no
+`a != actor(t)` side condition — and the self-observer case is a real one: the actor's own successor
+observation must be a function of its own observation. Every guard whose refusal the *caller* reads
+back lives in exactly that case, which is why the sweep had never seen one. With the skip removed the
+sweep is strictly stronger, and it produced counterexamples at **depth 2–5** — the four below were
+not deep, they were invisible. *(Method note: this inverts ②′'s experience, where the defects genuinely
+sat at depth 7–9 and needed hand-built probes. Both failure modes are real, and "the sweep is green"
+is only as strong as the quantification the sweep actually runs — check the checker against the
+theorem statement, not against its docstring.)*
+
+**F1 — peer liveness (`AlreadyAlive` and the `reject_dead_target` family) — RESOLVED by observing.**
+Four guards read a *named peer's* liveness and report the result to the caller: `AlreadyAlive` on
+`DomainCreate{target}`, and `NotAlive` on `GrantAccess{grantee}`, `EvtchnAllocUnbound{remote}` and
+`ControlGrant{to}`. Two `obs⁺(caller)`-equal worlds differing only in whether an unrelated creator
+raised an unrelated slot take `DomainCreate{target}` to different successors (the success writes
+`controls[caller][target]`, which `obs⁺` does carry) — step consistency false, at **depth 2**.
+
+None can be *removed*: each is what keeps `DeadDomainReferenced` / `ControlEdgeDeadEndpoint` standing
+invariants, so force-completing would let a reference outlive the incarnation it named (domid-reuse
+unsoundness), or — for `AlreadyAlive` — silently reincarnate a *live* peer. Refusal strands nothing.
+So by #62 this is the observe case: `obs⁺` gains every domain's liveness.
+
+**What is new is the quadrant.** (c) was "another's state + strands a resource ⇒ remove"; (e) was
+"caller's own + strands nothing ⇒ observe". This is the fourth cell — **another principal's state,
+strands nothing** — and its repair is neither: the predicate is surfaced, but because the state
+belongs to a third party that makes it a **declared disclosure**, not a channel closed by
+construction. Stated plainly: **domain liveness is public in Baleen.** Any domain can probe any
+slot's liveness with one hypercall, gated by no capability. `obs⁺` is the upper bound on what `a` can
+learn, so it must say so; whether Baleen *should* partition the domid namespace (the mediation route,
+as for frames and pCPUs) is a separate design question, recorded in the honest ledger and not taken
+here — it would need a new naming-authority axis in `hv-core`, which is a program, not a rung.
+Pinned depth-independently by `the_already_alive_guard_is_observed` (the (c)/(e)-style two-state
+probe) and by `dropping_peer_liveness_from_obs_plus_breaks_step_consistency`, which also asserts the
+counterexample is a *self-observer* one — so reinstating F0's skip fails the test.
+
+**F2 — the inbound invitation closure (`EvtchnBindInterdomain`) — RESOLVED by observing.**
+`bind_interdomain` refuses unless the named remote port stands `Unbound{remote: caller}`, so a peer's
+half-open invitation decides whether the caller gains an `Interdomain` port — state that belongs to
+the peer, and that `obs(caller)` cannot show. This is the **event-channel twin of the grant
+read-closure**, and it gets the same treatment for the same reason: the observed state is an
+invitation the peer deliberately addressed to `a`, exactly as a grant row naming `a` as grantee is,
+so it is a *confidentiality*-only component (a peer revealing itself to `a` is not integrity
+interference — design-lesson #58) and stays out of the local-respect `obs`. Only the invited port's
+`(owner, port)` identity is recorded, which is all `bind_interdomain` names. Pinned by
+`dropping_invitations_from_obs_plus_breaks_step_consistency`.
+
+**F3 — control-edge provenance — RESOLVED by observing, and a coverage hole behind it.**
+`ControlGrant`/`ControlRevoke` had `delegate: false` in **every** NI config, so the delegation guards
+had never been swept for local respect *or* step consistency. Turning delegation on produced a
+counterexample immediately: `obs⁺` recorded control edges via `Hypervisor::controls()`, a **boolean
+presence** projection, but a `Root` edge (`a` created `c`) survives its delegator's teardown while a
+`Via` edge (`a` was delegated control of `c`) is cascaded away by `sweep_orphaned_control_edges`. Two
+present-but-differently-rooted edges are `obs⁺`-equal yet take `DomainDestroy{target: delegator}` to
+different successors. Exactly ②′-(e)'s shape — an aggregate projection hiding the detail the
+transition reads, as `refs` hid *which* grantee had linked.
+
+Fix: `obs⁺` records `Root` vs `Via` for `a`'s **outgoing** edges. The delegator's *identity* inside
+`Via(d)` is deliberately **not** recorded — `a` is passive in `ControlGrant{to: a}` and learns no `d`
+from any outcome, so recording it would over-approximate the observable exactly as the raw frame
+owner did in ②′-(a). The **incoming** row stays a boolean for the same reason. Pinned by
+`dropping_control_provenance_from_obs_plus_breaks_step_consistency` and
+`step_consistency_holds_over_the_delegation_forest`.
+
+**F4 — pCPU contention (`SchedRun` → `PcpuBusy`) — RESOLVED by partitioning, and it corrects §2.1.**
+`sched::run` refuses when the named pCPU is already occupied, a guard that reads **which other domain
+is running** — precisely the global pcpu-occupancy vector §2.1 excludes from `obs`. That exclusion
+was documented as an *abstraction*; the audit shows the word was doing work it cannot do.
+**Abstracting a channel out of `obs` does not make step consistency hold — it makes it false.** The
+counterexample is concrete: `SchedRun{vcpu:0, pcpu:0}` by dom0 succeeds when dom1 does not occupy
+pcpu0 and returns `PcpuBusy` when it does, from two `obs⁺(0)`-equal states. It had never been seen
+because **`sched: false` in every step-consistency config** — the scheduler had been swept for
+invariant preservation (Tiers A–C) and for local respect, never for confidentiality.
+
+The repair follows ②′-(b)'s precedent rather than #62's remove/observe fork, because it is the same
+*class*: contention for a **shared resource nobody owns**. The guard cannot be removed (two vCPUs
+cannot share a pCPU) and the occupant's identity is not the caller's to observe, so the resource is
+**partitioned** instead — the enumerator's new `mediated_pcpus` flag emits `SchedRun{vcpu, pcpu}`
+only for `pcpu`'s partition-owner, which is what real hypervisors implement as **pinning**. Under it
+a `PcpuBusy` refusal can only name the caller's *own* vCPU, whose placement `obs(caller)` already
+carries, and step consistency **holds** (`step_consistency_holds_with_partitioned_pcpus`). Load-bearing,
+not trivially safe: turn the flag off and the same config breaks
+(`unpartitioned_pcpus_break_step_consistency`, the "remove the fix → CE" discipline). Off by default,
+so the Tier-A/B soundness + saturation witnesses keep their calibration. **§2.1's pcpu-occupancy
+exclusion should now be read as "abstracted *and* partitioned", not "abstracted".**
+
+**The rest of the inventory — clean, and now actually swept.** `BadDomain`/`BadVcpu` (constant index
+range, no state read) · caller-liveness `NotAlive` (the caller's own, in `obs`) · `Denied` authority
+(`may_create`/`controls`, in `obs⁺` since §5g findings #1/#4) · the `StaleGrant` seam check · the
+`Unauthorized` foreign-link guard · grant `InUse`/`WrongState`/`Overflow` · `WxConflict` ·
+`SpanConflict`. The last five had *also* never been step-consistency swept — every prior config ran
+`levels: vec![]`, so no `P2mPin`/`P2mLink` ever fired — and are now covered green by
+`step_consistency_holds_over_the_page_table_guards` (two page-table levels, so interior and leaf
+entries both arise, with both shared resources partitioned so the known contention channels do not
+mask what the config is for). The **async EL2 agent** (`RaiseVcpuVirq`, the one non-guest transition)
+was the last such hole — `async_agent: false` in every step-consistency config, so it had been swept
+for local respect since Phase I-1c but never for confidentiality — and it is clean
+(`step_consistency_holds_with_the_async_agent`): the raise reads only the target's own
+`(vcpu, virq)` port binding, with no guard over another principal's state.
+
+**Config-flag coverage is now a first-class artifact of this section.** Four of the six holes ⑥ found
+were not missing *code* but missing *transitions in the swept universe* — `delegate`, `sched`,
+`levels`, `async_agent` all defaulted off in every step-consistency config, and a green sweep over a
+universe that never emits a guard's transition says nothing about that guard. For each guard, name
+the committed config whose universe emits it.
+
+**All four repairs are model-side only — `hv-core` is untouched by ⑥**, so every Kani harness and
+Verus proof stands verbatim. Local respect is re-run over the two universes ⑥ added to the
+confidentiality side and holds under the **unchanged** channel relation
+(`local_respect_holds_over_delegation_and_the_scheduler`): delegation moves only the `controls`
+matrix, which the integrity `obs` deliberately excludes, and a peer's pCPU placement is likewise
+outside `obs(a)`. So all of ⑥'s widenings are confidentiality-only, as design-lesson #58 requires —
+no `Channels` term was needed for any of them.
 
 ## 5. The Verus spike — signal-channel local respect, ∀-N (green)
 

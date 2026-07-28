@@ -103,6 +103,22 @@ pub struct Config {
     /// looseness. With it off, allocation is unconstrained, exactly the prior behaviour. This is the
     /// storage-side analogue of abstracting the pcpu-occupancy channel (`obs`'s §2.1 exclusion).
     pub mediated_frames: bool,
+    /// Model a **partitioned pCPU assignment** (Tier D / ⑥): emit `SchedRun{vcpu, pcpu}` only for
+    /// the domain that owns `pcpu`'s partition (`pcpu % domains`), so each domain runs only on its
+    /// own physical CPU and two domains never contend for one. The scheduling-side twin of
+    /// [`Self::mediated_frames`], and off by default for the same reason (it restricts the
+    /// reachable set, so the Tier-A/B soundness + saturation witnesses keep their calibration with
+    /// it off).
+    ///
+    /// It exists because `sched::run` refuses with `SchedError::PcpuBusy` when the named pCPU is
+    /// already occupied — a guard that reads **which other domain is running**, the one thing
+    /// `obs` deliberately excludes (the pcpu-occupancy vector, §2.1). That exclusion was documented
+    /// as an *abstraction*, but abstracting a channel out of `obs` does not make step consistency
+    /// hold — it makes it **false**, and the ⑥ audit was what finally witnessed it (no
+    /// step-consistency config had ever enabled `sched`). Partitioning is the honest repair, and
+    /// the one real hypervisors implement (pinning): with it on, a `PcpuBusy` refusal can only be
+    /// caused by the caller's *own* vCPUs, whose placement is already in `obs(caller)`.
+    pub mediated_pcpus: bool,
     /// Maximum hypercall depth from the initial state to explore.
     pub depth: u32,
     /// Safety cap: stop after this many distinct states (a partial result).
@@ -141,6 +157,7 @@ impl Config {
             async_agent: false,
             drive_execute: false,
             mediated_frames: false,
+            mediated_pcpus: false,
             depth: 5,
             max_states: 1_500_000,
             symmetry: false,
@@ -290,14 +307,20 @@ pub(crate) fn ops(cfg: &Config) -> Vec<(u16, HvCall)> {
                 v.push((caller, HvCall::SchedPreempt { vcpu, now: NOW }));
                 v.push((caller, HvCall::SchedOffline { vcpu, now: NOW }));
                 for pcpu in 0..cfg.pcpus as u32 {
-                    v.push((
-                        caller,
-                        HvCall::SchedRun {
-                            vcpu,
-                            pcpu,
-                            now: NOW,
-                        },
-                    ));
+                    // A partitioned pCPU assignment pins each domain to its own physical CPU, so
+                    // only `pcpu`'s partition-owner may run there and two domains never contend
+                    // for one (`SchedError::PcpuBusy` can then only name the caller's own vCPU).
+                    // Unpartitioned (the default): any caller may name any pCPU.
+                    if !cfg.mediated_pcpus || pcpu as usize % cfg.domains == caller as usize {
+                        v.push((
+                            caller,
+                            HvCall::SchedRun {
+                                vcpu,
+                                pcpu,
+                                now: NOW,
+                            },
+                        ));
+                    }
                 }
                 // Every affinity mask over the pCPU set, for every `target` — so the
                 // model-checker drives the full spectrum from empty (unschedulable) through

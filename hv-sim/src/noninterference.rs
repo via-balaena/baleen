@@ -71,7 +71,14 @@
 //! *function of* `(obs⁺(a), obs⁺(actor))` before it (two states `a` and the actor can't tell
 //! apart go to the same successor). It needs no channel relation — it is pure determinism.
 //!
-//! It is checked over a wider surface [`obs_plus`] (`obs⁺`) with two additions the integrity
+//! Note the quantification: `a` ranges over **every** domain, *including the actor*. The
+//! self-observer case is a real obligation — the actor's own successor observation must be a
+//! function of its own observation — and it is where every guard whose refusal the caller reads
+//! back lives. It used to be skipped here (while the Verus obligation it bridges to always
+//! quantified over it), which hid four defects at depth 2–5; see [`Surface`] and ⑥ in
+//! `docs/TIER-D-NONINTERFERENCE.md` §4b.
+//!
+//! It is checked over a wider surface [`obs_plus`] (`obs⁺`) with several additions the integrity
 //! `obs` deliberately omits:
 //!
 //! * the **read-closure** — the grants `a` is a *grantee* of, with each grantor, frame, and the
@@ -85,7 +92,17 @@
 //! * `a`'s own **authority** (`may_create[a]`, the `controls` rows) — a guard reads it, so
 //!   step consistency is *false* without it. The bridge surfaces this exactly as the
 //!   instantiation's `step_consistent` did (its **finding #1**): strip authority from `obs⁺`
-//!   and the sweep finds a `DomainCreate` (or destroy/affinity) counterexample.
+//!   and the sweep finds a `DomainCreate` (or destroy/affinity) counterexample. `a`'s
+//!   **outgoing** edges carry their `Root`/`Via` **provenance**, not bare presence, since that is
+//!   what decides whether the destroy cascade strips them (⑥).
+//! * **every domain's liveness** (⑥) — four guards read a named peer's liveness and report it to
+//!   the caller (`AlreadyAlive` on `DomainCreate`; `NotAlive` on `GrantAccess{grantee}`,
+//!   `EvtchnAllocUnbound{remote}`, `ControlGrant{to}`), so it is factually public and `obs⁺` must
+//!   say so. A *declared disclosure* rather than a closed channel — the state belongs to a third
+//!   principal, but none of the four guards can be removed without breaking domid-reuse soundness.
+//! * the **inbound invitation closure** (⑥) — the half-open ports other domains have opened toward
+//!   `a`, which `EvtchnBindInterdomain` refuses on. The event-channel twin of the read-closure, and
+//!   confidentiality-only for the same reason.
 //!
 //! Over three domains the read direction is live and step consistency **holds**, non-vacuously
 //! (see the tests). The four-domain edge that used to be declared here — a fourth domain `m`
@@ -461,12 +478,47 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
 /// revealing themselves to it), so the read direction is a *confidentiality* property, checked by
 /// [`check_step_consistency`] — not [`check`]'s local respect. See `docs/TIER-D-NONINTERFERENCE.md`.
 pub fn obs_plus(hv: &Hypervisor, a: Dom) -> Vec<u64> {
-    obs_plus_impl(hv, a, true)
+    obs_plus_impl(hv, a, Surface::full())
 }
 
-/// [`obs_plus`] with the authority projection toggleable — so the non-vacuity test can drop it and
-/// watch step consistency *break* (the real-code form of the instantiation's finding #1).
-fn obs_plus_impl(hv: &Hypervisor, a: Dom, authority: bool) -> Vec<u64> {
+/// Which optional components of the confidentiality surface [`obs_plus`] carries. Each is
+/// **load-bearing** — dropping it makes step consistency *false* — and each has a non-vacuity test
+/// that drops exactly it and watches the sweep produce a counterexample. (The mandatory core is
+/// [`obs`] plus the read-closure, which have no toggle.)
+#[derive(Clone, Copy, Debug)]
+pub struct Surface {
+    /// `a`'s **own authority** — `may_create[a]`, `controls[·][a]`, `controls[a][·]`. The
+    /// instantiation's findings #1 and #4.
+    pub authority: bool,
+    /// The **provenance** (`Root` vs `Via`) of `a`'s outgoing control edges rather than their bare
+    /// presence — what decides whether the destroy cascade strips them (⑥). Only meaningful with
+    /// [`Self::authority`] on. See [`obs_plus`].
+    pub provenance: bool,
+    /// **Every domain's liveness** — the bit the four peer-liveness guards read (⑥). See
+    /// [`obs_plus`].
+    pub peer_liveness: bool,
+    /// **The inbound invitation closure** — the half-open ports *other* domains have opened
+    /// toward `a`, which `EvtchnBindInterdomain`'s guard reads (⑥). The event-channel twin of the
+    /// grant read-closure. See [`obs_plus`].
+    pub invitations: bool,
+}
+
+impl Surface {
+    /// The complete confidentiality surface — the one [`obs_plus`] uses.
+    pub fn full() -> Self {
+        Surface {
+            authority: true,
+            provenance: true,
+            peer_liveness: true,
+            invitations: true,
+        }
+    }
+}
+
+/// [`obs_plus`] with its optional components toggleable — so each non-vacuity test can drop exactly
+/// one and watch step consistency *break*.
+fn obs_plus_impl(hv: &Hypervisor, a: Dom, surface: Surface) -> Vec<u64> {
+    let e = hv.evtchn();
     let g = hv.grant();
     let p = hv.p2m();
     let n = hv.domain_count() as Dom;
@@ -478,14 +530,96 @@ fn obs_plus_impl(hv: &Hypervisor, a: Dom, authority: bool) -> Vec<u64> {
     // fire the guarded transition differently. Exactly the instantiation's forced corrections —
     // `may_create[a]` (creation), `controls[·][a]` (who controls `a`; affinity/destroy of `a`), and
     // `controls[a][·]` (whom `a` controls; `a`'s own destroy authority — the outgoing analogue).
-    if authority {
+    if surface.authority {
         k.push(0xD_0007);
         k.push(hv.may_create(a) as u64);
         for b in 0..n {
             k.push(hv.controls(b, a) as u64); // incoming: who controls a
         }
         for c in 0..n {
-            k.push(hv.controls(a, c) as u64); // outgoing: whom a controls
+            // Outgoing: whom `a` controls — and **with what provenance** (⑥). Presence alone is
+            // too coarse: a `Root` edge (`a` created `c`) survives its delegator's teardown,
+            // while a `Via` edge (`a` was delegated control of `c`) is cascaded away when the
+            // delegator dies or revokes (`sweep_orphaned_control_edges`). Two states in which `a`
+            // holds a present-but-differently-rooted edge over `c` are otherwise `obs⁺`-equal,
+            // yet `DomainDestroy{target: delegator}` strips the edge in one and not the other —
+            // a step-consistency violation the boolean projection hid. `a` genuinely knows the
+            // difference: it either created `c` itself or did not. Same shape as ②′-(e), where
+            // the frame's aggregate `refs` hid *which* grantee had linked.
+            //
+            // The delegator's **identity** inside `Via(d)` is deliberately *not* recorded — `a`
+            // is passive in `ControlGrant{to: a}` and learns no `d` from any outcome, so
+            // recording it would over-approximate the observable exactly as the raw frame owner
+            // did in ②′-(a). `Root` vs `Via` is the tightest faithful projection.
+            k.push(match (surface.provenance, hv.control_edge(a, c)) {
+                (_, hv_core::hypervisor::Control::Absent) => 0,
+                (false, _) => 1, // presence only
+                (true, hv_core::hypervisor::Control::Root) => 1,
+                (true, hv_core::hypervisor::Control::Via(_)) => 2,
+            });
+        }
+    }
+
+    // **Every domain's liveness** (⑥, the guard-observability audit). `obs(a)` carries only `a`'s
+    // *own* liveness — correct for the integrity surface, since a peer's birth or death touches
+    // none of `a`'s resources. But four guards read a *named peer's* liveness and report the
+    // result to the caller, so `a` genuinely **learns** it, and the confidentiality surface must
+    // say so or step consistency is *false*:
+    //
+    // * `DomainCreate{target}` → `AlreadyAlive` (the target must be `Dead`);
+    // * `GrantAccess{grantee}` → `NotAlive` (`reject_dead_target`);
+    // * `EvtchnAllocUnbound{remote}` → `NotAlive` (`reject_dead_target`);
+    // * `ControlGrant{to}` → `NotAlive` (a capability cannot rest on a `Dead` holder).
+    //
+    // Each is a one-hypercall probe of an arbitrary slot's liveness, gated by **no** capability —
+    // so domain liveness is, factually, *public* in Baleen, and `obs⁺` is the upper bound on what
+    // `a` can learn. None of the four can be *removed* the way ②′-(c) removed `DomainBusy`: each
+    // is what keeps `DeadDomainReferenced` / `ControlEdgeDeadEndpoint` standing invariants, so
+    // force-completing would let a reference outlive the incarnation it named (domid-reuse
+    // unsoundness) or, for `AlreadyAlive`, silently reincarnate a *live* peer. Refusal also
+    // strands nothing — the caller keeps every resource and may retry. So by design-lesson #62
+    // this is the observe case, not the remove case; what is new here is that the state observed
+    // belongs to a **third** principal, which is why it is a declared disclosure rather than a
+    // closed channel (`docs/TIER-D-NONINTERFERENCE.md` §4b/F1).
+    if surface.peer_liveness {
+        k.push(0xD_0008);
+        for b in 0..n {
+            k.push(hv.is_live(b) as u64);
+        }
+    }
+
+    // **The inbound invitation closure** (⑥) — for every *other* domain's port, whether it stands
+    // `Unbound{remote: a}`: a half-open invitation addressed to `a`. This is the exact predicate
+    // `evtchn::bind_interdomain` refuses on ("half-open and waiting for exactly us"), so `a` learns
+    // it by trying to bind (`Ok` vs `WrongState`) — and without it step consistency is *false* (two `obs⁺(a)`-equal
+    // states, one where a created peer has opened a port toward `a` and one where it has not, take
+    // `EvtchnBindInterdomain{remote, remote_port}` to different successors, since success writes an
+    // `Interdomain` port into `obs(a)`).
+    //
+    // This is the **event-channel twin of the grant read-closure** below, and it is *not* a
+    // third-party leak: the observed state is an invitation the peer deliberately addressed to `a`,
+    // exactly as a grant row naming `a` as grantee is. Its exclusion from the integrity `obs` is
+    // the same call for the same reason — a peer freely offering itself to `a` moves it, and a
+    // domain cannot stop others revealing themselves to it (design-lesson #58: the confidentiality
+    // surface is strictly wider than the integrity one). Only the invited port's `(owner, port)`
+    // identity is recorded, which is all `bind_interdomain` names.
+    if surface.invitations {
+        k.push(0xD_0009);
+        let mut invites: Vec<[u64; 2]> = Vec::new();
+        for b in 0..n {
+            if b == a {
+                continue; // `a`'s own ports are already in `obs(a)`.
+            }
+            for port in 0..e.port_count(b) as u32 {
+                if e.state_of(b, port) == Some(PortState::Unbound { remote: a }) {
+                    invites.push([u64::from(b), u64::from(port)]);
+                }
+            }
+        }
+        invites.sort_unstable();
+        k.push(invites.len() as u64);
+        for iv in invites {
+            k.extend(iv);
         }
     }
 
@@ -723,11 +857,15 @@ pub struct ScOutcome {
 
 /// Run the **step-consistency** sweep over `cfg` — the confidentiality dual of [`check`], and the
 /// real-code counterpart of `noninterference_instantiation.rs`'s `step_consistent_holds`. For every
-/// transition and every observer `a ≠ actor`, it verifies that `obs⁺(a)` after the step is a
-/// **function of** `(obs⁺(a), obs⁺(actor))` before it: two reachable states that `a` and the actor
-/// cannot tell apart are driven to the same successor observation. (This is exactly the unwinding
-/// *step-consistency* condition; unlike local respect it needs no channel relation — it is a pure
-/// determinism property.) This is where the `DomainDestroy` **read direction** lives: destroying
+/// transition and **every** observer `a` — *including the actor itself* — it verifies that `obs⁺(a)`
+/// after the step is a **function of** `(obs⁺(a), obs⁺(actor))` before it: two reachable states that
+/// `a` and the actor cannot tell apart are driven to the same successor observation. (This is exactly
+/// the unwinding *step-consistency* condition; unlike local respect it needs no channel relation — it
+/// is a pure determinism property, and unlike local respect it does **not** exclude the actor: `a`
+/// learns most of all from its own hypercall results, so `a == actor` is where every guard whose
+/// refusal the caller reads back lives. That case was skipped until ⑥, which is how four defects
+/// stayed hidden at depth 2–5 — see `docs/TIER-D-NONINTERFERENCE.md` §4b/F0.) This is also where the
+/// `DomainDestroy` **read direction** lives: destroying
 /// `a`'s grantor revokes `a`'s read-cap, and step consistency asks that two `obs⁺(a)`-equal states
 /// lose it *together*.
 ///
@@ -739,9 +877,39 @@ pub fn check_step_consistency(cfg: &Config) -> ScOutcome {
     check_step_consistency_with(cfg, obs_plus)
 }
 
+/// An **interner** for observation vectors: each distinct `obs⁺` value is stored once and
+/// thereafter referred to by a `u32` id. Purely a memory optimization with **no effect on what is
+/// checked** — ids compare equal exactly when the vectors do, so every class and every comparison
+/// is identical to the `Vec`-keyed form.
+///
+/// It matters because the sweep is grouping-based: the class map holds one key per *state*, and a
+/// key is two whole observations, with a third as the value — `O(states × |obs⁺|)` **per
+/// (transition, observer) pair**. Interning collapses that to one copy per *distinct* observation,
+/// and distinct observations are far fewer than states (a populated class is precisely several
+/// states sharing one — what `witnessed_classes` counts). ⑥ widened `obs⁺` by four components, so
+/// this is what keeps the class map from growing with the surface.
+///
+/// It does **not** address the sweep's actual memory ceiling, which is [`reachable`] materialising
+/// every reachable `Hypervisor` at once (~13 GB at the deep four-domain config, unchanged by ⑥ and
+/// unchanged by this) — that is a separate, pre-existing cost, recorded here so the next person
+/// profiling this looks in the right place.
+#[derive(Default)]
+struct ObsInterner {
+    ids: HashMap<Vec<u64>, u32>,
+}
+
+impl ObsInterner {
+    /// The id of `v`, assigning a fresh one if unseen. Equal vectors always get equal ids.
+    fn intern(&mut self, v: Vec<u64>) -> u32 {
+        let next = self.ids.len() as u32;
+        *self.ids.entry(v).or_insert(next)
+    }
+}
+
 /// A step-consistency equivalence class: `(obs⁺(observer), obs⁺(actor))` before → the observed
-/// `(obs⁺(observer) after, reproducing trace)`. Every state in a class must share the successor.
-type ScClass = HashMap<(Vec<u64>, Vec<u64>), (Vec<u64>, Vec<Transition>)>;
+/// `(obs⁺(observer) after, reproducing trace)`, all three interned. Every state in a class must
+/// share the successor.
+type ScClass = HashMap<(u32, u32), (u32, Vec<Transition>)>;
 
 /// [`check_step_consistency`] over an arbitrary observation projection — so the non-vacuity test
 /// can supply an authority-stripped `obs⁺` and watch the property fail.
@@ -758,16 +926,19 @@ fn check_step_consistency_with(
     for &transition in &universe {
         let actor = transition_actor(&transition);
         for a in 0..n {
-            if a == actor {
-                continue;
-            }
-            // key: (obs⁺(a), obs⁺(actor)) before → value: (obs⁺(a) after, trace).
+            // key: (obs⁺(a), obs⁺(actor)) before → value: (obs⁺(a) after, trace) — all three
+            // interned to ids, so the map holds `u32`s rather than whole observations. Equal ids
+            // iff equal vectors, so this changes nothing about what is compared.
             let mut class: ScClass = HashMap::new();
+            let mut interner = ObsInterner::default();
             for (hv, trace) in &states {
-                let key = (proj(hv, a), proj(hv, actor));
+                let key = (
+                    interner.intern(proj(hv, a)),
+                    interner.intern(proj(hv, actor)),
+                );
                 let mut h = hv.clone();
                 let _: Result<TransitionOutcome, _> = h.apply(transition);
-                let after = proj(&h, a);
+                let after = interner.intern(proj(&h, a));
                 checks += 1;
                 match class.get(&key) {
                     None => {
@@ -833,6 +1004,7 @@ mod tests {
             async_agent: false,
             drive_execute: false,
             mediated_frames: false,
+            mediated_pcpus: false,
             depth,
             max_states: 200_000,
             symmetry: false,
@@ -866,6 +1038,7 @@ mod tests {
             async_agent: false,
             drive_execute: false,
             mediated_frames: false,
+            mediated_pcpus: false,
             depth,
             max_states: 400_000,
             symmetry: false,
@@ -1260,7 +1433,16 @@ mod tests {
     /// authority-excluding observation.
     #[test]
     fn dropping_authority_from_obs_plus_breaks_step_consistency() {
-        let out = check_step_consistency_with(&ni_cfg3(3), |hv, a| obs_plus_impl(hv, a, false));
+        let out = check_step_consistency_with(&ni_cfg3(3), |hv, a| {
+            obs_plus_impl(
+                hv,
+                a,
+                Surface {
+                    authority: false,
+                    ..Surface::full()
+                },
+            )
+        });
         assert!(
             out.violation.is_some(),
             "stripping authority from obs⁺ should break step consistency (finding #1), but it held"
@@ -1389,6 +1571,7 @@ mod tests {
             async_agent: false,
             drive_execute: false,
             mediated_frames: true,
+            mediated_pcpus: false,
             depth,
             max_states: 2_000_000,
             symmetry: false,
@@ -1438,6 +1621,7 @@ mod tests {
         use hv_core::HvCall;
         let cfg = Config {
             mediated_frames: false,
+            mediated_pcpus: false,
             ..ni_cfg4_mediated(4)
         };
         let out = check_step_consistency(&cfg);
@@ -1490,6 +1674,383 @@ mod tests {
             out.violation.unwrap()
         );
         assert!(out.witnessed_classes > 10_000_000);
+    }
+
+    // ─── ⑥ THE GUARD-OBSERVABILITY AUDIT ────────────────────────────────────────────────
+    //
+    // Every guard is checked against the rule ②′-(c)/(e) established (design-lesson #62): a
+    // refusal conditioned on state the caller CAN observe is a legitimate error; one conditioned
+    // on state it CANNOT observe is a covert channel, and the repair follows from which. The
+    // audit's first act was to fix the *checker*: `check_step_consistency_with` used to skip the
+    // `observer == actor` case, while the obligation it bridges to
+    // (`noninterference_instantiation.rs::step_consistent`) quantifies over **every** `a`,
+    // including the actor. That skip hid four defects, all at depth 2–5 — not past the sweep, but
+    // invisible to it. Each is now closed and pinned below.
+
+    /// The delegation forest in a **step-consistency** config — `ControlGrant`/`ControlRevoke`
+    /// had `delegate: false` in every NI config, so the delegation guards had never been swept at
+    /// all (⑥). Three domains so a delegated `Via` edge and its delegator's teardown coexist.
+    fn ni_cfg3_delegate(depth: u32) -> Config {
+        Config {
+            delegate: true,
+            ..ni_cfg3(depth)
+        }
+    }
+
+    /// A **scheduler** step-consistency config — `sched: false` in every NI config until ⑥, so
+    /// `SchedRun`'s `PcpuBusy` guard had never been swept. Two domains, one vCPU each, and **two**
+    /// pCPUs so the partition (`mediated_pcpus`) is not vacuous — with one pCPU, partitioning
+    /// would let only dom0 ever run. Depth 5 is the shallowest that builds contention (create the
+    /// peer, admit both vCPUs, run one, then have the other try the same pCPU).
+    fn ni_cfg_sched(depth: u32, mediated_pcpus: bool) -> Config {
+        Config {
+            evtchn: false,
+            grant: false,
+            p2m: false,
+            destroy: false,
+            sched: true,
+            pcpus: 2,
+            mediated_pcpus,
+            ..ni_cfg(depth)
+        }
+    }
+
+    /// **`AlreadyAlive` is observed, not leaked (⑥'s headline, depth-independent).** The guard
+    /// `DomainCreate` refuses on reads the **target's** liveness — another principal's state — and
+    /// the caller has no other window onto it: `obs⁺(caller)` carries `caller`'s own liveness, its
+    /// ports, grants, frames and authority, none of which move when an unrelated creator raises an
+    /// unrelated slot. Two such worlds are `obs⁺(0)`-equal, yet `DomainCreate{target: 1}` succeeds
+    /// in one (writing `controls[0][1]`, which `obs⁺(0)` *does* carry) and returns `AlreadyAlive`
+    /// in the other — so without the peer-liveness component the caller's own successor
+    /// observation is not a function of its own observation, and step consistency is false.
+    ///
+    /// The repair is **observe**, not remove (design-lesson #62's two dimensions): the guard is
+    /// what keeps `DomainCreate` a `Dead` → `Live` transition, so force-completing it would
+    /// silently reincarnate a *live* peer — an integrity catastrophe, not a repair — and refusal
+    /// strands nothing (the caller keeps every resource and may retry). What is new versus (c)/(e)
+    /// is the quadrant: the observed state belongs to a **third** principal, so this is a
+    /// *declared disclosure* — domain liveness is public in Baleen, probeable by any domain with
+    /// one uncapability-gated hypercall — rather than a channel closed by construction.
+    ///
+    /// Depth-independent by construction: the two worlds are built directly, so this pins the
+    /// property whether or not any sweep configuration happens to reach the configuration.
+    #[test]
+    fn the_already_alive_guard_is_observed() {
+        use hv_core::HvCall;
+        // dom0 = the caller (boots Live with `may_create`). dom2 = a second creator dom0 raises.
+        // dom1 = the probed slot: left Dead in one world, created *by dom2* in the other — an act
+        // dom0 has no window onto (it touches none of dom0's resources or authority).
+        fn world(dom2_creates_dom1: bool) -> Hypervisor {
+            let mut h = Hypervisor::new(3, 1, 1, 1, 1, 2);
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: 2,
+                    may_create: true,
+                },
+            )
+            .unwrap();
+            if dom2_creates_dom1 {
+                h.dispatch(
+                    2,
+                    HvCall::DomainCreate {
+                        target: 1,
+                        may_create: false,
+                    },
+                )
+                .unwrap();
+            }
+            h
+        }
+        let mut dead = world(false);
+        let mut alive = world(true);
+
+        // The states really are the awkward pair: *every* component of `obs⁺(0)` other than the
+        // peer-liveness vector agrees, so nothing but the new component separates them.
+        assert_eq!(
+            obs_plus_impl(
+                &dead,
+                0,
+                Surface {
+                    peer_liveness: false,
+                    ..Surface::full()
+                }
+            ),
+            obs_plus_impl(
+                &alive,
+                0,
+                Surface {
+                    peer_liveness: false,
+                    ..Surface::full()
+                }
+            ),
+            "the two worlds must be indistinguishable to the caller without peer liveness"
+        );
+        // With it, `obs⁺(0)` separates them — so the differing guard outcome is determined by the
+        // observation, which is step consistency for this transition.
+        assert_ne!(
+            obs_plus(&dead, 0),
+            obs_plus(&alive, 0),
+            "obs⁺(caller) must record the target's liveness, or AlreadyAlive leaks it"
+        );
+        let create = HvCall::DomainCreate {
+            target: 1,
+            may_create: false,
+        };
+        assert_eq!(dead.dispatch(0, create), Ok(hv_core::HvOutcome::Done));
+        assert_eq!(
+            alive.dispatch(0, create),
+            Err(hv_core::HvError::AlreadyAlive)
+        );
+        // And the outcomes really do diverge in `obs⁺(0)` — the success writes `controls[0][1]`,
+        // so the guard is not behaviour-nil for the caller.
+        assert_ne!(obs_plus(&dead, 0), obs_plus(&alive, 0));
+    }
+
+    /// **Non-vacuity: `obs⁺` must carry every domain's liveness (⑥ / F1).** Drop it and step
+    /// consistency **breaks** — the four peer-liveness guards (`AlreadyAlive` on `DomainCreate`,
+    /// `NotAlive` on `GrantAccess{grantee}` / `EvtchnAllocUnbound{remote}` / `ControlGrant{to}`)
+    /// all report a named peer's liveness to a caller whose observation no longer shows it.
+    ///
+    /// The counterexample is asserted to be a **self-observer** one (`observer == actor`), which
+    /// pins the checker fix too: reinstate the old `a == actor` skip and this test goes green with
+    /// no violation, failing the assertion.
+    #[test]
+    fn dropping_peer_liveness_from_obs_plus_breaks_step_consistency() {
+        let out = check_step_consistency_with(&ni_cfg3(3), |hv, a| {
+            obs_plus_impl(
+                hv,
+                a,
+                Surface {
+                    peer_liveness: false,
+                    ..Surface::full()
+                },
+            )
+        });
+        let v = out
+            .violation
+            .expect("dropping peer liveness from obs⁺ should break step consistency (⑥ / F1)");
+        assert_eq!(
+            v.observer, v.actor,
+            "the peer-liveness channel is a SELF-observer violation — the case the sweep used to \
+             skip; got observer {} vs actor {}",
+            v.observer, v.actor
+        );
+    }
+
+    /// **Non-vacuity: `obs⁺` must carry the inbound invitation closure (⑥ / F2).** Drop it and
+    /// step consistency **breaks**: `EvtchnBindInterdomain{remote, remote_port}` refuses unless
+    /// that port stands `Unbound{remote: caller}`, so a peer's half-open invitation decides
+    /// whether the caller gains an `Interdomain` port — state `obs(caller)` cannot show, since the
+    /// port belongs to the peer. The event-channel twin of the grant read-closure, and like it a
+    /// *confidentiality*-only component (a peer offering itself to `a` is not integrity
+    /// interference), so it stays out of the local-respect `obs`.
+    #[test]
+    fn dropping_invitations_from_obs_plus_breaks_step_consistency() {
+        let out = check_step_consistency_with(&ni_cfg3(3), |hv, a| {
+            obs_plus_impl(
+                hv,
+                a,
+                Surface {
+                    invitations: false,
+                    ..Surface::full()
+                },
+            )
+        });
+        let v = out
+            .violation
+            .expect("dropping the invitation closure from obs⁺ should break step consistency (F2)");
+        assert_eq!(v.observer, v.actor);
+    }
+
+    /// **Non-vacuity: `obs⁺` must carry control-edge *provenance*, not just presence (⑥ / F3).**
+    /// Project `controls[a][·]` back down to a boolean and step consistency **breaks**: a `Root`
+    /// edge (`a` created `c`) survives its delegator's teardown while a `Via` edge (`a` was
+    /// delegated control of `c`) is cascaded away by `sweep_orphaned_control_edges`, so two
+    /// present-but-differently-rooted edges take `DomainDestroy{target: delegator}` to different
+    /// successors. Exactly ②′-(e)'s shape — an aggregate projection (`controls()`, like `refs`)
+    /// hiding the detail the transition actually reads.
+    #[test]
+    fn dropping_control_provenance_from_obs_plus_breaks_step_consistency() {
+        let out = check_step_consistency_with(&ni_cfg3_delegate(3), |hv, a| {
+            obs_plus_impl(
+                hv,
+                a,
+                Surface {
+                    provenance: false,
+                    ..Surface::full()
+                },
+            )
+        });
+        assert!(
+            out.violation.is_some(),
+            "dropping control-edge provenance from obs⁺ should break step consistency (F3)"
+        );
+    }
+
+    /// **Step consistency holds over the delegation forest (⑥ / F3, the repair).** With
+    /// provenance observed, the whole `ControlGrant`/`ControlRevoke`/`DomainDestroy`-cascade
+    /// universe is consistent — the first time the delegation guards have been step-consistency
+    /// swept at all. Non-vacuous (six figures of witnessed key-classes).
+    #[test]
+    fn step_consistency_holds_over_the_delegation_forest() {
+        let out = check_step_consistency(&ni_cfg3_delegate(3));
+        assert!(
+            out.violation.is_none(),
+            "delegation step-consistency violation: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 100_000);
+    }
+
+    /// **The page-table and grant-seam guards, step-consistency swept (⑥).** Every
+    /// step-consistency config before ⑥ ran with `levels: vec![]`, so no `P2mPin`/`P2mLink` ever
+    /// fired and the page-table guards were swept for *invariant preservation* (Tiers A–C) but
+    /// never for confidentiality. This config turns the page tables on — two levels, so interior
+    /// and leaf entries both arise — over a grant universe, and covers: the `Unauthorized`
+    /// foreign-link guard, `WxConflict` (W^X), `SpanConflict`, the `StaleGrant` seam check, and
+    /// the grant `InUse`/`WrongState`/`Overflow` family. All hold.
+    ///
+    /// Both shared resources are partitioned, so the two *known* contention channels
+    /// ([`an_unmediated_allocator_breaks_step_consistency`],
+    /// [`unpartitioned_pcpus_break_step_consistency`]) do not mask what this config is for.
+    #[test]
+    fn step_consistency_holds_over_the_page_table_guards() {
+        let cfg = Config {
+            pcpus: 2,
+            mediated_frames: true,
+            mediated_pcpus: true,
+            ..ni_cfg(3)
+        };
+        let out = check_step_consistency(&cfg);
+        assert!(
+            out.violation.is_none(),
+            "page-table/grant-seam step-consistency violation: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 100_000);
+    }
+
+    /// **The async EL2 agent, step-consistency swept (⑥).** `async_agent: false` in every
+    /// step-consistency config too, so `Transition::RaiseVcpuVirq` — the one non-guest transition —
+    /// had been swept for local respect (Phase I-1c) but never for confidentiality. It holds:
+    /// the raise reads only the target domain's own `(vcpu, virq)` port binding and sets its
+    /// pending bit, with no guard over another principal's state. Both shared resources are
+    /// partitioned so the known contention channels do not mask it.
+    #[test]
+    fn step_consistency_holds_with_the_async_agent() {
+        let cfg = Config {
+            pcpus: 2,
+            mediated_frames: true,
+            mediated_pcpus: true,
+            ..ni_cfg_async(3)
+        };
+        let out = check_step_consistency(&cfg);
+        assert!(
+            out.violation.is_none(),
+            "async-agent step-consistency violation: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 100_000);
+    }
+
+    /// **Local respect holds over the delegation forest and the scheduler (⑥).** The two
+    /// universes ⑥ added to the step-consistency side were absent from the *integrity* side too
+    /// (`delegate: false`, and `sched` only ever swept for local respect at two domains), so the
+    /// audit re-runs local respect over both. It holds under the unchanged channel relation:
+    /// delegation moves only the `controls` matrix, which the integrity `obs` deliberately
+    /// excludes (it is `a`'s power over others, not `a`'s protected state), and a peer's pCPU
+    /// placement is likewise outside `obs(a)`. So ⑥'s `obs⁺` widenings are confidentiality-only,
+    /// as design-lesson #58 requires — no [`Channels`] term was needed for either.
+    #[test]
+    fn local_respect_holds_over_delegation_and_the_scheduler() {
+        for (name, cfg) in [
+            ("delegation", ni_cfg3_delegate(3)),
+            ("scheduler", ni_cfg_sched(5, true)),
+        ] {
+            let out = check(&cfg, Channels::full());
+            assert!(
+                out.violation.is_none(),
+                "local-respect violation over {name}: {:?}",
+                out.violation.unwrap()
+            );
+        }
+    }
+
+    /// **Step consistency over the delegation forest, deeper (deep sweep).** Ignored by default;
+    /// run in the deep-verification workflow.
+    #[test]
+    #[ignore = "deep delegation step-consistency sweep — run in deep-verify.yml"]
+    fn step_consistency_holds_over_the_delegation_forest_deep() {
+        let out = check_step_consistency(&ni_cfg3_delegate(4));
+        assert!(
+            out.violation.is_none(),
+            "delegation step-consistency violation (deep): {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 1_000_000);
+    }
+
+    /// **Step consistency over the page-table guards, deeper (deep sweep).** Ignored by default;
+    /// run in the deep-verification workflow.
+    #[test]
+    #[ignore = "deep page-table step-consistency sweep — run in deep-verify.yml"]
+    fn step_consistency_holds_over_the_page_table_guards_deep() {
+        let cfg = Config {
+            pcpus: 2,
+            mediated_frames: true,
+            mediated_pcpus: true,
+            ..ni_cfg(4)
+        };
+        let out = check_step_consistency(&cfg);
+        assert!(
+            out.violation.is_none(),
+            "page-table step-consistency violation (deep): {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 1_000_000);
+    }
+
+    /// **Unpartitioned pCPUs break step consistency (⑥ / F4, the counterexample).** `sched::run`
+    /// refuses with `SchedError::PcpuBusy` when the named pCPU is occupied — a guard reading
+    /// **which other domain is running**, precisely the global pcpu-occupancy vector `obs`
+    /// excludes (§2.1). That exclusion was documented as an *abstraction*, but abstracting a
+    /// channel out of `obs` does not make step consistency hold: it makes it **false**, and this
+    /// is the machine-checked witness. It went unseen because no step-consistency config had ever
+    /// enabled `sched`.
+    ///
+    /// The repair follows ②′-(b)'s precedent rather than #62's remove/observe fork, because this
+    /// is the same *class*: contention for a **shared resource** nobody owns. The guard cannot be
+    /// removed (two vCPUs cannot share a pCPU) and the occupant's identity is not the caller's to
+    /// observe, so the resource is **partitioned** instead — see
+    /// [`step_consistency_holds_with_partitioned_pcpus`], the scheduling twin of the mediated
+    /// allocator, and what real hypervisors implement as pinning.
+    #[test]
+    fn unpartitioned_pcpus_break_step_consistency() {
+        let out = check_step_consistency(&ni_cfg_sched(5, false));
+        let v = out.violation.expect(
+            "unpartitioned pCPUs should break step consistency — `PcpuBusy` reads the occupant",
+        );
+        assert_eq!(
+            v.observer, v.actor,
+            "the pcpu-contention channel is a SELF-observer violation"
+        );
+    }
+
+    /// **Step consistency holds with partitioned pCPUs (⑥ / F4, the repair).** Pin each domain to
+    /// its own physical CPU (`mediated_pcpus`) and the contention channel closes by construction:
+    /// a `PcpuBusy` refusal can then only name the caller's *own* vCPU, whose placement
+    /// `obs(caller)` already carries. The scheduling twin of
+    /// [`step_consistency_holds_with_a_mediated_allocator`].
+    #[test]
+    fn step_consistency_holds_with_partitioned_pcpus() {
+        let out = check_step_consistency(&ni_cfg_sched(5, true));
+        assert!(
+            out.violation.is_none(),
+            "step-consistency violation under partitioned pCPUs: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(out.witnessed_classes > 1_000);
     }
 
     // ─── ②′-(c): the `DomainBusy` availability channel, closed by force-reclaim ──────────
