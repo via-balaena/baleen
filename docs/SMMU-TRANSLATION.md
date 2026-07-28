@@ -221,8 +221,12 @@ platform, and the guard has to move somewhere the platform is not.
   (`docs/SMMU-DEVICE-ASSIGNMENT.md`): `hv-core` now carries the device→domain relation, two
   authority-gated transitions, and the lifecycle coupling `assigned ⇒ Live` — proven ∀-values on the
   shipped code (Kani), ∀-size (Verus), over every reachable state (the enumerator), and quantified
-  in Tier-D non-interference. **Still open:** the metal does not yet *derive* its stream table from
-  that relation — the STE is still bound by hand in the witness. That is rung 4b.
+  in Tier-D non-interference. ~~**Still open:** the metal does not yet *derive* its stream table
+  from that relation — the STE is still bound by hand in the witness.~~ **ALSO CLOSED, by rung 4b**
+  (`docs/SMMU-STREAM-DERIVATION.md`): the whole table is now derived from the relation in
+  `teardown::dispatch`'s post-dispatch funnel, proven as a biconditional, and witnessed by Arc-0's
+  lifecycle matrix run on the device path — destroy a domain holding a device and its bus master
+  reaches nothing of the reborn tenant's memory.
 * **Invalidation discipline is exercised, not proven** — unchanged from rung 2, and now weaker in one
   respect, per §5's second finding.
 

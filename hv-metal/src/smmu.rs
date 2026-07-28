@@ -340,6 +340,16 @@ const _: () = assert!(core::mem::align_of::<CmdQueue>() >= core::mem::size_of::<
 struct EventQueue([u64; EVENTQ_ENTRIES * 4]);
 const _: () = assert!(core::mem::align_of::<EventQueue>() >= core::mem::size_of::<EventQueue>());
 
+/// Scratch storage the derivation builds into before it is compared with the live table.
+///
+/// Deriving into scratch and copying on difference is what lets the **hardware** be touched only
+/// when the table actually changed, while the *words* are re-derived after every single dispatch.
+/// That matters twice: the invalidation stays load-bearing at the moments a stream really is bound
+/// or dropped (so a remove-the-fix probe on `CMD_CFGI_STE` can still go red), and a boot's worth of
+/// unrelated hypercalls costs no command-queue traffic.
+#[repr(C, align(16384))]
+struct ScratchTable([u64; STRTAB_WORDS]);
+
 /// Everything the SMMU reads out of RAM, plus the software queue indices.
 ///
 /// One [`BootCell`] over all of it, for the same reason [`crate::stage2`]'s `STAGE2_SETS` is one cell
@@ -350,24 +360,57 @@ const _: () = assert!(core::mem::align_of::<EventQueue>() >= core::mem::size_of:
 #[repr(C)]
 struct Smmu {
     strtab: StreamTable,
+    scratch: ScratchTable,
     cmdq: CmdQueue,
     eventq: EventQueue,
     /// Software's view of `CMDQ_PROD`, including the wrap bit at bit [`CMDQ_LOG2SIZE`].
     cmdq_prod: u32,
     /// Software's view of `EVENTQ_CONS`, including the wrap bit at bit [`EVENTQ_LOG2SIZE`].
     eventq_cons: u32,
+    /// Whether a stream table exists to derive into (set by [`install_stream_table`]).
+    ///
+    /// Before it does, the answer to a bus master is rung 1's `GBPA.ABORT` — so this flag does not
+    /// open a window, it names which of the two mechanisms is answering. A derivation attempted
+    /// before the table is installed would poke registers on a machine whose queues are not enabled.
+    armed: bool,
+    /// The `DevId → StreamID` map — **the rung's fence crossing**, and the one place the model's
+    /// opaque device token may meet a hardware identifier.
+    ///
+    /// `hv-core` cannot name a StreamID for the same reason it cannot name a physical address
+    /// (design-lesson #14e), and `hv-s2` is only ever *told* one; the derivation therefore takes
+    /// this as data. Supplied to [`install_stream_table`] rather than set separately, so a stream
+    /// table cannot exist without the map that gives its indices meaning.
+    stream_of: [u32; crate::NUM_DEVICES],
+    /// The `DomId → Stage2Binding` map: which Stage-2 tables (and VMID) each domain's image was
+    /// emitted at. Written by [`register_domain_binding`], from the `VTTBR_EL2` value that domain's
+    /// CPU would be given — so the device and the CPU cannot be pointed at different tables.
+    binding_of: [Option<st::Stage2Binding>; crate::NUM_DOMAINS],
+    /// How many derivations reached the hardware. Read by the witness so a phase can require that
+    /// the derivation **ran**, rather than passing because nothing happened at all (#66).
+    published: u32,
 }
 
 static SMMU: BootCell<Smmu> = BootCell::new(
     "SMMU",
     Smmu {
         strtab: StreamTable([0; STRTAB_WORDS]),
+        scratch: ScratchTable([0; STRTAB_WORDS]),
         cmdq: CmdQueue([0; CMDQ_ENTRIES * 2]),
         eventq: EventQueue([0; EVENTQ_ENTRIES * 4]),
         cmdq_prod: 0,
         eventq_cons: 0,
+        armed: false,
+        stream_of: [0; crate::NUM_DEVICES],
+        binding_of: [None; crate::NUM_DOMAINS],
+        published: 0,
     },
 );
+
+// The device population the metal models must be one the ∀-values proofs actually instantiate: the
+// derivation's aliasing, sweep-exactness and biconditional harnesses unwind the device axis, so a
+// metal that grew a third bus master would be running a builder nothing had proven at that size.
+// Pinned to `hv-s2`'s own statement of it rather than restated here (design-lesson #71(c)).
+const _: () = assert!(crate::NUM_DEVICES <= st::MAX_PROVEN_DEVICES);
 
 /// A queue index register's wrap-inclusive mask: `log2size + 1` bits, the low `log2size` of which are
 /// the index and the top one the wrap flag.
@@ -421,7 +464,11 @@ impl StreamTableReport {
 ///
 /// Nothing here is a claim about isolation yet — an all-deny table is trivially satisfiable by an
 /// SMMU that is not looking at it. That is what the caller's through-STE control is for.
-pub(crate) fn install_stream_table() -> StreamTableReport {
+///
+/// `stream_of` is the `DevId → StreamID` map (rung 4b) and is taken **here** rather than through a
+/// setter of its own: it is what gives the table's indices meaning, so a stream table that exists
+/// without one should not be constructible.
+pub(crate) fn install_stream_table(stream_of: [u32; crate::NUM_DEVICES]) -> StreamTableReport {
     let idr1 = read32(SMMU_IDR1);
     let sidsize = idr1 & IDR1_SIDSIZE_MASK;
     let page1_at_64k = idr1 & IDR1_REL == 0;
@@ -491,6 +538,12 @@ pub(crate) fn install_stream_table() -> StreamTableReport {
     //     assert it permits nothing. The Kani property says the builder writes a denying table; this
     //     says the bytes at the address the SMMU was handed are one.
     let denies_every_stream = st::denies_every_stream(&smmu.strtab.0, STRTAB_LOG2SIZE);
+
+    // (7) Rung 4b: the fence crossing, and the arming of the post-dispatch derivation. From here on
+    //     the stream table is a function of `hv-core`'s assignment relation, re-derived after every
+    //     dispatch; before here the answer to a bus master was rung 1's `GBPA.ABORT`.
+    smmu.stream_of = stream_of;
+    smmu.armed = true;
 
     StreamTableReport {
         sidsize,
@@ -655,6 +708,146 @@ pub(crate) fn unbind_stream(sid: u32) -> bool {
     publish();
     let synced = invalidate_ste(&mut smmu, sid);
     synced && st::denies_every_stream(&smmu.strtab.0, STRTAB_LOG2SIZE)
+}
+
+// ─── Rung 4b: the table is DERIVED from the model, after every dispatch ──────────────────────────
+
+/// Record the Stage-2 tables domain `dom`'s image was emitted at, from the `VTTBR_EL2` value its
+/// CPU would be given.
+///
+/// Called by [`crate::stage2::build_stage2_from_p2m`] itself — the emission seam, not its callers —
+/// so a domain whose image is built can never be a domain the device side has not heard of, and the
+/// binding is obtained the way rung 3 established: read back out of the `VTTBR_EL2` value through
+/// [`hv_s2::arm64::vttbr_table`]/[`vttbr_vmid`](hv_s2::arm64::vttbr_vmid), so *"the device walks the
+/// same table as the domain's CPU, under the same VMID"* holds by construction rather than by two
+/// derivations agreeing (`docs/SMMU-TRANSLATION.md` §2b).
+pub(crate) fn register_domain_binding(dom: hv_core::hypervisor::DomId, vttbr: u64) {
+    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS};
+    let binding = st::Stage2Binding {
+        s2ttb: vttbr_table(vttbr),
+        vmid: vttbr_vmid(vttbr, BALEEN_VMID_BITS),
+        regime: BALEEN_STAGE2,
+    };
+    let mut smmu = SMMU.borrow_mut();
+    if let Some(slot) = smmu.binding_of.get_mut(dom as usize) {
+        *slot = Some(binding);
+    }
+}
+
+/// What one re-derivation did.
+pub(crate) enum Derived {
+    /// No stream table yet — rung 1's `GBPA.ABORT` is the answer at this point in the boot.
+    NotArmed,
+    /// The relation still says exactly what the published table says; the hardware was not touched.
+    Unchanged,
+    /// The table changed and was republished (invalidated, and read back as refining the relation).
+    Published,
+    /// The relation names something the hardware cannot be configured to express. The table has
+    /// been left **denying every stream** and published; the caller must stop the machine.
+    Refused(st::DeriveError),
+    /// The derivation succeeded but the bytes at the address the SMMU walks do **not** refine the
+    /// relation — an emit/decode disagreement, and a fail-loud one.
+    Unfaithful,
+}
+
+/// **Re-derive the stream table from `hv`'s assignment relation, and publish it if it changed.**
+///
+/// The device-axis twin of [`crate::stage2::build_stage2_from_p2m`], and the consumer rung 4a's
+/// proven relation was missing. Called from [`crate::teardown::dispatch`]'s post-dispatch funnel,
+/// unconditionally, for the reason the module docs give: a stream table is a **pure function of
+/// state**, not an action hanging off a transition, so re-deriving it is simply correct where the
+/// frame scrub had to diff for an *edge*. What is diffed here is the derived artifact — the words —
+/// which is not a soundness question at all: equal words mean the hardware already holds the right
+/// configuration.
+///
+/// **What it deliberately does NOT check.** It does not re-test that the holder is `Live`, and the
+/// metal does not withdraw a domain's binding when that domain dies. Both are obvious
+/// defence-in-depth and both would **mask the model's own mechanism**: with either in place,
+/// deleting `device::System::release_all_of` from `domain_destroy` would leave the device denied for
+/// the *metal's* reason, and the probe that shows the proven sweep is load-bearing could not go red.
+/// The metal consumes `assigned ⇒ Live` (proven ∀-values, ∀-size and over every reachable state in
+/// rung 4a) instead of duplicating it — which is what it means for this table to *refine* the
+/// relation rather than to run beside it.
+pub(crate) fn rederive(hv: &hv_core::Hypervisor) -> Derived {
+    let mut smmu = SMMU.borrow_mut();
+    if !smmu.armed {
+        return Derived::NotArmed;
+    }
+    // Copied out so the derivation can borrow the scratch table mutably; both are a handful of
+    // words, and taking them by value keeps the maps immutable for the duration of a derivation.
+    let streams = smmu.stream_of;
+    let bindings = smmu.binding_of;
+
+    let outcome = st::derive_stream_table(
+        &mut smmu.scratch.0,
+        STRTAB_LOG2SIZE,
+        hv.device(),
+        &streams,
+        &bindings,
+    );
+
+    if smmu.scratch.0 == smmu.strtab.0 {
+        // The relation has not changed the table. Note this is reached on a refusal too — a second
+        // refused dispatch after the table is already all-deny — so the error is still reported.
+        return match outcome {
+            Ok(()) => Derived::Unchanged,
+            Err(e) => Derived::Refused(e),
+        };
+    }
+
+    {
+        // Disjoint field borrows, checked rather than argued (the `Stage2Set` idiom).
+        let Smmu {
+            strtab, scratch, ..
+        } = &mut *smmu;
+        strtab.0.copy_from_slice(&scratch.0);
+    }
+    publish();
+    // The whole table was rebuilt, so the whole configuration cache is invalidated — the range form
+    // of the same `CMD_CFGI_STE` rung 3 probed load-bearing — and then the stage-2 TLB, because a
+    // stream whose STE now names a different domain's tables must not be answered from translations
+    // cached for the previous one.
+    let synced = invalidate_all_config(&mut smmu) && invalidate_s2_tlb(&mut smmu);
+    smmu.published = smmu.published.wrapping_add(1);
+
+    if let Err(e) = outcome {
+        return Derived::Refused(e);
+    }
+    // Read the published bytes back through the DECODE seam and compare against what the RELATION
+    // asks for — the two directions at once, over the table the SMMU will actually walk rather than
+    // over the builder's bookkeeping. `hv-s2`'s unit tests confirm this predicate can answer `false`
+    // for an extra entry, a missing one, and a merely-permitting one.
+    if !synced
+        || !st::table_refines_the_relation(
+            &smmu.strtab.0,
+            STRTAB_LOG2SIZE,
+            hv.device(),
+            &streams,
+            &bindings,
+        )
+    {
+        return Derived::Unfaithful;
+    }
+    Derived::Published
+}
+
+/// The binding StreamID `sid`'s entry currently expresses, read back through the decode seam.
+/// The witness's window onto the derived table.
+pub(crate) fn published_binding(sid: u32) -> Option<st::Stage2Binding> {
+    let smmu = SMMU.borrow_mut();
+    st::stage2_binding_at(&smmu.strtab.0, STRTAB_LOG2SIZE, sid)
+}
+
+/// Whether the derived table currently permits no StreamID at all.
+pub(crate) fn denies_everything() -> bool {
+    let smmu = SMMU.borrow_mut();
+    st::denies_every_stream(&smmu.strtab.0, STRTAB_LOG2SIZE)
+}
+
+/// How many derivations have reached the hardware. A phase that asserts a *change* asserts against
+/// this, so "the table says what I expect" cannot pass because no derivation ever ran.
+pub(crate) fn derivations_published() -> u32 {
+    SMMU.borrow_mut().published
 }
 
 /// One decoded SMMU event record.

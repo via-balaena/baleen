@@ -67,6 +67,16 @@
 //! device is held to exactly the relation the domain's CPU is held to. The ∀-address refinement
 //! covers that walk verbatim (it constrains the *table*, not the *walker*); what is proven here is
 //! the **binding**, whose failure mode is not a fault but a wrong domain's memory.
+//!
+//! ## Rung 4b — the table becomes a REFINEMENT rather than a configuration
+//!
+//! Rung 3 binds *one* stream, and the metal chooses which by hand. [`derive_stream_table`] (the
+//! last section of this module) makes the whole table a **pure function of `hv-core`'s proven
+//! device→domain relation**, the way `build_stage2_from_p2m` makes the Stage-2 image a pure
+//! function of the `p2m`. The theorem is a **biconditional** — ∀ StreamID, the table binds it *iff*
+//! an assigned device carries it, to exactly that domain — because the two halves fail differently:
+//! losing soundness is a device in the wrong domain's memory, losing completeness is a relation
+//! that quietly does nothing. See `docs/SMMU-STREAM-DERIVATION.md`.
 
 /// Words in one Stream Table Entry. SMMUv3 STEs are 64 bytes — 8 × `u64` — in both the linear and
 /// 2-level formats.
@@ -639,6 +649,217 @@ pub fn bind_stage2(
     bind(words, log2size, sid, ste)
 }
 
+// ─── Rung 4b: DERIVING the whole table from the model's assignment relation ──────────────────────
+//
+// Rung 3 binds one stream to one domain, and the metal calls `bind_stage2` **by hand**. So the
+// relation `hv-core` proves (`docs/SMMU-DEVICE-ASSIGNMENT.md` — which domain holds which device,
+// swept on teardown, `assigned ⇒ Live`) has no consumer, and the hardware's answer to "whose memory
+// may this bus master write?" is still a hand-written configuration that nothing checks against it.
+//
+// This is the arrow between them, and it is the device-axis twin of `build_stage2_from_p2m`: the
+// whole stream table becomes a **pure function of the proven relation**, so the table is a
+// REFINEMENT of it rather than a parallel copy. The theorem is stated as a **biconditional** —
+// `check_authorized`'s shape one level out — because a one-directional theorem is the weaker rung:
+//
+// > ∀ StreamID: the table binds it **iff** an assigned device carries it, to exactly that domain.
+//
+// * **soundness** (⇐) is rung 2's ∀-StreamID default-deny surviving derivation: a StreamID no
+//   assigned device carries reaches nothing, so building the table can only *narrow* the answer;
+// * **completeness** (⇒) is that every assignment is realized: a device the model says belongs to
+//   `d` really does walk `d`'s tables, so the relation is not quietly a no-op.
+
+use hv_core::device::{DevId, DomId, System as DeviceSystem};
+
+/// The largest device population the ∀-values proofs instantiate.
+///
+/// Declared here rather than in the harness so `hv-metal`'s `NUM_DEVICES` can be pinned against it
+/// with a `const _` (design-lesson #71(c) — a size proven but not shipped, or shipped but not
+/// proven, is a build error). Kani makes the whole assignment vector symbolic, which means the
+/// device axis is the one it must unwind; two is enough for every property here to have content
+/// (aliasing, "exactly one entry moved", one device swept while another is spared) and the metal
+/// drives exactly one bus master.
+pub const MAX_PROVEN_DEVICES: usize = 2;
+
+/// Why a stream table could not be derived from the assignment relation.
+///
+/// Every variant is a **refusal**, and every refusal leaves the table **denying every StreamID** —
+/// not merely denying the device that could not be represented. Two arms rather than N is what
+/// makes the postcondition statable: either `Ok` and the biconditional holds exactly, or `Err` and
+/// nothing reaches memory at all. The caller is expected to treat any of these as fatal (the metal
+/// publishes the denying table and halts): a model that authorizes something the hardware cannot be
+/// configured to express is not a weaker configuration, it is a *silent* divergence between the
+/// relation and the machine — and the over-conservative direction is the one no invariant checks
+/// (design-lesson #79).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeriveError {
+    /// `stream_of` does not cover every device the model carries — the metal cannot name the
+    /// StreamID of a bus master the model can assign.
+    StreamMapTooShort,
+    /// `binding_of` does not cover every domain slot the model carries.
+    BindingMapTooShort,
+    /// Two devices present the **same** StreamID.
+    ///
+    /// This is the premise rung 4a's exclusivity rests on and does not itself establish. The model
+    /// makes "two holders for one device" *unrepresentable* (one `Option<DomId>` per device), but
+    /// that refines to exclusivity **in the hardware** only if the `DevId → StreamID` map is
+    /// injective: two devices sharing a StreamID collapse onto one STE, so whichever is bound last
+    /// silently decides where *both* land. Unreachable at one device, and exactly the kind of
+    /// premise that goes unstated until a second bus master arrives.
+    StreamAliased { a: DevId, b: DevId },
+    /// A device is assigned to a domain for which no [`Stage2Binding`] is registered — the domain
+    /// has no Stage-2 tables the device could be pointed at. Refused, never approximated: there is
+    /// no "smaller permission" to fall back to, only a different domain's memory.
+    NoBinding(DomId),
+    /// An assigned device's StreamID lies outside the table this hypervisor built.
+    SidOutOfRange(u32),
+    /// The domain's binding cannot be named exactly by an STE — see [`SteError`].
+    Unencodable(SteError),
+    /// The storage is smaller than `log2size` claims.
+    TableTooSmall,
+}
+
+/// **What the relation says StreamID `sid` must reach** — the *specification* seam.
+///
+/// Written as a search over the relation, deliberately **not** derived from
+/// [`derive_stream_table`]'s loop, for the same reason [`decode`] is not derived from
+/// [`bypass_ste`] (design-lesson #36): the biconditional is then a statement relating three
+/// independent readings — this one says what *should* be there, `derive_stream_table` writes, and
+/// [`stage2_binding_at`] reads the bytes back.
+///
+/// `None` means "no assigned device carries this StreamID", which the table must express as a
+/// **denial**. At most one device can match once [`derive_stream_table`] has accepted the map
+/// (it refuses a non-injective one), so the first match is the only match.
+#[must_use]
+pub fn intended_binding(
+    devices: &DeviceSystem,
+    stream_of: &[u32],
+    binding_of: &[Option<Stage2Binding>],
+    sid: u32,
+) -> Option<Stage2Binding> {
+    let mut dev = 0usize;
+    while dev < devices.device_count() {
+        if stream_of.get(dev).copied() == Some(sid) {
+            if let Some(holder) = devices.holder_of(dev as DevId) {
+                return binding_of.get(holder as usize).copied().flatten();
+            }
+            return None;
+        }
+        dev += 1;
+    }
+    None
+}
+
+/// **Derive the whole stream table from the assignment relation.** The device-axis twin of
+/// `build_stage2_from_p2m`.
+///
+/// `stream_of` is the `DevId → StreamID` map and `binding_of` the `DomId → Stage2Binding` map: the
+/// two things this layer must be *told* rather than compute. `hv-core` cannot name a StreamID (a
+/// device is an opaque token there, exactly as a frame is), and this crate cannot compute one — it
+/// only indexes with the number the metal hands it, which is what keeps one proven relation able to
+/// serve an SMMU, an x86 IOMMU or a fixed device tree.
+///
+/// **Total, and fail-closed in one direction only.** The table is zeroed *first*, so every refusal
+/// path below leaves it denying every StreamID; on `Ok` the biconditional in this section's header
+/// holds exactly. It is deliberately all-or-nothing: a derivation that bound the devices it *could*
+/// represent and quietly dropped the rest would leave a table nothing describes.
+///
+/// The caller owes the hardware-publication half (`CMD_CFGI_STE` + `CMD_SYNC`, and the stage-2 TLB
+/// invalidation when a stream's tables change), exactly as [`bind`] does.
+pub fn derive_stream_table(
+    words: &mut [u64],
+    log2size: u32,
+    devices: &DeviceSystem,
+    stream_of: &[u32],
+    binding_of: &[Option<Stage2Binding>],
+) -> Result<(), DeriveError> {
+    // Deny FIRST: every `return Err` below is then already fail-closed, and there is no ordering in
+    // which a refusal leaves a previously-derived entry standing.
+    init_deny(words);
+
+    match table_words(log2size) {
+        Some(needed) if words.len() >= needed => {}
+        _ => return Err(DeriveError::TableTooSmall),
+    }
+
+    let ndev = devices.device_count();
+    if stream_of.len() < ndev {
+        return Err(DeriveError::StreamMapTooShort);
+    }
+    if binding_of.len() < devices.domain_count() {
+        return Err(DeriveError::BindingMapTooShort);
+    }
+
+    // Injectivity of the fence crossing — see [`DeriveError::StreamAliased`]. Checked over the
+    // whole map rather than only over assigned devices: a map that aliases is a mistake in this
+    // hypervisor's device table, not a runtime condition, and it should be refused before it
+    // happens to matter.
+    let mut a = 0usize;
+    while a < ndev {
+        let mut b = a + 1;
+        while b < ndev {
+            if stream_of[a] == stream_of[b] {
+                init_deny(words);
+                return Err(DeriveError::StreamAliased {
+                    a: a as DevId,
+                    b: b as DevId,
+                });
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+
+    let mut dev = 0usize;
+    while dev < ndev {
+        if let Some(holder) = devices.holder_of(dev as DevId) {
+            let Some(binding) = binding_of[holder as usize] else {
+                init_deny(words);
+                return Err(DeriveError::NoBinding(holder));
+            };
+            if let Err(e) = bind_stage2(words, log2size, stream_of[dev], &binding) {
+                init_deny(words);
+                return Err(match e {
+                    StreamTableError::BadBinding(e) => DeriveError::Unencodable(e),
+                    StreamTableError::SidOutOfRange => DeriveError::SidOutOfRange(stream_of[dev]),
+                    StreamTableError::TableTooSmall => DeriveError::TableTooSmall,
+                });
+            }
+        }
+        dev += 1;
+    }
+    Ok(())
+}
+
+/// Whether the bytes in `words` say **exactly** what the relation says, for every StreamID the
+/// table covers — the runtime companion to the Kani biconditional, in the shape
+/// [`denies_every_stream`] and `crate::arm64::verify_encoding` set.
+///
+/// Read back through the *decode* seam and compared against the *specification* seam, so a green
+/// boot witnesses the derivation over the bytes the SMMU will actually walk rather than over the
+/// builder's own bookkeeping. Both directions, in one predicate: an entry the relation does not
+/// authorize is as much a failure as an assignment that was not realized.
+#[must_use]
+pub fn table_refines_the_relation(
+    words: &[u64],
+    log2size: u32,
+    devices: &DeviceSystem,
+    stream_of: &[u32],
+    binding_of: &[Option<Stage2Binding>],
+) -> bool {
+    match table_words(log2size) {
+        None => false,
+        Some(needed) if words.len() < needed => false,
+        Some(_) => (0..(1u32 << log2size)).all(|sid| {
+            let want = intended_binding(devices, stream_of, binding_of, sid);
+            // The binding must match — AND a table that permitted the stream by some *other*
+            // encoding (a bypass entry, say) would satisfy `stage2_binding_at(..) == None` while
+            // still letting the device reach memory unconfined, so permission is checked too.
+            stage2_binding_at(words, log2size, sid) == want
+                && verdict(words, log2size, sid).permits() == want.is_some()
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +1023,173 @@ mod tests {
         assert_ne!(ste[2] & (1 << 58), 0, "S2R: faults must be RECORDED");
         assert_eq!(ste[2] & (1 << 57), 0, "S2S: never stall");
         assert_eq!(ste[3], 0x4010_0000);
+    }
+
+    // ─── Rung 4b: derivation from the relation ────────────────────────────────────────────────
+
+    /// Two devices, four domain slots — the fixture the derivation tests share.
+    fn devices() -> DeviceSystem {
+        DeviceSystem::new(4, 2)
+    }
+
+    /// StreamIDs the metal would hand over: device 0 at 8 (`edu`'s slot), device 1 at 16.
+    const STREAMS: [u32; 2] = [8, 16];
+
+    fn bindings() -> [Option<Stage2Binding>; 4] {
+        [
+            None,
+            Some(binding(0x4010_0000, 1)),
+            Some(binding(0x4020_0000, 2)),
+            None,
+        ]
+    }
+
+    #[test]
+    fn an_unassigned_relation_derives_the_deny_table() {
+        let mut t = table();
+        let d = devices();
+        let b = bindings();
+        assert_eq!(derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b), Ok(()));
+        assert!(denies_every_stream(&t, LOG2));
+        assert!(table_refines_the_relation(&t, LOG2, &d, &STREAMS, &b));
+    }
+
+    #[test]
+    fn an_assignment_becomes_exactly_one_binding() {
+        let mut t = table();
+        let mut d = devices();
+        let b = bindings();
+        d.assign(0, 1).unwrap();
+        assert_eq!(derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b), Ok(()));
+        assert_eq!(stage2_binding_at(&t, LOG2, 8), b[1]);
+        assert_eq!(permitted_stream_count(&t, LOG2), 1);
+        // The other device's StreamID is untouched — the derivation is per-assignment.
+        assert_eq!(stage2_binding_at(&t, LOG2, 16), None);
+        assert!(table_refines_the_relation(&t, LOG2, &d, &STREAMS, &b));
+    }
+
+    #[test]
+    fn the_teardown_sweep_is_what_takes_the_binding_away() {
+        let mut t = table();
+        let mut d = devices();
+        let b = bindings();
+        d.assign(0, 1).unwrap();
+        d.assign(1, 2).unwrap();
+        derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b).unwrap();
+        assert_eq!(permitted_stream_count(&t, LOG2), 2);
+
+        // Domain 1 dies: `release_all_of` is the model's whole mechanism, and re-deriving is the
+        // metal's whole mechanism. Together they are the property — and domain 2 keeps its device,
+        // which is the over-sweep direction nothing else would notice (design-lesson #79).
+        d.release_all_of(1);
+        derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b).unwrap();
+        assert_eq!(stage2_binding_at(&t, LOG2, 8), None);
+        assert_eq!(stage2_binding_at(&t, LOG2, 16), b[2]);
+        assert!(table_refines_the_relation(&t, LOG2, &d, &STREAMS, &b));
+    }
+
+    #[test]
+    fn a_reassignment_leaves_no_trace_of_the_previous_domain() {
+        let mut t = table();
+        let mut d = devices();
+        let b = bindings();
+        d.assign(0, 1).unwrap();
+        derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b).unwrap();
+        d.release(0, 1).unwrap();
+        d.assign(0, 2).unwrap();
+        derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b).unwrap();
+        assert_eq!(stage2_binding_at(&t, LOG2, 8), b[2]);
+        assert_eq!(permitted_stream_count(&t, LOG2), 1);
+    }
+
+    #[test]
+    fn a_holder_with_no_stage2_binding_denies_everything_and_says_so() {
+        let mut t = table();
+        let mut d = devices();
+        let b = bindings();
+        // Domain 3 is a live slot with no emitted Stage-2 tables.
+        d.assign(0, 3).unwrap();
+        d.assign(1, 2).unwrap();
+        assert_eq!(
+            derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b),
+            Err(DeriveError::NoBinding(3))
+        );
+        // All-or-nothing: device 1's perfectly representable binding is gone too.
+        assert!(denies_every_stream(&t, LOG2));
+    }
+
+    #[test]
+    fn a_non_injective_stream_map_is_refused() {
+        let mut t = table();
+        let mut d = devices();
+        let b = bindings();
+        d.assign(0, 1).unwrap();
+        assert_eq!(
+            derive_stream_table(&mut t, LOG2, &d, &[8, 8], &b),
+            Err(DeriveError::StreamAliased { a: 0, b: 1 })
+        );
+        assert!(denies_every_stream(&t, LOG2));
+    }
+
+    #[test]
+    fn a_streamid_outside_the_table_is_refused_not_wrapped() {
+        let mut t = table();
+        let mut d = devices();
+        let b = bindings();
+        d.assign(0, 1).unwrap();
+        let beyond = 1u32 << LOG2;
+        assert_eq!(
+            derive_stream_table(&mut t, LOG2, &d, &[beyond, 16], &b),
+            Err(DeriveError::SidOutOfRange(beyond))
+        );
+        assert!(denies_every_stream(&t, LOG2));
+    }
+
+    #[test]
+    fn a_short_stream_map_is_refused() {
+        let mut t = table();
+        let d = devices();
+        let b = bindings();
+        assert_eq!(
+            derive_stream_table(&mut t, LOG2, &d, &[8], &b),
+            Err(DeriveError::StreamMapTooShort)
+        );
+        assert_eq!(
+            derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b[..1]),
+            Err(DeriveError::BindingMapTooShort)
+        );
+    }
+
+    /// The check the metal runs on the real table every derivation: it must be able to FAIL, or a
+    /// green boot witnesses nothing (design-lesson #66).
+    #[test]
+    fn the_refinement_check_notices_a_table_that_does_not_match() {
+        let mut t = table();
+        let mut d = devices();
+        let b = bindings();
+        d.assign(0, 1).unwrap();
+        derive_stream_table(&mut t, LOG2, &d, &STREAMS, &b).unwrap();
+        assert!(table_refines_the_relation(&t, LOG2, &d, &STREAMS, &b));
+
+        // An entry the relation does not authorize — the soundness direction.
+        let mut extra = t;
+        bind_stage2(&mut extra, LOG2, 16, &binding(0x4020_0000, 2)).unwrap();
+        assert!(!table_refines_the_relation(&extra, LOG2, &d, &STREAMS, &b));
+
+        // An assignment that was not realized — the completeness direction.
+        let mut missing = t;
+        unbind(&mut missing, LOG2, 8).unwrap();
+        assert!(!table_refines_the_relation(
+            &missing, LOG2, &d, &STREAMS, &b
+        ));
+
+        // Permitted, but UNCONFINED: a bypass entry has no binding to decode, so a check that only
+        // compared bindings would call this a match. It permits and the relation does not.
+        let mut bypassed = t;
+        bind(&mut bypassed, LOG2, 16, bypass_ste()).unwrap();
+        assert!(!table_refines_the_relation(
+            &bypassed, LOG2, &d, &STREAMS, &b
+        ));
     }
 
     #[test]

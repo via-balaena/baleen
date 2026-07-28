@@ -516,7 +516,18 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
         }
     }
 
-    hv_s2::arm64::vttbr(layout.l1_pa, set_vmid(set))
+    let vttbr = hv_s2::arm64::vttbr(layout.l1_pa, set_vmid(set));
+
+    // (5) SMMU rung 4b — tell the DEVICE side which tables this domain's image was emitted at.
+    //     Registered by the emission itself rather than by its callers: the stream table is derived
+    //     from `hv-core`'s device→domain relation after every dispatch, and a domain whose image
+    //     exists but whose binding the device side has never heard of would make that derivation
+    //     refuse. The binding is read back out of the `VTTBR_EL2` value the CPU would be given, so
+    //     the two consumers cannot be pointed at different tables (`docs/SMMU-TRANSLATION.md` §2b).
+    #[cfg(feature = "smmu")]
+    crate::smmu::register_domain_binding(guest_dom, vttbr);
+
+    vttbr
 }
 
 // ---------------------------------------------------------------------------------------------

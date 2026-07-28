@@ -156,6 +156,47 @@ pub(crate) fn dispatch(
             }
             *was = now;
         }
+
+        // **Re-derive the SMMU stream table from the model's device→domain relation** (SMMU rung
+        // 4b). Unconditionally, and NOT as a diff: the scrub above hangs off an *edge* (a frame
+        // that stopped being owned), so it has to watch for one, but a stream table is a pure
+        // *function of state* — re-deriving it after every dispatch is simply what makes it a
+        // refinement rather than a configuration someone has to remember to update. The same
+        // transition-agnostic argument this module makes for scrubbing, and the stronger form of
+        // it: there is not even an edge to get wrong.
+        //
+        // `DeviceAssign`, `DeviceRelease`, `DomainDestroy`'s sweep and any device-touching
+        // transition a later arc adds therefore all need no arm here. The hardware is touched only
+        // when the derived words actually change (`smmu::rederive`), so the invalidation stays
+        // load-bearing exactly where a stream is really bound or dropped.
+        #[cfg(feature = "smmu")]
+        match crate::smmu::rederive(hv) {
+            crate::smmu::Derived::NotArmed
+            | crate::smmu::Derived::Unchanged
+            | crate::smmu::Derived::Published => {}
+            // The model authorizes something the hardware cannot be configured to express. The
+            // table has already been left denying every stream and published, so this is fail-CLOSED
+            // before it is fail-LOUD — and it is loud for the reason `build_stage2_from_p2m` halts
+            // on a model state it cannot represent faithfully: a silent divergence between the
+            // proven relation and the machine is a denial of service that leaves every invariant
+            // in the repository perfectly satisfied (design-lesson #79's unchecked direction).
+            crate::smmu::Derived::Refused(e) => {
+                let mut uart = crate::uart();
+                let _ = writeln!(
+                    uart,
+                    "baleen: smmu: the stream table cannot be derived from the model's device assignment: {e:?}; the table has been left DENYING every stream; halting"
+                );
+                crate::park();
+            }
+            crate::smmu::Derived::Unfaithful => {
+                let mut uart = crate::uart();
+                let _ = writeln!(
+                    uart,
+                    "baleen: smmu: the published stream table does NOT refine the model's device assignment (emit/decode disagreement, or an invalidation that did not complete); halting"
+                );
+                crate::park();
+            }
+        }
     }
 
     outcome

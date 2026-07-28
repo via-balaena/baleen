@@ -2240,3 +2240,327 @@ mod device_assignment {
         );
     }
 }
+
+/// **SMMU rung 4b — the stream table is DERIVED from the assignment relation.**
+///
+/// Rung 4a put the device→domain relation in `hv-core` and proved it; rung 3 bound one stream to
+/// one domain by hand. Nothing joined them, so the hardware's answer to *"whose memory may this bus
+/// master write?"* was still a configuration nothing checked against the relation. `hv_s2::smmu::
+/// derive_stream_table` is the join, and it is the device-axis twin of `build_stage2_from_p2m`.
+///
+/// **The theorem is a biconditional, and that is the whole point of the rung.**
+///
+/// > ∀ StreamID: the table binds it **iff** an assigned device carries it, to exactly that domain.
+///
+/// A one-directional theorem would have been the weaker rung, because the two directions fail
+/// differently and neither implies the other. *Soundness* (⇐) is rung 2's ∀-StreamID default-deny
+/// surviving derivation — losing it puts a device in some domain's memory with nothing to authorize
+/// it. *Completeness* (⇒) is that every assignment is realized — losing it makes the proven relation
+/// a decoration, satisfied by a derivation that writes nothing at all, which is exactly the shape ⑦
+/// found in the Verus `Obs` split and rung 2's `binding_one_stream_…` non-vacuity clause guards.
+///
+/// **Three seams, not two.** `derive_stream_table` writes, `stage2_binding_at` reads the bytes back
+/// through the architecture's field definitions, and `intended_binding` says independently what the
+/// relation asks for. The assertions relate the second and the third, so a wrong emission and a
+/// wrong expectation cannot agree (design-lesson #36).
+///
+/// **Sized to two devices and two domains, deliberately.** These are *pure builder* harnesses — no
+/// `dispatch` seam, so none of `first_cross_violation`'s O(domains²) cost (design-lesson #79's
+/// corollary) — but the device count is the axis Kani unwinds, and two is where every property here
+/// has content: aliasing needs a pair, "one holder swept, another spared" needs a pair, and the
+/// metal drives exactly one bus master. `hv_s2::smmu::MAX_PROVEN_DEVICES` is the shared constant
+/// `hv-metal` pins its `NUM_DEVICES` against, so a device population proven here but not shipped —
+/// or shipped but not proven — is a build error (design-lesson #71(c)).
+#[cfg(kani)]
+mod smmu_stream_derivation {
+    use hv_core::device::System as DeviceSystem;
+    use hv_s2::arm64::BALEEN_STAGE2;
+    use hv_s2::smmu::{
+        bind, bypass_ste, derive_stream_table, intended_binding, stage2_binding_at,
+        table_refines_the_relation, verdict, DeriveError, Stage2Binding, MAX_PROVEN_DEVICES,
+        STE_WORDS,
+    };
+
+    const NDOM: usize = 2;
+    const NDEV: usize = MAX_PROVEN_DEVICES;
+
+    /// Four entries — the StreamID axis is symbolic, and the *size* axis is closed the way rung 2
+    /// closed it: the builder's refusals are size-generic, one harness below runs at the deployed
+    /// 256-entry size, and the metal re-checks the real table every derivation.
+    const MAX_HARNESS_LOG2: u32 = 2;
+    const WORDS: usize = (1 << MAX_HARNESS_LOG2) * STE_WORDS;
+
+    fn any_log2() -> u32 {
+        let n: u32 = kani::any();
+        kani::assume(n <= MAX_HARNESS_LOG2);
+        n
+    }
+
+    /// A device system in an **arbitrary** state, built by real `assign` calls so the vector is a
+    /// reachable one (the rung-4a idiom, design-lesson #13f).
+    fn symbolic_devices() -> DeviceSystem {
+        let mut s = DeviceSystem::new(NDOM, NDEV);
+        for dev in 0..NDEV as u16 {
+            if kani::any::<bool>() {
+                let to: u16 = kani::any();
+                kani::assume((to as usize) < NDOM);
+                assert!(s.assign(dev, to).is_ok());
+            }
+        }
+        s
+    }
+
+    /// An arbitrary binding at the deployed regime — any table base the alignment allows, any VMID.
+    fn any_binding() -> Stage2Binding {
+        let s2ttb: u64 = kani::any();
+        kani::assume(s2ttb >> 52 == 0);
+        kani::assume(s2ttb % BALEEN_STAGE2.table_align() == 0);
+        let vmid: u16 = kani::any();
+        Stage2Binding {
+            s2ttb,
+            vmid,
+            regime: BALEEN_STAGE2,
+        }
+    }
+
+    /// A `DomId → Stage2Binding` map in which every domain independently does or does not have
+    /// emitted Stage-2 tables.
+    fn symbolic_bindings() -> [Option<Stage2Binding>; NDOM] {
+        let mut out = [None; NDOM];
+        for slot in out.iter_mut() {
+            if kani::any::<bool>() {
+                *slot = Some(any_binding());
+            }
+        }
+        out
+    }
+
+    /// The `DevId → StreamID` map the harnesses below derive from: two distinct in-range
+    /// StreamIDs, with two more (1 and 3) that **no** device carries, so the denial arm has content.
+    ///
+    /// **Concrete on purpose, and the reason is measured.** A StreamID is an arbitrary label — the
+    /// quantification that carries this rung's meaning is over the **query** (∀ StreamID, what does
+    /// the table say?) and over the **assignment vector**, both of which stay symbolic. A symbolic
+    /// *map* instead makes `bind_stage2` write at a symbolic offset, which is the single most
+    /// expensive thing CBMC can be asked to do here: it took the biconditional from 21 s to 81 s and
+    /// the two-derivation harnesses past ten minutes, against a whole-suite CI budget of forty-five.
+    /// The one property that genuinely needs a symbolic map is the aliasing refusal, and that
+    /// harness uses one. Injectivity itself is asserted rather than assumed, so this constant cannot
+    /// quietly stop satisfying the builder's premise.
+    const STREAMS: [u32; NDEV] = [0, 2];
+    const _: () = assert!(STREAMS[0] != STREAMS[1]);
+    const _: () = assert!((STREAMS[0] as u64) < (1 << MAX_HARNESS_LOG2));
+    const _: () = assert!((STREAMS[1] as u64) < (1 << MAX_HARNESS_LOG2));
+
+    /// **THE RUNG'S THEOREM, ∀ StreamID and ∀ assignment vector.** Whenever the derivation succeeds,
+    /// the entry for every StreamID the table covers is *exactly* what the relation asks for — both
+    /// directions in one statement, because the equality's `None` arm is the deny half and its
+    /// `Some` arm is the realize half.
+    ///
+    /// The `permits` clause is not redundant with the binding equality, and the difference is the
+    /// one rung 2 named: an entry can permit a device **unconfined** (a bypass STE) while decoding
+    /// to no stage-2 binding at all, so `stage2_binding_at(..) == None` alone would call that table
+    /// a faithful derivation of "nothing is assigned".
+    #[kani::proof]
+    fn the_derived_table_binds_exactly_the_assigned_streams() {
+        let mut words = [0u64; WORDS];
+        let log2 = MAX_HARNESS_LOG2;
+        let devices = symbolic_devices();
+        let streams = STREAMS;
+        let bindings = symbolic_bindings();
+
+        if derive_stream_table(&mut words, log2, &devices, &streams, &bindings).is_ok() {
+            let sid: u32 = kani::any();
+            let want = intended_binding(&devices, &streams, &bindings, sid);
+            if (sid as u64) < (1u64 << log2) {
+                assert!(
+                    stage2_binding_at(&words, log2, sid) == want,
+                    "the table must bind exactly the streams the relation assigns, to exactly those domains"
+                );
+                assert!(
+                    verdict(&words, log2, sid).permits() == want.is_some(),
+                    "and it must permit exactly those streams — nothing unconfined"
+                );
+            } else {
+                assert!(!verdict(&words, log2, sid).permits());
+            }
+        }
+    }
+
+    // **There is deliberately NO deployed-size (256-entry) harness here, and the reason is measured
+    // rather than assumed** — recorded because a silently-dropped axis reads as covered.
+    //
+    // Rung 2 has one (`the_deployed_stream_table_denies_every_streamid`) and it is cheap, because
+    // `verdict` decodes a single word. A *derivation* harness at that size is not: it fills the
+    // table, writes an STE, and then decodes three words at a symbolic StreamID out of a 2048-word
+    // array. Measured on this machine: **265 s at 64 entries**, and non-terminating at ten minutes
+    // at 256 — against a whole-suite CI budget of forty-five minutes, most of which is already
+    // spent. The lever is harness world size, not the timeout (design-lesson #79's corollary).
+    //
+    // What covers the size axis instead, and it is not nothing:
+    //   * the builder is **size-generic** — every write routes through `bind_stage2` → `bind` →
+    //     `entry_offset`, whose size handling rung 2 proves over every size its storage supports
+    //     *and* at `BUS0_LOG2SIZE` for the deny property;
+    //   * `hv-s2`'s own unit tests run `derive_stream_table` at **`BUS0_LOG2SIZE`** — concretely,
+    //     but at exactly the deployed size, including the sweep and every refusal arm;
+    //   * `hv-metal` runs `table_refines_the_relation` over the **real 256-entry table** after every
+    //     derivation and halts if it disagrees, so each boot is a ∀-StreamID check at the deployed
+    //     size on the bytes the SMMU actually walks;
+    //   * `STRTAB_LOG2SIZE = hv_s2::smmu::BUS0_LOG2SIZE` plus `const _` assertions in `hv-metal`
+    //     make "proven at a size that is not shipped" a build error (design-lesson #71(c)).
+
+    /// **A swept holder reaches nothing — the model's teardown, realized in the hardware table.**
+    ///
+    /// This is the rung's isolation content in proof form, and the model half of its headline probe:
+    /// `release_all_of` is the *only* mechanism, so a derivation that ignored it would be caught
+    /// here. Both halves of the sweep are asserted, because they are caught by different things
+    /// (design-lesson #79): every stream of the dying holder's devices denies, **and** every other
+    /// holder's device keeps exactly the binding it had — an over-sweep leaves every invariant in
+    /// the repository perfectly satisfied while silently disarming the survivors.
+    #[kani::proof]
+    fn a_swept_holder_leaves_no_stream_bound_and_spares_the_others() {
+        let mut words = [0u64; WORDS];
+        let log2 = MAX_HARNESS_LOG2;
+        let mut devices = symbolic_devices();
+        let streams = STREAMS;
+        let bindings = symbolic_bindings();
+        kani::assume(derive_stream_table(&mut words, log2, &devices, &streams, &bindings).is_ok());
+
+        let dying: u16 = kani::any();
+        kani::assume((dying as usize) < NDOM);
+        let held_before: [Option<u16>; NDEV] = [devices.holder_of(0), devices.holder_of(1)];
+
+        devices.release_all_of(dying);
+        let mut after = [0u64; WORDS];
+        assert!(derive_stream_table(&mut after, log2, &devices, &streams, &bindings).is_ok());
+
+        for dev in 0..NDEV {
+            if held_before[dev] == Some(dying) {
+                assert!(
+                    !verdict(&after, log2, streams[dev]).permits(),
+                    "a device of the destroyed domain still reaches memory after re-derivation"
+                );
+            } else {
+                assert!(
+                    stage2_binding_at(&after, log2, streams[dev])
+                        == stage2_binding_at(&words, log2, streams[dev]),
+                    "the sweep must not disarm another holder's device"
+                );
+            }
+        }
+    }
+
+    /// **A refusal denies everything — ∀ input.** The derivation is total, and its failure mode is
+    /// all-or-nothing: a table that bound the devices it *could* represent and quietly dropped the
+    /// rest would be a configuration nothing describes.
+    ///
+    /// Nothing is assumed here — the StreamID map may alias, sit outside the table, or name a domain
+    /// with no Stage-2 tables — so this is also the totality statement: every input reaches one of
+    /// the two arms.
+    #[kani::proof]
+    fn a_refused_derivation_leaves_the_table_denying_every_stream() {
+        let mut words = [0u64; WORDS];
+        // Start from a table that already permits, so "denies everything" cannot pass by the storage
+        // having been zero all along (design-lesson #66).
+        let dirty: u32 = kani::any();
+        kani::assume((dirty as u64) < (1u64 << MAX_HARNESS_LOG2));
+        assert!(bind(&mut words, MAX_HARNESS_LOG2, dirty, bypass_ste()).is_ok());
+
+        let log2 = any_log2();
+        let devices = symbolic_devices();
+        let streams: [u32; NDEV] = [kani::any(), kani::any()];
+        let bindings = symbolic_bindings();
+
+        if derive_stream_table(&mut words, log2, &devices, &streams, &bindings).is_err() {
+            let sid: u32 = kani::any();
+            assert!(
+                !verdict(&words, log2, sid).permits(),
+                "a refused derivation must leave nothing reachable"
+            );
+        }
+    }
+
+    /// **A map that aliases two devices onto one entry is refused** — the premise rung 4a's
+    /// exclusivity rests on and does not itself establish.
+    ///
+    /// The model makes a second holder *unrepresentable* (`Option<DomId>`, not a set), which refines
+    /// to exclusivity in the hardware only if `DevId → StreamID` is injective: two devices sharing a
+    /// StreamID share one STE, so whichever is bound last decides where *both* land, and one
+    /// domain's bus master silently walks another domain's tables. Unreachable at the metal's single
+    /// device, which is exactly why it is proven rather than argued.
+    #[kani::proof]
+    fn a_map_that_aliases_two_devices_onto_one_entry_is_refused() {
+        let mut words = [0u64; WORDS];
+        let log2 = any_log2();
+        let devices = symbolic_devices();
+        let bindings = symbolic_bindings();
+
+        let sid: u32 = kani::any();
+        let streams = [sid, sid];
+
+        assert!(
+            derive_stream_table(&mut words, log2, &devices, &streams, &bindings)
+                == Err(DeriveError::StreamAliased { a: 0, b: 1 })
+        );
+        let any_sid: u32 = kani::any();
+        assert!(!verdict(&words, log2, any_sid).permits());
+    }
+
+    /// **The derivation is a function of the relation alone — ∀ prior table contents.**
+    ///
+    /// This is what makes "re-derive after every dispatch" sound rather than merely convenient: the
+    /// table the metal publishes cannot carry residue from the state it was in before. Derived twice
+    /// from the same relation — once over storage an adversary has scribbled a permissive entry
+    /// into, once over zeroed storage — the words are **identical**, so a stream that stopped being
+    /// assigned cannot survive as a stale entry the way a hand-maintained table could.
+    #[kani::proof]
+    fn the_derivation_is_a_function_of_the_relation_alone() {
+        let log2 = MAX_HARNESS_LOG2;
+        let devices = symbolic_devices();
+        let streams = STREAMS;
+        let bindings = symbolic_bindings();
+
+        let mut dirty = [0u64; WORDS];
+        let stale: u32 = kani::any();
+        kani::assume((stale as u64) < (1u64 << MAX_HARNESS_LOG2));
+        assert!(bind(&mut dirty, MAX_HARNESS_LOG2, stale, bypass_ste()).is_ok());
+        let from_dirty = derive_stream_table(&mut dirty, log2, &devices, &streams, &bindings);
+
+        let mut clean = [0u64; WORDS];
+        let from_clean = derive_stream_table(&mut clean, log2, &devices, &streams, &bindings);
+
+        assert!(from_dirty == from_clean);
+        assert!(
+            dirty == clean,
+            "a re-derivation must leave no trace of the table's previous contents"
+        );
+    }
+
+    /// **The check the metal runs on every derivation IS the property — and it can fail.**
+    ///
+    /// `table_refines_the_relation` is what the boot asserts over the real 256-entry table, so it
+    /// has to be worth asserting: green whenever the derivation succeeded, and red for ∀ StreamID
+    /// the relation does not authorize the moment that stream is permitted. Without the second half
+    /// it would be a check that cannot fail, which reads as evidence when it is none (#71).
+    #[kani::proof]
+    fn the_refinement_check_is_the_property_and_can_fail() {
+        let mut words = [0u64; WORDS];
+        let log2 = MAX_HARNESS_LOG2;
+        let devices = symbolic_devices();
+        let streams = STREAMS;
+        let bindings = symbolic_bindings();
+        kani::assume(derive_stream_table(&mut words, log2, &devices, &streams, &bindings).is_ok());
+        assert!(table_refines_the_relation(
+            &words, log2, &devices, &streams, &bindings
+        ));
+
+        let sid: u32 = kani::any();
+        kani::assume((sid as u64) < (1u64 << log2));
+        kani::assume(intended_binding(&devices, &streams, &bindings, sid).is_none());
+        assert!(bind(&mut words, log2, sid, bypass_ste()).is_ok());
+        assert!(
+            !table_refines_the_relation(&words, log2, &devices, &streams, &bindings),
+            "permitting a stream the relation does not authorize must fail the check"
+        );
+    }
+}
