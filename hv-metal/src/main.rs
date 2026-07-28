@@ -40,6 +40,7 @@
 
 mod blk;
 mod cell;
+mod dmawitness;
 mod el2;
 mod exceptions;
 mod gic;
@@ -47,7 +48,10 @@ mod guest;
 mod heap;
 #[cfg(feature = "real-linux")]
 mod linux;
+mod pcie;
 mod pl011;
+#[cfg(feature = "smmu")]
+mod smmu;
 mod stage2;
 mod teardown;
 mod time;
@@ -251,6 +255,17 @@ pub extern "C" fn rust_main() -> ! {
     //      metal's live interrupt sources cannot fill 4 LRs, so the overflow is manufactured here.
     #[cfg(feature = "selftest")]
     guest::selftest_vgic_pending_overflow(&mut uart);
+
+    // (6f) SMMU rung 1 — the DMA default-deny witness, and the FIRST statement baleen makes about bus
+    //      masters. Every isolation result so far is about CPU accesses; a DMA-capable device ignores
+    //      `VTTBR_EL2` entirely, so on real hardware it could write anywhere. `SMMU_GBPA`'s reset value
+    //      leaves `ABORT` clear — i.e. BYPASS — so from power-on until the hypervisor configures the
+    //      SMMU every device may DMA freely. This closes that window (`GBPA.ABORT`) BEFORE enabling any
+    //      device's bus mastering, then proves it with a real bus master (QEMU's `edu`): its DMA over a
+    //      sentinel is aborted. On a machine with no SMMU the same code is the POSITIVE CONTROL — the
+    //      DMA must LAND, without which the abort result would be vacuous (design-lesson #66).
+    //      Translation through the `p2m`-derived tables + the ∀-StreamID stream-table deny is rung 2.
+    dmawitness::witness(&mut uart);
 
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven
     //     `p2m`, run the Arc-5 authorize/deny isolation matrix (the proof touches reality), then the
