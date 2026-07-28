@@ -128,7 +128,20 @@ jobs:
     name: kani proofs (PR)
     needs: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # MEASURED, not guessed (SMMU rung 4a, PR #94). The suite passed at **29m50s** against a
+    # 30-minute wall — ten seconds of headroom on a REQUIRED gate, i.e. green by luck. The job log
+    # gives the breakdown: 1662.7 s of verification over 53 harnesses, of which
+    # `foreign_link_state_machine` alone is 792 s (two harnesses, ~48% of the suite) and rung 4a's
+    # six device harnesses are 99 s. So the budget was already spent before that rung; it merely
+    # consumed the last of it. 45 minutes is ~50% headroom over the measured total, for a job whose
+    # cost grows with every rung that drives the real `dispatch` seam.
+    #
+    # If this starts creeping again, the lever is the harness *world size*, not the timeout: a seam
+    # harness is priced by `first_cross_violation` inside `dispatch` (O(domains²) with a provenance
+    # walk), so one extra domain is worth minutes — rung 4a measured two of its own harnesses going
+    # from 21 s/42 s at two domains to non-terminating at three. Push ∀-domain content to Verus and
+    # the enumerator instead. Keep in lockstep with deep-verify.yml's weekly `kani` job.
+    timeout-minutes: 45
     steps:
       - name: Harden the runner (audit egress)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
