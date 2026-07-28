@@ -30,13 +30,15 @@
 //! (`unwinding_destroy.rs`). Both unwinding conditions are discharged, and both trace theorems
 //! (`ni_theorem_a`, `ni_theorem_b`) are premise-free, for all five.
 //!
-//! The cascade touches four `obs` components at once — `a`'s **ports** (`close_all`/
+//! The cascade touches five `obs`/`obs⁺` components at once — `a`'s **ports** (`close_all`/
 //! `clear_unbound_into` drop links naming `c`), **grant rows** (`revoke_grants_to` clears active
 //! grants to `c`, and `c`'s own outgoing rows drop — the read direction), the **frame-map
-//! population** (`drain_maps_of` releases `c`'s maps), and the **read-caps** (destroying `a`'s
-//! grantor `c` alters `obs⁺(a)`) — and carries the intransitive **teardown-reach** term
-//! (`interferes` gains `teardown_reach`: `∃c. controls[caller][c] ∧ reach(a, c)`, where `reach`
-//! includes the read direction the pre-`obs⁺` §2.4 lacked — finding #3). The `map`-identity
+//! population** (`drain_maps_of` releases `c`'s maps), the **held-map population** (the same drain
+//! force-reclaims the maps `a` made over `c`'s frames — ②′-(c)), and the **read-caps** (destroying
+//! `a`'s grantor `c` alters `obs⁺(a)`) — and carries **both** halves of the intransitive teardown
+//! term: `teardown_reach` (`∃c. controls[caller][c] ∧ reach(a, c)`, the outbound references `a`
+//! holds naming `c`) and `teardown_borrow` (`∃c. (c == caller ∨ controls[caller][c]) ∧
+//! borrows_from(a, c)`, the inbound ones — see ⑦ below). The `map`-identity
 //! (`unwinding_destroy.rs::no_c_map_over_a_frame`) is threaded as a `wf` invariant and proven
 //! preserved (`wf_step_destroy`) so the drain is owner-local. Two modeling choices, recorded below.
 //!
@@ -90,6 +92,48 @@
 //!   is exact rather than sound-but-loose. The modelling choice made here to keep the proof
 //!   honest turned out to be the right semantics; the real-code bridge
 //!   (`hv-sim::noninterference`) pins the resulting channel closure directly.
+//!
+//! ## ⑦ — the `Obs`/`ObsPlus` split, and why a *narrower* `interferes` is the whole point
+//!
+//! As first written, this file used **one** `obs` for both unwinding conditions, and it carried the
+//! read-closure. The real-code bridge has used **two** surfaces since ②′ — `obs` (integrity) and
+//! `obs⁺` (confidentiality) — which is design-lesson #58. The single read-closed surface here had a
+//! consequence that is easy to miss: `local_respect` then has to tolerate a grantor *creating* an
+//! offer to `a`, since that moves `a`'s read-caps. A domain cannot stop others revealing themselves
+//! to it, so this is not integrity interference at all — but with the read-caps inside `obs`, the
+//! only way to make the theorem go through was a **blanket `reads_from(s, a, b)` disjunct** in
+//! `interferes`: *any* grantor of `a` was authorized to move `a`'s observation via **any**
+//! transition, forever. `b` could not set its own vCPU's affinity without the theorem giving up on
+//! `a`. Theorem A was therefore strictly weaker than what the bridge had been demonstrating all
+//! along — a genuine bridge↔composition divergence, not a presentational one.
+//!
+//! ⑦ splits the surface (`Obs` / `ObsPlus`, `obs` / `obs_plus`), moves `step_consistent` and
+//! Theorem B to `obs⁺` while `local_respect` and Theorem A stay at `obs`, and **deletes the blanket
+//! disjunct**. The two conditions may sit at different surfaces because they are separate theorems
+//! whose inductions each appeal only to their own condition.
+//!
+//! The subtler half is what the split *revealed*. Dropping the blanket term left the ②′-(c)
+//! **borrow** flow — `b` dying force-reclaims the page `a` had mapped from it — with nothing to
+//! name it, and yet `local_respect_holds` still verified. Not because the flow was harmless:
+//! because `Obs` could not **see** it. The observation carried `a_frame_maps` (maps over frames `a`
+//! *owns*) and had no component for the maps `a` *holds*, so the write landed outside the surface
+//! entirely. A relation that omitted the term looked sound for the worst possible reason. Writing
+//! the disjunct down anyway — on the strength of the bridge having one — would have been an
+//! *unforced* widening, i.e. a quietly weaker theorem defended by a citation.
+//!
+//! So `Obs` gained `held` ([`a_held_maps`]), matching the bridge's handle-indexed held-maps, and
+//! `teardown_borrow` is now **forced**: delete it and the destroy case fails. Its step-consistency
+//! argument is what makes the split pay for itself twice — the survivors depend on `owner` at frames
+//! `a` does **not** own, which is not in `obs(a)`, and is recovered from `obs⁺(a)` through
+//! `map_identity` ([`held_frame_owner_observed`]). The borrow surface is deterministic *because* the
+//! read-closure is observed.
+//!
+//! Net: `interferes ⊊ interferes_pre7`, **proven** — containment ([`interferes_shrank`]) plus a
+//! witness refuting equality ([`interferes_shrank_strictly`]), because a channel relation can be
+//! narrowed or merely re-shuffled and prose cannot tell those apart. The witness is the crisp
+//! statement of the rung: **an unexercised offer is not a channel — the flow opens when the borrow
+//! does, not when the offer does.** `hv-core` is untouched; the relation now coincides term for term
+//! with `hv-sim::noninterference::Channels::authorized`.
 //!
 //! Run: `verus --crate-type=lib hv-verify/verus/noninterference_instantiation.rs` (exit 0 = all
 //! proven).
@@ -206,6 +250,97 @@ pub proof fn frame_maps_destroyed(maps: Seq<(Dom, int)>, owner: Map<int, Dom>, a
         );
         filter_false(maps);
     }
+}
+
+/// **The compound drain is a no-op on the maps `a` HOLDS when `a` borrows nothing from `c`**
+/// (`a ≠ c`). The held-side twin of [`compound_drain_preserves`]: the destroy filter drops `c`'s
+/// own maps *and* every map over a `c`-owned frame; on the maps `a` made the first clause is
+/// vacuous (`a ≠ c`), so if none of them names a `c`-owned frame — i.e. `¬borrows_from(s, a, c)` —
+/// `a`'s held population is unchanged. This is the lemma [`teardown_borrow`] earns its place by.
+pub proof fn held_drain_preserves(maps: Seq<(Dom, int)>, owner: Map<int, Dom>, a: Dom, c: Dom)
+    requires
+        a != c,
+        forall|i: int| #![trigger maps[i]]
+            0 <= i < maps.len() ==> !(maps[i].0 == a && owner[maps[i].1] == c),
+    ensures
+        maps.filter(drain_pred(owner, c)).filter(a_held_pred(a)) == maps.filter(a_held_pred(a)),
+{
+    filter_and(maps, drain_pred(owner, c), a_held_pred(a));
+    filter_ext(
+        maps,
+        |m: (Dom, int)| (drain_pred(owner, c))(m) && (a_held_pred(a))(m),
+        a_held_pred(a),
+    );
+}
+
+/// **`a`'s post-destroy HELD maps as a function of `obs(a).held` and the frames' owners** (used by
+/// step consistency). When `a ≠ c` the compound drain restricted to `a`'s own maps drops exactly
+/// those naming a `c`-owned frame; when `a == c` (`a` destroys itself) every map `a` holds is one of
+/// `c`'s, so the population empties. The held-side twin of [`frame_maps_destroyed`].
+///
+/// Note what the `a ≠ c` result is a function of: `obs(a).held` **and `owner` at the frames it
+/// names**. The frame owners are *not* in `obs(a)` — they are in `obs⁺(a)`, via the read-caps'
+/// `owner` component, reachable through [`map_identity`] ([`held_frame_owner_observed`]). That is
+/// the precise sense in which the borrow surface is determined by the read-closure, and hence why
+/// `held` can live on the integrity surface while its step-consistency argument needs `obs⁺`.
+pub proof fn held_maps_destroyed(maps: Seq<(Dom, int)>, owner: Map<int, Dom>, a: Dom, c: Dom)
+    ensures
+        maps.filter(drain_pred(owner, c)).filter(a_held_pred(a)) == (if a != c {
+            maps.filter(a_held_pred(a)).filter(not_c_owner_pred(owner, c))
+        } else {
+            Seq::<(Dom, int)>::empty()
+        }),
+{
+    filter_and(maps, drain_pred(owner, c), a_held_pred(a));
+    if a != c {
+        filter_and(maps, a_held_pred(a), not_c_owner_pred(owner, c));
+        filter_ext(
+            maps,
+            |m: (Dom, int)| (drain_pred(owner, c))(m) && (a_held_pred(a))(m),
+            |m: (Dom, int)| (a_held_pred(a))(m) && (not_c_owner_pred(owner, c))(m),
+        );
+    } else {
+        filter_ext(
+            maps,
+            |m: (Dom, int)| (drain_pred(owner, c))(m) && (a_held_pred(a))(m),
+            |m: (Dom, int)| false,
+        );
+        filter_false(maps);
+    }
+}
+
+/// **The owner of a frame `a` holds a map over is pinned by `a`'s READ-CLOSURE** — so two states
+/// that agree on `obs⁺(a)` agree on `owner[f]` for every frame `f` in `a`'s held population.
+///
+/// This is the bridge between the two surfaces, and the reason `held` costs no new `Obs` field for
+/// frame ownership. `a` cannot map a frame it was not granted: [`map_identity`] (`grant.rs`'s
+/// no-map-without-an-active-backing-grant) turns the live map `(a, f)` into an **active grant with
+/// grantee `a`, frame `f`, and grantor `owner[f]`** — and every such grant is an entry of
+/// [`a_read_caps`], whose `owner` component *is* `owner[f]` (the `StaleGrant` read the grant's own
+/// map guard performs). So the ownership fact the destroy drain tests is already inside `obs⁺(a)`,
+/// having been put there by the read-closure work of ②′-(a) rather than by ⑦.
+pub proof fn held_frame_owner_observed(s: Sys, u: Sys, a: Dom, f: int)
+    requires
+        wf(s),
+        a_read_caps(s, a) == a_read_caps(u, a),
+        s.maps.contains((a, f)),
+    ensures
+        s.owner[f] == u.owner[f],
+{
+    let j = choose|j: int| 0 <= j < s.maps.len() && s.maps[j] == (a, f);
+    assert(map_backed(s, j));
+    let g = choose|g: int|
+        s.grants.dom().contains(g) && s.grants[g].active && s.grants[g].grantor
+            == s.owner[s.maps[j].1] && s.grants[g].grantee == s.maps[j].0 && s.grants[g].frame
+            == s.maps[j].1;
+    // `g` is one of `a`'s read-caps (grantee `a`), so both states carry the same cap for it: the
+    // same `frame` (== f) and the same `owner` (== the frame's owner on each side).
+    assert(s.grants[g].grantee == a && s.grants[g].frame == f);
+    assert(a_read_caps(s, a).dom().contains(g));
+    assert(a_read_caps(s, a)[g].frame == f && a_read_caps(s, a)[g].owner == s.owner[f]);
+    assert(a_read_caps(u, a).dom().contains(g));
+    assert(u.grants[g].frame == f);
+    assert(a_read_caps(u, a)[g].owner == u.owner[f]);
 }
 
 /// A domain id (the security principal). `int` is the ∀-N honest domain (only identity/size
@@ -367,13 +502,36 @@ pub open spec fn destroy_guard(s: Sys, caller: Dom, target: Dom) -> bool {
     caller == target || s.controls.contains((caller, target))
 }
 
-/// `a` has a **reach relationship** with `c` — an outbound reference the destroy of `c` would
-/// clear: `a` holds a port toward `c` (signal cleanup), `a` granted actively to `c` (consent
-/// revoke + frame drain), or `a` *reads* from `c` (`c` is the grantor of, or owns a frame behind,
-/// a grant `a` holds — the read direction, finding #3). The per-target content of the
-/// `noninterference::teardown_reach` term, extended with the read direction `obs⁺` demands.
+/// `a` has an **outbound reach relationship** with `c` — a reference *`a` holds naming `c`* that
+/// the destroy of `c` would clear: `a` holds a port toward `c` (signal cleanup), or `a` granted
+/// actively to `c` (consent revoke + frame drain). The per-target content of the
+/// `noninterference::teardown_reach` term.
+///
+/// **The read direction is no longer here (⑦).** It used to carry `reads_from(s, a, c)` because
+/// the read-closure sat on the integrity surface; now that `obs` is the narrow surface and the
+/// read-closure lives on [`ObsPlus`], losing a read-cap is a *confidentiality* event, governed by
+/// `step_consistent` — which needs no channel relation at all. What survives on the integrity side
+/// is the **borrow** direction ([`borrows_from`]), and it is deliberately *not* folded in here:
+/// borrowing points the other way (`c` granted to `a`), so it is [`teardown_borrow`]'s business, and
+/// `teardown_reach` would be wrong to carry it — the two halves need different `c == b` treatment.
 pub open spec fn reach(s: Sys, a: Dom, c: Dom) -> bool {
-    a_holds_port_toward(s, a, c) || a_grants_to(s, a, c) || reads_from(s, a, c)
+    a_holds_port_toward(s, a, c) || a_grants_to(s, a, c)
+}
+
+/// `a` **borrows from** `c` — `a` holds a live grant map over a frame `c` owns. This is precisely
+/// what `c`'s teardown force-reclaims (its `drain_pred` drops every map over a `c`-owned frame), so
+/// it is a write to `a`'s [`a_held_maps`] — the `held` component ⑦ added to [`Obs`] for exactly this
+/// reason. Note it is **not** a write to `a`'s `frame_maps`: those are the maps over frames `a`
+/// *owns*, and a borrowed frame is by definition owned by someone else. Conflating the two is what
+/// made the borrow flow look invisible here.
+///
+/// The mirror of `hv-sim::noninterference::a_borrows_from` (⑦). That bridge predicate also counts a
+/// page-table edge of `a`'s rooted at a `c`-owned frame; this model has no page tables, a declared
+/// modelling boundary (`docs/TIER-D-NONINTERFERENCE.md` §4a) — the grant-map half is the whole of
+/// the borrow relation *here*.
+pub open spec fn borrows_from(s: Sys, a: Dom, c: Dom) -> bool {
+    exists|i: int| #![trigger s.maps[i]]
+        0 <= i < s.maps.len() && (s.maps[i]).0 == a && s.owner[(s.maps[i]).1] == c
 }
 
 /// The **teardown-reach** channel — the intransitive two-hop: `caller` controls some `c` that `a`
@@ -381,6 +539,32 @@ pub open spec fn reach(s: Sys, a: Dom, c: Dom) -> bool {
 /// (`docs/TIER-D-NONINTERFERENCE.md` §2.4; `unwinding_destroy.rs`).
 pub open spec fn teardown_reach(s: Sys, b: Dom, a: Dom) -> bool {
     exists|c: Dom| #![trigger s.controls.contains((b, c))] s.controls.contains((b, c)) && reach(s, a, c)
+}
+
+/// The **teardown-borrow** channel — the *inbound* half of the two-hop, and the term that replaces
+/// the old blanket `reads_from(s, a, b)` disjunct of [`interferes`] (⑦). `b` destroying a `c` that
+/// `a` borrows from force-reclaims the page `a` was mapping, which `a` observes.
+///
+/// **The quantifier includes `c == b` — the self-destroy case — and it is load-bearing**, exactly as
+/// in the bridge (`Channels::teardown_borrow_from`, design-lesson #61d). [`teardown_reach`] can omit
+/// it because when `b` tears *itself* down, `a`'s outbound reference to `b` is a port `a` opened
+/// toward `b` or a grant `a` offered `b` — already named by the *direct* signal and consent
+/// disjuncts. The borrow direction has no such direct term: `a` borrowing from `b` means **`b`
+/// granted to `a`**, the opposite of `a_grants_to(s, a, b)`. Self-authority is inherent rather than
+/// an edge (`controls` never contains `(b, b)`), so it has to be spelled out.
+///
+/// **This term is FORCED, and it was not forced until ⑦ widened `Obs`** — a distinction worth
+/// recording, because getting it backwards is how a channel relation silently loosens. With `Obs`
+/// carrying only [`a_frame_maps`] (the maps over frames `a` *owns*), `local_respect_holds` verifies
+/// with this disjunct **deleted**: the borrow write landed outside the observation, so the model
+/// could not see the flow and the narrower relation looked sound. Adding [`a_held_maps`] is what
+/// makes the write visible and the disjunct load-bearing — delete it now and the destroy case fails.
+/// So the term is here because the machine demands it, not because the bridge has one; a disjunct
+/// added on the strength of the bridge alone would have been an unforced widening, i.e. a quietly
+/// weaker theorem. The way to tell the two apart is to *try removing it* and watch what happens.
+pub open spec fn teardown_borrow(s: Sys, b: Dom, a: Dom) -> bool {
+    exists|c: Dom| #![trigger borrows_from(s, a, c)]
+        (c == b || s.controls.contains((b, c))) && borrows_from(s, a, c)
 }
 
 /// The transition function — `dispatch(caller, α)`. `DomainCreate` sets `life[target]` when its
@@ -454,9 +638,11 @@ pub open spec fn step(s: Sys, t: Trans) -> Sys {
 // The observation `obs(a)` and the authorized-channel relation `interferes`.
 // ============================================================================================
 
-/// Domain `a`'s observation — its isolation surface, projected from `Sys`. Grows one field per
-/// class. **`maycreate` is `a`'s OWN creation authority** — the GAP-C `obs`-refinement (module
-/// docs): without it `step_consistent()` is false for the creation channel.
+/// Domain `a`'s **integrity** observation — its isolation surface, projected from `Sys`. Grows one
+/// field per class. **`maycreate` is `a`'s OWN creation authority** — the GAP-C `obs`-refinement
+/// (module docs): without it `step_consistent()` is false for the creation channel.
+///
+/// **This is the narrow surface (⑦).** It deliberately carries no read-closure: see [`ObsPlus`].
 pub struct Obs {
     /// `life[a]`.
     pub live: bool,
@@ -479,9 +665,10 @@ pub struct Obs {
     /// frames (per-frame count = `a`'s owned-frame reference load). A peer's authorized
     /// `GrantMap` of `a`'s grant appends here; a `DomainDestroy` cascade drains it.
     pub frame_maps: Seq<(Dom, int)>,
-    /// `a`'s **read-closure** (`obs⁺`) — read-caps for grants naming `a` as grantee. The
-    /// confidentiality read direction (`read_closure.rs`).
-    pub read_caps: Map<int, ReadCap>,
+    /// `a`'s **held-map population** — the maps `a` itself has made ([`a_held_maps`]). The
+    /// **borrow** surface, added by ⑦ so that the read-direction teardown flow is *visible* to the
+    /// integrity condition instead of falling outside it.
+    pub held: Seq<(Dom, int)>,
     /// `a`'s **vCPU affinities**.
     pub aff: Map<int, nat>,
     /// `a`'s **incoming control edges** — who controls `a` (self-authority; GAP-C).
@@ -502,11 +689,36 @@ pub open spec fn obs(s: Sys, a: Dom) -> Obs {
         grows: a_grant_rows(s, a),
         owned: a_owned_frames(s, a),
         frame_maps: a_frame_maps(s, a),
-        read_caps: a_read_caps(s, a),
+        held: a_held_maps(s, a),
         aff: a_affinity(s, a),
         controllers: a_controllers(s, a),
         controls_out: a_controls_out(s, a),
     }
+}
+
+/// Domain `a`'s **confidentiality** observation, `obs⁺` — [`Obs`] extended with the read-closure.
+///
+/// **The two surfaces are different, and that is the point (⑦; design-lesson #58).** Integrity
+/// (`local_respect`) asks what an unauthorized principal can *do to* `a`; confidentiality
+/// (`step_consistent`) asks what `a` can *learn*. A grantor freely **creating** an offer to `a`
+/// moves `a`'s read-caps — and that is not integrity interference, because a domain cannot stop
+/// others revealing themselves to it. Carrying the read-closure on the integrity surface therefore
+/// forced [`interferes`] to name a *blanket* read term (`reads_from(a, b)`: any grantor of `a`
+/// interferes with `a` for **every** transition), which made Theorem A strictly weaker than it
+/// needed to be — weaker, in particular, than what the real-code bridge
+/// (`hv-sim::noninterference`) had been demonstrating with its own two-surface split all along.
+/// Splitting here removes that term and closes the bridge↔composition divergence.
+pub struct ObsPlus {
+    /// The integrity surface, carried entire — `obs⁺ ⊇ obs`.
+    pub base: Obs,
+    /// `a`'s **read-closure** — read-caps for grants naming `a` as grantee. The confidentiality
+    /// read direction (`read_closure.rs`), and the sole thing `obs⁺` adds.
+    pub read_caps: Map<int, ReadCap>,
+}
+
+/// `obs⁺(s, a)` — the confidentiality projection: [`obs`] plus the read-closure.
+pub open spec fn obs_plus(s: Sys, a: Dom) -> ObsPlus {
+    ObsPlus { base: obs(s, a), read_caps: a_read_caps(s, a) }
 }
 
 /// `a` holds a port toward `b`: some interdomain port owned by `a` whose peer lies in domain `b`
@@ -545,6 +757,36 @@ pub open spec fn drain_pred(owner: Map<int, Dom>, c: Dom) -> spec_fn((Dom, int))
 /// The "map is not `c`'s" predicate — `obs(a)`'s frame maps with `c`'s dropped (step consistency).
 pub open spec fn not_c_pred(c: Dom) -> spec_fn((Dom, int)) -> bool {
     |m: (Dom, int)| m.0 != c
+}
+
+/// The "this map's frame is not `c`'s" predicate — the *held*-side form of the destroy drain
+/// (step consistency). Its dual: [`not_c_pred`] drops the maps `c` **made**, this drops the maps
+/// made over the frames `c` **owned**.
+pub open spec fn not_c_owner_pred(owner: Map<int, Dom>, c: Dom) -> spec_fn((Dom, int)) -> bool {
+    |m: (Dom, int)| owner[m.1] != c
+}
+
+/// The "`(mapper, frame)` was mapped **by** `a`" predicate — projects the global map population
+/// onto the maps `a` *holds*, whatever frame they name. The mirror image of [`a_frame_pred`],
+/// which projects onto the maps *over* `a`'s frames.
+pub open spec fn a_held_pred(a: Dom) -> spec_fn((Dom, int)) -> bool {
+    |m: (Dom, int)| m.0 == a
+}
+
+/// `a`'s **held-map population** — the live maps `a` has made over *other* domains' frames (and
+/// its own). The surface the ②′-(c) **borrow** channel moves: when the frame's owner is destroyed,
+/// `drain_foreign_maps_of` force-reclaims `a`'s map and the page vanishes from under it.
+///
+/// **This component is what ⑦ added (`held`), and adding it is what *forces* [`teardown_borrow`].**
+/// Before it, `Obs` carried only [`a_frame_maps`] — the maps over frames `a` **owns** — so a map
+/// `a` *held* over a peer's frame was in the peer's observation and in nobody else's. The borrow
+/// flow was therefore not absent from the model but **invisible** to it, and a channel relation
+/// that omitted it looked sound only because the surface could not see the write. The real-code
+/// bridge (`hv-sim::noninterference::obs`) has carried handle-indexed held-maps since ②′-(d), so
+/// this closes a surface divergence, not merely a term divergence: with `held` in place the
+/// machine *demands* `teardown_borrow`, which is the only honest reason to write it down.
+pub open spec fn a_held_maps(s: Sys, a: Dom) -> Seq<(Dom, int)> {
+    s.maps.filter(a_held_pred(a))
 }
 
 /// `a`'s **frame-map population** — the live map population restricted to frames `a` owns. Its
@@ -635,17 +877,153 @@ pub open spec fn a_controls_out(s: Sys, a: Dom) -> Set<(Dom, Dom)> {
 ///   pending bit);
 /// * **consent** — `a` has an active grant with grantee `b` (`b` may map it, moving `a`'s frame
 ///   refs and grant map-counts);
-/// * **read (`⇝⁺`)** — `b` controls what `a` reads through a grant it holds (grantor / frame owner
-///   — `read_closure.rs`), the confidentiality dual;
-/// * **authority** — `b` controls `a` (may set `a`'s vCPU affinity, or destroy `a`).
+/// * **authority** — `b` controls `a` (may set `a`'s vCPU affinity, or destroy `a`);
+/// * **teardown-reach** — the intransitive outbound two-hop ([`teardown_reach`]);
+/// * **teardown-borrow** — its inbound twin ([`teardown_borrow`]).
+///
+/// **⑦ removed a blanket `reads_from(s, a, b)` disjunct** that used to sit between *consent* and
+/// *authority*. It authorized **any** grantor of `a` to move `obs(a)` via **any** transition — a
+/// far wider licence than the flow it was there to name, which is the *self-destroy borrow*
+/// ([`teardown_borrow`]'s `c == b` arm). It was unavoidable only while the read-closure sat on the
+/// integrity surface; with the [`Obs`]/[`ObsPlus`] split it is not, and Theorem A is correspondingly
+/// stronger — a grantor no longer interferes with its grantee merely by having offered.
+/// The relation now has the same shape, term for term, as the real-code bridge's
+/// `hv-sim::noninterference::Channels::authorized`.
 pub open spec fn interferes(s: Sys, b: Dom, a: Dom) -> bool {
+    ||| b == a
+    ||| (s.maycreate.contains(b) && !s.live.contains(a))
+    ||| a_holds_port_toward(s, a, b)
+    ||| a_grants_to(s, a, b)
+    ||| s.controls.contains((b, a))
+    ||| teardown_reach(s, b, a)
+    ||| teardown_borrow(s, b, a)
+}
+
+// ============================================================================================
+// ⑦'s own check: that this rung STRENGTHENED the theorem rather than moving it sideways.
+//
+// A channel relation can be edited in two indistinguishable-looking ways: narrowed (the theorem
+// says more) or merely re-shuffled (it says the same thing in new words — and a previous probe in
+// this arc produced exactly that, a "strengthening" that instantiated to a tautology). Prose
+// cannot tell them apart, so the pre-⑦ relation is kept below and the comparison is PROVEN:
+// containment one way (`interferes_shrank`) plus a witness refuting the other
+// (`interferes_shrank_strictly`). Together they are the machine-checked statement
+// "`interferes ⊊ interferes_pre7`", hence "Theorem A is strictly stronger than it was".
+// ============================================================================================
+
+/// The **pre-⑦ reach relation** — [`reach`] as it stood while the read-closure sat on the
+/// integrity surface, i.e. with the read direction included. Archival, for the comparison below.
+pub open spec fn reach_pre7(s: Sys, a: Dom, c: Dom) -> bool {
+    a_holds_port_toward(s, a, c) || a_grants_to(s, a, c) || reads_from(s, a, c)
+}
+
+/// The **pre-⑦ teardown-reach channel** — [`teardown_reach`] over [`reach_pre7`]. Archival.
+pub open spec fn teardown_reach_pre7(s: Sys, b: Dom, a: Dom) -> bool {
+    exists|c: Dom| #![trigger s.controls.contains((b, c))]
+        s.controls.contains((b, c)) && reach_pre7(s, a, c)
+}
+
+/// **The pre-⑦ channel relation, verbatim** — what `interferes` was before this rung: a single
+/// read-closed `Obs`, and therefore a *blanket* `reads_from(s, a, b)` disjunct plus a read-closed
+/// `reach`. Kept only as the comparison point for [`interferes_shrank`] and
+/// [`interferes_shrank_strictly`]; nothing else references it.
+pub open spec fn interferes_pre7(s: Sys, b: Dom, a: Dom) -> bool {
     ||| b == a
     ||| (s.maycreate.contains(b) && !s.live.contains(a))
     ||| a_holds_port_toward(s, a, b)
     ||| a_grants_to(s, a, b)
     ||| reads_from(s, a, b)
     ||| s.controls.contains((b, a))
-    ||| teardown_reach(s, b, a)
+    ||| teardown_reach_pre7(s, b, a)
+}
+
+/// **`interferes ⊆ interferes_pre7`** — every channel ⑦ still authorizes was authorized before, so
+/// the new relation licenses nothing new and `local_respect` over it is at least as strong.
+///
+/// The only non-trivial arm is the *new* [`teardown_borrow`] term: it is subsumed because a live
+/// borrow implies a grant. `a` holding a map over a `c`-owned frame forces, by [`map_identity`], an
+/// active grant with grantor `c` and grantee `a` — that is `reads_from(s, a, c)`. For the
+/// self-destroy arm (`c == b`) that is the pre-⑦ blanket disjunct directly; otherwise
+/// `controls[b][c]` plus `reads_from(s, a, c)` is the pre-⑦ read-closed `teardown_reach`. So
+/// widening `interferes` with `teardown_borrow` did **not** cost anything: the flow was already
+/// authorized before, far more loosely, by the blanket term ⑦ removed.
+pub proof fn interferes_shrank(s: Sys, b: Dom, a: Dom)
+    requires
+        wf(s),
+        interferes(s, b, a),
+    ensures
+        interferes_pre7(s, b, a),
+{
+    if teardown_borrow(s, b, a) {
+        let c = choose|c: Dom| (c == b || s.controls.contains((b, c))) && borrows_from(s, a, c);
+        let i = choose|i: int| 0 <= i < s.maps.len() && (s.maps[i]).0 == a && s.owner[(s.maps[i]).1]
+            == c;
+        assert(map_backed(s, i));  // wf: the map is witnessed by an active backing grant
+        let g = choose|g: int|
+            s.grants.dom().contains(g) && s.grants[g].active && s.grants[g].grantor
+                == s.owner[s.maps[i].1] && s.grants[g].grantee == s.maps[i].0 && s.grants[g].frame
+                == s.maps[i].1;
+        assert(s.grants[g].grantee == a && s.grants[g].grantor == c);
+        assert(reads_from(s, a, c));  // the witness grant `g`
+        if c != b {
+            assert(reach_pre7(s, a, c));
+            assert(teardown_reach_pre7(s, b, a));  // witness `c`
+        }
+    } else if teardown_reach(s, b, a) {
+        let c = choose|c: Dom| s.controls.contains((b, c)) && reach(s, a, c);
+        assert(reach_pre7(s, a, c));  // `reach ⊆ reach_pre7` — ⑦ only REMOVED a disjunct
+        assert(teardown_reach_pre7(s, b, a));
+    }
+}
+
+/// **…and the containment is STRICT** — a witness state where the pre-⑦ relation authorizes `b ⇝ a`
+/// and the post-⑦ one does not. So [`interferes_shrank`] is a real narrowing, not an equality
+/// dressed up as one.
+///
+/// The witness is the plain **unexercised offer**: `b` owns frame 7 and has an active grant of it to
+/// `a`, which `a` has not mapped. Pre-⑦ that made `b` interfere with `a` for **every** transition —
+/// `b` could not so much as set its own vCPU's affinity without the theorem giving up on `a`.
+/// Post-⑦ it authorizes nothing: `b` has offered, and until `a` takes the offer up there is no live
+/// map for `b`'s teardown to reclaim, hence no write to `a`'s surface at all. **The channel opens
+/// when the borrow does, not when the offer does** — which is precisely the distinction the single
+/// read-closed `Obs` could not draw, and the reason ⑦'s Theorem A is stronger.
+pub proof fn interferes_shrank_strictly() -> (r: (Sys, Dom, Dom))
+    ensures
+        wf(r.0),
+        r.1 != r.2,
+        interferes_pre7(r.0, r.1, r.2),
+        !interferes(r.0, r.1, r.2),
+{
+    let g0 = GrantRec { grantor: 1, grantee: 0, frame: 7, active: true, count: 0 };
+    let s = Sys {
+        live: set![0int, 1int],
+        maycreate: Set::empty(),
+        peer: Map::empty(),
+        pending: Set::empty(),
+        grants: map![0int => g0],
+        owner: map![7int => 1int],
+        maps: Seq::empty(),
+        controls: Set::empty(),
+        vowner: Map::empty(),
+        vaff: Map::empty(),
+    };
+    assert(involution(s.peer));
+    assert(map_identity(s));  // no live maps at all
+    assert(wf(s));
+    assert(reads_from(s, 0, 1)) by {
+        assert(s.grants.dom().contains(0int) && s.grants[0int].grantee == 0
+            && s.grants[0int].grantor == 1);
+    }
+    assert(interferes_pre7(s, 1, 0));
+    // Post-⑦: the offer is not a channel. No port, no grant BY `a`, no control edge, and — the
+    // point — no live map, so neither teardown term can find a witness.
+    assert(!a_holds_port_toward(s, 0, 1));
+    assert(!a_grants_to(s, 0, 1));
+    assert(forall|c: Dom| !borrows_from(s, 0, c));
+    assert(!teardown_borrow(s, 1, 0));
+    assert(!teardown_reach(s, 1, 0));
+    assert(!interferes(s, 1, 0));
+    (s, 1, 0)
 }
 
 // ============================================================================================
@@ -867,13 +1245,25 @@ pub open spec fn local_respect() -> bool {
             == obs(s, a)
 }
 
-/// **Step consistency** — `obs(a)`'s successor is a function of `obs(a)` and the actor's
+/// **Step consistency** — `obs⁺(a)`'s successor is a function of `obs⁺(a)` and the actor's
 /// observation. (The meta-theorem's premise; here a discharged theorem.)
+///
+/// Stated over [`obs_plus`], **not** [`obs`] (⑦): confidentiality is asked over the *wider* surface,
+/// because the read-closure is exactly what `a` can learn and losing a read-cap is something `a`
+/// observes. Note this condition needs no channel relation at all — it is pure determinism — which
+/// is why widening its surface costs nothing on the integrity side, and why the two conditions can
+/// sit at different surfaces without either weakening the other.
+///
+/// Note also the quantification: `a` ranges over **every** domain, *including* `actor(t)`. The
+/// real-code bridge used to skip that case and was thereby checking a strictly weaker property than
+/// this one; ⑥ fixed the bridge to match (four channels were hiding in it).
 pub open spec fn step_consistent() -> bool {
     forall|s: Sys, u: Sys, t: Trans, a: Dom|
-        #![trigger obs(step(s, t), a), obs(step(u, t), a)]
-        wf(s) && wf(u) && obs(s, a) == obs(u, a) && obs(s, actor(t)) == obs(u, actor(t))
-            ==> obs(step(s, t), a) == obs(step(u, t), a)
+        #![trigger obs_plus(step(s, t), a), obs_plus(step(u, t), a)]
+        wf(s) && wf(u) && obs_plus(s, a) == obs_plus(u, a) && obs_plus(s, actor(t)) == obs_plus(
+            u,
+            actor(t),
+        ) ==> obs_plus(step(s, t), a) == obs_plus(step(u, t), a)
 }
 
 /// **Local respect holds for the concrete system** (∀-N). Case-split over the transition class;
@@ -942,11 +1332,8 @@ pub proof fn local_respect_holds()
                     broadcast use Seq::lemma_filter_push;
                     assert(!(a_frame_pred(s.owner, a))((mapper, f)));
                     assert(obs(step(s, t), a).frame_maps == obs(s, a).frame_maps);
-                    // Read-closure: the mapped grant has grantee == mapper == b != a, so it is not
-                    // one of `a`'s held grants; `a`'s read-caps (and the owners behind them) are
-                    // untouched.
-                    assert(rec.grantee == mapper && mapper != a);
-                    assert(obs(step(s, t), a).read_caps =~= obs(s, a).read_caps);
+                    // (The read-closure needs no argument here: it is not on the integrity
+                    // surface — `step_consistent_holds` carries it over `obs⁺`. ⑦)
                 }
                 assert(obs(step(s, t), a) == obs(s, a));
             },
@@ -1021,16 +1408,33 @@ pub proof fn local_respect_holds()
                     }
                     compound_drain_preserves(s.maps, s.owner, a, c);
                     assert(obs(step(s, t), a).frame_maps == obs(s, a).frame_maps);
-                    // read-caps: `a`'s held grants survive (grantee `a != c`; no grant `a` holds has
-                    // grantor `c`, else `reads_from(a, c)` — ¬reach). `owner` is untouched.
-                    assert(!reads_from(s, a, c));  // ¬reach
-                    assert_maps_equal!(obs(step(s, t), a).read_caps, obs(s, a).read_caps, g => {
-                        assert(obs(s, a).read_caps.dom().contains(g) == (s.grants.dom().contains(g)
-                            && s.grants[g].grantee == a));
-                        if s.grants.dom().contains(g) && s.grants[g].grantee == a {
-                            assert(s.grants[g].grantor != c);  // ¬reads_from (grantor-c disjunct)
+                    // held maps: the drain also force-reclaims the maps `a` holds over `c`-OWNED
+                    // frames — the ②′-(c) BORROW flow, and the one `obs` component whose teardown
+                    // is not covered by ¬reach (`reach` is the *outbound* direction: `a` naming
+                    // `c`. Borrowing is the inbound one — `c` granted to `a`). ¬interferes supplies
+                    // ¬teardown_borrow(caller, a), and the destroy guard itself witnesses that
+                    // term's `(c == caller ∨ controls[caller][c])` conjunct at `c' := c` — so
+                    // ¬borrows_from(a, c), and the drain is a no-op on `a`'s held population.
+                    // **This is the disjunct ⑦ let the machine force rather than assuming.**
+                    assert(!borrows_from(s, a, c)) by {
+                        if borrows_from(s, a, c) {
+                            assert(c == caller || s.controls.contains((caller, c)));  // guard
+                            assert(teardown_borrow(s, caller, a));  // witness c' := c ⟹ interferes, ⊥
                         }
-                    });
+                    }
+                    assert forall|i: int| #![trigger s.maps[i]]
+                        0 <= i < s.maps.len() implies !(s.maps[i].0 == a && s.owner[s.maps[i].1]
+                        == c) by {
+                        if s.maps[i].0 == a && s.owner[s.maps[i].1] == c {
+                            assert(borrows_from(s, a, c));  // the witness index, ⊥
+                        }
+                    }
+                    held_drain_preserves(s.maps, s.owner, a, c);
+                    assert(obs(step(s, t), a).held == obs(s, a).held);
+                    // (Read-caps are not on the integrity surface — ⑦. Destroying `a`'s grantor
+                    // *does* drop `a`'s read-cap, but that is a confidentiality event, carried by
+                    // `step_consistent_holds` over `obs⁺`, which needs no channel relation. This is
+                    // exactly why the blanket `reads_from` disjunct could leave `interferes`.)
                 }
                 assert(obs(step(s, t), a) == obs(s, a));
             },
@@ -1039,22 +1443,36 @@ pub proof fn local_respect_holds()
 }
 
 /// **Step consistency holds for the concrete system** (∀-N). The creation channel factors through
-/// the read-closed `obs`: the successor `life[a]` depends only on `life[a]` (in `obs(a)`) and
+/// the read-closed `obs⁺`: the successor `life[a]` depends only on `life[a]` (in `obs(a)`) and
 /// `may_create[creator]` (in `obs(creator)` — the GAP-C refinement); `maycreate` is unchanged.
-/// Two states agreeing on both observations compute the same successor `obs(a)`.
+/// Two states agreeing on both observations compute the same successor `obs⁺(a)`.
+///
+/// **Stated and proved over `obs⁺` (⑦).** `ObsPlus` is a two-field datatype, so the obligation
+/// splits structurally into the integrity surface and the read-closure; the body establishes both
+/// components per arm, and the hypothesis is likewise destructured on entry. That is the entire
+/// mechanical cost of the surface split on this side — confidentiality needs no channel relation,
+/// so nothing here has to be re-argued, only re-projected.
 pub proof fn step_consistent_holds()
     ensures
         step_consistent(),
 {
     assert forall|s: Sys, u: Sys, t: Trans, a: Dom|
-        wf(s) && wf(u) && obs(s, a) == obs(u, a) && obs(s, actor(t)) == obs(u, actor(t)) implies
-        #[trigger] obs(step(s, t), a) == #[trigger] obs(step(u, t), a) by {
+        wf(s) && wf(u) && obs_plus(s, a) == obs_plus(u, a) && obs_plus(s, actor(t)) == obs_plus(
+            u,
+            actor(t),
+        ) implies #[trigger] obs_plus(step(s, t), a) == #[trigger] obs_plus(step(u, t), a) by {
+        // Destructure the hypothesis: `obs⁺` agreement is agreement on `obs` and on the read-closure.
+        assert(obs(s, a) == obs(u, a));
+        assert(a_read_caps(s, a) == a_read_caps(u, a));
+        assert(obs(s, actor(t)) == obs(u, actor(t)));
+        assert(a_read_caps(s, actor(t)) == a_read_caps(u, actor(t)));
         match t {
             Trans::Create { creator, target } => {
                 // obs(·,a).live == live.contains(a); obs(·,creator).maycreate ==
                 // maycreate.contains(creator). Both agree across s,u, so the guard (for target==a)
                 // and the write agree; for target!=a, life[a] is untouched on both sides.
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::Send { sender, port } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
@@ -1083,6 +1501,7 @@ pub proof fn step_consistent_holds()
                 }
                 assert(obs(step(s, t), a).pend =~= obs(step(u, t), a).pend);
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::GrantMap { mapper, g } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
@@ -1167,12 +1586,12 @@ pub proof fn step_consistent_holds()
                 broadcast use vstd::map_lib::group_map_properties;
                 let reads = s.grants.dom().contains(g) && s.grants[g].grantee == a;
                 assert(reads == (u.grants.dom().contains(g) && u.grants[g].grantee == a)) by {
-                    assert(obs(s, a).read_caps.dom().contains(g) == reads);
-                    assert(obs(u, a).read_caps.dom().contains(g) == (u.grants.dom().contains(g)
+                    assert(a_read_caps(s, a).dom().contains(g) == reads);
+                    assert(a_read_caps(u, a).dom().contains(g) == (u.grants.dom().contains(g)
                         && u.grants[g].grantee == a));
                 }
                 if reads {
-                    assert(obs(s, a).read_caps[g] == obs(u, a).read_caps[g]);
+                    assert(a_read_caps(s, a)[g] == a_read_caps(u, a)[g]);
                     let fr = s.grants[g].frame;
                     // Record + frame owner pinned by the read-cap (the `owner` component).
                     assert(s.grants[g].grantor == u.grants[g].grantor && fr == u.grants[g].frame
@@ -1181,17 +1600,18 @@ pub proof fn step_consistent_holds()
                     assert(s.owner.dom().contains(fr) && u.owner.dom().contains(fr));  // wf
                     assert(grant_map_guard(s, mapper, g) == grant_map_guard(u, mapper, g));
                 }
-                assert_maps_equal!(obs(step(s, t), a).read_caps, obs(step(u, t), a).read_caps, k => {
+                assert_maps_equal!(a_read_caps(step(s, t), a), a_read_caps(step(u, t), a), k => {
                     if k != g {
                         assert(step(s, t).grants[k] == s.grants[k]);
                         assert(step(u, t).grants[k] == u.grants[k]);
-                        assert(obs(s, a).read_caps.dom().contains(k) == obs(u, a).read_caps.dom().contains(k));
-                        if obs(s, a).read_caps.dom().contains(k) {
-                            assert(obs(s, a).read_caps[k] == obs(u, a).read_caps[k]);
+                        assert(a_read_caps(s, a).dom().contains(k) == a_read_caps(u, a).dom().contains(k));
+                        if a_read_caps(s, a).dom().contains(k) {
+                            assert(a_read_caps(s, a)[k] == a_read_caps(u, a)[k]);
                         }
                     }
                 });
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::SetAffinity { caller, vcpu, aff } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
@@ -1227,6 +1647,7 @@ pub proof fn step_consistent_holds()
                     }
                 });
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::Destroy { caller, target } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas,
@@ -1274,25 +1695,55 @@ pub proof fn step_consistent_holds()
                     frame_maps_destroyed(u.maps, u.owner, a, c);
                     assert(obs(s, a).frame_maps == obs(u, a).frame_maps);
                     assert(obs(step(s, t), a).frame_maps == obs(step(u, t), a).frame_maps);
+                    // ---- held maps ---- the survivors are `obs(a).held` minus the maps naming a
+                    // `c`-OWNED frame (or empty when `a == c`). Unlike every other component this is
+                    // NOT a function of `obs(a)` alone: it tests `owner` at frames `a` does not own,
+                    // which the integrity surface deliberately omits. It IS a function of `obs⁺(a)`
+                    // — `held_frame_owner_observed` recovers each such owner from the read-caps via
+                    // `map_identity`. **This is the ⑦ split earning its keep in the other
+                    // direction**: the wider surface is what makes the borrow component
+                    // deterministic, so `held` can sit on `obs` without `obs` having to grow a
+                    // foreign-ownership field.
+                    held_maps_destroyed(s.maps, s.owner, a, c);
+                    held_maps_destroyed(u.maps, u.owner, a, c);
+                    let held = s.maps.filter(a_held_pred(a));
+                    assert(held == u.maps.filter(a_held_pred(a)));  // obs(a).held agreement
+                    if a != c {
+                        broadcast use Seq::lemma_filter_pred, Seq::lemma_filter_contains_rev;
+                        assert forall|i: int| 0 <= i < held.len() implies (not_c_owner_pred(
+                            s.owner,
+                            c,
+                        ))(held[i]) == (not_c_owner_pred(u.owner, c))(held[i]) by {
+                            assert(held.contains(held[i]));
+                            assert((a_held_pred(a))(held[i]));  // filter_pred: mapped BY `a`
+                            assert(held[i] == (a, held[i].1));
+                            assert(s.maps.contains(held[i]));  // filter_contains_rev
+                            held_frame_owner_observed(s, u, a, held[i].1);
+                        }
+                        filter_ext(held, not_c_owner_pred(s.owner, c), not_c_owner_pred(u.owner, c));
+                    }
+                    assert(obs(step(s, t), a).held == obs(step(u, t), a).held);
                     // ---- read-caps ---- a held grant survives iff grantor `≠ c` (and not an active
                     // self-grant when `a == c`) — a function of `obs(a).read_caps[g]`; `owner` fixed.
-                    assert_maps_equal!(obs(step(s, t), a).read_caps, obs(step(u, t), a).read_caps, g => {
-                        assert(obs(s, a).read_caps.dom().contains(g) == (s.grants.dom().contains(g)
+                    assert_maps_equal!(a_read_caps(step(s, t), a), a_read_caps(step(u, t), a), g => {
+                        assert(a_read_caps(s, a).dom().contains(g) == (s.grants.dom().contains(g)
                             && s.grants[g].grantee == a));
-                        assert(obs(u, a).read_caps.dom().contains(g) == (u.grants.dom().contains(g)
+                        assert(a_read_caps(u, a).dom().contains(g) == (u.grants.dom().contains(g)
                             && u.grants[g].grantee == a));
-                        assert(obs(s, a).read_caps.dom().contains(g) == obs(u, a).read_caps.dom().contains(g));
-                        if obs(s, a).read_caps.dom().contains(g) {
-                            assert(obs(s, a).read_caps[g] == obs(u, a).read_caps[g]);
+                        assert(a_read_caps(s, a).dom().contains(g) == a_read_caps(u, a).dom().contains(g));
+                        if a_read_caps(s, a).dom().contains(g) {
+                            assert(a_read_caps(s, a)[g] == a_read_caps(u, a)[g]);
                             assert(s.grants[g].grantor == u.grants[g].grantor
                                 && s.grants[g].active == u.grants[g].active
                                 && s.grants[g].grantee == u.grants[g].grantee);
                         }
                     });
                     assert(obs(step(s, t), a) == obs(step(u, t), a));
+                    assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
                 } else {
                     // Neither destroy fires: both states are unchanged and already obs(a)-agree.
                     assert(obs(step(s, t), a) == obs(step(u, t), a));
+                    assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
                 }
             },
         }
@@ -1331,14 +1782,15 @@ pub open spec fn trace_noninterfering(s: Sys, tr: Seq<Trans>, a: Dom) -> bool
     }
 }
 
-/// Two executions agree, at each step, on the acting domain's observation.
+/// Two executions agree, at each step, on the acting domain's observation — at the
+/// **confidentiality** surface `obs⁺` (⑦), the surface `step_consistent` is stated over.
 pub open spec fn traces_agree_on_actor(s: Sys, u: Sys, tr: Seq<Trans>, a: Dom) -> bool
     decreases tr.len(),
 {
     if tr.len() == 0 {
         true
     } else {
-        obs(s, actor(tr[0])) == obs(u, actor(tr[0])) && traces_agree_on_actor(
+        obs_plus(s, actor(tr[0])) == obs_plus(u, actor(tr[0])) && traces_agree_on_actor(
             step(s, tr[0]),
             step(u, tr[0]),
             tr.subrange(1, tr.len() as int),
@@ -1368,23 +1820,29 @@ pub proof fn ni_theorem_a(s: Sys, tr: Seq<Trans>, a: Dom)
     }
 }
 
-/// **Theorem B (confidentiality), premise-free.** Two executions that start `obs(a)`-equivalent
-/// and agree at each step on the acting domain's observation stay `obs(a)`-equivalent throughout.
+/// **Theorem B (confidentiality), premise-free.** Two executions that start `obs⁺(a)`-equivalent
+/// and agree at each step on the acting domain's observation stay `obs⁺(a)`-equivalent throughout.
 /// Takes **no** `step_consistent()` premise — it invokes the discharged `step_consistent_holds`.
+///
+/// **Composed at the `obs⁺` surface (⑦), while [`ni_theorem_a`] stays at `obs`.** The two are
+/// separate inductions over separate unwinding conditions, so the surfaces need not agree: each
+/// theorem's induction only ever appeals to its own condition. Confidentiality reads the wider
+/// surface because the read-closure is what `a` can *learn*; integrity reads the narrower one
+/// because a grantor revealing itself to `a` is not something `a` is entitled to prevent.
 pub proof fn ni_theorem_b(s: Sys, u: Sys, tr: Seq<Trans>, a: Dom)
     requires
         wf(s),
         wf(u),
-        obs(s, a) == obs(u, a),
+        obs_plus(s, a) == obs_plus(u, a),
         traces_agree_on_actor(s, u, tr, a),
     ensures
-        obs(run(s, tr), a) == obs(run(u, tr), a),
+        obs_plus(run(s, tr), a) == obs_plus(run(u, tr), a),
     decreases tr.len(),
 {
     step_consistent_holds();
     if tr.len() > 0 {
         let act = tr[0];
-        assert(obs(step(s, act), a) == obs(step(u, act), a));
+        assert(obs_plus(step(s, act), a) == obs_plus(step(u, act), a));
         wf_step(s, act);
         wf_step(u, act);
         ni_theorem_b(step(s, act), step(u, act), tr.subrange(1, tr.len() as int), a);

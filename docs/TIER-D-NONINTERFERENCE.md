@@ -9,10 +9,13 @@ on real code (the enumerator bridge); every transition class proven ∀-N (five 
 local-respect lemmas); the **unwinding theorem** (`noninterference_theorem.rs`) assembles them into
 whole-system non-interference; the last mile (`step_consistency.rs`) reduces the confidentiality
 premise to the read direction; and the **read-closure** (`read_closure.rs`) discharges that via
-`obs⁺` and the extended relation `⇝⁺` (§5e–§5f). **§5g (`noninterference_instantiation.rs`, 14
+`obs⁺` and the extended relation `⇝⁺` (§5e–§5f). **§5g (`noninterference_instantiation.rs`, 19
 verified) turns the meta-theorem's `local_respect()`/`step_consistent()` *premises* into discharged
 theorems over a concrete carrier for ALL FIVE transition classes (including the `DomainDestroy`
-cascade), closing the "paper composition" GAP-C and forcing four `obs` corrections (see §2.1 + §5g).**
+cascade), closing the "paper composition" GAP-C and forcing four `obs` corrections (see §2.1 + §5g);
+§5h (⑦) then splits that carrier's single `obs` into the bridge's two surfaces, which lets a blanket
+`reads_from` disjunct leave `interferes` — `interferes ⊊ interferes_pre7` is itself proven — and adds
+the held-map component that makes the ②′-(c) borrow flow visible, and `teardown_borrow` forced.**
 This is the deepest and last tier of the true-diamond program — the
 "are we checking the **right** things" capstone. Tiers A–C prove the invariants hold in every
 reachable state, ∀-N; Tier D proves those invariants **collectively imply real isolation**. Read
@@ -159,8 +162,18 @@ We did not guess this — **the bridge found it** (§4).
 
 **Since ②′-(c) the term has a second, inbound half** (`Channels::teardown_borrow`):
 
-> `∃ c: controls[b][c] ∧ (a holds a live grant map over one of c's frames ∨ a has a page-table
-> edge into one)`.
+> `∃ c: (c == b ∨ controls[b][c]) ∧ (a holds a live grant map over one of c's frames ∨ a has a
+> page-table edge into one)`.
+
+Note the `c == b` disjunct, which the outbound half does **not** need. When `b` tears *itself* down,
+an outbound reference of `a`'s naming `b` is a grant `a` offered `b` or a port `a` opened toward `b`
+— already named by the direct consent and signal channels. The borrow direction has no such direct
+term, because `a` borrowing from `b` means **`b` granted to `a`**, the opposite of the consent
+channel's `a`-granted-to-`b`; and self-authority is inherent rather than an edge (`controls[b][b]`
+is always `Absent`), so it cannot be picked up by the `controls` conjunct either. A domain
+force-reclaiming, by dying, the page it had lent out would otherwise be an unauthorized flow with
+nothing to name it. The deep two-domain sweep found exactly that case (`1` destroys itself while `0`
+holds a map of `1`'s frame), and ⑦ (§5h) later had Verus force the same arm independently.
 
 Originally this was unnecessary, and the reason is instructive: a live foreign hold on `c`'s frames
 made destroy *refuse* (`DomainBusy`), so the only reachable effect on `obs(a)` was the cleanup of
@@ -725,7 +738,7 @@ the model level in both directions.**
 ## 5g. The concrete instantiation — discharging the premises (closing GAP-C)
 
 *Status: **all five transition classes done — GAP-C fully closed (`noninterference_instantiation.rs`,
-14 verified).***
+19 verified after ⑦/§5h; 14 at the time this section was written).***
 
 §5d's assembly (`noninterference_theorem.rs`) proves the unwinding theorem over *uninterpreted*
 `obs`/`step`/`actor`/`interferes`, taking `local_respect()` and `step_consistent()` as **premises**.
@@ -743,9 +756,10 @@ system — a composite `Sys` state and *interpreted* `obs`/`step`/`actor`/`inter
 any run depends only on principals authorized to affect `a`, integrity *and* confidentiality — now
 stands as a closed Verus obligation for **all five** classes: creation, signal, consent (memory) +
 the confidentiality read-closure, authority, and the **`DomainDestroy` cascade** (§5c) — the sole
-multi-domain transition, touching four `obs` components at once (ports, grant rows, the frame-map
-population, read-caps) and carrying the intransitive **teardown-reach** channel (`interferes` gains
-`∃c. controls[caller][c] ∧ reach(a, c)`). The `map`-identity is threaded as a `wf` invariant and
+multi-domain transition, touching five `obs`/`obs⁺` components at once (ports, grant rows, the
+frame-map population, the held-map population, read-caps) and carrying **both** halves of the
+intransitive teardown channel (`teardown_reach` and, since ⑦/§5h, `teardown_borrow`). The
+`map`-identity is threaded as a `wf` invariant and
 proven preserved (`wf_step_destroy`) so the drain is owner-local; non-vacuity is validated (dropping
 `teardown_reach` makes Verus reject `local_respect` at the `¬reach` step).
 
@@ -764,10 +778,15 @@ premises imply whole-run NI (meta-theorem)** — with no prose seam between them
    grantor still owns the frame (`StaleGrant`), so `obs⁺` must expose that owner, else
    `step_consistent` fails for the read direction (non-vacuity validated by a probe). This is §5f's
    `obs⁺` made load-bearing, not decorative.
-3. **Teardown-reach extends to the read direction**: destroying `a`'s *grantor* alters `obs⁺(a)`, so
-   the intransitive reach term carries a read-direction addend the original §2.4 (pre-`obs⁺`) lacked.
-   `reach(a, c)` is `a→c port ∨ a→c grant ∨ a reads-from c` — the third disjunct discharges the
-   read-cap component of the cascade.
+3. **Teardown-reach extends to the read direction** — *and this finding was an artifact of using one
+   surface for both conditions; **⑦ (§5h) retracted it**.* As written here, `reach(a, c)` was
+   `a→c port ∨ a→c grant ∨ a reads-from c`, the third disjunct discharging the read-cap component of
+   the cascade. That was forced only because this file's single `obs` carried the read-closure, so a
+   read-cap movement had to be answered by the *integrity* relation. Once the surface is split, a
+   read-cap movement is a `step_consistent` obligation — which needs no channel relation at all — and
+   the disjunct goes. What genuinely survives on the integrity side is the *borrow* direction, and it
+   belongs to `teardown_borrow`, not `reach`. Recorded rather than deleted because the retraction is
+   the instructive part: **a finding can be an artifact of the surface you stated the property over.**
 4. **The actor observes its own *outgoing* destroy authority** (forced by `DomainDestroy`'s
    `step_consistent`): `destroy_guard` reads `controls[caller][c]` — `caller`'s power over the
    *target*, not over `a`, so it is in neither `obs(a)` nor `obs(caller)` under the incoming-only
@@ -777,6 +796,68 @@ premises imply whole-run NI (meta-theorem)** — with no prose seam between them
    would break `step_consistent` the same way; the carrier instead has the drain *clean up* maps over
    `c`'s frames — then a sound over-approximation of `DomainBusy`-refusal on `obs(a)` for `a ≠ c`,
    and since ②′-(c) an *exact* match for what the code does (§4a-(c)).
+
+## 5h. ⑦ — splitting the instantiation's surface, and a *narrower* `interferes`
+
+*Status: **done (`noninterference_instantiation.rs`, 19 verified). `hv-core` untouched; the change is
+entirely inside the Verus carrier.***
+
+**The divergence.** §5g's instantiation used **one** `obs` for both unwinding conditions, and it
+carried the read-closure. The real-code bridge has used **two** surfaces since ②′ — `obs` (integrity)
+and `obs⁺` (confidentiality), design-lesson #58. With the read-caps inside the single `obs`,
+`local_respect` has to tolerate a grantor *creating* an offer to `a`, because that moves `a`'s
+read-caps. But a domain cannot stop others revealing themselves to it — that is not integrity
+interference at all, and the only way to make the theorem go through was a **blanket
+`reads_from(s, a, b)` disjunct** in `interferes`: any grantor of `a` authorized to move `a`'s
+observation via **any** transition, indefinitely. `b` could not set its own vCPU's affinity without
+the theorem giving up on `a`. So §5g's Theorem A was **strictly weaker than what the bridge had been
+demonstrating all along** — a real bridge↔composition divergence, not a presentational one.
+
+**The fix.** Split the surface (`Obs`/`ObsPlus`, `obs`/`obs_plus`); move `step_consistent` and
+Theorem B to `obs⁺`, leave `local_respect` and Theorem A at `obs`; delete the blanket disjunct. The
+two conditions may sit at different surfaces because they are separate theorems, each induction
+appealing only to its own condition. `step_consistent` needs no channel relation whatsoever, so
+widening *its* surface costs the integrity side nothing.
+
+**The part worth reading twice — a green proof that proved too little.** Dropping the blanket term
+left the ②′-(c) **borrow** flow (`b` dying force-reclaims the page `a` had mapped from it) with
+nothing in the relation naming it, and `local_respect_holds` **still verified**. Not because the flow
+was harmless — because `Obs` could not *see* it. The observation carried `a_frame_maps`, the maps over
+frames `a` **owns**, and had no component for the maps `a` **holds**; a borrowed frame is by
+definition owned by someone else, so the write landed outside the surface entirely. The relation
+looked sound for the worst possible reason. Writing the disjunct down anyway — on the strength of the
+bridge having one — would have been an **unforced widening**: a quietly weaker theorem defended by a
+citation.
+
+So `Obs` gained `held` (`a_held_maps`), matching the bridge's handle-indexed held-maps, and
+`teardown_borrow` is now **forced** — delete it and the destroy case fails, which is the remove-the-fix
+witness. Its step-consistency argument is where the split pays for itself a second time: the
+survivors depend on `owner` at frames `a` does *not* own, which is not in `obs(a)`, and is recovered
+from `obs⁺(a)` through `map_identity` (`held_frame_owner_observed` — a live map forces an active
+backing grant, whose read-cap carries the frame's owner, put there by §5f's read-closure work). **The
+borrow surface is deterministic precisely because the read-closure is observed.**
+
+**The result, machine-checked rather than asserted.** A channel relation can be *narrowed* or merely
+*re-shuffled*, and prose cannot tell those apart — an earlier probe in this arc produced exactly a
+"strengthening" that instantiated to a tautology. So the pre-⑦ relation is kept in the file as
+`interferes_pre7` and the comparison is proven both ways:
+
+| artifact | statement |
+|---|---|
+| `interferes_shrank` | `wf(s) ∧ interferes(s,b,a) ⟹ interferes_pre7(s,b,a)` — nothing newly authorized. The only non-trivial arm is `teardown_borrow`, subsumed because a live borrow implies a grant (`map_identity`), hence `reads_from`. |
+| `interferes_shrank_strictly` | a `wf` witness with `interferes_pre7(s,1,0) ∧ ¬interferes(s,1,0)` — so the containment is **strict**. |
+
+Together: `interferes ⊊ interferes_pre7`, therefore Theorem A is strictly stronger than §5g's, and it
+now holds over a **wider** `obs` (`held` added) as well. The strictness witness is the crisp statement
+of the whole rung — **an unexercised offer is not a channel; the flow opens when the borrow does, not
+when the offer does** — which is exactly the distinction a single read-closed surface cannot draw.
+The relation now coincides term for term with `Channels::authorized` (§2.2/§2.4), closing the
+divergence in both directions: same terms, and same observation surface behind them.
+
+**Declared boundary (unchanged, now explicit here).** The bridge's `a_borrows_from` also counts a
+page-table edge of `a`'s rooted at a frame the destroyed domain owned; this carrier has no page
+tables, so its `borrows_from` is the grant-map half only. That is a modelling boundary of the Verus
+instantiation, and the bridge is what covers the edge half on real code.
 
 ## 6. Honest scope, cost read, and the fork
 

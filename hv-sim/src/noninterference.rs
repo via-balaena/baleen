@@ -1258,8 +1258,13 @@ mod tests {
     ///
     /// Built directly rather than swept: the witness needs four domains, a delegation (so the
     /// actor controls `c` but *not* `a`), an allocation, a grant, a map and a destroy — deeper
-    /// than the sweep reaches. This is the integrity twin of PR #80's finding (3) (teardown
-    /// reach extends to the read direction), and it is the correction the design change forced.
+    /// than the sweep reaches. It was originally recorded as the integrity twin of PR #80's
+    /// finding (3) ("teardown reach extends to the read direction"); ⑦ **retracted that finding** —
+    /// it was an artifact of the Verus carrier using one read-closed `obs` for both unwinding
+    /// conditions, and a read-cap movement is a `step_consistent` obligation, not an integrity one.
+    /// This term is what genuinely survives on the integrity side, and Verus now forces it
+    /// independently over its own carrier (`noninterference_instantiation.rs::teardown_borrow`,
+    /// docs §5h) — so the two artifacts agree on it for the same reason rather than by analogy.
     #[test]
     fn dropping_teardown_borrow_is_caught() {
         use hv_core::HvCall;
