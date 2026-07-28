@@ -1044,6 +1044,29 @@ impl Hypervisor {
     /// grantee*: a different domain's grant of the same frame may still be revoked freely
     /// (its grantee's mapping — if any — is authorized by its own grant, not this one). No
     /// foreign link depending, and the grant subsystem's own checks apply unchanged.
+    ///
+    /// **Why this still refuses while [`Self::domain_destroy`] force-reclaims (②′-(c)/(e)).**
+    /// The two look inconsistent — both are "reclaim my page from a borrower" — and the split
+    /// is deliberate, on two grounds:
+    ///
+    /// * **Refusal here is not a denial of service.** A refused revoke strands nothing: the
+    ///   grantor still exists and still owns the frame, so it loses no resource and can revoke
+    ///   once the borrower lets go. A refused *destroy* left the target's frames permanently
+    ///   unreclaimable, with the controller powerless — that asymmetry in *consequence* is what
+    ///   made one refusal tolerable and the other a DoS.
+    /// * **The guard reads the caller's OWN state, so it is not a covert channel.** This
+    ///   predicate is over a frame `caller` owns and a grant `caller` issued. The `DomainBusy`
+    ///   precondition read the *target's* frames — state the caller has no business observing —
+    ///   which is exactly why it was a step-consistency residual and had to go. A refusal
+    ///   conditioned on what the caller can see is a legitimate error; one conditioned on what
+    ///   it cannot see is a channel. That is the rule the two cases jointly establish.
+    ///
+    /// The second ground has a *precondition of its own*, and ②′-(e) had to make it true: the
+    /// guard reads **which** grantee linked, and the grantor could not originally distinguish
+    /// that (two grantees of one frame move its aggregate refcount identically). So the
+    /// non-interference bridge's `obs` now carries each grant row's foreign-linked status —
+    /// the bit the grantor genuinely learns off `InUse` vs `Done`. Model-side only; this
+    /// seam's behaviour is unchanged. See `docs/TIER-D-NONINTERFERENCE.md` §4a-(e).
     fn grant_end_access(&mut self, caller: DomId, gref: GrantRef) -> Result<HvOutcome, HvError> {
         if let (Some(frame), Some(grantee)) = (
             self.grant.granted_frame(caller, gref),
