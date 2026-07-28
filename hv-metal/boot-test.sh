@@ -346,10 +346,31 @@ boot_and_check "dma-control" "" \
     "hv-metal alive" \
     "smmu rung1 POSITIVE CONTROL OK"
 
+# Rung 2 runs in the SAME boot as rung 1's deny, and needs no second machine: its phases differ from
+# each other only in the contents of one 64-byte Stream Table Entry (or, for the last, in the table
+# size announced to the SMMU), which is a far smaller difference than "a machine with an IOMMU vs one
+# without". The four markers are four distinct facts, and the FIRST is the load-bearing one:
+#
+#   * THROUGH-STE POSITIVE CONTROL — the device's own StreamID bound to a bypass STE, DMA LANDS.
+#     Without this the deny below is vacuous: a wrong LOG2SIZE, a mis-aligned STRTAB_BASE, a StreamID
+#     that is not the device's RequesterID, or an SMMUEN that never took ALL yield "aborted".
+#     (Probed: with CR0.SMMUEN never written, every phase reports "aborted" — and this marker is
+#     what goes red.)
+#   * STREAM-TABLE DEFAULT-DENY — same device, same DMA, STE zeroed (V=0): ABORTED, and the SMMU
+#     records C_BAD_STE naming that StreamID on the event queue.
+#   * STREAMID-SPECIFIC — a permissive STE one StreamID away does NOT admit this device; re-binding
+#     its own StreamID lets the DMA land again, so the denials were decisions and not a wedged SMMU.
+#   * OUT-OF-RANGE STREAMID — with the entry still saying BYPASS, announcing a 1-entry table puts the
+#     StreamID outside the range: ABORTED with C_BAD_STREAMID. The range check is what makes "size
+#     the table to bus 0" a stronger denial than a zeroed entry rather than a coverage gap.
 MACHINE_EXTRA=",iommu=smmuv3"
 boot_and_check "smmu" "--features smmu" \
     "hv-metal alive" \
-    "smmu rung1 DEFAULT-DENY OK"
+    "smmu rung1 DEFAULT-DENY OK" \
+    "smmu rung2 THROUGH-STE POSITIVE CONTROL OK" \
+    "smmu rung2 STREAM-TABLE DEFAULT-DENY OK" \
+    "smmu rung2 STREAMID-SPECIFIC OK" \
+    "smmu rung2 OUT-OF-RANGE STREAMID OK"
 EXTRA_QEMU=""
 MACHINE_EXTRA=""
 

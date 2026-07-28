@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # SMMUv3 — closing the DMA window (the SMMU arc, rung 1)
+//! # SMMUv3 — closing the DMA window, then the stream table (the SMMU arc, rungs 1–2)
 //!
 //! Stage-2 constrains the **CPU** and says nothing about **bus masters**. Every isolation property
 //! baleen proves — the p2m refinement, the VMID-tagged address spaces, the whole Tier-D
@@ -25,12 +25,34 @@
 //! Rung 1 shuts it: set `GBPA.ABORT` early, before any device is enabled, and a device's DMA is
 //! terminated rather than performed.
 //!
-//! **Not here (rung 2+):** the stream table (`STRTAB_BASE`, per-`StreamID` STEs, `STE.Config` abort vs
-//! bypass — the ∀-StreamID default-deny after `SMMUEN`), the command and event queues
-//! (`CMD_CFGI_STE` / `CMD_SYNC`, and reading translation faults off `EVENTQ`), and translation proper
-//! (`STE.S2TTB` pointing at the `p2m`-derived Stage-2 tables with the domain's VMID, which is where
-//! `hv-s2`'s existing ∀-address refinement starts carrying the device path for free — the theorem
-//! constrains the *table*, not the *walker*).
+//! ## What rung 2 adds: the stream table, and the trap it is built around
+//!
+//! `GBPA` only decides what happens while `CR0.SMMUEN == 0`. Once the SMMU is *translating*, every
+//! transaction is decided by the **stream table**: the StreamID indexes it, and the Stream Table Entry
+//! there says abort, bypass, or translate. Rung 2 installs one — a linear table covering every
+//! StreamID on PCIe bus 0, every entry zeroed, i.e. `STE.V == 0`, i.e. **deny** — enables the command
+//! and event queues, and turns `SMMUEN` on. The table-building decision itself is not here: it is
+//! pure code in [`hv_s2::smmu`], where `hv-verify::smmu_stream_table` proves the ∀-StreamID property
+//! over it. This module keeps only what must be `unsafe`: MMIO, the publication barrier, and the
+//! configuration-cache invalidation.
+//!
+//! **The trap, named up front.** An ∀-StreamID deny passes *trivially* if no device ever reaches the
+//! stream table at all — a wrong `LOG2SIZE`, a mis-aligned `STRTAB_BASE`, a StreamID that is not the
+//! device's RequesterID, or an `SMMUEN` that never took all produce "the DMA was aborted", which is
+//! indistinguishable from the property holding. So rung 2's first witness is a **through-STE positive
+//! control**: the device's own StreamID bound to a [`bypass STE`](hv_s2::smmu::bypass_ste), and its
+//! DMA must **land**. Only then does the deny half mean anything. See [`dmawitness`](crate::dmawitness)
+//! for the three-phase witness this module's primitives serve.
+//!
+//! **Ordering, again, is the property.** The all-deny stream table is installed *before* `SMMUEN` is
+//! written, and `GBPA.ABORT` covers everything before that — so there is no instant, from reset to
+//! translating, in which a bus master would be let through.
+//!
+//! **Not here (rung 3):** translation proper — `STE.Config = 0b110` with `S2TTB` pointing at the
+//! `p2m`-derived Stage-2 tables under the domain's `S2VMID`, which is where `hv-s2`'s existing
+//! ∀-address refinement starts carrying the device path for free (the theorem constrains the *table*,
+//! not the *walker*). Everything rung 2 permits, it permits **unconfined** — a bypass STE is a path
+//! witness, never an isolation configuration.
 //!
 //! ## Unsafe
 //!
@@ -46,23 +68,69 @@
 /// must take it from the device tree.
 const SMMU_BASE: u64 = 0x0905_0000;
 
-/// `SMMU_IDR0` — feature identification. Bit 0 `S1P` (stage-1 translation), **bit 1 `S2P` (stage-2
-/// translation)** — the capability the whole arc depends on, since baleen's plan is to point the SMMU
-/// at the *same* `p2m`-derived Stage-2 tables the CPU walks.
+/// `SMMU_IDR0` — feature identification. **Bit 0 `S2P` (stage-2 translation)** — the capability the
+/// whole arc depends on, since baleen's plan is to point the SMMU at the *same* `p2m`-derived Stage-2
+/// tables the CPU walks — and bit 1 `S1P` (stage-1).
 const SMMU_IDR0: u64 = 0x0000;
-/// `SMMU_IDR1` — queue/table size parameters (`SIDSIZE` in bits [5:0] is the one rung 2 needs, to size
-/// the stream table).
+/// `SMMU_IDR1` — queue/table size parameters. `SIDSIZE` in bits [5:0] bounds the stream table;
+/// `CMDQS`/`EVTQS` bound the queues; `REL` (bit 28) says where page 1 sits.
 const SMMU_IDR1: u64 = 0x0004;
 /// `SMMU_CR0` — global control; bit 0 is `SMMUEN`.
 const SMMU_CR0: u64 = 0x0020;
+/// `SMMU_CR0ACK` — the *acknowledged* value of [`SMMU_CR0`]. An SMMUv3 absorbs `CR0` writes
+/// asynchronously, so `CR0` reads back what was requested while `CR0ACK` reads back what took effect.
+/// Every enable here polls `CR0ACK`, never `CR0` — checking the request would be checking our own
+/// bookkeeping, the distinction rung 1's `GBPA` read-back already turned on.
+const SMMU_CR0ACK: u64 = 0x0024;
+/// `SMMU_CR1` — memory attributes the SMMU uses for its **own** fetches of tables and queues.
+const SMMU_CR1: u64 = 0x0028;
+/// `SMMU_CR2` — bit 1 `RECINVSID`: record an event for a transaction whose StreamID is out of range.
+const SMMU_CR2: u64 = 0x002c;
 /// `SMMU_GBPA` — the **global bypass attribute**: what happens to a transaction while the SMMU is not
 /// translating. Bit 31 `Update` (write 1 to commit, self-clearing), bit 20 `ABORT`.
 const SMMU_GBPA: u64 = 0x0044;
+/// `SMMU_GERROR` / `SMMU_GERRORN` — global error flags and their software acknowledgement. They are
+/// equal exactly when no error is outstanding, which is how this module tells "the command queue
+/// consumed my command" from "the command queue rejected it and stalled" — two states that otherwise
+/// both look like a `CMD_SYNC` that never completes.
+const SMMU_GERROR: u64 = 0x0060;
+const SMMU_GERRORN: u64 = 0x0064;
+/// `SMMU_STRTAB_BASE` (64-bit) — physical base of the stream table, bits [51:6].
+const SMMU_STRTAB_BASE: u64 = 0x0080;
+/// `SMMU_STRTAB_BASE_CFG` — `LOG2SIZE` [5:0], `SPLIT` [10:6], `FMT` [17:16].
+const SMMU_STRTAB_BASE_CFG: u64 = 0x0088;
+/// `SMMU_CMDQ_BASE` (64-bit) — `ADDR` [51:5], `LOG2SIZE` [4:0].
+const SMMU_CMDQ_BASE: u64 = 0x0090;
+const SMMU_CMDQ_PROD: u64 = 0x0098;
+const SMMU_CMDQ_CONS: u64 = 0x009c;
+/// `SMMU_EVENTQ_BASE` (64-bit) — same layout as `CMDQ_BASE`.
+const SMMU_EVENTQ_BASE: u64 = 0x00a0;
+/// `SMMU_EVENTQ_PROD` / `_CONS` live in the SMMU's **page 1**, not page 0 — at `base + 64 KiB + 0xa8`
+/// when `IDR1.REL == 0` (the case on this machine, checked at setup rather than assumed). They are the
+/// registers Linux calls `ARM_SMMU_EVTQ_PROD`/`_CONS` at `0x100a8`/`0x100ac`.
+///
+/// Getting this offset wrong is a silent failure — the reads would return some other register's value
+/// and the event witness would report nothing — so the event evidence is deliberately **doubled**:
+/// `PROD` advancing *and* a decodable record in the queue's own memory, which the CPU reads directly
+/// and which no register offset can spoof.
+const SMMU_EVENTQ_PROD: u64 = 0x1_00a8;
+const SMMU_EVENTQ_CONS: u64 = 0x1_00ac;
 
-/// `SMMU_IDR0.S1P` — stage-1 translation supported.
-const IDR0_S1P: u32 = 1 << 0;
-/// `SMMU_IDR0.S2P` — stage-2 translation supported.
-const IDR0_S2P: u32 = 1 << 1;
+/// `SMMU_IDR0.S2P` — **stage-2** translation supported (bit 0).
+const IDR0_S2P: u32 = 1 << 0;
+/// `SMMU_IDR0.S1P` — stage-1 translation supported (bit 1).
+///
+/// The bit positions are this way round in the architecture (`S2P` is bit 0) and were **swapped in
+/// rung 1**. It changed no result there — QEMU's SMMU sets both, so `supports_stage2()` answered
+/// `true` either way — which is exactly why it survived: a check whose two inputs are both set cannot
+/// discriminate between them. Corrected here, and worth recording as the shape rather than the
+/// instance.
+const IDR0_S1P: u32 = 1 << 1;
+/// `SMMU_IDR1.SIDSIZE` — bits [5:0]; the SMMU supports StreamIDs below `2^SIDSIZE`.
+const IDR1_SIDSIZE_MASK: u32 = 0x3f;
+/// `SMMU_IDR1.REL` — bit 28; clear means page 1 is at `base + 64 KiB` (the layout
+/// [`SMMU_EVENTQ_PROD`] assumes).
+const IDR1_REL: u32 = 1 << 28;
 /// `SMMU_GBPA.Update` — writes to `GBPA` are ignored unless this is set; it self-clears when the
 /// update has been absorbed, so it doubles as the completion signal.
 const GBPA_UPDATE: u32 = 1 << 31;
@@ -70,6 +138,23 @@ const GBPA_UPDATE: u32 = 1 << 31;
 const GBPA_ABORT: u32 = 1 << 20;
 /// `SMMU_CR0.SMMUEN` — the SMMU is translating.
 const CR0_SMMUEN: u32 = 1 << 0;
+/// `SMMU_CR0.EVENTQEN` — the event queue is live; without it faults are silently dropped rather than
+/// recorded, and the deny witness would lose its *reason*.
+const CR0_EVENTQEN: u32 = 1 << 2;
+/// `SMMU_CR0.CMDQEN` — the command queue is live; without it `CMD_CFGI_STE` is never consumed and an
+/// STE edit would appear to have no effect.
+const CR0_CMDQEN: u32 = 1 << 3;
+/// `SMMU_CR2.RECINVSID` — record `C_BAD_STREAMID` for transactions outside the configured table.
+const CR2_RECINVSID: u32 = 1 << 1;
+
+/// Command opcodes (`CMD_*[7:0]`).
+const CMD_CFGI_STE: u64 = 0x03;
+const CMD_SYNC: u64 = 0x46;
+
+/// Event-record types this module names. `C_BAD_STE` is what a zeroed (`V == 0`) entry produces and
+/// is therefore the deny witness's expected reason; `C_BAD_STREAMID` is the out-of-range arm.
+pub(crate) const EVT_C_BAD_STREAMID: u8 = 0x02;
+pub(crate) const EVT_C_BAD_STE: u8 = 0x04;
 
 fn read32(off: u64) -> u32 {
     // SAFETY: a documented SMMUv3 register offset inside the `virt` machine's 128 KiB SMMU window —
@@ -78,17 +163,44 @@ fn read32(off: u64) -> u32 {
 }
 
 fn write32(off: u64, v: u32) {
-    // SAFETY: as `read32`; the written offsets (`GBPA`) are RW.
+    // SAFETY: as `read32`; the written offsets (`GBPA`, `CR0`–`CR2`, the queue pointers and the table
+    // base configuration) are RW.
     unsafe { core::ptr::write_volatile((SMMU_BASE + off) as *mut u32, v) }
+}
+
+fn write64(off: u64, v: u64) {
+    // SAFETY: as `write32`; the 64-bit registers written here (`STRTAB_BASE`, `CMDQ_BASE`,
+    // `EVENTQ_BASE`) are RW and 64-bit accessible.
+    unsafe { core::ptr::write_volatile((SMMU_BASE + off) as *mut u64, v) }
+}
+
+fn read64(off: u64) -> u64 {
+    // SAFETY: as `read32`.
+    unsafe { core::ptr::read_volatile((SMMU_BASE + off) as *const u64) }
+}
+
+/// Publish CPU writes to the tables and queues before the SMMU is told to look at them.
+///
+/// EL2 runs MMU-off, so its stores are Device-nGnRnE — already strongly ordered and uncached — and on
+/// QEMU this barrier is a no-op. It is issued anyway because the ordering obligation is *real* (a
+/// second agent reads this memory without going through the CPU's caches at all) and would bite on
+/// silicon the moment the EL2 MMU brings normal cacheable mappings with it. `sy` rather than `ish`:
+/// the SMMU is not in the inner-shareable domain.
+fn publish() {
+    // SAFETY: a barrier instruction; no memory operand, no privilege requirement at EL2.
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
 }
 
 /// Whether an SMMUv3 appears to be present at [`SMMU_BASE`].
 ///
-/// QEMU only instantiates the SMMU with `-machine virt,iommu=smmuv3`, and the metal must run on both
-/// configurations — the SMMU-less one is the arc's **positive control** (the boot where the device's
-/// DMA is expected to *land*, proving the witness is not vacuous). Unassigned MMIO on `virt` reads as
-/// zero rather than faulting, and a real SMMU always reports at least one translation stage, so a zero
-/// `IDR0` is a sound "absent" test here.
+/// A real SMMU always reports at least one translation stage, so a zero `IDR0` would mean "absent".
+///
+/// **This is a consistency check, not a probe.** Unassigned MMIO on `virt` takes a *synchronous
+/// external abort* rather than reading as zero (measured — `EC=0x25 FAR=0x9050000` — after assuming
+/// otherwise), and EL2's fault handler is `-> !` by design, so calling this on a machine without an
+/// SMMU ends the boot. That is why the whole SMMU half is a cargo feature rather than a runtime
+/// probe: the boot that touches these registers is only ever launched with `iommu=smmuv3`. See the
+/// `smmu` feature's note in `Cargo.toml`.
 pub(crate) fn present() -> bool {
     read32(SMMU_IDR0) & (IDR0_S1P | IDR0_S2P) != 0
 }
@@ -140,4 +252,407 @@ pub(crate) fn abort_bypassed_traffic() -> bool {
         core::hint::spin_loop();
     }
     false
+}
+
+// ─── Rung 2: the stream table, the command queue, the event queue ────────────────────────────────
+
+use crate::cell::BootCell;
+use hv_s2::smmu as st;
+
+/// The stream table covers StreamIDs `0 .. 256` — every function on PCIe bus 0.
+///
+/// Taken from [`hv_s2::smmu::BUS0_LOG2SIZE`] rather than written here, because that is the size the
+/// Kani default-deny property is proven at: a size chosen independently in the metal could be a size
+/// nothing proves anything about. See that constant for why the bus, and not `IDR1.SIDSIZE`.
+pub(crate) const STRTAB_LOG2SIZE: u32 = st::BUS0_LOG2SIZE;
+const STRTAB_ENTRIES: usize = 1 << STRTAB_LOG2SIZE;
+const STRTAB_WORDS: usize = STRTAB_ENTRIES * st::STE_WORDS;
+
+/// The command queue: 16 entries × 16 bytes. Rung 2 issues at most three commands between syncs, so
+/// the queue never comes close to wrapping; it is sized to its alignment requirement, not its load.
+const CMDQ_LOG2SIZE: u32 = 4;
+const CMDQ_ENTRIES: usize = 1 << CMDQ_LOG2SIZE;
+/// The event queue: 16 entries × 32 bytes.
+const EVENTQ_LOG2SIZE: u32 = 4;
+const EVENTQ_ENTRIES: usize = 1 << EVENTQ_LOG2SIZE;
+
+/// The linear stream table. Alignment is **the larger of the table size and 64 bytes** — an
+/// architectural requirement, and a silent one: `STRTAB_BASE` carries only bits [51:6], so an
+/// under-aligned base is *truncated* to a different address, the SMMU walks whatever is there, and
+/// every StreamID denies for a reason that has nothing to do with the property under test. That is
+/// the vacuity failure in its purest form, so the requirement is bound to the type by a `const _`
+/// against `hv-s2`'s own statement of it rather than restated as a literal here.
+#[repr(C, align(16384))]
+struct StreamTable([u64; STRTAB_WORDS]);
+
+const _: () = assert!(
+    core::mem::align_of::<StreamTable>() == st::base_alignment(STRTAB_LOG2SIZE).unwrap(),
+    "the stream table's alignment must be the architectural one for its size"
+);
+const _: () = assert!(core::mem::size_of::<StreamTable>() == STRTAB_WORDS * 8);
+// The table must be big enough for the size it will be *configured* with, or the SMMU fetches STEs
+// from past the allocation — the one way this scheme fails open, and the case `hv-s2`'s
+// `TableTooSmall` refusal exists to make unreachable. Pinned at compile time as well, since the
+// runtime refusal cannot help a table that was declared too small in the first place.
+const _: () = assert!(STRTAB_WORDS >= st::table_words(STRTAB_LOG2SIZE).unwrap());
+
+/// The `STRTAB_BASE_CFG` value for this table, resolved at **compile time**.
+///
+/// A `const` rather than a runtime `unwrap_or(0)`: falling back to `0` would announce a *one-entry*
+/// table, which denies everything and would therefore look exactly like the property holding while
+/// meaning the configuration never happened. A size this module cannot encode must break the build,
+/// not degrade into a silent success.
+const STRTAB_CFG: u32 = match st::strtab_base_cfg(STRTAB_LOG2SIZE) {
+    Some(cfg) => cfg,
+    None => panic!("STRTAB_LOG2SIZE exceeds what STRTAB_BASE_CFG.LOG2SIZE can encode"),
+};
+
+/// The command queue. Aligned to its size (`CMDQ_BASE.ADDR` is bits [51:5], and the architecture
+/// requires queue-size alignment).
+#[repr(C, align(256))]
+struct CmdQueue([u64; CMDQ_ENTRIES * 2]);
+const _: () = assert!(core::mem::align_of::<CmdQueue>() >= core::mem::size_of::<CmdQueue>());
+
+/// The event queue. 32-byte records.
+#[repr(C, align(512))]
+struct EventQueue([u64; EVENTQ_ENTRIES * 4]);
+const _: () = assert!(core::mem::align_of::<EventQueue>() >= core::mem::size_of::<EventQueue>());
+
+/// Everything the SMMU reads out of RAM, plus the software queue indices.
+///
+/// One [`BootCell`] over all of it, for the same reason [`crate::stage2`]'s `STAGE2_SETS` is one cell
+/// over all the Stage-2 sets: the second agent here is **the SMMU**, not another CPU, so the
+/// obligation is *publication* (discharged by [`publish`] and `CMD_CFGI_STE`/`CMD_SYNC`) rather than
+/// mutual exclusion — and what the cell adds is the *aliasing* half, so the table and the queues come
+/// out as disjoint field borrows the compiler checks.
+#[repr(C)]
+struct Smmu {
+    strtab: StreamTable,
+    cmdq: CmdQueue,
+    eventq: EventQueue,
+    /// Software's view of `CMDQ_PROD`, including the wrap bit at bit [`CMDQ_LOG2SIZE`].
+    cmdq_prod: u32,
+    /// Software's view of `EVENTQ_CONS`, including the wrap bit at bit [`EVENTQ_LOG2SIZE`].
+    eventq_cons: u32,
+}
+
+static SMMU: BootCell<Smmu> = BootCell::new(
+    "SMMU",
+    Smmu {
+        strtab: StreamTable([0; STRTAB_WORDS]),
+        cmdq: CmdQueue([0; CMDQ_ENTRIES * 2]),
+        eventq: EventQueue([0; EVENTQ_ENTRIES * 4]),
+        cmdq_prod: 0,
+        eventq_cons: 0,
+    },
+);
+
+/// A queue index register's wrap-inclusive mask: `log2size + 1` bits, the low `log2size` of which are
+/// the index and the top one the wrap flag.
+const fn queue_mask(log2size: u32) -> u32 {
+    (1u32 << (log2size + 1)) - 1
+}
+
+/// What [`install_stream_table`] observed — every field read back from the device, never inferred
+/// from what was written.
+pub(crate) struct StreamTableReport {
+    /// `IDR1.SIDSIZE` — the SMMU's own StreamID width.
+    pub(crate) sidsize: u32,
+    /// `IDR1.REL == 0`, i.e. page 1 (and so [`SMMU_EVENTQ_PROD`]) is where this module expects it.
+    pub(crate) page1_at_64k: bool,
+    /// Physical base of the stream table, as the CPU sees it.
+    pub(crate) strtab_pa: u64,
+    /// `STRTAB_BASE` read back — equal to what `hv-s2` says should have been written.
+    pub(crate) strtab_base_ok: bool,
+    /// `STRTAB_BASE_CFG` read back — linear format, the configured `LOG2SIZE`.
+    pub(crate) strtab_cfg_ok: bool,
+    /// Every requested `CR0` bit is set in **`CR0ACK`**: the SMMU acknowledged the enable.
+    pub(crate) enabled: bool,
+    /// The initial `CMD_CFGI_STE_RANGE` + `CMD_SYNC` was **consumed** (`CMDQ_CONS` reached `PROD`)
+    /// and left `GERROR == GERRORN`. Both halves matter: a malformed command stalls the queue with a
+    /// global error, and a stalled queue makes every later `CMD_CFGI_STE` silently do nothing — so an
+    /// STE edit would appear to take effect when the SMMU never saw it.
+    pub(crate) gerror_clean: bool,
+    /// The freshly-built table, read back through `hv-s2`'s *decode* seam, permits no StreamID.
+    pub(crate) denies_every_stream: bool,
+}
+
+impl StreamTableReport {
+    /// Every fact that must hold for a later deny result to be about the stream table at all.
+    pub(crate) fn ok(&self) -> bool {
+        self.page1_at_64k
+            && self.strtab_base_ok
+            && self.strtab_cfg_ok
+            && self.enabled
+            && self.gerror_clean
+            && self.denies_every_stream
+            && STRTAB_LOG2SIZE <= self.sidsize
+    }
+}
+
+/// Build an all-deny stream table, enable the queues, and turn the SMMU on.
+///
+/// The order is load-bearing at both ends. The table is fully zeroed and its base published *before*
+/// `SMMUEN`, so the SMMU never translates against a table that does not exist; and `GBPA.ABORT`
+/// (rung 1, already set by the time this runs) governs everything before `SMMUEN` takes. There is no
+/// instant in which a bus master is admitted.
+///
+/// Nothing here is a claim about isolation yet — an all-deny table is trivially satisfiable by an
+/// SMMU that is not looking at it. That is what the caller's through-STE control is for.
+pub(crate) fn install_stream_table() -> StreamTableReport {
+    let idr1 = read32(SMMU_IDR1);
+    let sidsize = idr1 & IDR1_SIDSIZE_MASK;
+    let page1_at_64k = idr1 & IDR1_REL == 0;
+
+    let mut smmu = SMMU.borrow_mut();
+
+    // (1) The table itself — deny by construction, established by `hv-s2` rather than inherited from
+    //     `.bss` being zero (a linker property this code should not depend on).
+    st::init_deny(&mut smmu.strtab.0);
+    let strtab_pa = core::ptr::addr_of!(smmu.strtab.0) as u64;
+
+    // (2) The SMMU's own fetch attributes. `CR1 = 0` is non-cacheable, non-shareable for both tables
+    //     and queues — which is what matches an EL2 running MMU-off, where every CPU store is
+    //     Device-nGnRnE and reaches memory directly. Linux writes write-back/inner-shareable here
+    //     because *its* CPU mappings are cacheable; copying that value would be copying a premise
+    //     baleen does not have. Written explicitly rather than left at its reset value: rung 1's
+    //     entire content was a reset value that happened to be wrong.
+    write32(SMMU_CR1, 0);
+    // Record an event for a StreamID outside the table, so the out-of-range denial is observable
+    // rather than merely silent.
+    write32(SMMU_CR2, CR2_RECINVSID);
+
+    // (3) Publish the table, then point the SMMU at it.
+    publish();
+    write64(SMMU_STRTAB_BASE, st::strtab_base(strtab_pa));
+    write32(SMMU_STRTAB_BASE_CFG, STRTAB_CFG);
+    // Read back through the SAME masking function that produced the written value, rather than
+    // against a copy of the ADDR mask: a duplicated field literal that drifts would make this check
+    // agree with itself and with nothing else.
+    let strtab_base_ok = st::strtab_base(read64(SMMU_STRTAB_BASE)) == st::strtab_base(strtab_pa);
+    let strtab_cfg_ok = read32(SMMU_STRTAB_BASE_CFG) == STRTAB_CFG;
+
+    // (4) The queues, then the enables. `CMDQ`/`EVENTQ` come up before `SMMUEN` so that the first
+    //     configuration invalidation can be issued while nothing is translating.
+    let cmdq_pa = core::ptr::addr_of!(smmu.cmdq.0) as u64;
+    let eventq_pa = core::ptr::addr_of!(smmu.eventq.0) as u64;
+    smmu.cmdq_prod = 0;
+    smmu.eventq_cons = 0;
+    publish();
+    write64(SMMU_CMDQ_BASE, cmdq_pa | u64::from(CMDQ_LOG2SIZE));
+    write32(SMMU_CMDQ_PROD, 0);
+    write32(SMMU_CMDQ_CONS, 0);
+    write64(SMMU_EVENTQ_BASE, eventq_pa | u64::from(EVENTQ_LOG2SIZE));
+
+    // The event queue's producer/consumer indices live in the SMMU's **page 1**, and `IDR1.REL` is
+    // what says where page 1 is. Gate the writes on it rather than merely reporting it afterwards:
+    // if `REL` disagreed, these offsets would name some *other* register, and writing an index into
+    // an unidentified register is a worse failure than not having an event queue. The boot fails
+    // either way (`StreamTableReport::ok` requires `page1_at_64k`), but it fails without having
+    // poked something unknown.
+    let mut enabled = page1_at_64k;
+    if page1_at_64k {
+        write32(SMMU_EVENTQ_PROD, 0);
+        write32(SMMU_EVENTQ_CONS, 0);
+        enabled = set_cr0_bits(CR0_CMDQEN | CR0_EVENTQEN);
+    }
+
+    // (5) Invalidate the whole configuration cache before enabling translation: the SMMU may hold
+    //     STEs from before this table existed (on QEMU it does not, on silicon after a warm reset it
+    //     may), and an enable that inherited a stale permissive entry is precisely the window rung 1
+    //     closed at the `GBPA` level.
+    let gerror_clean = invalidate_all_config(&mut smmu);
+
+    enabled &= set_cr0_bits(CR0_SMMUEN);
+
+    // (6) Read the table back through `hv-s2`'s DECODE seam — not the builder's own bookkeeping — and
+    //     assert it permits nothing. The Kani property says the builder writes a denying table; this
+    //     says the bytes at the address the SMMU was handed are one.
+    let denies_every_stream = st::denies_every_stream(&smmu.strtab.0, STRTAB_LOG2SIZE);
+
+    StreamTableReport {
+        sidsize,
+        page1_at_64k,
+        strtab_pa,
+        strtab_base_ok,
+        strtab_cfg_ok,
+        enabled,
+        gerror_clean,
+        denies_every_stream,
+    }
+}
+
+/// Set `bits` in `CR0` and wait for **`CR0ACK`** to show them. Returns whether the SMMU acknowledged.
+///
+/// Bounded, and reports failure rather than spinning: an SMMU that never acknowledges must not hang a
+/// CI boot, and "the enable did not take" is exactly the fact a vacuous deny would otherwise hide.
+fn set_cr0_bits(bits: u32) -> bool {
+    let want = read32(SMMU_CR0) | bits;
+    write32(SMMU_CR0, want);
+    for _ in 0..100_000 {
+        if read32(SMMU_CR0ACK) & bits == bits {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Push one 16-byte command and ring the doorbell.
+fn submit(smmu: &mut Smmu, word0: u64, word1: u64) {
+    let idx = (smmu.cmdq_prod as usize) & (CMDQ_ENTRIES - 1);
+    smmu.cmdq.0[idx * 2] = word0;
+    smmu.cmdq.0[idx * 2 + 1] = word1;
+    // The command must be visible to the SMMU *before* `PROD` tells it to look.
+    publish();
+    smmu.cmdq_prod = smmu.cmdq_prod.wrapping_add(1) & queue_mask(CMDQ_LOG2SIZE);
+    write32(SMMU_CMDQ_PROD, smmu.cmdq_prod);
+}
+
+/// Issue `CMD_SYNC` and wait for `CMDQ_CONS` to reach `CMDQ_PROD`.
+///
+/// Returns whether the queue drained *and* no global error appeared. The second half matters: a
+/// malformed command makes the SMMU raise `GERROR.CMDQ_ERR` and **stall** the queue, which otherwise
+/// looks identical to a sync that is merely slow — and a stalled queue means every later
+/// `CMD_CFGI_STE` silently does nothing, so an STE edit would appear to have no effect and the deny
+/// phase would "pass" without the SMMU ever having seen the change.
+fn sync(smmu: &mut Smmu) -> bool {
+    submit(smmu, CMD_SYNC, 0);
+    for _ in 0..1_000_000 {
+        if read32(SMMU_CMDQ_CONS) & queue_mask(CMDQ_LOG2SIZE) == smmu.cmdq_prod {
+            return read32(SMMU_GERROR) == read32(SMMU_GERRORN);
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// `CMD_CFGI_STE` for every StreamID the table covers, via the range form (`Range = 31` is "all").
+fn invalidate_all_config(smmu: &mut Smmu) -> bool {
+    // Opcode 0x04 is `CMD_CFGI_STE_RANGE`; word 1's `Range` field [4:0] = 31 invalidates everything.
+    submit(smmu, 0x04, 31);
+    sync(smmu)
+}
+
+/// Re-announce the table's size to the SMMU as `2^log2size` entries, leaving its **contents**
+/// untouched.
+///
+/// Exists for one witness: the architecture denies a StreamID outside the configured table
+/// (`C_BAD_STREAMID`) *before* it ever fetches an entry, which is what makes "size the table to PCIe
+/// bus 0" a stronger denial than a zeroed entry rather than a coverage gap. Shrinking the announced
+/// size below a StreamID whose STE is still **permissive** isolates that arm exactly: the entry says
+/// yes, the range check says no, and only one of them can be the reason the DMA fails.
+///
+/// **Refuses to announce a size larger than the allocation.** That is the one way a linear stream
+/// table fails *open* — the SMMU would fetch STEs from past the table — and it is the state
+/// `hv-s2`'s `TableTooSmall` refusal exists to keep unreachable. A test helper is exactly the sort of
+/// path that would otherwise create it.
+pub(crate) fn set_announced_table_size(log2size: u32) -> bool {
+    if log2size > STRTAB_LOG2SIZE {
+        return false;
+    }
+    let Some(cfg) = st::strtab_base_cfg(log2size) else {
+        return false;
+    };
+    write32(SMMU_STRTAB_BASE_CFG, cfg);
+    let mut smmu = SMMU.borrow_mut();
+    let synced = invalidate_all_config(&mut smmu);
+    synced && read32(SMMU_STRTAB_BASE_CFG) == cfg
+}
+
+/// Invalidate one StreamID's cached configuration and wait for the invalidation to complete.
+///
+/// This is the SMMU's analogue of the Stage-2 path's `dsb`+`tlbi`+`isb`: without it the SMMU may keep
+/// serving a *cached* STE, so an edit to the table in RAM would not be the edit the hardware is
+/// acting on — and a deny phase following a bypass phase would be testing the wrong bytes.
+fn invalidate_ste(smmu: &mut Smmu, sid: u32) -> bool {
+    submit(
+        smmu,
+        CMD_CFGI_STE | (u64::from(sid) << 32),
+        1, /* Leaf */
+    );
+    sync(smmu)
+}
+
+/// Install a **bypass** STE for `sid` — rung 2's positive control.
+///
+/// Returns whether the entry was written, the invalidation completed, and the table now reads back
+/// (through the decode seam) as permitting exactly this one StreamID and no other. That last clause
+/// is what makes this a check rather than a report: a bind that also permitted a neighbour would pass
+/// a "the bound stream is permitted" test and fail this one.
+pub(crate) fn bind_stream_bypass(sid: u32) -> bool {
+    let mut smmu = SMMU.borrow_mut();
+    if st::bind(&mut smmu.strtab.0, STRTAB_LOG2SIZE, sid, st::bypass_ste()).is_err() {
+        return false;
+    }
+    publish();
+    let synced = invalidate_ste(&mut smmu, sid);
+    let permits_only_this = st::permitted_stream_count(&smmu.strtab.0, STRTAB_LOG2SIZE) == 1
+        && st::verdict(&smmu.strtab.0, STRTAB_LOG2SIZE, sid).permits();
+    synced && permits_only_this
+}
+
+/// Restore `sid`'s entry to the all-zero deny, and confirm the whole table denies again.
+pub(crate) fn unbind_stream(sid: u32) -> bool {
+    let mut smmu = SMMU.borrow_mut();
+    if st::unbind(&mut smmu.strtab.0, STRTAB_LOG2SIZE, sid).is_err() {
+        return false;
+    }
+    publish();
+    let synced = invalidate_ste(&mut smmu, sid);
+    synced && st::denies_every_stream(&smmu.strtab.0, STRTAB_LOG2SIZE)
+}
+
+/// One decoded SMMU event record.
+pub(crate) struct SmmuEvent {
+    /// The record's type field — see [`EVT_C_BAD_STE`] / [`EVT_C_BAD_STREAMID`].
+    pub(crate) kind: u8,
+    /// The StreamID the faulting transaction carried.
+    pub(crate) sid: u32,
+    /// `EVENTQ_PROD` as read from the device, so a caller can tell "the queue produced nothing" from
+    /// "the queue produced something this code failed to decode".
+    pub(crate) prod: u32,
+}
+
+/// Discard every record currently in the event queue, returning how many there were.
+///
+/// Called **before** each observed DMA so that whatever the queue then holds was produced by *that*
+/// transaction. Without it the queue is a running log and [`take_event`] returns the oldest record in
+/// it — which measurably is not the one under test: a single aborted 8-byte `edu` transfer produces
+/// **two** records here (QEMU translates the access more than once), so by the third phase the "first
+/// event" was two phases old. That mistake was live and the event assertion caught it, which is the
+/// argument for asserting the event's *type and StreamID* rather than merely that one exists.
+pub(crate) fn drain_events() -> u32 {
+    let mut n = 0;
+    while take_event().is_some() {
+        n += 1;
+        // The queue is 16 entries; a bound rather than a `while` on a device-driven condition.
+        if n >= EVENTQ_ENTRIES as u32 {
+            break;
+        }
+    }
+    n
+}
+
+/// Pop the oldest event record, if the queue holds one.
+///
+/// Deliberately reads the record out of the **queue's own memory** (a plain CPU load of RAM the SMMU
+/// wrote) and takes only the *count* from `EVENTQ_PROD`. If [`SMMU_EVENTQ_PROD`]'s page-1 offset were
+/// wrong, the count would be wrong but the record would not — so the two pieces of evidence fail
+/// independently, which is the point of collecting both.
+pub(crate) fn take_event() -> Option<SmmuEvent> {
+    let mut smmu = SMMU.borrow_mut();
+    let prod = read32(SMMU_EVENTQ_PROD) & queue_mask(EVENTQ_LOG2SIZE);
+    if prod == smmu.eventq_cons {
+        return None;
+    }
+    let idx = (smmu.eventq_cons as usize) & (EVENTQ_ENTRIES - 1);
+    let word0 = smmu.eventq.0[idx * 4];
+    smmu.eventq_cons = smmu.eventq_cons.wrapping_add(1) & queue_mask(EVENTQ_LOG2SIZE);
+    write32(SMMU_EVENTQ_CONS, smmu.eventq_cons);
+    Some(SmmuEvent {
+        kind: (word0 & 0xff) as u8,
+        sid: (word0 >> 32) as u32,
+        prod,
+    })
 }

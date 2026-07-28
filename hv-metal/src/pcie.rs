@@ -70,6 +70,26 @@ impl Bdf {
     }
 }
 
+/// The **StreamID** this function's transactions carry into the SMMU.
+///
+/// On PCIe the SMMU's stream identifier is the **RequesterID** — `(bus << 8) | (device << 3) |
+/// function` — mapped through the `iommu-map` property of the host bridge. On QEMU `virt` that
+/// property is `<0 &smmuv3 0 0x10000>`, i.e. the identity over the whole 16-bit RequesterID space, so
+/// StreamID *is* RequesterID here.
+///
+/// **The mapping is a platform fact, and it is the single most likely way an ∀-StreamID deny goes
+/// vacuous**: bind the wrong StreamID and the device's transactions land on a different (zeroed) STE,
+/// abort, and look exactly like the property holding. That is why rung 2 binds this StreamID to a
+/// *permitting* entry first and requires the DMA to get through — the through-path is what proves this
+/// function returns the number the hardware actually presents.
+/// Gated to the SMMU boot: on a machine with no SMMU there is no stream table to index, and leaving
+/// the lint able to see that keeps an unreachable phase from going unnoticed.
+#[cfg(feature = "smmu")]
+pub(crate) fn stream_id(bdf: Bdf) -> u32 {
+    // Bus 0, function 0 — the same two assumptions `cfg` makes.
+    u32::from(bdf.dev) << 3
+}
+
 /// Read a 32-bit config-space register.
 fn cfg_read32(bdf: Bdf, off: u64) -> u32 {
     // SAFETY: ECAM is device memory on the `virt` machine, addressed directly at EL2 (MMU off). The
