@@ -102,9 +102,15 @@ mapped as cacheable Normal memory would have booted fine and been wrong.
 
 ## 5. Evidence, and its limits
 
-- **`cargo xtask qemu-linux` is kernel-gated and NOT part of CI.** The Linux boot is a **local**
+- ~~**`cargo xtask qemu-linux` is kernel-gated and NOT part of CI.** The Linux boot is a **local**
   result, run against the final tree. CI covers the synthetic path only (140 checks, both feature
-  configs).
+  configs).~~ **CLOSED (⑬).** The boot is now the `real-linux boot (QEMU)` required check: the guest
+  artifacts are built by `hv-metal/linux/fetch-guest-image.sh` from checksum-pinned official Alpine
+  downloads, and `cargo xtask qemu-linux-test` asserts the markers — including `448 super-span 2 MiB
+  block(s) emitted and decoded; device window 32 MiB`, i.e. **this arc's `verify_encoding` on the one
+  real guest's emission is now checked on every PR** rather than only whenever someone remembered to
+  run it. See `docs/ARC-5-M5-GUEST-INTERFACE.md` §5f. No isolation content — it makes the existing
+  demonstration re-runnable, nothing more.
 - Verus 12 files, **61 verified, 0 errors**; Kani suite re-run; workspace CI green; hv-s2 38 tests.
 - `hv-core` / `hv-hal` untouched.
 

@@ -40,9 +40,14 @@ fn main() {
         }
         "qemu-test" => run("bash", &["hv-metal/boot-test.sh"]),
         // Metal (M5 Arc 5e): boot a REAL aarch64 Linux kernel as a single EL1 guest under hv-metal.
-        // Kernel-gated — needs a kernel `Image` + initramfs in `$BALEEN_LINUX_DIR` (see the fn). Never
-        // part of CI (the synthetic `qemu-test` is the CI check); this is the capstone demo.
-        "qemu-linux" => qemu_linux(),
+        // Needs a kernel `Image` + initramfs in `$BALEEN_LINUX_DIR`, which `hv-metal/linux/
+        // fetch-guest-image.sh` builds from checksum-pinned Alpine downloads.
+        //   `qemu-linux`      the interactive demo (stdio inherited; you watch a kernel boot).
+        //   `qemu-linux-test` the headless gate: same QEMU line, output captured, markers asserted.
+        // Both go through ONE `linux_qemu_args` (design-lesson #14c) — the gate must not be able to
+        // pass against a QEMU invocation the demo does not use.
+        "qemu-linux" => qemu_linux(false),
+        "qemu-linux-test" => qemu_linux(true),
         "metal-lint" => metal_lint(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
@@ -72,6 +77,8 @@ fn main() {
                  ci     fmt --check, clippy -D warnings, test, then doc\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
+                 qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
+                 qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
                  metal-lint fmt --check + clippy -D warnings for hv-metal (all four feature configs)"
             );
             exit(2);
@@ -97,11 +104,22 @@ const LINUX_INITRD_ADDR: u64 = 0x4c00_0000; // initramfs (DTB /chosen linux,init
 /// real-linux`, compiles the guest DTB (patching `initrd-end` to the initramfs size), and launches
 /// QEMU with the kernel `Image` + initramfs + DTB loaded into guest RAM via `-device loader`.
 ///
-/// Kernel-gated: the `Image` and `initramfs` come from `$BALEEN_LINUX_DIR` (default
-/// `~/forge/baleen-metal-linux/alpine`), holding `Image` (raw arm64 kernel) and `custom-initramfs.gz`.
-fn qemu_linux() -> bool {
+/// With `check` false this is the interactive demo: QEMU inherits stdio and you watch a kernel boot.
+/// With `check` true it is the gate `.github/workflows/ci.yml`'s `real-linux boot (QEMU)` job runs —
+/// the SAME QEMU line, with the output captured and [`LINUX_MARKERS`] / [`LINUX_FORBIDDEN`] asserted
+/// against it. One derivation, so the gate cannot pass against a boot the demo does not perform.
+///
+/// The `Image` and `initramfs` come from `$BALEEN_LINUX_DIR` (default
+/// `~/forge/baleen-metal-linux/alpine`); `hv-metal/linux/fetch-guest-image.sh` builds both from
+/// checksum-pinned official Alpine downloads.
+fn qemu_linux(check: bool) -> bool {
     use std::path::PathBuf;
 
+    let task = if check {
+        "qemu-linux-test"
+    } else {
+        "qemu-linux"
+    };
     let dir = std::env::var("BALEEN_LINUX_DIR").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_default();
         format!("{home}/forge/baleen-metal-linux/alpine")
@@ -113,9 +131,10 @@ fn qemu_linux() -> bool {
     for (what, p) in [("kernel Image", &image), ("initramfs", &initrd)] {
         if !p.exists() {
             eprintln!(
-                "xtask qemu-linux: missing {what} at {}\n  \
-                 This target is kernel-gated: set $BALEEN_LINUX_DIR to a dir containing a raw arm64 \
-                 `Image` and `custom-initramfs.gz` (see docs/ARC-5-M5-GUEST-INTERFACE.md).",
+                "xtask {task}: missing {what} at {}\n  \
+                 Build the guest artifacts first:  hv-metal/linux/fetch-guest-image.sh\n  \
+                 (or point $BALEEN_LINUX_DIR at a dir holding a raw arm64 `Image` and \
+                 `custom-initramfs.gz` — see docs/ARC-5-M5-GUEST-INTERFACE.md).",
                 p.display()
             );
             return false;
@@ -126,7 +145,7 @@ fn qemu_linux() -> bool {
     let dts = match std::fs::read_to_string("hv-metal/linux/guest.dts") {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("xtask qemu-linux: cannot read hv-metal/linux/guest.dts: {e}");
+            eprintln!("xtask {task}: cannot read hv-metal/linux/guest.dts: {e}");
             return false;
         }
     };
@@ -139,7 +158,7 @@ fn qemu_linux() -> bool {
     let dts_out = dir.join("guest.patched.dts");
     let dtb_out = dir.join("guest.dtb");
     if let Err(e) = std::fs::write(&dts_out, patched) {
-        eprintln!("xtask qemu-linux: cannot write {}: {e}", dts_out.display());
+        eprintln!("xtask {task}: cannot write {}: {e}", dts_out.display());
         return false;
     }
     if !run(
@@ -154,7 +173,7 @@ fn qemu_linux() -> bool {
             dtb_out.to_str().unwrap(),
         ],
     ) {
-        eprintln!("xtask qemu-linux: dtc failed to compile the guest DTB");
+        eprintln!("xtask {task}: dtc failed to compile the guest DTB");
         return false;
     }
 
@@ -200,7 +219,187 @@ fn qemu_linux() -> bool {
         loader(&initrd, LINUX_INITRD_ADDR),
     ];
     let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run("qemu-system-aarch64", &argv)
+    if !check {
+        return run("qemu-system-aarch64", &argv);
+    }
+    boot_and_check_linux(&argv)
+}
+
+// ─── the real-Linux boot's assertions (⑬: the capstone becomes a re-runnable gate) ───────────────
+
+/// Markers that MUST appear in the real-Linux boot. Each is a witness produced BY a mechanism rather
+/// than a claim about one (design-lesson #24f), and the VALUES are load-bearing — do not loosen any
+/// of these to a value-free substring, exactly as `hv-metal/boot-test.sh` says of `-> result=100`.
+///
+/// Why each one could have failed:
+///
+/// * **`linux model built — 448 super-span leaves …`** — `build_model_and_stage2` issues 448
+///   `P2mAllocate`/`P2mLink` pairs plus 56 `P2mAllocate`/`P2mPin` through the real
+///   `Hypervisor::dispatch`, halting on the first `Err`. The three numbers are the memory contract:
+///   shrink `LINUX_RAM_END`, change the granule, or change the span the emitter picks, and they move.
+/// * **`selftest: Stage-2 encoding verified …`** — `verify_encoding` re-decodes the descriptors the
+///   proven emitter actually wrote for THIS guest (448 blocks + the 32 MiB device window) and asserts
+///   every other slot is dead. The one real guest's emission is the one that would otherwise never be
+///   checked at runtime (M5 Arc 6b).
+/// * **`Machine model: baleen-metal-guest`** — a string that exists only in `hv-metal/linux/
+///   guest.dts`, echoed by the kernel. The kernel can only print it by READING the DTB at
+///   `0x4b00_0000` through the emitted Stage-2 map AND driving the PL011 in the pass-through device
+///   window. Un-forgeable in the same way `ro=0x5eed` is on the synthetic path.
+/// * **`node   0: [mem 0x0000000048000000-0x000000007fffffff]`** — THE MEMORY CONTRACT, in one
+///   string. It is the kernel reporting the window it got from our DTB, and it must equal
+///   `LINUX_RAM_BASE..LINUX_RAM_END` in `hv-metal/src/linux.rs` (what the emitter maps) and the
+///   `-device loader` addresses above (where the blobs land). Four places that must agree; this is
+///   the assertion that goes red when they stop agreeing.
+/// * **`Linux version 6.18.`** — an unmodified upstream Alpine kernel, not a stub that prints
+///   markers.
+/// * **`linux PSCI FID 0x84000006 -> NOT_SUPPORTED`** — the kernel's `MIGRATE_INFO_TYPE` probe
+///   trapped from EL1 to EL2 and hv-metal's handler serviced it. The HVC path is live and the kernel
+///   continued past it.
+/// * **`Run /init as init process` + `BALEEN-STEP0-OK` + `baleen-guest-ram: …`** — the kernel
+///   unpacked OUR initramfs from `0x4c00_0000` and reached userspace, which then reports the RAM
+///   window from INSIDE the guest (`/proc/iomem`) — the guest-side half of the memory contract.
+/// * **`linux guest issued PSCI SYSTEM_OFF …`** — the whole round trip, and the reason the boot
+///   terminates rather than parking: busybox `poweroff -f` -> the kernel's PSCI -> `HVC` -> EL2.
+const LINUX_MARKERS: &[&str] = &[
+    // hv-metal, before the guest runs.
+    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest",
+    "baleen: linux model built — 448 super-span leaves (896 MiB of guest RAM) across 56 L2-pinned tables",
+    "448 super-span 2 MiB block(s) emitted and decoded; device window 32 MiB",
+    // The kernel, behind the proven emitter.
+    "Linux version 6.18.",
+    "Machine model: baleen-metal-guest",
+    "node   0: [mem 0x0000000048000000-0x000000007fffffff]",
+    "baleen: linux PSCI FID 0x84000006 -> NOT_SUPPORTED",
+    "Run /init as init process",
+    // Userspace, out of our initramfs.
+    "########## BALEEN-STEP0-OK ##########",
+    "baleen-guest-ram: 48000000-7fffffff:SystemRAM",
+    // The round trip home.
+    "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
+];
+
+/// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
+///
+/// `LINUX GUEST TRAP` is the sharp one: `handle_linux_sync` prints it for any lower-EL synchronous
+/// exception that is not an `HVC` — i.e. for every Stage-2 abort. A mis-emitted descriptor, a missing
+/// device-window mapping, or a permission bit the kernel needs and does not get all land here. It is
+/// what makes this job an assertion about the EMITTER and not merely about Linux.
+const LINUX_FORBIDDEN: &[&str] = &[
+    "baleen: LINUX GUEST TRAP",
+    "Kernel panic",
+    "baleen: linux model setup",
+];
+
+/// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
+/// TCG on a CI runner, and the cost of a too-tight cap is an intermittently-red REQUIRED gate.
+/// Overridable with `$BALEEN_LINUX_WAIT` (seconds) — the same escape hatch `boot-test.sh` gives.
+const LINUX_WAIT_SECS_DEFAULT: u64 = 300;
+
+/// Boot the real-Linux config headlessly and assert its markers. Returns whether every required
+/// marker appeared and no forbidden one did; dumps the whole serial log on failure, since a boot
+/// failure is diagnosed from the log or not at all.
+fn boot_and_check_linux(argv: &[&str]) -> bool {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let wait = std::env::var("BALEEN_LINUX_WAIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(LINUX_WAIT_SECS_DEFAULT);
+
+    // The guest powers itself off (PSCI SYSTEM_OFF -> semihosting SYS_EXIT), so QEMU exits on its
+    // own on a good boot. The deadline is for the bad ones: a kernel that panics into a spin, or an
+    // EL2 park, would otherwise hang the job until the runner's own timeout with no log.
+    // `std::env::temp_dir` plus the pid is enough uniqueness here: xtask is a task runner, and only
+    // one of these runs at a time.
+    let out = std::env::temp_dir().join(format!("baleen-qemu-linux-{}.log", std::process::id()));
+    let log = match std::fs::File::create(&out) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("xtask qemu-linux-test: cannot open {}: {e}", out.display());
+            return false;
+        }
+    };
+    let errlog = match log.try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("xtask qemu-linux-test: cannot duplicate the log handle: {e}");
+            return false;
+        }
+    };
+
+    eprintln!("$ qemu-system-aarch64 {}", argv.join(" "));
+    let mut child = match Command::new("qemu-system-aarch64")
+        .args(argv)
+        .stdout(log)
+        .stderr(errlog)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("xtask qemu-linux-test: cannot spawn qemu-system-aarch64: {e}");
+            return false;
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    let mut timed_out = true;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                timed_out = false;
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+            Err(e) => {
+                eprintln!("xtask qemu-linux-test: wait failed: {e}");
+                break;
+            }
+        }
+    }
+    if timed_out {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("xtask qemu-linux-test: the boot did not finish within {wait}s — killed");
+    }
+
+    let mut serial = String::new();
+    if let Ok(mut f) = std::fs::File::open(&out) {
+        // The kernel log is UTF-8 in practice, but a truncated multi-byte sequence at the kill point
+        // must not turn a marker failure into a read failure.
+        let mut bytes = Vec::new();
+        let _ = f.read_to_end(&mut bytes);
+        serial = String::from_utf8_lossy(&bytes).into_owned();
+    }
+
+    let mut failed = timed_out;
+    for m in LINUX_MARKERS {
+        if serial.contains(m) {
+            println!("qemu-linux-test: OK — found '{m}'");
+        } else {
+            println!("qemu-linux-test: FAIL — marker '{m}' not found");
+            failed = true;
+        }
+    }
+    for m in LINUX_FORBIDDEN {
+        if serial.contains(m) {
+            println!("qemu-linux-test: FAIL — FORBIDDEN marker '{m}' appeared");
+            failed = true;
+        } else {
+            println!("qemu-linux-test: OK — forbidden '{m}' absent");
+        }
+    }
+
+    if failed {
+        println!("----------------------------------------");
+        print!("{serial}");
+        println!("----------------------------------------");
+        println!("qemu-linux-test: FAILED");
+    } else {
+        println!("qemu-linux-test: OK — a real Linux kernel booted behind the proven emitter and powered off");
+    }
+    let _ = std::fs::remove_file(&out);
+    !failed
 }
 
 /// Build `hv-metal` for the bare-metal target with `real-linux` + `selftest` (M5 Arc 5e/6b).
