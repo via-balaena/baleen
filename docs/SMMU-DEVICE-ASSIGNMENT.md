@@ -219,16 +219,23 @@ and saying so in prose would have been exactly the move GAP-C existed to stamp o
 
 ## 8. What rung 4a does **not** claim
 
-* **Nothing on the metal changes.** `hv-metal` gains one constant (`NUM_DEVICES = 1`) and no
-  behaviour. Assignment is now a proven relation with **no consumer** — deliberately, and exactly as
-  Phase II-1a landed W^X in the model before II-1b made the emitter follow it.
+* ~~**Nothing on the metal changes.** `hv-metal` gains one constant (`NUM_DEVICES = 1`) and no
+  behaviour. Assignment is now a proven relation with **no consumer**~~ — deliberately, and exactly
+  as Phase II-1a landed W^X in the model before II-1b made the emitter follow it. **CLOSED by rung
+  4b** (`docs/SMMU-STREAM-DERIVATION.md`): the metal now derives its whole stream table from this
+  relation after every dispatch, proven as a biconditional.
 * **It says who holds a device, never what memory that device reaches.** Reachability is already a
   proven relation (`p2m` → `hv-s2`'s leaf map); restating it on the device axis would be a second
-  copy to keep in step. The composition — *a device assigned to `d` walks `d`'s Stage-2 tables* — is
-  rung 4b's refinement obligation.
-* **No guest drives it.** The transitions are swept, fuzzed and proven, but no boot assigns a device
-  through them yet. Behaviour-nil by design, and the same standing as the model's executable-leaf
-  bit after II-1a.
+  copy to keep in step. The composition — *a device assigned to `d` walks `d`'s Stage-2 tables* — was
+  rung 4b's refinement obligation, and it is discharged there: `binding_of[d]` is read out of the
+  `VTTBR_EL2` value `d`'s CPU would be given, so the two consumers cannot diverge.
+* ~~**No guest drives it.** The transitions are swept, fuzzed and proven, but no boot assigns a
+  device through them yet.~~ **CLOSED by rung 4b**: every phase of its witness is a real hypercall
+  through `Hypervisor::dispatch`, and the DMA that follows lands (or does not) because of it.
+* **One caveat rung 4b added to §2a.** Exclusivity being unrepresentable in the *model* refines to
+  exclusivity in the *hardware* only if the `DevId → StreamID` map is injective — two devices sharing
+  a StreamID share one STE. The derivation refuses a non-injective map, and the refusal is proven;
+  see `docs/SMMU-STREAM-DERIVATION.md` §2a.
 * **The device namespace is public to controllers**, per §5 — declared, recorded in `obs⁺`, and not
   closed. Closing it means mediating the namespace, the same program declined for domids.
 

@@ -391,7 +391,14 @@ pub(crate) fn witness(uart: &mut Pl011) {
 #[cfg(feature = "smmu")]
 fn rung2(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
     let sid = pcie::stream_id(bdf);
-    let setup = smmu::install_stream_table();
+    // **The rung-4b fence crossing, and the only place it exists.** `hv-core` names this bus master
+    // `DevId 0` and can say nothing else about it — no BDF, no RequesterID, no StreamID — for the
+    // same reason it cannot name a physical address (design-lesson #14e). This one line is the
+    // device-axis twin of `stage2::frame_ipa`, and it is handed to the stream table rather than
+    // recomputed anywhere, so there is one derivation of it (design-lesson #14c).
+    let mut stream_of = [0u32; crate::NUM_DEVICES];
+    stream_of[DEV_EDU as usize] = sid;
+    let setup = smmu::install_stream_table(stream_of);
 
     // ── Phase 1: through-STE positive control ────────────────────────────────────────────────────
     let bound = smmu::bind_stream_bypass(sid);
@@ -549,6 +556,11 @@ const F_B_RW: Mfn = 5;
 /// Allocated by nobody, so no domain's table has a descriptor for it — the confinement arm's target.
 #[cfg(feature = "smmu")]
 const F_HOLE: Mfn = 6;
+
+/// The model's token for the one bus master this machine has. `hv-core` knows it as an opaque
+/// index and nothing more; [`rung2`] maps it to [`pcie::stream_id`]'s StreamID exactly once.
+#[cfg(feature = "smmu")]
+const DEV_EDU: hv_core::device::DevId = 0;
 
 /// The magic at the address the device **asks for** (the IPA, read as a raw physical address).
 ///
@@ -934,6 +946,316 @@ fn rung3(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
             l(&landed5), p5.seeds_took, p5.landing_after,
             p6.seeds_took, p6.landing_after,
             p7.landing_after, ev(&e7),
+        );
+        crate::park();
+    }
+
+    rung4(uart, bdf, bar0);
+}
+
+// ─── SMMU rung 4b — the table is DERIVED, and the LIFECYCLE runs on the device path ─────────────
+
+/// Drive `hv` into a live domain `dom` owning one writable frame, then emit its Stage-2 image.
+///
+/// Returns the `VTTBR_EL2` value, whose table base the device's STE must end up naming. **Emission
+/// registers the domain's binding** (`stage2::build_stage2_from_p2m` → `smmu::register_domain_binding`),
+/// which is why it has to happen before the device is assigned: the derivation refuses — loudly —
+/// to bind a device to a domain that has no Stage-2 image to be pointed at.
+#[cfg(feature = "smmu")]
+fn birth_domain_with_one_frame(hv: &mut Hypervisor, uart: &mut Pl011, dom: DomId) -> u64 {
+    expect(
+        hv,
+        uart,
+        DOM0,
+        HvCall::DomainCreate {
+            target: dom,
+            may_create: false,
+        },
+        "create",
+    );
+    expect(
+        hv,
+        uart,
+        dom,
+        HvCall::P2mAllocate { mfn: F_A_ROOT },
+        "alloc root",
+    );
+    expect(
+        hv,
+        uart,
+        dom,
+        HvCall::P2mAllocate { mfn: F_A_RW },
+        "alloc data",
+    );
+    expect(
+        hv,
+        uart,
+        dom,
+        HvCall::P2mPin {
+            mfn: F_A_ROOT,
+            level: PtLevel::L1,
+        },
+        "pin root",
+    );
+    expect(
+        hv,
+        uart,
+        dom,
+        HvCall::P2mLink {
+            parent: F_A_ROOT,
+            slot: 0,
+            child: F_A_RW,
+            writable: true,
+            leaf: true,
+            execute: false,
+        },
+        "link data",
+    );
+    crate::stage2::build_stage2_from_p2m(hv, dom, 0)
+}
+
+/// Drive one hypercall through the metal's funnel and stop the machine if the **model** refused it.
+///
+/// Every rung-4b phase is a hypercall, so a phase that silently failed to issue would leave the
+/// table in its previous state and the next assertion would be about the wrong thing entirely.
+#[cfg(feature = "smmu")]
+fn expect(hv: &mut Hypervisor, uart: &mut Pl011, caller: DomId, call: HvCall, what: &str) {
+    if let Err(e) = crate::teardown::dispatch(hv, caller, call) {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung4 '{what}' was refused by the model: {e:?}; halting"
+        );
+        crate::park();
+    }
+}
+
+/// **SMMU rung 4b — the stream table is a REFINEMENT of the model's device assignment, and it
+/// survives a domain's whole lifecycle.**
+///
+/// Rung 3 bound a stream to a domain by calling `bind_stream_stage2` **by hand**, so rung 4a's
+/// proven device→domain relation had no consumer and the hardware's answer to *"whose memory may
+/// this bus master write?"* was still a configuration nothing checked. Nothing here binds anything
+/// by hand. Every entry in the table below is produced by `hv_s2::smmu::derive_stream_table` out of
+/// the relation, from `teardown::dispatch`'s post-dispatch funnel, as a consequence of a hypercall
+/// this witness issues through the **proven** `Hypervisor::dispatch`.
+///
+/// | phase | the hypercall | what the derivation must do | required outcome |
+/// |---|---|---|---|
+/// | 1 — derivation control | `DeviceAssign{dev 0 → A}` | bind StreamID `sid` to **A's** tables | the DMA lands **where the table says**, not at the IPA |
+/// | 2 — release | `DeviceRelease{dev 0 from A}` | leave every stream denied | **aborted**, `C_BAD_STE` |
+/// | 3 — re-permit | `DeviceAssign{dev 0 → A}` | bind it again | lands again — so phase 2 was a decision |
+/// | 4 — **teardown** | `DomainDestroy{A}` | the model's sweep removes the assignment ⇒ the table denies | **aborted**, and A's old landing PA untouched |
+/// | 5 — **rebirth** | `DomainCreate{A}` + fresh tables | *nothing* — the device is not assigned to the reborn slot | still **aborted**, and the reborn tenant's memory intact |
+/// | 6 — re-assign | `DeviceAssign{dev 0 → A}` | bind the **reborn** domain's tables | lands in the reborn domain's frame |
+///
+/// **Phase 1 is the control and it is first** (design-lesson #70), and it is stronger than rung 3's:
+/// it witnesses the *derivation* as well as the translation, because the STE it lands through was
+/// never written by this file. Two sentinels, as in rung 3 (design-lesson #75) — the address the
+/// device asked for must be untouched.
+///
+/// **Phases 4 and 5 are the rung's isolation content**, and they are the confused deputy in the
+/// flavour every CPU-side proof in the repository is structurally blind to: a stale assignment is
+/// not a capability the reborn tenant would have to *use*, it is a bus master already pointed at its
+/// memory, writing with no hypercall and no vCPU. The headline probe is exactly that — delete
+/// `device::System::release_all_of` from `domain_destroy` and phases 4 and 5 both go red, with the
+/// dead tenant's device writing into the reborn tenant's frame.
+///
+/// **Phase 6 is what keeps 2, 4 and 5 from being about a wedged mechanism**, the same re-permit
+/// rungs 2 and 3 end on (#70c) — and it is sharper here, because the domain it re-permits into is a
+/// *different incarnation* with freshly emitted tables.
+#[cfg(feature = "smmu")]
+fn rung4(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
+    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_VMID_BITS};
+
+    let sid = pcie::stream_id(bdf);
+    let walk = crate::stage2::walk_stage2;
+    let slot = |phase: u64| phase * 64;
+    let ipa = crate::stage2::frame_ipa(F_A_RW);
+
+    // A fresh model, and domain A born into it. The device is UNASSIGNED at boot — `hv-core`'s
+    // fail-closed default — and the derived table therefore denies every stream before the first
+    // hypercall, which is the same default rung 2 installs by hand.
+    let mut hv = crate::build_hypervisor();
+    let vttbr_a = birth_domain_with_one_frame(&mut hv, uart, DOM_A);
+    let l1_a = vttbr_table(vttbr_a);
+    let vmid_a = vttbr_vmid(vttbr_a, BALEEN_VMID_BITS);
+    let denied_at_boot = smmu::denies_everything();
+
+    // ── Phase 1: THE DERIVATION CONTROL ──────────────────────────────────────────────────────────
+    // One hypercall, no hardware call at all — and the device is now confined to A's memory.
+    expect(
+        &mut hv,
+        uart,
+        DOM0,
+        HvCall::DeviceAssign {
+            dev: DEV_EDU,
+            to: DOM_A,
+        },
+        "assign",
+    );
+    let derived1 = smmu::published_binding(sid);
+    let asked1 = ipa + slot(1);
+    let landed1 = walk(l1_a, asked1);
+    let (p1, e1) = attempt_stage2(bar0, asked1, landed1.as_ref().map(|r| r.pa), None);
+    // The entry the funnel derived must name A's own tables, under A's VMID — the same two values
+    // rung 3 had to be handed by hand.
+    let names_a = derived1.is_some_and(|b| b.s2ttb == l1_a && b.vmid == vmid_a);
+    let translation_is_real = landed1
+        .as_ref()
+        .is_some_and(|r| r.pa != asked1 && r.writable);
+    let phase1 =
+        denied_at_boot && names_a && translation_is_real && p1.translated() && e1.is_none();
+
+    // ── Phase 2: RELEASE — the relation says no, so the table says no ────────────────────────────
+    expect(
+        &mut hv,
+        uart,
+        DOM0,
+        HvCall::DeviceRelease {
+            dev: DEV_EDU,
+            from: DOM_A,
+        },
+        "release",
+    );
+    let denied_after_release = smmu::denies_everything();
+    let asked2 = ipa + slot(2);
+    let (p2, e2) = attempt_stage2(bar0, asked2, walk(l1_a, asked2).map(|r| r.pa), None);
+    let phase2 = denied_after_release
+        && p2.refused()
+        && matches!(&e2, Some(e) if e.kind == smmu::EVT_C_BAD_STE && e.sid == sid);
+
+    // ── Phase 3: RE-PERMIT — so phase 2 was a decision, not a wedged SMMU ────────────────────────
+    expect(
+        &mut hv,
+        uart,
+        DOM0,
+        HvCall::DeviceAssign {
+            dev: DEV_EDU,
+            to: DOM_A,
+        },
+        "re-assign",
+    );
+    let asked3 = ipa + slot(3);
+    let landed3 = walk(l1_a, asked3);
+    let (p3, e3) = attempt_stage2(bar0, asked3, landed3.as_ref().map(|r| r.pa), None);
+    let phase3 = p3.translated() && e3.is_none();
+
+    // ── Phase 4: TEARDOWN — the model's sweep, seen from the bus ─────────────────────────────────
+    // A dies **holding the device**. Nothing here unbinds anything: `domain_destroy`'s
+    // `device::System::release_all_of` takes the assignment, and the funnel's re-derivation is what
+    // turns that into a denying entry. The forbidden address is A's landing site for the very IPA
+    // the device is about to ask for — seeded AFTER the destroy, because the teardown funnel scrubs
+    // a freed frame, and a sentinel written before the scrub would be zero either way (a check that
+    // could not have failed).
+    let old_landing = walk(l1_a, ipa + slot(4)).map(|r| r.pa);
+    expect(
+        &mut hv,
+        uart,
+        DOM0,
+        HvCall::DomainDestroy {
+            target: DOM_A,
+            now: 0,
+        },
+        "destroy",
+    );
+    let denied_after_destroy = smmu::denies_everything();
+    let asked4 = ipa + slot(4);
+    let (p4, e4) = attempt_stage2(bar0, asked4, None, old_landing);
+    let phase4 = denied_after_destroy
+        && old_landing.is_some()
+        && p4.refused()
+        && matches!(&e4, Some(e) if e.kind == smmu::EVT_C_BAD_STE && e.sid == sid);
+
+    // ── Phase 5: REBIRTH — a fresh tenant in the same slot, with the same frame ──────────────────
+    // The reborn domain re-allocates the SAME model frame, so it is backed by the SAME machine
+    // frame at the SAME physical address the dead tenant's device was reaching. If anything of the
+    // old assignment survived, this is where it writes into a live tenant's memory.
+    let published_before_rebirth = smmu::derivations_published();
+    let vttbr_reborn = birth_domain_with_one_frame(&mut hv, uart, DOM_A);
+    let l1_reborn = vttbr_table(vttbr_reborn);
+    let no_churn = smmu::derivations_published() == published_before_rebirth;
+    let denied_after_rebirth = smmu::denies_everything();
+    let asked5 = ipa + slot(5);
+    let reborn_landing = walk(l1_reborn, asked5).map(|r| r.pa);
+    let (p5, e5) = attempt_stage2(bar0, asked5, None, reborn_landing);
+    let phase5 = denied_after_rebirth
+        && no_churn
+        && reborn_landing.is_some()
+        && p5.refused()
+        && matches!(&e5, Some(e) if e.kind == smmu::EVT_C_BAD_STE && e.sid == sid);
+
+    // ── Phase 6: RE-ASSIGN to the REBORN domain ──────────────────────────────────────────────────
+    expect(
+        &mut hv,
+        uart,
+        DOM0,
+        HvCall::DeviceAssign {
+            dev: DEV_EDU,
+            to: DOM_A,
+        },
+        "assign to the reborn domain",
+    );
+    let derived6 = smmu::published_binding(sid);
+    let asked6 = ipa + slot(6);
+    let landed6 = walk(l1_reborn, asked6);
+    let (p6, e6) = attempt_stage2(bar0, asked6, landed6.as_ref().map(|r| r.pa), None);
+    let phase6 = derived6.is_some_and(|b| b.s2ttb == l1_reborn) && p6.translated() && e6.is_none();
+
+    // Leave the machine denying every stream again, through the model — the same restore rung 3
+    // ends on, but issued as a hypercall rather than as a hardware poke.
+    expect(
+        &mut hv,
+        uart,
+        DOM0,
+        HvCall::DeviceRelease {
+            dev: DEV_EDU,
+            from: DOM_A,
+        },
+        "restore",
+    );
+    let restored = smmu::denies_everything();
+
+    if phase1 && phase2 && phase3 && phase4 && phase5 && phase6 && restored {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung4 DERIVATION POSITIVE CONTROL OK: nothing in this phase touched the SMMU — ONE HvCall DeviceAssign{{dev {DEV_EDU} -> domain {DOM_A}}} through the proven dispatch, and teardown::dispatch DERIVED StreamID {sid}'s entry from the model's assignment relation (S2TTB={:#x} = domain {DOM_A}'s own VTTBR_EL2 table, S2VMID={vmid_a}); the device asked for IPA {asked1:#x} and the DMA landed at PA {:#x} — where the TABLE says, not where the device asked ({asked1:#x} intact {:#x})",
+            derived1.map_or(0, |b| b.s2ttb),
+            p1.landing.unwrap_or(0),
+            p1.asked_after
+        );
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung4 RELEASE OK: HvCall DeviceRelease made the derived table deny EVERY StreamID and the same DMA to IPA {asked2:#x} was ABORTED with C_BAD_STE (sentinel intact); re-assigning let the SAME DMA land again at PA {:#x} — the denial was a decision the RELATION made, not a wedged SMMU",
+            p3.landing.unwrap_or(0)
+        );
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung4 TEARDOWN OK: domain {DOM_A} was destroyed while HOLDING the device — nothing unbound the stream, hv-core's release_all_of took the assignment and the re-derivation turned that into a denying entry: the SAME device asking for the SAME IPA {asked4:#x} was ABORTED with C_BAD_STE and domain {DOM_A}'s old landing PA {:#x} was untouched ({:#x})",
+            old_landing.unwrap_or(0),
+            p4.forbidden_after.unwrap_or(0)
+        );
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung4 REBIRTH OK: a fresh domain {DOM_A} in the same slot re-allocated the same model frame at the same PA {:#x} and its memory is INTACT ({:#x}) — the dead tenant's bus master reaches NOTHING of the reborn tenant's; re-assigning to the reborn domain then landed in ITS frame at PA {:#x} (S2TTB={:#x}), and releasing left the table denying every StreamID again — the stream table is a REFINEMENT of hv-core's proven device assignment, biconditional and machine-checked in hv-verify::smmu_stream_derivation",
+            reborn_landing.unwrap_or(0),
+            p5.forbidden_after.unwrap_or(0),
+            p6.landing.unwrap_or(0),
+            derived6.map_or(0, |b| b.s2ttb)
+        );
+    } else {
+        let ev = |e: &Option<smmu::SmmuEvent>| match e {
+            Some(e) => (e.kind, e.sid, e.addr),
+            None => (0xff, u32::MAX, u64::MAX),
+        };
+        let _ = writeln!(
+            uart,
+            "baleen: smmu rung4 FAIL (sid={sid} boot_denied={denied_at_boot} a_ttb={l1_a:#x}/{vmid_a} reborn_ttb={l1_reborn:#x} | p1 derived={:x?} names_a={names_a} real={translation_is_real} seeds={} landing_after={:?} evt={:x?} | p2 denied={denied_after_release} refused={} evt={:x?} | p3 seeds={} landing_after={:?} evt={:x?} | p4 denied={denied_after_destroy} old={:?} forbidden_after={:?} evt={:x?} | p5 denied={denied_after_rebirth} churn={} reborn={:?} forbidden_after={:?} evt={:x?} | p6 derived={:x?} landing_after={:?} evt={:x?} | restored={restored}); halting",
+            derived1.map(|b| b.s2ttb), p1.seeds_took, p1.landing_after, ev(&e1),
+            p2.refused(), ev(&e2),
+            p3.seeds_took, p3.landing_after, ev(&e3),
+            old_landing, p4.forbidden_after, ev(&e4),
+            !no_churn, reborn_landing, p5.forbidden_after, ev(&e5),
+            derived6.map(|b| b.s2ttb), p6.landing_after, ev(&e6),
         );
         crate::park();
     }

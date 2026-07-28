@@ -397,6 +397,35 @@ boot_and_check "dma-control" "" \
 #
 # The metal now REQUIRES `IDR0.S2P` before rung 3 runs, so a machine that does not implement stage 2
 # fails loudly and by name rather than reporting a wall of unexplained `C_BAD_STE`.
+#
+# Rung 4b (THE TABLE IS DERIVED) runs in the same boot again and needs no machine change at all —
+# which is the point. Rung 3 bound its STE by hand; nothing in rung 4b touches the SMMU. Every entry
+# is DERIVED from `hv-core`'s proven device→domain relation by `teardown::dispatch`'s post-dispatch
+# funnel, as a consequence of a hypercall issued through the real `Hypervisor::dispatch`, so the
+# stream table becomes a REFINEMENT of that relation exactly as the Stage-2 tables are a refinement
+# of the `p2m`. The four markers run Arc-0's lifecycle matrix on the DEVICE path:
+#
+#   * DERIVATION POSITIVE CONTROL — one `HvCall::DeviceAssign` and nothing else; the derived STE
+#     names the domain's own VTTBR_EL2 table and VMID, and the DMA lands where the TABLE says (not at
+#     the IPA the device issued). First, and stronger than rung 3's control, because it witnesses the
+#     derivation as well as the translation.
+#   * RELEASE — `HvCall::DeviceRelease` makes the derived table deny EVERY StreamID: aborted with
+#     C_BAD_STE. Re-assigning lets the same DMA land again, so the denial was a decision the RELATION
+#     made rather than a wedged SMMU (design-lesson #70c).
+#   * TEARDOWN — the domain is destroyed while HOLDING the device. Nothing unbinds the stream:
+#     `hv-core`'s `release_all_of` takes the assignment and the re-derivation turns that into a
+#     denying entry. The same device asking for the same IPA is aborted, and the dead domain's old
+#     landing PA is untouched (seeded AFTER the destroy, because the funnel scrubs a freed frame and
+#     a sentinel written before the scrub would be zero either way).
+#   * REBIRTH — a fresh domain in the same slot re-allocates the SAME model frame at the SAME
+#     physical address, and its memory survives intact: the dead tenant's bus master reaches nothing
+#     of the reborn tenant's. Re-assigning then lands in the REBORN domain's frame.
+#
+# **The headline probe:** delete `device::System::release_all_of` from `domain_destroy` and the
+# TEARDOWN and REBIRTH markers both go red, with the dead tenant's device writing into the reborn
+# tenant's memory. That is the confused deputy in the one flavour every CPU-side proof in this
+# repository is structurally blind to — a bus master already pointed at a live tenant's memory,
+# writing with no hypercall and no vCPU.
 MACHINE_EXTRA=",iommu=smmuv3"
 EXTRA_QEMU="-m 2048 -global arm-smmuv3.stage=2 -device edu,dma_mask=0xffffffffff"
 boot_and_check "smmu" "--features smmu" \
@@ -410,7 +439,11 @@ boot_and_check "smmu" "--features smmu" \
     "smmu rung3 CONFINEMENT OK" \
     "smmu rung3 PERMISSION OK" \
     "smmu rung3 STREAM-TO-DOMAIN BINDING OK" \
-    "smmu rung3 RESTORED OK"
+    "smmu rung3 RESTORED OK" \
+    "smmu rung4 DERIVATION POSITIVE CONTROL OK" \
+    "smmu rung4 RELEASE OK" \
+    "smmu rung4 TEARDOWN OK" \
+    "smmu rung4 REBIRTH OK"
 EXTRA_QEMU=""
 MACHINE_EXTRA=""
 
