@@ -241,6 +241,17 @@ pub extern "C" fn rust_main() -> ! {
     #[cfg(feature = "selftest")]
     guest::selftest_vgic_lr_ownership(&mut uart);
 
+    // (6e) III-1 — the >N-pending overflow witness, and the retirement of the last correctness residue
+    //      in the ledger. Arc 8b (6d above) made a FULL list-register bank *reported* rather than
+    //      silently clobbering a pending vINT — and `inject_interrupt` then HALTED on that report. This
+    //      asserts the replacement: a per-vCPU software pending set absorbs the overflow, the underflow
+    //      maintenance interrupt is armed only while something waits for it, a refill drains the set into
+    //      the bank in order, and a peer vCPU's refill takes NONE of it (the isolation half — a single
+    //      global queue would reopen the cross-vCPU leak 8b/III-3 closed for the hardware half). The
+    //      metal's live interrupt sources cannot fill 4 LRs, so the overflow is manufactured here.
+    #[cfg(feature = "selftest")]
+    guest::selftest_vgic_pending_overflow(&mut uart);
+
     // (7) The guest headline: enter a real EL1 guest behind real Stage-2 emitted from the proven
     //     `p2m`, run the Arc-5 authorize/deny isolation matrix (the proof touches reality), then the
     //     M5 Arc 0 LIFECYCLE phase — destroy the guest and reborn a fresh domain in the same slot,

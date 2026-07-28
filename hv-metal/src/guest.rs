@@ -1961,6 +1961,127 @@ fn vcpu_meta(slot: usize) -> VcpuMeta {
     VCPU_META.borrow_mut()[slot]
 }
 
+// ─── III-1: the software pending set — vINTs that did not fit the list-register bank ─────────────
+//
+// The `ICH_LR<n>_EL2` bank holds at most `num_list_registers()` simultaneously-pending virtual
+// interrupts (4 on QEMU `virt`). Arc 8b made a full bank *reported* rather than silently clobbering a
+// pending vINT, and `ArmVcpu::inject_interrupt` then **halted** on that report — loud, but a hypervisor
+// that cannot accept an interrupt is broken, so this was the last correctness residue in the ledger.
+//
+// **Why a SET and not a queue.** The residue was written down as "a software pending *queue*", and a
+// queue is the wrong shape: it has a capacity, so `queue full` becomes the new halt path and the defect
+// relocates instead of closing. Pending-ness in the GIC is **one bit per INTID** — re-injecting an
+// already-pending interrupt is idempotent, which is precisely what `Pending` means — and the HAL fence
+// (`hv_hal::VcpuOps::inject_interrupt`) types a vINTID as `u8`. So the faithful representation is a
+// **set over 256 INTIDs**: 4 × `u64` per vCPU, a fixed 32 bytes, in which **there is no representable
+// overflow state**. Nothing is lost by dropping to a set: a bitmap discards arrival order and
+// multiplicity, and the GIC delivers by *priority* while keeping exactly one pending bit per INTID, so
+// neither was ever observable. It also makes the metal's pending representation mirror `hv-core`'s
+// `evtchn` pending, which is a set too.
+//
+// **Why PER-vCPU.** A single global set would deliver one vCPU's overflow vINTs into whichever vCPU
+// happened to be running — reopening exactly the cross-vCPU leak Arc 8b/III-3 closed for the hardware
+// half of the same state. The LR bank rides the context switch per vCPU ([`GuestContext::ich_lr`]); its
+// software overflow must too, or the isolation property holds for the first 4 pending interrupts and
+// silently stops holding for the fifth. So this is indexed by [`CUR_VCPU`], and the witness asserts the
+// isolation half explicitly rather than only the correctness half.
+//
+// **Not a `BootCell`.** Plain atomics, because `inject_interrupt` is reachable from the asynchronous EL2
+// agent (`handle_guest_irq`) as well as the synchronous HVC path, and `crate::cell`'s class-3 hazard (the
+// I1 invariant) is about a borrow being live across those. Atomics have no borrow to overlap, so the
+// hazard does not arise and no I1 argument is needed for this state.
+
+/// `u64` words in a per-vCPU pending set — 256 INTIDs, the whole range the `u8` HAL fence can express.
+const PENDING_WORDS: usize = 4;
+
+/// Per-vCPU **software pending set**: bit `i` of word `w` = vINTID `w * 64 + i` is pending for that vCPU
+/// but has no list register yet. Drained into free LRs by [`flush_pending_to_lrs`].
+static VCPU_PENDING: [[AtomicU64; PENDING_WORDS]; NUM_VCPUS_METAL] =
+    [const { [const { AtomicU64::new(0) }; PENDING_WORDS] }; NUM_VCPUS_METAL];
+
+/// Record `intid` as pending for vCPU `slot` (idempotent — the whole point of a set).
+fn pending_mark(slot: usize, intid: u32) {
+    let (w, b) = ((intid as usize) / 64, (intid as usize) % 64);
+    VCPU_PENDING[slot][w].fetch_or(1 << b, Ordering::Relaxed);
+}
+
+/// Whether vCPU `slot` has any software-pending vINT waiting for a list register.
+fn pending_is_empty(slot: usize) -> bool {
+    VCPU_PENDING[slot]
+        .iter()
+        .all(|w| w.load(Ordering::Relaxed) == 0)
+}
+
+/// Remove and return the lowest-numbered software-pending vINTID of vCPU `slot`, if any.
+///
+/// Lowest-first is not an ordering promise — a set has no order. It is chosen because the GIC itself
+/// resolves simultaneous pending interrupts by priority and, at equal priority, by lowest INTID, so
+/// draining in this order makes the software half agree with the hardware half's tie-break.
+fn pending_take_next(slot: usize) -> Option<u32> {
+    for (w, word) in VCPU_PENDING[slot].iter().enumerate() {
+        let bits = word.load(Ordering::Relaxed);
+        if bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            word.fetch_and(!(1u64 << b), Ordering::Relaxed);
+            return Some((w * 64 + b) as u32);
+        }
+    }
+    None
+}
+
+/// Clear vCPU `slot`'s whole pending set. (`selftest`-only: the real paths only ever *drain* the set
+/// through [`flush_pending_to_lrs`], which is what keeps the `UIE` arming consistent with it — a bulk
+/// clear would need its own re-arm, so the witness pairs every call with one.)
+#[cfg(feature = "selftest")]
+fn pending_clear(slot: usize) {
+    for w in &VCPU_PENDING[slot] {
+        w.store(0, Ordering::Relaxed);
+    }
+}
+
+/// **Drain vCPU `slot`'s software pending set into free list registers, then re-arm the underflow
+/// maintenance interrupt to match what is left** (III-1). Returns how many vINTs were placed.
+///
+/// This is the refill, and it runs from two places for two different reasons:
+///
+/// * [`restore_context`] — on every switch-in, so a vCPU resumes with its bank as full as it can be.
+///   Deterministic and needs no interrupt, which is why it, not the maintenance interrupt, is the
+///   primary path. (KVM does the same on `vcpu_load`.)
+/// * [`handle_guest_irq`] on [`gic::MAINT_INTID`] — for the case the first path cannot reach: a guest
+///   that keeps running, taking and completing interrupts, without ever exiting to EL2. There the bank
+///   runs down while EL2 is not executing, and only the hardware's underflow signal can tell us.
+///
+/// The trailing `set_underflow_interrupt(!empty)` is the storm guard: `UIE` is level-based on the LR
+/// occupancy, so arming it over an empty set makes an idle guest re-assert the maintenance interrupt
+/// immediately after every EOI. Arming is therefore always a function of what remains pending, and this
+/// is the single place that decides it.
+fn flush_pending_to_lrs(slot: usize) -> usize {
+    let n = gic::num_list_registers();
+    let mut placed = 0;
+    for i in 0..n {
+        if !gic::lr_is_free(gic::read_lr(i)) {
+            continue;
+        }
+        match pending_take_next(slot) {
+            Some(intid) => {
+                // Re-enters the raw allocator rather than writing the LR here, so the pending set and
+                // the synchronous path place interrupts through exactly one encoder (#55).
+                if gic::inject(intid) {
+                    placed += 1;
+                } else {
+                    // The bank filled under us (it cannot, single-CPU, with a free LR just observed —
+                    // but do not lose the vINT on a surprise): put it back.
+                    pending_mark(slot, intid);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    gic::set_underflow_interrupt(!pending_is_empty(slot));
+    placed
+}
+
 /// Install a VMID-tagged `VTTBR_EL2` with **no TLB flush** (M5 Arc 2 — the headline property). Switching
 /// the active Stage-2 between two domains needs no `tlbi` *because* the two domains' translations are
 /// tagged with distinct VMIDs (`set_vmid(set) = set + 1`): a walk for one domain's VMID can never hit
@@ -2097,6 +2218,18 @@ __guest_irq_entry:
 #[no_mangle]
 extern "C" fn handle_guest_irq(_frame: *mut GuestFrame) {
     let intid = gic::ack_physical();
+    // III-1: the GIC maintenance interrupt with `UIE` armed means the list-register bank has run down
+    // to at most one occupant and can take more. Refill it from this vCPU's software pending set. This
+    // is the path `restore_context`'s refill cannot cover — a guest that keeps running, taking and
+    // completing its interrupts without ever exiting to EL2, drains the bank while EL2 is not
+    // executing, so only the hardware underflow signal can tell us to top it up.
+    //
+    // `flush_pending_to_lrs` re-arms `UIE` from what remains pending, so when the set empties the
+    // arming drops and this interrupt stops re-asserting. Getting that wrong is an EL2 livelock (see
+    // `gic::ICH_HCR_EL2_UIE`), which is why the arming decision lives in exactly one place.
+    if intid == gic::MAINT_INTID {
+        let _ = flush_pending_to_lrs(CUR_VCPU.load(Ordering::Relaxed) as usize);
+    }
     if intid == gic::VTIMER_INTID {
         gic::disable_vtimer(); // one-shot: stop the level-triggered PPI re-asserting after EOI
         TIMER_IRQ_FIRED.store(true, Ordering::Relaxed);
@@ -2143,17 +2276,25 @@ struct ArmVcpu;
 impl hv_hal::VcpuOps for ArmVcpu {
     fn inject_interrupt(&mut self, vector: u8) {
         // The `u8` vector is a vGIC vINTID (Arc 7a exercises INTID 42). The trait's `u8` cannot
-        // express SPIs > 255 — recorded in the Arc-7 ledger as a HAL-fence limit, not a metal one.
-        // Arc 8b: `inject` allocates a free list register; a full bank is reported, not silently
-        // dropped. The software pending queue is deferred, so halt loudly rather than lose a vINT
-        // (the metal has too few interrupt sources to fill the bank today — this never fires).
+        // express SPIs > 255 — recorded in the Arc-7 ledger as a HAL-fence limit, not a metal one
+        // (III-2), and it is what bounds III-1's pending set to `PENDING_WORDS` words.
+        //
+        // Arc 8b: `inject` allocates a free list register, so a new vINT never overwrites one the
+        // guest has not taken; a full bank was *reported*, and this function then HALTED on the
+        // report. III-1 removes that halt. A full bank is no longer a delivery failure: the vINT
+        // joins the running vCPU's software pending set and the underflow maintenance interrupt is
+        // armed, so it lands in a list register as soon as the bank runs down (via
+        // `flush_pending_to_lrs`, from the maintenance interrupt or the next switch-in).
+        //
+        // **This function can no longer fail**, which is why it stays `-> ()` and why the pending
+        // set is a set rather than a queue: with one bit per INTID there is no "full" state to
+        // report, so there is no residual path for a caller to have to handle. The interrupt is
+        // recorded against `CUR_VCPU` — the vCPU whose live LRs `gic::inject` just tried — so an
+        // overflow vINT stays the property of the vCPU it was raised for.
         if !gic::inject(vector as u32) {
-            let mut uart = crate::uart();
-            let _ = writeln!(
-                uart,
-                "baleen: vGIC list-register bank full injecting vINT {vector} — software pending queue deferred (Arc 8b); halting"
-            );
-            crate::park();
+            let slot = CUR_VCPU.load(Ordering::Relaxed) as usize;
+            pending_mark(slot, u32::from(vector));
+            gic::set_underflow_interrupt(true);
         }
     }
 
@@ -2558,6 +2699,12 @@ fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
     for (i, &lr) in ctx.ich_lr.iter().enumerate().take(n) {
         gic::write_lr(i, lr);
     }
+    // III-1: with this vCPU's own bank reinstated, top up any free list registers from ITS software
+    // pending set — the deterministic half of the refill, needing no maintenance interrupt. It must run
+    // *after* the restore (which overwrites the whole bank, so a pre-restore refill would be discarded)
+    // and it re-arms `UIE` for whatever is still pending, which is also what makes the arming follow the
+    // switched-in vCPU rather than the outgoing one.
+    let _ = flush_pending_to_lrs(vcpu);
     set_vttbr_no_flush(vcpu_meta(vcpu).vttbr);
 }
 
@@ -5367,6 +5514,151 @@ pub(crate) fn selftest_vgic_lr_ownership(uart: &mut Pl011) {
         let _ = writeln!(
             uart,
             "baleen: selftest: vGIC LR-bank ownership FAIL (n={n} placed={all_placed} overflow={overflow_reported} none={slot1_sees_none} preserved={slot0_preserved}); halting"
+        );
+        crate::park();
+    }
+}
+
+/// **The III-1 >N-pending overflow witness (`selftest` builds) — the residue's replacement, asserted.**
+///
+/// Arc 8b left the last *correctness* residue in the ledger: with all `num_list_registers()` LRs occupied,
+/// the next `inject_interrupt` **halted the hypervisor**. III-1 replaces that with a per-vCPU software
+/// pending set ([`VCPU_PENDING`]) drained by [`flush_pending_to_lrs`]. The bank cannot be filled by the
+/// metal's live interrupt sources (4 LRs on QEMU `virt`; only INTIDs 25/27/42 are in play), so the
+/// overflow has to be **manufactured** — which is exactly why it needs a witness rather than a comment.
+///
+/// Driven through `hv_hal::VcpuOps::inject_interrupt` — the realized HAL fence, not the raw
+/// [`gic::inject`] — so what is asserted is the path a real injector takes:
+///
+/// 1. **`N + M` injections all succeed and nothing halts.** The first `N` land in list registers, the
+///    next `M` land in the pending set. Under Arc 8b, injection `N+1` was a `park()`.
+/// 2. **`UIE` is armed** while the set is non-empty — the refill signal is requested, not assumed.
+/// 3. **The guest drains the bank** (modelled by clearing the LRs, as taking + EOI-ing each vINT does)
+///    and a refill places the `M` overflow vINTs in list registers, **lowest INTID first**.
+/// 4. **`UIE` is disarmed** the moment the set empties. This is the storm guard, and the one assertion
+///    whose failure mode is a livelocked EL2 rather than a wrong answer — `UIE` is level-based on LR
+///    occupancy, so armed-over-empty re-asserts the maintenance interrupt after every EOI forever.
+/// 5. **The overflow is PER-vCPU.** A vINT overflowed while vCPU 0 runs is marked against vCPU 0; a
+///    refill for vCPU 1 must place **none** of it. A single global queue would pass 1–4 and fail this —
+///    it would deliver one vCPU's interrupts into whichever vCPU happened to be running, reopening the
+///    cross-vCPU leak Arc 8b/III-3 closed for the hardware half of the very same state. So III-1 carries
+///    isolation content, not just correctness, and this is the assertion that pins it.
+///
+/// Runs over the live registers before any guest exists, enables only the LR sysreg interface (no `IMO`,
+/// so no physical IRQ routing is perturbed), and leaves both the bank and both pending sets clean.
+#[cfg(feature = "selftest")]
+pub(crate) fn selftest_vgic_pending_overflow(uart: &mut Pl011) {
+    gic::enable_lr_sysreg_access();
+    // Bring up the distributor/redistributor and enable the maintenance PPI, so step (2b) can read back
+    // whether the GIC actually *asserts* the refill request — not merely whether we set `UIE`. Safe this
+    // early: it enables no physical CPU interface and EL2 keeps IRQs masked, so nothing can be taken here;
+    // the witness clears the pending PPI and disarms `UIE` before returning. The real timer phase calls
+    // this again (same values).
+    gic::init_physical_vtimer();
+    let n = gic::num_list_registers();
+    let base = SELFTEST_LR_BASE_INTID;
+    // Overflow the bank by this many vINTs — enough that the set holds more than one, so the drain
+    // order is observable rather than vacuous.
+    const M: usize = 3;
+
+    // Clean slate: empty bank, empty pending sets, and vCPU 0 current.
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
+    for slot in 0..NUM_VCPUS_METAL {
+        pending_clear(slot);
+    }
+    gic::set_underflow_interrupt(false);
+    CUR_VCPU.store(0, Ordering::Relaxed);
+
+    // (1) N + M injections through the HAL fence. None may halt; `inject_interrupt` returns `()`, so
+    // "did not halt" is witnessed by reaching the next line at all.
+    {
+        use hv_hal::VcpuOps;
+        for k in 0..(n + M) {
+            ArmVcpu.inject_interrupt((base as usize + k) as u8);
+        }
+    }
+    let bank_full = (0..n).all(|i| !gic::lr_is_free(gic::read_lr(i)));
+    // The first N are in the bank, in order; the M overflow vINTs are in the set, not lost.
+    let bank_holds_first_n = (0..n).all(|i| gic::lr_vintid(gic::read_lr(i)) == base + i as u32);
+    let set_holds_overflow = !pending_is_empty(0);
+
+    // (2) the refill signal is armed while something is waiting for it.
+    let uie_armed_when_pending = gic::underflow_interrupt_armed();
+
+    // (5) --- per-vCPU: a refill for the OTHER vCPU must take none of vCPU 0's overflow ---
+    // (Done before the drain, while vCPU 0's set is still loaded.) Empty the bank so a mis-scoped
+    // refill would have somewhere to put a stolen vINT — otherwise the assertion passes vacuously.
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
+
+    // (2b) With the bank now empty and vCPU 0's set still non-empty, the underflow condition genuinely
+    // holds — so the GIC must have the maintenance PPI ASSERTED. This is the one assertion the metal
+    // cannot make from its own bookkeeping: everything else here checks state this file wrote, whereas
+    // this checks that the interrupt controller agrees the refill is due. Without it, `UIE` and the whole
+    // maintenance-interrupt arm of III-1 would be compiled and armed but never witnessed to *do*
+    // anything — and a deferred check is an unverified one.
+    //
+    // Note what this does and does not establish. It establishes that our arming produces a real
+    // interrupt request from the hardware for a real underflow. It does not establish EL2 *taking* it
+    // while a guest runs — see the phase-level residue in the III-1 notes; the refill body it would run
+    // (`flush_pending_to_lrs`) is the same one steps (3)–(5) exercise directly.
+    let maint_asserted = gic::maint_is_pending();
+
+    CUR_VCPU.store(1, Ordering::Relaxed);
+    let peer_placed = flush_pending_to_lrs(1);
+    let peer_took_none = peer_placed == 0 && (0..n).all(|i| gic::lr_is_free(gic::read_lr(i)));
+    // vCPU 1's set is empty, so its refill must also have DISARMED the signal — the arming follows the
+    // switched-in vCPU, not the one that overflowed.
+    let uie_follows_vcpu = !gic::underflow_interrupt_armed();
+    CUR_VCPU.store(0, Ordering::Relaxed);
+
+    // (3) vCPU 0's own refill: the bank is empty (the guest took everything), so the M overflow vINTs
+    // move into list registers, lowest INTID first.
+    let placed = flush_pending_to_lrs(0);
+    let refilled_in_order =
+        (0..M).all(|k| gic::lr_vintid(gic::read_lr(k)) == base + (n + k) as u32);
+    let drained = pending_is_empty(0);
+
+    // (4) the storm guard: nothing pending ⇒ the maintenance interrupt is not requested.
+    let uie_disarmed_when_empty = !gic::underflow_interrupt_armed();
+
+    // Leave no phantom vINT or armed signal behind for the first real phase: empty bank, empty sets,
+    // `UIE` disarmed (which removes the underflow condition), then clear any maintenance PPI the witness
+    // caused to assert and confirm it really went away.
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
+    for slot in 0..NUM_VCPUS_METAL {
+        pending_clear(slot);
+    }
+    gic::set_underflow_interrupt(false);
+    gic::clear_maint_pending();
+    let left_clean = !gic::maint_is_pending() && !gic::underflow_interrupt_armed();
+
+    let ok = bank_full
+        && bank_holds_first_n
+        && set_holds_overflow
+        && uie_armed_when_pending
+        && maint_asserted
+        && left_clean
+        && peer_took_none
+        && uie_follows_vcpu
+        && placed == M
+        && refilled_in_order
+        && drained
+        && uie_disarmed_when_empty;
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: selftest: vGIC pending-overflow OK ({n} LRs + {M} overflowed: none lost, none halted, refilled in order, GIC asserted the maintenance IRQ for the underflow, UIE armed only while pending, peer vCPU took none)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: selftest: vGIC pending-overflow FAIL (n={n} full={bank_full} first_n={bank_holds_first_n} set={set_holds_overflow} uie_on={uie_armed_when_pending} maint={maint_asserted} clean={left_clean} peer_none={peer_took_none} uie_follows={uie_follows_vcpu} placed={placed} order={refilled_in_order} drained={drained} uie_off={uie_disarmed_when_empty}); halting"
         );
         crate::park();
     }
