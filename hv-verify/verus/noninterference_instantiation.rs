@@ -1110,22 +1110,36 @@ pub proof fn local_respect_holds()
 }
 
 /// **Step consistency holds for the concrete system** (∀-N). The creation channel factors through
-/// the read-closed `obs`: the successor `life[a]` depends only on `life[a]` (in `obs(a)`) and
+/// the read-closed `obs⁺`: the successor `life[a]` depends only on `life[a]` (in `obs(a)`) and
 /// `may_create[creator]` (in `obs(creator)` — the GAP-C refinement); `maycreate` is unchanged.
-/// Two states agreeing on both observations compute the same successor `obs(a)`.
+/// Two states agreeing on both observations compute the same successor `obs⁺(a)`.
+///
+/// **Stated and proved over `obs⁺` (⑦).** `ObsPlus` is a two-field datatype, so the obligation
+/// splits structurally into the integrity surface and the read-closure; the body establishes both
+/// components per arm, and the hypothesis is likewise destructured on entry. That is the entire
+/// mechanical cost of the surface split on this side — confidentiality needs no channel relation,
+/// so nothing here has to be re-argued, only re-projected.
 pub proof fn step_consistent_holds()
     ensures
         step_consistent(),
 {
     assert forall|s: Sys, u: Sys, t: Trans, a: Dom|
-        wf(s) && wf(u) && obs(s, a) == obs(u, a) && obs(s, actor(t)) == obs(u, actor(t)) implies
-        #[trigger] obs(step(s, t), a) == #[trigger] obs(step(u, t), a) by {
+        wf(s) && wf(u) && obs_plus(s, a) == obs_plus(u, a) && obs_plus(s, actor(t)) == obs_plus(
+            u,
+            actor(t),
+        ) implies #[trigger] obs_plus(step(s, t), a) == #[trigger] obs_plus(step(u, t), a) by {
+        // Destructure the hypothesis: `obs⁺` agreement is agreement on `obs` and on the read-closure.
+        assert(obs(s, a) == obs(u, a));
+        assert(a_read_caps(s, a) == a_read_caps(u, a));
+        assert(obs(s, actor(t)) == obs(u, actor(t)));
+        assert(a_read_caps(s, actor(t)) == a_read_caps(u, actor(t)));
         match t {
             Trans::Create { creator, target } => {
                 // obs(·,a).live == live.contains(a); obs(·,creator).maycreate ==
                 // maycreate.contains(creator). Both agree across s,u, so the guard (for target==a)
                 // and the write agree; for target!=a, life[a] is untouched on both sides.
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::Send { sender, port } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
@@ -1154,6 +1168,7 @@ pub proof fn step_consistent_holds()
                 }
                 assert(obs(step(s, t), a).pend =~= obs(step(u, t), a).pend);
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::GrantMap { mapper, g } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
@@ -1238,12 +1253,12 @@ pub proof fn step_consistent_holds()
                 broadcast use vstd::map_lib::group_map_properties;
                 let reads = s.grants.dom().contains(g) && s.grants[g].grantee == a;
                 assert(reads == (u.grants.dom().contains(g) && u.grants[g].grantee == a)) by {
-                    assert(obs(s, a).read_caps.dom().contains(g) == reads);
-                    assert(obs(u, a).read_caps.dom().contains(g) == (u.grants.dom().contains(g)
+                    assert(a_read_caps(s, a).dom().contains(g) == reads);
+                    assert(a_read_caps(u, a).dom().contains(g) == (u.grants.dom().contains(g)
                         && u.grants[g].grantee == a));
                 }
                 if reads {
-                    assert(obs(s, a).read_caps[g] == obs(u, a).read_caps[g]);
+                    assert(a_read_caps(s, a)[g] == a_read_caps(u, a)[g]);
                     let fr = s.grants[g].frame;
                     // Record + frame owner pinned by the read-cap (the `owner` component).
                     assert(s.grants[g].grantor == u.grants[g].grantor && fr == u.grants[g].frame
@@ -1252,17 +1267,18 @@ pub proof fn step_consistent_holds()
                     assert(s.owner.dom().contains(fr) && u.owner.dom().contains(fr));  // wf
                     assert(grant_map_guard(s, mapper, g) == grant_map_guard(u, mapper, g));
                 }
-                assert_maps_equal!(obs(step(s, t), a).read_caps, obs(step(u, t), a).read_caps, k => {
+                assert_maps_equal!(a_read_caps(step(s, t), a), a_read_caps(step(u, t), a), k => {
                     if k != g {
                         assert(step(s, t).grants[k] == s.grants[k]);
                         assert(step(u, t).grants[k] == u.grants[k]);
-                        assert(obs(s, a).read_caps.dom().contains(k) == obs(u, a).read_caps.dom().contains(k));
-                        if obs(s, a).read_caps.dom().contains(k) {
-                            assert(obs(s, a).read_caps[k] == obs(u, a).read_caps[k]);
+                        assert(a_read_caps(s, a).dom().contains(k) == a_read_caps(u, a).dom().contains(k));
+                        if a_read_caps(s, a).dom().contains(k) {
+                            assert(a_read_caps(s, a)[k] == a_read_caps(u, a)[k]);
                         }
                     }
                 });
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::SetAffinity { caller, vcpu, aff } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
@@ -1298,6 +1314,7 @@ pub proof fn step_consistent_holds()
                     }
                 });
                 assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
             Trans::Destroy { caller, target } => {
                 broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas,
@@ -1347,23 +1364,25 @@ pub proof fn step_consistent_holds()
                     assert(obs(step(s, t), a).frame_maps == obs(step(u, t), a).frame_maps);
                     // ---- read-caps ---- a held grant survives iff grantor `≠ c` (and not an active
                     // self-grant when `a == c`) — a function of `obs(a).read_caps[g]`; `owner` fixed.
-                    assert_maps_equal!(obs(step(s, t), a).read_caps, obs(step(u, t), a).read_caps, g => {
-                        assert(obs(s, a).read_caps.dom().contains(g) == (s.grants.dom().contains(g)
+                    assert_maps_equal!(a_read_caps(step(s, t), a), a_read_caps(step(u, t), a), g => {
+                        assert(a_read_caps(s, a).dom().contains(g) == (s.grants.dom().contains(g)
                             && s.grants[g].grantee == a));
-                        assert(obs(u, a).read_caps.dom().contains(g) == (u.grants.dom().contains(g)
+                        assert(a_read_caps(u, a).dom().contains(g) == (u.grants.dom().contains(g)
                             && u.grants[g].grantee == a));
-                        assert(obs(s, a).read_caps.dom().contains(g) == obs(u, a).read_caps.dom().contains(g));
-                        if obs(s, a).read_caps.dom().contains(g) {
-                            assert(obs(s, a).read_caps[g] == obs(u, a).read_caps[g]);
+                        assert(a_read_caps(s, a).dom().contains(g) == a_read_caps(u, a).dom().contains(g));
+                        if a_read_caps(s, a).dom().contains(g) {
+                            assert(a_read_caps(s, a)[g] == a_read_caps(u, a)[g]);
                             assert(s.grants[g].grantor == u.grants[g].grantor
                                 && s.grants[g].active == u.grants[g].active
                                 && s.grants[g].grantee == u.grants[g].grantee);
                         }
                     });
                     assert(obs(step(s, t), a) == obs(step(u, t), a));
+                    assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
                 } else {
                     // Neither destroy fires: both states are unchanged and already obs(a)-agree.
                     assert(obs(step(s, t), a) == obs(step(u, t), a));
+                    assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
                 }
             },
         }
@@ -1402,14 +1421,15 @@ pub open spec fn trace_noninterfering(s: Sys, tr: Seq<Trans>, a: Dom) -> bool
     }
 }
 
-/// Two executions agree, at each step, on the acting domain's observation.
+/// Two executions agree, at each step, on the acting domain's observation — at the
+/// **confidentiality** surface `obs⁺` (⑦), the surface `step_consistent` is stated over.
 pub open spec fn traces_agree_on_actor(s: Sys, u: Sys, tr: Seq<Trans>, a: Dom) -> bool
     decreases tr.len(),
 {
     if tr.len() == 0 {
         true
     } else {
-        obs(s, actor(tr[0])) == obs(u, actor(tr[0])) && traces_agree_on_actor(
+        obs_plus(s, actor(tr[0])) == obs_plus(u, actor(tr[0])) && traces_agree_on_actor(
             step(s, tr[0]),
             step(u, tr[0]),
             tr.subrange(1, tr.len() as int),
@@ -1439,23 +1459,29 @@ pub proof fn ni_theorem_a(s: Sys, tr: Seq<Trans>, a: Dom)
     }
 }
 
-/// **Theorem B (confidentiality), premise-free.** Two executions that start `obs(a)`-equivalent
-/// and agree at each step on the acting domain's observation stay `obs(a)`-equivalent throughout.
+/// **Theorem B (confidentiality), premise-free.** Two executions that start `obs⁺(a)`-equivalent
+/// and agree at each step on the acting domain's observation stay `obs⁺(a)`-equivalent throughout.
 /// Takes **no** `step_consistent()` premise — it invokes the discharged `step_consistent_holds`.
+///
+/// **Composed at the `obs⁺` surface (⑦), while [`ni_theorem_a`] stays at `obs`.** The two are
+/// separate inductions over separate unwinding conditions, so the surfaces need not agree: each
+/// theorem's induction only ever appeals to its own condition. Confidentiality reads the wider
+/// surface because the read-closure is what `a` can *learn*; integrity reads the narrower one
+/// because a grantor revealing itself to `a` is not something `a` is entitled to prevent.
 pub proof fn ni_theorem_b(s: Sys, u: Sys, tr: Seq<Trans>, a: Dom)
     requires
         wf(s),
         wf(u),
-        obs(s, a) == obs(u, a),
+        obs_plus(s, a) == obs_plus(u, a),
         traces_agree_on_actor(s, u, tr, a),
     ensures
-        obs(run(s, tr), a) == obs(run(u, tr), a),
+        obs_plus(run(s, tr), a) == obs_plus(run(u, tr), a),
     decreases tr.len(),
 {
     step_consistent_holds();
     if tr.len() > 0 {
         let act = tr[0];
-        assert(obs(step(s, act), a) == obs(step(u, act), a));
+        assert(obs_plus(step(s, act), a) == obs_plus(step(u, act), a));
         wf_step(s, act);
         wf_step(u, act);
         ni_theorem_b(step(s, act), step(u, act), tr.subrange(1, tr.len() as int), a);
