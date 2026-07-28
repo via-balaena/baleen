@@ -41,6 +41,10 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 target="aarch64-unknown-none-softfloat"
+
+# Per-config QEMU additions (see boot_and_check). Empty for the base configs.
+EXTRA_QEMU=""
+MACHINE_EXTRA=""
 wait_secs="${BOOT_TEST_WAIT:-8}"
 
 # boot_and_check <label> <cargo-feature-args> <marker>...
@@ -61,11 +65,15 @@ boot_and_check() {
     # boot.
     local out
     out="$(mktemp)"
+    # `$EXTRA_QEMU` lets a config add machine options / devices (the SMMU arc needs `iommu=smmuv3`
+    # and a real DMA-capable device); it is intentionally word-split and empty for the base configs.
+    # shellcheck disable=SC2086
     qemu-system-aarch64 \
-        -M virt,virtualization=on,gic-version=3 \
+        -M "virt,virtualization=on,gic-version=3${MACHINE_EXTRA:-}" \
         -cpu max \
         -nographic \
         -net none \
+        $EXTRA_QEMU \
         -kernel "$bin" \
         >"$out" 2>&1 &
     local qemu_pid=$!
@@ -317,5 +325,32 @@ boot_and_check "selftest" "--features selftest" \
     "THESIS TEST PASSED — the vault's secret never reached the disposable" \
     "vector=4 (cur_el_spx_sync)" \
     "EC=0x3c"
+
+# ─── SMMU arc, rung 1 — the DMA default-deny witness (two configs, and BOTH are needed) ──────────
+#
+# Every isolation result above is about CPU accesses. These two boots are baleen's first statement
+# about BUS MASTERS, and they only mean something as a pair:
+#
+#   * "dma-control" — no IOMMU in the machine. A real DMA-capable device (QEMU's `edu`) writes over a
+#     sentinel in EL2 RAM and the write MUST LAND. Without this, the deny result below would be
+#     vacuous: a sentinel can survive because the SMMU blocked the write, or because the BAR was
+#     misassigned / bus mastering never enabled / the device absent (design-lesson #66).
+#   * "smmu" — same device, machine with `iommu=smmuv3`, and a binary that sets `SMMU_GBPA.ABORT`
+#     BEFORE enabling the device's bus mastering. The same write MUST BE ABORTED.
+#
+# `dma_mask` is not decoration: `edu` defaults to a 28-bit DMA mask, which cannot reach the metal's
+# sentinel (~0x400b1000), so the device silently transfers nothing and the control fails for a reason
+# that has nothing to do with the SMMU. Measured the hard way.
+EXTRA_QEMU="-device edu,dma_mask=0xffffffffff"
+boot_and_check "dma-control" "" \
+    "hv-metal alive" \
+    "smmu rung1 POSITIVE CONTROL OK"
+
+MACHINE_EXTRA=",iommu=smmuv3"
+boot_and_check "smmu" "--features smmu" \
+    "hv-metal alive" \
+    "smmu rung1 DEFAULT-DENY OK"
+EXTRA_QEMU=""
+MACHINE_EXTRA=""
 
 echo "boot-test: OK — all checks passed"

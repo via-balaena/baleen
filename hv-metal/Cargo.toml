@@ -19,6 +19,16 @@ publish = false
 # `src/exceptions.rs` and `rust_main`.
 selftest = []
 
+# `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rung 1). It is a separate binary rather
+# than a runtime probe for a concrete reason: reading the SMMUv3 register window on a machine QEMU
+# started WITHOUT `iommu=smmuv3` takes a synchronous external abort (unassigned MMIO on `virt` faults,
+# it does not read as zero — measured, after assuming otherwise), and EL2's fault handler is `-> !` by
+# design ("Arc 2 does not resume faults"). Making the probe survivable would mean putting a resumable
+# fault path into the exception vectors for a diagnostic's benefit — new risk in a load-bearing path.
+# So the boot that touches SMMU registers is the one only ever launched on a machine that has an SMMU.
+# The DMA half of the witness is shared code across both boots; only the SMMU setup is gated.
+smmu = []
+
 # `real-linux` (M5 Arc 5e) replaces the synthetic guest phases with the real-Linux capstone: boot an
 # actual aarch64 Linux kernel as a single EL1 guest that owns the machine (device pass-through,
 # `HCR_EL2.IMO=0`). Off by default — the default build (what the CI boot-test asserts on) runs the
