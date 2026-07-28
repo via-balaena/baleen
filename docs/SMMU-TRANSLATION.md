@@ -215,9 +215,14 @@ platform, and the guard has to move somewhere the platform is not.
   delivered — is a further rung, not this one.
 * **One device, one StreamID.** QEMU's `edu` is the only bus master in the machine. Nothing here
   witnesses two devices bound to two different domains at once.
-* **No `hv-core` model of DMA.** Device→domain assignment is metal configuration; the model knows
+* ~~**No `hv-core` model of DMA.** Device→domain assignment is metal configuration; the model knows
   nothing about bus masters, so there is no ∀-N statement that a device is assigned to at most one
-  domain, and no hypercall by which a guest could ask for one.
+  domain, and no hypercall by which a guest could ask for one.~~ **CLOSED IN THE MODEL by rung 4a**
+  (`docs/SMMU-DEVICE-ASSIGNMENT.md`): `hv-core` now carries the device→domain relation, two
+  authority-gated transitions, and the lifecycle coupling `assigned ⇒ Live` — proven ∀-values on the
+  shipped code (Kani), ∀-size (Verus), over every reachable state (the enumerator), and quantified
+  in Tier-D non-interference. **Still open:** the metal does not yet *derive* its stream table from
+  that relation — the STE is still bound by hand in the witness. That is rung 4b.
 * **Invalidation discipline is exercised, not proven** — unchanged from rung 2, and now weaker in one
   respect, per §5's second finding.
 

@@ -450,6 +450,22 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
     for ed in edges {
         k.extend(ed);
     }
+    k.push(0xD_0006);
+
+    // The DMA-capable devices `a` holds (the SMMU arc's rung 4). This belongs in the **integrity**
+    // surface, not merely the confidentiality one, and for a reason no other resource here has: a
+    // device assigned to `a` is a bus master that writes `a`'s memory *with no hypercall and no
+    // vCPU*. Excluding it would leave the one channel into `a`'s frames that the whole CPU-side
+    // surface above is blind to (design-lesson #66 — a green proof can mean the surface cannot see
+    // the flow).
+    //
+    // Only `a`'s own holdings, keyed by device id, so a change in *which* devices `a` holds is
+    // visible. Who holds the ones `a` does not is a confidentiality question and lives in `obs⁺`.
+    for dev in 0..hv.device().device_count() as u16 {
+        if hv.device().holder_of(dev) == Some(a) {
+            k.push(u64::from(dev));
+        }
+    }
 
     k
 }
@@ -505,6 +521,9 @@ pub struct Surface {
     /// `p2m` acquire would return, which the grantee reads off its own map (⑥). Carries the
     /// grantor's frame *type* state to the grantee. See [`obs_plus`].
     pub acquire_guard: bool,
+    /// **Each device's assignment status, as far as `a` can resolve it** — the bit
+    /// `DeviceAssign`'s exclusivity guard reports (SMMU rung 4). See [`obs_plus`].
+    pub devices: bool,
 }
 
 impl Surface {
@@ -516,7 +535,38 @@ impl Surface {
             peer_liveness: true,
             invitations: true,
             acquire_guard: true,
+            devices: true,
         }
+    }
+}
+
+/// A device's observation tag **as far as `a` can resolve it** (SMMU rung 4):
+///
+/// | tag | meaning |
+/// |---|---|
+/// | `0` | unassigned |
+/// | `1` | held by a domain `a` neither is nor controls — *taken*, holder not named |
+/// | `2 + h` | held by `h`, where `h` is `a` itself or a domain `a` controls |
+///
+/// **This is the tightest faithful projection, and each of the three arms is forced by a different
+/// outcome `a` can actually produce.** `DeviceAssign{dev, to}` is idempotent when `to` already
+/// holds `dev`, refused with `Busy` when a third party does, and succeeds when it is free — so a
+/// two-valued free/taken bit is *not* enough: two states in which `dev` is taken, once by a domain
+/// `a` controls and once by a stranger, are `obs⁺`-equal under that projection yet take the same
+/// hypercall to `Ok` and to `Busy`. Naming the holder in arm `2 + h` is likewise forced, since
+/// `a` may assign to any of several domains it controls and the outcome differs per holder.
+///
+/// Equally, the holder in arm `1` is deliberately **not** named: no outcome of any hypercall `a`
+/// can issue distinguishes one uncontrolled holder from another (`Busy` and `Denied` are the same
+/// whoever it is), so recording it would over-approximate the observable exactly as ②′-(a)'s raw
+/// frame owner did. The honest reading of the arm-`0`/arm-`1` distinction is that **Baleen's device
+/// namespace is free/taken-public to any domain holding a control edge** — a declared disclosure
+/// beside domain liveness (⑥/F1), not a closed channel.
+fn device_tag(hv: &Hypervisor, dev: u16, a: Dom) -> u64 {
+    match hv.device().holder_of(dev) {
+        None => 0,
+        Some(h) if h == a || hv.controls(a, h) => 2 + u64::from(h),
+        Some(_) => 1,
     }
 }
 
@@ -726,6 +776,37 @@ fn obs_plus_impl(hv: &Hypervisor, a: Dom, surface: Surface) -> Vec<u64> {
     for rc in rcaps {
         k.extend(rc);
     }
+
+    // **The device namespace, as far as `a` can resolve it** (SMMU rung 4). `obs(a)` carries only
+    // the devices `a` *holds* — correct for integrity, since a device someone else holds writes
+    // none of `a`'s memory. But `DeviceAssign`'s exclusivity guard reads a device's holder and
+    // reports the result to the caller, so a controller genuinely **learns** it, and the
+    // confidentiality surface must say so or step consistency is *false*.
+    //
+    // This is the ⑥/F1 repair (record the disclosure), not the ⑥/F4 one (partition the resource),
+    // and the difference between the two cases is worth naming because it decides which is
+    // honest. `sched::run`'s `PcpuBusy` reads *which domain* occupies a pCPU — an identity `obs⁺`
+    // could only carry by declaring the entire schedule public, so ⑥ partitioned instead.
+    // `DeviceAssign`'s `Busy` reads something `obs⁺` can carry **in full and exactly**
+    // ([`device_tag`]): free, taken-by-a-stranger, or taken-by-a-named-domain-`a`-controls. There
+    // is no residue left over to abstract away, so recording it is the complete repair rather than
+    // a declaration standing in for one.
+    //
+    // The guard cannot be *removed* the way ②′-(c) removed `DomainBusy`: re-pointing a held device
+    // instead of refusing would aim a live bus master at a different domain's memory with the
+    // previous holder never quiesced — so by design-lesson #62 this is the observe case, not the
+    // remove case. What the honest reading amounts to: **Baleen's device namespace is
+    // free/taken-public to any domain that holds a control edge**, alongside the public domid
+    // namespace (⑥/F1). Note it is strictly *narrower* than that one — a domain controlling
+    // nothing is refused at the authority gate and learns nothing at all — which is a consequence
+    // of `DeviceAssign` naming its assignee and `DeviceRelease` its holder, so both gates settle
+    // before the device table is read.
+    if surface.devices {
+        k.push(0xD_000A);
+        for dev in 0..hv.device().device_count() as u16 {
+            k.push(device_tag(hv, dev, a));
+        }
+    }
     k
 }
 
@@ -790,6 +871,7 @@ fn reachable(cfg: &Config) -> Vec<(Hypervisor, Vec<Transition>)> {
         cfg.vcpus,
         cfg.pcpus,
         cfg.frames,
+        cfg.devices,
     );
     let mut seen: HashMap<Vec<u64>, Vec<Transition>> = HashMap::new();
     seen.insert(state_key(&init), Vec::new());
@@ -830,6 +912,7 @@ fn reachable(cfg: &Config) -> Vec<(Hypervisor, Vec<Transition>)> {
                 cfg.vcpus,
                 cfg.pcpus,
                 cfg.frames,
+                cfg.devices,
             );
             for &transition in &trace {
                 let _: Result<TransitionOutcome, _> = h.apply(transition);
@@ -1058,6 +1141,7 @@ mod tests {
     fn ni_cfg(depth: u32) -> Config {
         Config {
             domains: 2,
+            devices: 0,
             ports: 2,
             grants: 2,
             vcpus: 1,
@@ -1072,6 +1156,7 @@ mod tests {
             create: true,
             destroy: true,
             delegate: false,
+            device: false,
             async_agent: false,
             drive_execute: false,
             mediated_frames: false,
@@ -1092,6 +1177,7 @@ mod tests {
     fn ni_cfg3(depth: u32) -> Config {
         Config {
             domains: 3,
+            devices: 0,
             ports: 1,
             grants: 1,
             vcpus: 0,
@@ -1106,6 +1192,7 @@ mod tests {
             create: true,
             destroy: true,
             delegate: false,
+            device: false,
             async_agent: false,
             drive_execute: false,
             mediated_frames: false,
@@ -1269,7 +1356,7 @@ mod tests {
     fn dropping_teardown_borrow_is_caught() {
         use hv_core::HvCall;
         let (a, b, c) = (1u16, 3u16, 2u16);
-        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2, 2);
         for t in 1..4u16 {
             h.dispatch(
                 0,
@@ -1334,7 +1421,7 @@ mod tests {
     fn teardown_borrow_authorizes_the_flow_it_names() {
         use hv_core::HvCall;
         let (a, b, c) = (1u16, 3u16, 2u16);
-        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2, 2);
         for t in 1..4u16 {
             h.dispatch(
                 0,
@@ -1554,7 +1641,7 @@ mod tests {
         use hv_core::HvCall;
         // dom0 = grantor, dom1 = grantee/observer, dom2 & dom3 = candidate third-party owners.
         fn stale_owned_by(third_owner: Dom) -> Hypervisor {
-            let mut h = Hypervisor::new(4, 1, 1, 0, 0, 1); // 4 domains, 1 frame
+            let mut h = Hypervisor::new(4, 1, 1, 0, 0, 1, 2); // 4 domains, 1 frame
             for t in 1..4u16 {
                 // dom0 boots live + privileged; bring the peers up so they can own a frame.
                 h.dispatch(
@@ -1593,7 +1680,7 @@ mod tests {
 
         // Non-vacuity: the boolean is not constant — a grant the grantor still backs is observably
         // different (valid vs stale is exactly what `a` learns by mapping).
-        let mut valid = Hypervisor::new(4, 1, 1, 0, 0, 1);
+        let mut valid = Hypervisor::new(4, 1, 1, 0, 0, 1, 2);
         for t in 1..4u16 {
             valid
                 .dispatch(
@@ -1630,6 +1717,7 @@ mod tests {
         // slots keeps the committed sweep debug-fast while still exercising the read-closure.
         Config {
             domains: 4,
+            devices: 0,
             ports: 0,
             grants: 1,
             vcpus: 0,
@@ -1644,6 +1732,7 @@ mod tests {
             create: true,
             destroy: false,
             delegate: false,
+            device: false,
             async_agent: false,
             drive_execute: false,
             mediated_frames: true,
@@ -1773,6 +1862,170 @@ mod tests {
         }
     }
 
+    /// A **device-assignment** config (SMMU rung 4). Three domains, because assignment is
+    /// authority-gated with **no self-exemption**: dom0 must create 1 and 2 to control them, and
+    /// the interesting confidentiality question — a device held by a domain the observer does
+    /// *not* control — needs a third principal to hold it. One device, since the guard is
+    /// per-device and a second squares the state space without adding a case.
+    ///
+    /// `delegate` is on so a delegated controller can assign too, and `destroy` so the teardown
+    /// sweep is in the swept universe — the sweep is the transition that moves `obs(a)` for the
+    /// *holder*, and local respect has to be true of it as much as of the assign.
+    fn ni_cfg_device(depth: u32) -> Config {
+        Config {
+            device: true,
+            devices: 1,
+            delegate: true,
+            ..ni_cfg3(depth)
+        }
+    }
+
+    /// **Local respect holds with device assignment in the universe (SMMU rung 4).** A device
+    /// changing hands moves `obs` of the domain that gains or loses it — and every transition that
+    /// can do so is issued by that domain itself, by a domain that *controls* it, or is that
+    /// domain's own teardown. All three are already authorized channels (`control` covers the
+    /// controller; a domain is always authorized to itself), so **no new `Channels` term is
+    /// needed** — recorded as a result rather than assumed, since the alternative (a device flow
+    /// with no channel behind it) is exactly the shape this sweep exists to catch.
+    ///
+    /// The non-vacuity floor matters more than usual here: a device the observer does not hold
+    /// contributes nothing to `obs`, so most triples are trivially satisfied, and a sweep that
+    /// never reached a *held* device would prove nothing at all.
+    #[test]
+    fn local_respect_holds_with_device_assignment() {
+        let cfg = ni_cfg_device(4);
+        assert!(
+            transitions(&cfg).iter().any(|t| matches!(
+                t,
+                Transition::Guest {
+                    call: hv_core::HvCall::DeviceAssign { .. },
+                    ..
+                }
+            )),
+            "device assignment is not in the NI universe"
+        );
+        let out = check(&cfg, Channels::full());
+        assert!(
+            out.violation.is_none(),
+            "device assignment created an unauthorized cross-domain flow: {:?}",
+            out.violation.unwrap()
+        );
+        assert!(
+            out.unauthorized_checks > 1_000,
+            "device NI sweep near-vacuous: only {} unauthorized checks over {} states",
+            out.unauthorized_checks,
+            out.states
+        );
+    }
+
+    /// **Step consistency holds with device assignment in the universe.** Every `obs⁺(a)`-equal
+    /// pair takes every transition `a` can issue to `obs⁺(a)`-equal successors — including the
+    /// exclusivity guard, whose refusal reads a device's holder.
+    #[test]
+    fn step_consistency_holds_with_device_assignment() {
+        let out = check_step_consistency(&ni_cfg_device(4));
+        assert!(
+            out.violation.is_none(),
+            "device assignment broke step consistency: {:?}",
+            out.violation.unwrap()
+        );
+    }
+
+    /// **The `Busy` guard is observed, not leaked (depth-independent).** The two worlds below
+    /// differ only in *who* holds the device — in one, a domain dom0 controls; in the other, a
+    /// domain it does not — and in both the device is *taken*, so a two-valued free/taken bit
+    /// cannot separate them. Yet the same hypercall succeeds in one (idempotent re-assignment)
+    /// and returns `Busy` in the other.
+    ///
+    /// This is why [`device_tag`] has three arms rather than two, and the test is written directly
+    /// rather than left to the sweep because it pins the *shape* of the observable, not merely its
+    /// presence: collapse arm `2 + h` to a bare "taken" and this fails while every ∀-N sweep in
+    /// the file stays green at the depths CI runs.
+    #[test]
+    fn the_device_busy_guard_is_observed() {
+        use hv_core::HvCall;
+        // dom0 creates 1 and 2 (controlling both), then delegates control of 2 away to 1 and
+        // renounces its own edge — so dom0 controls 1 but *not* 2, while both are Live.
+        fn world(held_by_controlled: bool) -> Hypervisor {
+            let mut h = Hypervisor::new(3, 1, 1, 1, 1, 2, 1);
+            for target in [1u16, 2] {
+                h.dispatch(
+                    0,
+                    HvCall::DomainCreate {
+                        target,
+                        may_create: false,
+                    },
+                )
+                .unwrap();
+            }
+            // Give the device to 1 (which dom0 controls) or to 2 (which it will not).
+            let holder = if held_by_controlled { 1 } else { 2 };
+            h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: holder })
+                .unwrap();
+            // dom0 hands control of 2 to 1 and drops its own edge, so 2 becomes a domain dom0
+            // neither is nor controls — while remaining Live, so peer-liveness cannot separate
+            // the worlds either.
+            h.dispatch(0, HvCall::ControlGrant { target: 2, to: 1 })
+                .unwrap();
+            h.dispatch(0, HvCall::ControlRevoke { target: 2, from: 0 })
+                .unwrap();
+            h
+        }
+        let mut mine = world(true);
+        let mut theirs = world(false);
+
+        // Without the device component the two worlds are indistinguishable to dom0: the device
+        // is held in both, dom0 holds it in neither, and its authority rows agree.
+        let blind = Surface {
+            devices: false,
+            ..Surface::full()
+        };
+        assert_eq!(
+            obs_plus_impl(&mine, 0, blind),
+            obs_plus_impl(&theirs, 0, blind),
+            "the two worlds must be indistinguishable to dom0 without the device component"
+        );
+        // With it, they separate.
+        assert_ne!(
+            obs_plus(&mine, 0),
+            obs_plus(&theirs, 0),
+            "obs⁺ must resolve who holds a device as far as the observer's authority reaches"
+        );
+        // And the guard really does diverge on exactly that difference.
+        let assign = HvCall::DeviceAssign { dev: 0, to: 1 };
+        assert_eq!(mine.dispatch(0, assign), Ok(hv_core::HvOutcome::Done));
+        assert_eq!(
+            theirs.dispatch(0, assign),
+            Err(hv_core::HvError::Device(hv_core::device::DeviceError::Busy))
+        );
+    }
+
+    /// **Non-vacuity: `obs⁺` must carry the device namespace (SMMU rung 4).** Drop it and step
+    /// consistency **breaks** — `DeviceAssign`'s exclusivity guard reports a device's holder to a
+    /// caller whose observation no longer shows it.
+    ///
+    /// This is the remove-the-fix teeth for the whole `obs⁺` widening: without it, a green
+    /// step-consistency sweep would be equally consistent with "the surface is right" and "the
+    /// surface cannot see the flow" (design-lesson #66).
+    #[test]
+    fn dropping_the_device_namespace_from_obs_plus_breaks_step_consistency() {
+        let out = check_step_consistency_with(&ni_cfg_device(4), |hv, a| {
+            obs_plus_impl(
+                hv,
+                a,
+                Surface {
+                    devices: false,
+                    ..Surface::full()
+                },
+            )
+        });
+        assert!(
+            out.violation.is_some(),
+            "dropping the device namespace left step consistency holding — the component is not \
+             load-bearing, or the sweep does not reach the exclusivity guard"
+        );
+    }
+
     /// A **scheduler** step-consistency config — `sched: false` in every NI config until ⑥, so
     /// `SchedRun`'s `PcpuBusy` guard had never been swept. Two domains, one vCPU each, and **two**
     /// pCPUs so the partition (`mediated_pcpus`) is not vacuous — with one pCPU, partitioning
@@ -1817,7 +2070,7 @@ mod tests {
         // dom1 = the probed slot: left Dead in one world, created *by dom2* in the other — an act
         // dom0 has no window onto (it touches none of dom0's resources or authority).
         fn world(dom2_creates_dom1: bool) -> Hypervisor {
-            let mut h = Hypervisor::new(3, 1, 1, 1, 1, 2);
+            let mut h = Hypervisor::new(3, 1, 1, 1, 1, 2, 2);
             h.dispatch(
                 0,
                 HvCall::DomainCreate {
@@ -1984,7 +2237,7 @@ mod tests {
         // dom1 owns frame 0 and grants it read-write to dom0; in one world it also pins that
         // frame as an L1 page table, which dom0 has no way to see except by mapping.
         fn world(pinned: bool) -> Hypervisor {
-            let mut h = Hypervisor::new(2, 1, 1, 1, 1, 2);
+            let mut h = Hypervisor::new(2, 1, 1, 1, 1, 2, 2);
             h.dispatch(
                 0,
                 HvCall::DomainCreate {
@@ -2093,7 +2346,7 @@ mod tests {
         // traces.) `via` names which world: false = dom0 holds `Root` over dom1, true = dom2 does
         // and dom0's edge is `Via(2)`.
         fn world(via: bool) -> Hypervisor {
-            let mut h = Hypervisor::new(3, 1, 1, 1, 1, 2);
+            let mut h = Hypervisor::new(3, 1, 1, 1, 1, 2, 2);
             let mk = |t: u16, mc: bool| HvCall::DomainCreate {
                 target: t,
                 may_create: mc,
@@ -2335,7 +2588,7 @@ mod tests {
     fn busy_channel_state(m_holds: bool, link_not_map: bool) -> Hypervisor {
         use hv_core::p2m::PtLevel;
         use hv_core::HvCall;
-        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2, 2);
         for t in 1..4u16 {
             h.dispatch(
                 0,
@@ -2515,7 +2768,7 @@ mod tests {
         // caller = 1 owns frame 0 and grants it to BOTH dom2 (gref 0) and dom3 (gref 1).
         // Exactly one of them links it into its own table.
         fn linked_by(linker: Dom) -> Hypervisor {
-            let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+            let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2, 2);
             for t in 1..4u16 {
                 h.dispatch(
                     0,
@@ -2591,7 +2844,7 @@ mod tests {
         // Non-vacuity: the boolean is not constant-true — an unlinked grant reads false, and it
         // is per-row, not per-frame (gref 1 names dom3, who has not linked in the `by2` world).
         let clean = {
-            let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+            let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2, 2);
             for t in 1..4u16 {
                 h.dispatch(
                     0,

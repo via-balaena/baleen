@@ -79,9 +79,10 @@ const GRANTS: usize = 6;
 const VCPUS: usize = 2;
 const PCPUS: usize = 2;
 const FRAMES: usize = 6;
+const DEVICES: usize = 2;
 
 fuzz_target!(|data: &[u8]| {
-    let mut hv = Hypervisor::new(DOMAINS, PORTS, GRANTS, VCPUS, PCPUS, FRAMES);
+    let mut hv = Hypervisor::new(DOMAINS, PORTS, GRANTS, VCPUS, PCPUS, FRAMES, DEVICES);
     // Only dom0 boots Live; bring every other slot up so the stream has live domains to
     // drive from the start (`DomainCreate`/`DomainDestroy` below then cycle them).
     for target in 1..DOMAINS as u16 {
@@ -108,10 +109,11 @@ fuzz_target!(|data: &[u8]| {
         let pcpu = u32::from(b) % PCPUS as u32;
         let mfn = u32::from(a) % FRAMES as u32;
         let child = u32::from(b) % FRAMES as u32;
+        let dev = u16::from(a) % DEVICES as u16;
         let slot = u32::from(a) % TABLE_SLOTS;
         now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 32 {
+        let call = match op % 34 {
             0 => HvCall::CreditGrant {
                 amount: u32::from(a),
             },
@@ -225,6 +227,14 @@ fuzz_target!(|data: &[u8]| {
             // Denied peer op are all attempted. A later SchedRun onto an excluded pCPU is
             // refused, so no Running vCPU is left off-affinity — the scheduler's affinity
             // invariant and its per-target authority gate are both exercised through the seam.
+            // Assign / release a DMA-capable device to `other` (the SMMU arc's rung 4). Assign
+            // is a no-op unless the caller *controls* `other` — there is deliberately no
+            // self-exemption — and is refused when a third domain already holds the device;
+            // release additionally succeeds for a self-release. Interleaved with arm 30's
+            // teardown, this is what drives the destroy sweep that keeps a bus master from
+            // outliving its holder into a reborn slot.
+            31 => HvCall::DeviceAssign { dev, to: other },
+            32 => HvCall::DeviceRelease { dev, from: other },
             _ => HvCall::SchedSetAffinity {
                 target: other,
                 vcpu,

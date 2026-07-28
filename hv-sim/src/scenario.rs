@@ -704,6 +704,9 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
     const VCPUS: u32 = 2;
     const PCPUS: u32 = 2;
     const FRAMES: u32 = 6;
+    // Two DMA-capable devices, so the driver exercises exclusivity (a second domain reaching
+    // for a held device) and the teardown sweep under random interleavings.
+    const DEVICES: u32 = 2;
 
     let mut hv = Hypervisor::new(
         DOMAINS as usize,
@@ -712,6 +715,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         VCPUS as usize,
         PCPUS as usize,
         FRAMES as usize,
+        DEVICES as usize,
     );
     bring_all_domains_live(&mut hv, DOMAINS);
     let mut rng = Prng::new(seed);
@@ -731,7 +735,7 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
         let pcpu = rng.below(PCPUS);
         let mfn = rng.below(FRAMES);
 
-        match rng.below(26) {
+        match rng.below(27) {
             0 => drop_ok(hv.dispatch(
                 caller,
                 HvCall::CreditGrant {
@@ -858,6 +862,21 @@ pub fn run_hypervisor(seed: u64, steps: u32) -> HvSummary {
                 },
             )),
             24 => drop_ok(hv.dispatch(caller, HvCall::P2mUnpin { mfn })),
+            // Assign / release a DMA-capable device to a seed-chosen domain (the SMMU arc's
+            // rung 4). Both paths matter here rather than in a dedicated driver, because what
+            // this stream has that a focused one does not is *interleaving with teardown*: a
+            // `DomainDestroy` landing between an assign and a release is exactly the state
+            // where the sweep has to have run, and the integrated invariant is checked after
+            // every step.
+            25 => {
+                let to = rng.below(u32::from(DOMAINS)) as u16;
+                let dev = rng.below(DEVICES) as u16;
+                if rng.below(2) == 0 {
+                    drop_ok(hv.dispatch(caller, HvCall::DeviceAssign { dev, to }));
+                } else {
+                    drop_ok(hv.dispatch(caller, HvCall::DeviceRelease { dev, from: to }));
+                }
+            }
             // A seed-derived hard-affinity mask over the pCPU set, on a seed-chosen target —
             // so dispatches face pins that can exclude a pCPU (exercising the affinity
             // invariant and the offline reset), and the per-target authority gate sees self,
@@ -948,6 +967,7 @@ pub fn run_seam(seed: u64, steps: u32) -> SeamOutcome {
     const PORTS: u32 = 8;
     const GRANTS: u32 = 1;
     const FRAMES: u32 = 1;
+    const DEVICES: u32 = 0;
 
     let mut hv = Hypervisor::new(
         DOMAINS as usize,
@@ -956,6 +976,7 @@ pub fn run_seam(seed: u64, steps: u32) -> SeamOutcome {
         VCPUS as usize,
         PCPUS as usize,
         FRAMES as usize,
+        DEVICES as usize,
     );
     bring_all_domains_live(&mut hv, DOMAINS);
     let clock = ManualClock::new();
@@ -1204,6 +1225,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
     const VCPUS: u32 = 2;
     const PCPUS: u32 = 2;
     const FRAMES: u32 = 8;
+    const DEVICES: u32 = 0;
 
     let mut hv = Hypervisor::new(
         DOMAINS as usize,
@@ -1212,6 +1234,7 @@ pub fn run_destroy(seed: u64, steps: u32) -> DestroyOutcome {
         VCPUS as usize,
         PCPUS as usize,
         FRAMES as usize,
+        DEVICES as usize,
     );
     bring_all_domains_live(&mut hv, DOMAINS);
     let clock = ManualClock::new();
@@ -1778,6 +1801,7 @@ pub struct ForeignOutcome {
 /// so a breach surfaces here with the seed as the whole reproducer.
 pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
     const DOMAINS: u16 = 2;
+    const DEVICES: u32 = 0;
     const GRANTS: u32 = 6;
     const FRAMES: u32 = 10;
     // Per domain `d`: frame `d` is its L2 table, frame `2 + d` its L1 *node*, frame `4 + d`
@@ -1790,7 +1814,15 @@ pub fn run_foreign(seed: u64, steps: u32) -> ForeignOutcome {
     let l2_of = |dom: u16| L2_BASE + u32::from(dom);
     let l1_of = |dom: u16| L1_BASE + u32::from(dom);
 
-    let mut hv = Hypervisor::new(DOMAINS as usize, 1, GRANTS as usize, 1, 1, FRAMES as usize);
+    let mut hv = Hypervisor::new(
+        DOMAINS as usize,
+        1,
+        GRANTS as usize,
+        1,
+        1,
+        FRAMES as usize,
+        DEVICES as usize,
+    );
     bring_all_domains_live(&mut hv, DOMAINS);
     // Stand up each domain's L2 table, its L1 node, and the node's own leaf; then hand out
     // the spare data frames. The L1 node thus starts as a real subtree (one leaf beneath),

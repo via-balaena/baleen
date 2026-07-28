@@ -27,6 +27,7 @@ use alloc::vec::Vec;
 
 use hv_hal::Ticks;
 
+use crate::device::{self, DevId};
 use crate::evtchn::{self, Port, Vcpu, Virq};
 use crate::grant::{self, Frame, GrantHandle, GrantRef};
 use crate::p2m::{self, Mfn, PageType, PtLevel};
@@ -202,8 +203,8 @@ pub enum HvCall {
 
     /// Tear down domain `target` completely: close its every event-channel port,
     /// offline its every vCPU (closing on-CPU intervals at `now`), unmap its every
-    /// grant map, revoke its every grant, unpin and free its every frame — leaving an
-    /// empty but still-existent domain shell. **Unconditional past the authority gate:** a
+    /// grant map, revoke its every grant, unpin and free its every frame, release its every
+    /// assigned device — leaving an empty but still-existent domain shell. **Unconditional past the authority gate:** a
     /// *foreign* reference into one of `target`'s frames — a live grant map, or a live
     /// cross-domain page-table entry — does not block teardown, it is *broken* by it (the
     /// mapper's handle goes stale, its entry becomes a hole), so no domain can veto another's
@@ -243,6 +244,48 @@ pub enum HvCall {
     /// is removed with it, so nothing is orphaned. Still only ever removes authority; the
     /// restriction is the policy refinement that closes the flat model's revoke-anyone wart.
     ControlRevoke { target: DomId, from: DomId },
+
+    /// Assign DMA-capable device `dev` to domain `to` — the device axis of isolation, and the
+    /// relation the SMMU stream table refines (`docs/SMMU-DEVICE-ASSIGNMENT.md`). A device
+    /// assigned to `to` may, on the metal, write `to`'s memory and no other domain's; until it
+    /// is assigned it reaches nothing.
+    ///
+    /// **Authority: strictly `controls[caller][to]`, with no self-exemption** — this is the one
+    /// whole-domain operation a domain may *not* perform on itself, and deliberately so. Every
+    /// other self-permitted control op ([`HvCall::DomainDestroy`], [`HvCall::SchedSetAffinity`])
+    /// only ever spends or narrows what the caller already holds; assignment does the opposite
+    /// twice over. It **takes a system-wide exclusive resource** (there is exactly one holder,
+    /// so a self-service device grab is a domain helping itself to a platform resource), and it
+    /// **creates an inbound-DMA authority over the assignee's own memory** (a bus master that
+    /// writes without any hypercall). Neither is something a domain may hand itself, for the
+    /// same reason `may_create` cannot be self-granted: authority must have a provenance.
+    /// Otherwise [`HvError::Denied`], mutating nothing — and checked before the device table is
+    /// read, so a caller with no claim on `to` learns nothing about `dev`.
+    ///
+    /// **Lifecycle:** `to` must be `Live` ([`HvError::NotAlive`]) — the same inbound-reference
+    /// mint gate that guards a grant's grantee and a half-open port's peer, since an assignment
+    /// is likewise a bare `DomId` that outlives the transition and would otherwise be inherited
+    /// by whoever is reborn into that slot.
+    ///
+    /// **Exclusivity:** [`HvError::Device`]`(`[`device::DeviceError::Busy`]`)` if another domain
+    /// holds `dev`; **idempotent** if `to` already does.
+    DeviceAssign { dev: DevId, to: DomId },
+
+    /// Release device `dev` from domain `from`, returning it to the unassigned pool — after
+    /// which it reaches no memory at all until reassigned.
+    ///
+    /// **Authority:** `caller == from` (a domain may always give up its own device) or
+    /// `controls[caller][from]`. The asymmetry with [`HvCall::DeviceAssign`] is the point:
+    /// *taking* requires an authority above you, *giving back* requires only being you — the
+    /// same shape as `may_create` (never self-granted) beside [`HvCall::ControlRevoke`]'s
+    /// renounce. Otherwise [`HvError::Denied`], mutating nothing.
+    ///
+    /// **`from` is named rather than looked up**, and that is a disclosure decision, not
+    /// ergonomics: it lets the authority gate be settled *before* the device table is read, so
+    /// a caller with no claim on `from` cannot use this call to probe whether `dev` is held.
+    /// Refused with [`HvError::Device`]`(`[`device::DeviceError::NotAssigned`]`)` if `from`
+    /// does not hold `dev` — one error whether it is unassigned or held by a third party.
+    DeviceRelease { dev: DevId, from: DomId },
 }
 
 /// The number of [`HvCall`] variants — the size of the guest hypercall vocabulary.
@@ -260,7 +303,7 @@ pub enum HvCall {
 /// using only first-party `rustc` — so the count is machine-verified with zero third-party trust.
 /// If you add or remove a variant: update this number, classify it in `hv-sim`'s `coverage`, and
 /// (if not excluded) wire it into `ops`.
-pub const HVCALL_VARIANT_COUNT: usize = 33;
+pub const HVCALL_VARIANT_COUNT: usize = 35;
 
 /// The success value of a routed hypercall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +335,8 @@ pub enum HvError {
     Sched(sched::SchedError),
     /// The page-type subsystem rejected the call.
     P2m(p2m::P2mError),
+    /// The device-assignment subsystem rejected the call.
+    Device(device::DeviceError),
     /// A grant map named a frame the grantor no longer owns — a stale grant, left
     /// pointing at a frame that was freed and reallocated after the grant was written.
     /// Refused at the seam so it can never reference another domain's page. Not a
@@ -367,9 +412,11 @@ pub enum CrossViolation {
     /// forever, across every subsystem at once. Whole-domain and cross-subsystem, so it
     /// belongs to the integrated core, not any one subsystem.
     DeadDomainNotClean { dom: DomId },
-    /// A `Dead` domain that some *other* domain still holds a live cross-reference to — a
-    /// half-open event-channel port awaiting it as a peer (`Unbound { remote: dom }`), or a
-    /// grant naming it as grantee. The **inbound** complement of
+    /// A `Dead` domain that something outside it still holds a live cross-reference to — a
+    /// half-open event-channel port awaiting it as a peer (`Unbound { remote: dom }`), a
+    /// grant naming it as grantee, or a **device assigned to it** (the SMMU arc's rung 4: a
+    /// bus master that would write the next tenant's memory with no hypercall and no vCPU, the
+    /// one inbound reference with no CPU-side analogue). The **inbound** complement of
     /// [`Self::DeadDomainNotClean`]: that one says a `Dead` slot holds nothing *outbound*
     /// (owns no frame, offers/holds no grant, has no bound port); this says nothing
     /// *inbound* points *at* it. Both must hold for a slot to be a truly isolated shell, so
@@ -378,9 +425,10 @@ pub enum CrossViolation {
     /// identity only if no reference to a past incarnation survives into the next. Maintained
     /// by construction with no per-reference generation: minting is gated on a `Live` target
     /// (`reject_dead_target`), and teardown eagerly clears every inbound reference to the
-    /// dying slot (`grant::revoke_grants_to` + `evtchn::clear_unbound_into`), so no reference
-    /// naming a slot can outlast the incarnation it was made against. Whole-domain and
-    /// cross-subsystem (it reads event channels and grant tables against the lifecycle), so
+    /// dying slot (`grant::revoke_grants_to` + `evtchn::clear_unbound_into` +
+    /// `device::release_all_of`), so no reference naming a slot can outlast the incarnation it
+    /// was made against. Whole-domain and cross-subsystem (it reads event channels, grant
+    /// tables and the device assignment relation against the lifecycle), so
     /// it belongs to the integrated core. (A live `Interdomain` port naming a `Dead` domain
     /// needs no separate check — it would already break event-channel reciprocity, since a
     /// `Dead` domain's ports are all `Free`.)
@@ -463,6 +511,12 @@ pub struct Hypervisor {
     grant: grant::System,
     sched: sched::System,
     p2m: p2m::System,
+    /// Which domain holds each DMA-capable device — the device axis, and the relation the
+    /// SMMU stream table refines. Exclusive by representation (one `Option<DomId>` per device,
+    /// never a set), coupled to the lifecycle by
+    /// [`CrossViolation::DeadDomainReferenced`]: an assignment is an inbound reference naming a
+    /// domain, so it is minted only against a `Live` target and swept on teardown.
+    device: device::System,
     /// Each domain slot's lifecycle state — the explicit `Dead`/`Live` machine that makes
     /// "doesn't exist yet" a first-class state. Domain 0 boots `Live` (the primordial
     /// control domain); every other slot starts `Dead` and only a `may_create` domain's
@@ -547,12 +601,14 @@ impl Hypervisor {
     /// A hypervisor of `num_domains` domains, each with `ports_per_domain`
     /// event-channel ports, `grants_per_domain` grant slots, and `vcpus_per_domain`
     /// virtual CPUs, scheduled over `num_pcpus` shared physical CPUs, with `num_frames`
-    /// machine frames in the shared page pool. Every subsystem shares the same domain
-    /// count; the physical CPUs and machine frames are system-wide. **Domain 0 boots
-    /// `Live` with the creation capability** (the control domain, Xen's dom0); **every other
-    /// slot boots `Dead`** — an empty shell that a `may_create` domain's
-    /// [`HvCall::DomainCreate`] must bring to life before it can act. No control edges exist
-    /// at boot: dom0 gains `controls` over each domain only by creating it.
+    /// machine frames in the shared page pool and `num_devices` DMA-capable devices. Every
+    /// subsystem shares the same domain count; the physical CPUs, machine frames and devices
+    /// are system-wide. **Domain 0 boots `Live` with the creation capability** (the control
+    /// domain, Xen's dom0); **every other slot boots `Dead`** — an empty shell that a
+    /// `may_create` domain's [`HvCall::DomainCreate`] must bring to life before it can act. No
+    /// control edges exist at boot: dom0 gains `controls` over each domain only by creating it.
+    /// **Every device boots unassigned** — dom0 included, so no bus master reaches any memory
+    /// until a controller says so.
     pub fn new(
         num_domains: usize,
         ports_per_domain: usize,
@@ -560,6 +616,7 @@ impl Hypervisor {
         vcpus_per_domain: usize,
         num_pcpus: usize,
         num_frames: usize,
+        num_devices: usize,
     ) -> Self {
         Hypervisor {
             credit: (0..num_domains).map(|_| HvCore::new()).collect(),
@@ -567,6 +624,7 @@ impl Hypervisor {
             grant: grant::System::new(num_domains, grants_per_domain),
             sched: sched::System::new(num_domains, vcpus_per_domain, num_pcpus),
             p2m: p2m::System::new(num_domains, num_frames),
+            device: device::System::new(num_domains, num_devices),
             // Domain 0 is the boot control domain: it may create. The rest cannot.
             may_create: (0..num_domains).map(|d| d == 0).collect(),
             // No control edges at boot — dom0 gains control of a domain by creating it.
@@ -803,6 +861,9 @@ impl Hypervisor {
             HvCall::DomainDestroy { target, now } => self.domain_destroy(caller, target, now),
             HvCall::ControlGrant { target, to } => self.control_grant(caller, target, to),
             HvCall::ControlRevoke { target, from } => self.control_revoke(caller, target, from),
+
+            HvCall::DeviceAssign { dev, to } => self.device_assign(caller, dev, to),
+            HvCall::DeviceRelease { dev, from } => self.device_release(caller, dev, from),
         }
     }
 
@@ -1217,8 +1278,8 @@ impl Hypervisor {
         // A Dead slot is a clean shell by standing invariant, so there is nothing to
         // clear — creation only lifts it to Live and stamps its authority.
         debug_assert!(
-            self.is_clean_shell(target),
-            "domain {target} was Dead but not a clean shell before creation"
+            self.is_clean_shell(target) && self.is_unreferenced(target),
+            "domain {target} was Dead but not a clean, unreferenced shell before creation"
         );
         self.life[target as usize] = DomainLife::Live;
         self.may_create[target as usize] = may_create;
@@ -1413,6 +1474,13 @@ impl Hypervisor {
         // revoke succeeds by construction, like `revoke_all`.
         self.grant.revoke_grants_to(target);
         self.evtchn.clear_unbound_into(target);
+        // The third kind of inbound reference, and the one with no CPU-side analogue: a device
+        // assigned to `target` is a bare `DomId` in the system's assignment table, and the
+        // hardware it stands for is a *bus master* — it writes memory with no hypercall and no
+        // vCPU. Left standing across teardown it would survive into the next tenant of this
+        // slot, aimed at that tenant's frames: the confused deputy, in the one flavour every
+        // CPU-side invariant is blind to. Total and unconditional, like its two neighbours.
+        self.device.release_all_of(target);
 
         // The slot drops to Dead and loses all authority — a clean, unprivileged shell that
         // only a later DomainCreate can revive. Clearing `may_create` keeps "may_create ⇒
@@ -1556,6 +1624,73 @@ impl Hypervisor {
         Ok(HvOutcome::Done)
     }
 
+    /// Assign a DMA-capable device to a domain — the device axis of isolation, gated by the
+    /// per-target authority axis and the inbound-reference mint gate.
+    ///
+    /// **The gate order is the disclosure decision.** Authority is settled *before* the device
+    /// table is read, so a caller with no control over `to` is refused without learning whether
+    /// `dev` is free. What remains visible to a caller that *does* hold control — a single
+    /// free/taken bit per device, via [`device::DeviceError::Busy`] — is a **declared
+    /// disclosure**, recorded in the non-interference observation surface (`obs⁺`) rather than
+    /// argued away: a guard that reads state the actor cannot otherwise see does not become
+    /// invisible by being left out of `obs`, it makes step consistency *false* (the ⑥/F4
+    /// lesson). Holder *identity* is never disclosed by an error; it is learnable only along a
+    /// control edge, which is why [`HvCall::DeviceRelease`] names its holder.
+    ///
+    /// **No self-exemption**, unlike every other self-permitted control operation — see
+    /// [`HvCall::DeviceAssign`] for why taking a device differs in kind from spending authority
+    /// you already hold.
+    fn device_assign(
+        &mut self,
+        caller: DomId,
+        dev: DevId,
+        to: DomId,
+    ) -> Result<HvOutcome, HvError> {
+        if to as usize >= self.domain_count() {
+            return Err(HvError::BadDomain);
+        }
+        // Authority first, and strictly: `caller == to` is *not* a licence. A refusal here
+        // mutates nothing and reveals nothing about `dev`.
+        if self.controls[caller as usize][to as usize] == Control::Absent {
+            return Err(HvError::Denied);
+        }
+        // The inbound-reference mint gate, reused verbatim: an assignment records a bare DomId
+        // that outlives this transition, so it may only ever name a Live domain. (A controlled
+        // target is Live by the ControlEdgeDeadEndpoint invariant, so this cannot fire today;
+        // it is kept because the *reason* an assignment needs a live target is a property of
+        // assignment, not of how authority happens to be gated — the guard must not depend on
+        // an invariant of a different subsystem staying arranged as it is.)
+        self.reject_dead_target(to)?;
+        self.device
+            .assign(dev, to)
+            .map(|()| HvOutcome::Done)
+            .map_err(HvError::Device)
+    }
+
+    /// Release a device from the domain holding it — the inverse of [`Self::device_assign`],
+    /// self-permitted because it only ever *removes* an authority.
+    ///
+    /// `from` is named by the caller so this gate, too, precedes any read of the device table.
+    fn device_release(
+        &mut self,
+        caller: DomId,
+        dev: DevId,
+        from: DomId,
+    ) -> Result<HvOutcome, HvError> {
+        if from as usize >= self.domain_count() {
+            return Err(HvError::BadDomain);
+        }
+        // A domain may always give up its own device; taking one back from a peer needs control
+        // of that peer — the same per-target capability `domain_destroy` requires.
+        if caller != from && self.controls[caller as usize][from as usize] == Control::Absent {
+            return Err(HvError::Denied);
+        }
+        self.device
+            .release(dev, from)
+            .map(|()| HvOutcome::Done)
+            .map_err(HvError::Device)
+    }
+
     /// Whether `node` lies in the subtree that `caller` roots in `target`'s delegation tree —
     /// i.e. `node == caller` (a controller renouncing its own edge) or `caller` is a
     /// transitive delegator of `node` (`caller` handed `node`'s control down, directly or
@@ -1632,6 +1767,24 @@ impl Hypervisor {
         no_ports && no_vcpus && no_grants && no_maps && no_frames
     }
 
+    /// Whether **nothing points at** `target` — the inbound complement of
+    /// [`Self::is_clean_shell`], and the predicate behind
+    /// [`CrossViolation::DeadDomainReferenced`].
+    ///
+    /// Three kinds of reference name a domain by bare [`DomId`] from a structure that is not
+    /// its own, outlive the transition that wrote them, and would be honoured later by whoever
+    /// occupies the slot: a **grant** issued to it, a **half-open port** awaiting it, and — since
+    /// the SMMU arc's rung 4 — a **device assigned** to it. Each is kept absent for a `Dead`
+    /// slot the same way (design-lesson #15): a mint gate refusing to create one against a
+    /// non-`Live` target, plus an eager teardown sweep. Naming the predicate rather than
+    /// inlining the disjunction keeps the three in one place, so a fourth kind of inbound
+    /// reference has an obvious home instead of a new invariant.
+    fn is_unreferenced(&self, target: DomId) -> bool {
+        !self.grant.any_grant_to(target)
+            && !self.evtchn.any_unbound_into(target)
+            && !self.device.any_device_of(target)
+    }
+
     /// The first cross-subsystem invariant breach, or `None` if both seams are
     /// consistent.
     ///
@@ -1651,8 +1804,9 @@ impl Hypervisor {
     /// Domain lifecycle & authority: every `Dead` slot is a provably-clean, authority-free
     /// shell — it owns no frame, offers or holds no grant, has no bound port or online vCPU,
     /// holds no `may_create`, sits on no control edge, *and* has nothing pointing into it (no
-    /// grant naming it as grantee, no half-open port awaiting it — so a reborn slot inherits
-    /// no stale reference, the domain-ID reuse guarantee); every control edge relates two
+    /// grant naming it as grantee, no half-open port awaiting it, no device assigned to it — so
+    /// a reborn slot inherits no stale reference, the domain-ID reuse guarantee, and in
+    /// particular no bus master aimed at its memory); every control edge relates two
     /// `Live` domains; and every control edge's provenance traces acyclically back to a
     /// creation `Root` (no delegation outlives its delegator's, no cycle). The whole-domain
     /// invariants that close the create/destroy loop — outbound cleanliness *and* inbound
@@ -1746,12 +1900,13 @@ impl Hypervisor {
                 if !self.is_clean_shell(dom) {
                     return Some(CrossViolation::DeadDomainNotClean { dom });
                 }
-                // The inbound complement: no *other* domain may hold a live reference naming
-                // this Dead slot — a grant issued to it, or a half-open port awaiting it —
-                // else a reborn slot would silently inherit a channel or a page permission
-                // that was meant for the tenant that died. The mint gate + teardown sweep
-                // keep this false by construction; this is the standing check that they do.
-                if self.grant.any_grant_to(dom) || self.evtchn.any_unbound_into(dom) {
+                // The inbound complement: nothing outside this Dead slot may hold a live
+                // reference naming it — a grant issued to it, a half-open port awaiting it, or
+                // a device assigned to it — else a reborn slot would silently inherit a
+                // channel, a page permission, or a bus master that was meant for the tenant
+                // that died. The mint gate + teardown sweep keep this false by construction;
+                // this is the standing check that they do.
+                if !self.is_unreferenced(dom) {
                     return Some(CrossViolation::DeadDomainReferenced { dom });
                 }
                 if self.may_create[dom as usize] {
@@ -1898,6 +2053,13 @@ impl Hypervisor {
         &self.sched
     }
 
+    /// The device-assignment relation, for inspection — the source the metal's SMMU stream
+    /// table is derived from (`docs/SMMU-DEVICE-ASSIGNMENT.md`), exactly as [`Self::p2m`] is
+    /// the source `build_stage2_from_p2m` derives Stage-2 descriptors from.
+    pub fn device(&self) -> &device::System {
+        &self.device
+    }
+
     /// The page-type subsystem, for inspection.
     pub fn p2m(&self) -> &p2m::System {
         &self.p2m
@@ -1917,7 +2079,7 @@ mod tests {
     // be created before it can act — that is the lifecycle. Lifecycle-specific tests build
     // straight on `Hypervisor::new` to observe the raw boot state.)
     fn hv() -> Hypervisor {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         h.dispatch(
             0,
             HvCall::DomainCreate {
@@ -3645,7 +3807,7 @@ mod tests {
     fn only_dom0_boots_live_the_rest_are_dead_shells() {
         // The raw boot state: domain 0 is the primordial Live control domain; every other
         // slot is a Dead, unprivileged, clean shell awaiting creation.
-        let h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         assert!(h.is_live(0));
         assert!(h.may_create(0));
         assert_eq!(h.life_of(0), Some(DomainLife::Live));
@@ -3666,7 +3828,7 @@ mod tests {
     fn a_dead_domain_can_issue_no_hypercall() {
         // A Dead slot must be inert: every op it attempts is NotAlive and a no-op, which is
         // exactly what keeps it a clean shell. Sample one op per subsystem.
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         for call in [
             HvCall::CreditGrant { amount: 100 },
             HvCall::P2mAllocate { mfn: 0 },
@@ -3690,7 +3852,7 @@ mod tests {
 
     #[test]
     fn create_brings_a_dead_slot_to_life_and_then_it_can_act() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         // dom0 (privileged) creates domain 1 as an ordinary (unprivileged) domain.
         assert_eq!(
             h.dispatch(
@@ -3712,7 +3874,7 @@ mod tests {
 
     #[test]
     fn only_a_privileged_domain_may_create_and_a_denial_is_a_noop() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         // dom0 brings up an *unprivileged* domain 1.
         h.dispatch(
             0,
@@ -3745,7 +3907,7 @@ mod tests {
         // The provenance chain: dom0 (privileged) can mint another privileged control
         // domain, which can in turn create; but no unprivileged domain can confer privilege
         // — not on a peer (Denied) and not on itself (it can never be a create target).
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         // dom0 creates domain 1 *privileged*.
         h.dispatch(
             0,
@@ -3819,7 +3981,7 @@ mod tests {
 
     #[test]
     fn destroying_a_dead_peer_is_denied_no_one_controls_a_dead_domain() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         // Domain 1 is Dead — never created, so no domain controls it (control edges only
         // exist between live domains). Even dom0, which *may create*, does not control a
         // slot it never brought up, so destroying it is Denied by the authority gate — not
@@ -3850,7 +4012,7 @@ mod tests {
         // The whole lifecycle loop, and privilege provenance across a slot's reuse: a
         // torn-down slot returns to a clean, *unprivileged* shell, so a later create decides
         // its authority afresh — a reborn domain never inherits a dead tenant's privilege.
-        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4, 2);
         // Create domain 1 privileged; give it a frame.
         h.dispatch(
             0,
@@ -3891,7 +4053,7 @@ mod tests {
         // Least-privilege: control is a per-target capability rooted in creation, with no
         // implicit transitivity — so a creation "grandparent" does NOT control its
         // grandchildren, and having `may_create` is not a blanket licence to destroy.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         // dom0 creates domain 1 as a control domain (may_create), and domain 2 directly.
         h.dispatch(
             0,
@@ -3947,7 +4109,7 @@ mod tests {
         // A capability must not outlive the domain it names, in either direction: destroying
         // a domain drops both the edges by which others controlled it and the edges by which
         // it controlled others.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         // dom0 → domain 1 (a control domain); domain 1 → domain 2 and domain 3.
         h.dispatch(
             0,
@@ -3991,7 +4153,7 @@ mod tests {
     fn control_can_be_delegated_and_revoked() {
         // Delegation makes control mutable: a controller hands control of a domain to a
         // peer, which can then destroy it; revocation takes it back.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         // dom0 creates domain 1 (the controlled domain) and domain 2 (a would-be delegate).
         for t in [1u16, 2] {
             h.dispatch(
@@ -4051,7 +4213,7 @@ mod tests {
 
     #[test]
     fn delegation_guards_the_recipient_and_the_self_edge() {
-        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4, 2);
         // dom0 controls domain 1 (created it); domain 2 stays Dead.
         h.dispatch(
             0,
@@ -4084,7 +4246,7 @@ mod tests {
 
     #[test]
     fn revoking_a_non_delegatee_is_denied() {
-        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4, 2);
         for t in [1u16, 2] {
             h.dispatch(
                 0,
@@ -4118,7 +4280,7 @@ mod tests {
     fn control_delegates_onward_in_a_chain() {
         // A delegate is a full controller: it may delegate onward. dom0 → 1, then 1 → 2, so
         // domain 2 controls the target without dom0 delegating to it directly.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         // Target is domain 3; domains 1 and 2 are the delegation chain.
         for t in [1u16, 2, 3] {
             h.dispatch(
@@ -4167,7 +4329,7 @@ mod tests {
         // and the prune cascades to everything the pruned node delegated — while the ancestor
         // and its own edge survive. Needs a depth-2 chain, so four domains: dom0 (Root over
         // target 3) → 1 (Via 0) → 2 (Via 1).
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         for t in [1u16, 2, 3] {
             h.dispatch(
                 0,
@@ -4202,7 +4364,7 @@ mod tests {
         // Renounce (from == caller) is the same tree operation as prune: it removes the
         // caller's own edge *and* everything it delegated (which would otherwise orphan).
         // dom0 (Root over target 1) delegates to domain 2, then renounces — both go.
-        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(3, 4, 4, 1, 1, 4, 2);
         for t in [1u16, 2] {
             h.dispatch(
                 0,
@@ -4234,7 +4396,7 @@ mod tests {
         // Chain restriction is *directional*, not a blanket "only the creator revokes": a
         // delegate is a full controller *within its subtree*. Domain 1 (delegated control of
         // target 3) delegates onward to 2, then revokes 2 — its own delegatee. Allowed.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         for t in [1u16, 2, 3] {
             h.dispatch(
                 0,
@@ -4272,7 +4434,7 @@ mod tests {
         // Two independent delegatees of the same delegator are siblings; neither is in the
         // other's subtree, so neither may revoke the other. dom0 (Root over target 3)
         // delegates to both 1 and 2; domain 1 tries to revoke domain 2 → Denied.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         for t in [1u16, 2, 3] {
             h.dispatch(
                 0,
@@ -4303,7 +4465,7 @@ mod tests {
         // domain that already controls the target must NOT re-parent it, else a cycle could
         // form. dom0 → 1 → 2 over target 3; then dom0 tries to delegate 3 to domain 2 again.
         // Domain 2 keeps Via(1), not Via(0) — no re-parent, no cycle.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         for t in [1u16, 2, 3] {
             h.dispatch(
                 0,
@@ -4349,7 +4511,7 @@ mod tests {
         // (they would orphan). dom0 delegates control of target 3 to domain 1, which delegates
         // onward to domain 2. Destroying domain 1 (a live delegator) must cascade domain 2's
         // Via(1) edge away — even though domain 2 is neither endpoint of the destroy.
-        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4);
+        let mut h = Hypervisor::new(4, 4, 4, 1, 1, 4, 2);
         for t in [1u16, 2, 3] {
             h.dispatch(
                 0,
@@ -4535,7 +4697,7 @@ mod tests {
     /// nothing. Once the slot is `Live`, the same references are allowed.
     #[test]
     fn a_reference_cannot_be_minted_naming_a_dead_domain() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         // Slots 1 and 2 boot Dead. dom0 owns a frame it would grant.
         h.dispatch(0, HvCall::P2mAllocate { mfn: 0 }).unwrap();
 
@@ -4593,7 +4755,7 @@ mod tests {
     /// reach the grantor's page — the confused deputy across the reuse boundary is prevented.
     #[test]
     fn a_reborn_domain_cannot_inherit_a_grant_made_to_its_predecessor() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         // dom0 brings up domain 1 (the tenant to be reused) and domain 2 (a third party).
         for target in 1..=2 {
             h.dispatch(
@@ -4660,7 +4822,7 @@ mod tests {
     /// peer opened for its predecessor.
     #[test]
     fn a_reborn_domain_cannot_inherit_a_channel_opened_for_its_predecessor() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         for target in 1..=2 {
             h.dispatch(
                 0,
@@ -4768,7 +4930,7 @@ mod tests {
     /// of the target is `Denied` — the same per-target authority gate as `DomainDestroy`.
     #[test]
     fn setting_a_peers_affinity_requires_control_of_it() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         // dom0 creates domains 1 and 2, so dom0 controls both; neither controls the other.
         for target in 1..=2 {
             h.dispatch(
@@ -4833,7 +4995,7 @@ mod tests {
     /// its predecessor. (Teardown offlines every vCPU, and offline resets affinity.)
     #[test]
     fn a_reborn_domain_starts_with_default_affinity() {
-        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8);
+        let mut h = Hypervisor::new(3, 8, 6, 2, 2, 8, 2);
         h.dispatch(
             0,
             HvCall::DomainCreate {
@@ -4872,6 +5034,238 @@ mod tests {
             Some(h.sched().full_affinity()),
             "a reborn vCPU starts with default (all-pCPUs) affinity"
         );
+        assert!(h.invariants_hold());
+    }
+
+    // ─── SMMU rung 4a — device assignment at the seam ──────────────────────────────────────
+    //
+    // The subsystem's own behaviour (exclusivity, idempotence, the sweep) is unit-tested in
+    // `crate::device`. What can only be tested *here* is the part that needs three axes at
+    // once: the authority gate, the lifecycle coupling, and the teardown sweep — and, for the
+    // two *policy* decisions (no self-assign; a release names its holder), tests are the only
+    // teeth there are, because a policy that permits more states breaks no invariant.
+
+    /// **Assignment is not self-service.** `DeviceAssign` is the one whole-domain operation with
+    /// no `caller == target` exemption: taking a device consumes a system-wide exclusive
+    /// resource *and* creates an inbound-DMA authority over the taker's own memory. A domain
+    /// with no controller-granted claim on the assignee is `Denied`, whoever it is.
+    ///
+    /// This test is load-bearing in a way the ∀-N sweep cannot be: a self-assigned device
+    /// violates **no invariant** (it is a perfectly well-formed state), so nothing else in the
+    /// repository would notice the gate disappearing.
+    #[test]
+    fn a_domain_cannot_assign_itself_a_device() {
+        let mut h = hv();
+        // Domain 1 is Live and controls nothing — it may not take a free device for itself...
+        assert_eq!(
+            h.dispatch(1, HvCall::DeviceAssign { dev: 0, to: 1 }),
+            Err(HvError::Denied)
+        );
+        // ... nor hand one to a peer.
+        assert_eq!(
+            h.dispatch(1, HvCall::DeviceAssign { dev: 0, to: 2 }),
+            Err(HvError::Denied)
+        );
+        assert_eq!(
+            h.device().holder_of(0),
+            None,
+            "a refusal must mutate nothing"
+        );
+        // Even dom0 — which holds `may_create` and controls 1 and 2 — cannot assign to *itself*:
+        // nobody controls dom0, so there is no authority above it to license the take.
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 0 }),
+            Err(HvError::Denied)
+        );
+        // The controller path is the only one that works.
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 }),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(h.device().holder_of(0), Some(1));
+        assert!(h.invariants_hold());
+    }
+
+    /// A device reaches one domain's memory or none: a second assignee is refused, and the
+    /// refusal does not re-point the device (which would aim a live bus master at a different
+    /// domain with the previous holder never quiesced). Re-assigning to the current holder is a
+    /// successful no-op.
+    #[test]
+    fn a_device_has_at_most_one_holder() {
+        let mut h = hv();
+        h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 })
+            .unwrap();
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 2 }),
+            Err(HvError::Device(device::DeviceError::Busy))
+        );
+        assert_eq!(h.device().holder_of(0), Some(1));
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 }),
+            Ok(HvOutcome::Done),
+            "re-assigning to the current holder is idempotent"
+        );
+        assert!(h.invariants_hold());
+    }
+
+    /// **Release is self-permitted; assignment is not.** The asymmetry is the point — taking
+    /// needs an authority above you, giving back needs only being you.
+    #[test]
+    fn a_domain_may_release_its_own_device_but_not_a_peers() {
+        let mut h = hv();
+        h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 })
+            .unwrap();
+        // Domain 2 controls nothing: it can neither take the device nor make 1 give it up.
+        assert_eq!(
+            h.dispatch(2, HvCall::DeviceRelease { dev: 0, from: 1 }),
+            Err(HvError::Denied)
+        );
+        assert_eq!(h.device().holder_of(0), Some(1));
+        // The holder itself may hand it back...
+        assert_eq!(
+            h.dispatch(1, HvCall::DeviceRelease { dev: 0, from: 1 }),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(h.device().holder_of(0), None);
+        // ... and so may its controller.
+        h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 })
+            .unwrap();
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceRelease { dev: 0, from: 1 }),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(h.device().holder_of(0), None);
+        assert!(h.invariants_hold());
+    }
+
+    /// **A release names its holder, and that is a disclosure decision.** Because `from` is
+    /// given rather than looked up, the authority gate is settled before the device table is
+    /// read — so a caller with no claim on `from` gets `Denied` whether or not `from` actually
+    /// holds the device, and cannot use the call to probe. A caller that *does* hold the claim
+    /// gets the ordinary `NotAssigned`.
+    ///
+    /// The two verdicts below differ **only** in who is asking, over identical device state:
+    /// that is what makes this a test of the gate ordering rather than of the error mapping.
+    #[test]
+    fn a_release_by_a_stranger_reveals_nothing_about_the_device() {
+        let mut h = hv();
+        h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 })
+            .unwrap();
+        // Device 0 is held by 1; device 1 is free. To domain 2 — which controls neither — both
+        // look exactly the same.
+        assert_eq!(
+            h.dispatch(2, HvCall::DeviceRelease { dev: 0, from: 1 }),
+            Err(HvError::Denied)
+        );
+        assert_eq!(
+            h.dispatch(2, HvCall::DeviceRelease { dev: 1, from: 1 }),
+            Err(HvError::Denied)
+        );
+        // To dom0, which controls 1, they are distinguishable — and legitimately so: it is
+        // dom0's own authority over 1 that makes 1's holdings its business.
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceRelease { dev: 0, from: 1 }),
+            Ok(HvOutcome::Done)
+        );
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceRelease { dev: 1, from: 1 }),
+            Err(HvError::Device(device::DeviceError::NotAssigned))
+        );
+        assert!(h.invariants_hold());
+    }
+
+    /// **The confused deputy, in the flavour no CPU-side invariant can see.** Teardown sweeps
+    /// the devices its target held, so a reborn tenant of the same slot inherits no bus master
+    /// aimed at its memory — the device half of domain-ID reuse soundness. Without the sweep
+    /// the standing `DeadDomainReferenced` invariant fails immediately, which is what makes
+    /// this a machine-checked property rather than an ordering convention.
+    #[test]
+    fn domain_destroy_releases_the_devices_its_target_held() {
+        let mut h = hv();
+        h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 })
+            .unwrap();
+        h.dispatch(0, HvCall::DeviceAssign { dev: 1, to: 2 })
+            .unwrap();
+        h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .unwrap();
+        assert_eq!(
+            h.device().holder_of(0),
+            None,
+            "the dead tenant's device was not released"
+        );
+        assert_eq!(
+            h.device().holder_of(1),
+            Some(2),
+            "the sweep must spare every other holder"
+        );
+        // The slot is a clean, unreferenced shell — the precondition creation relies on.
+        assert!(h.is_clean_shell(1) && h.is_unreferenced(1));
+        assert!(h.invariants_hold());
+        // Rebirth: the fresh tenant of slot 1 starts with nothing, and must be assigned a
+        // device explicitly to hold one.
+        h.dispatch(
+            0,
+            HvCall::DomainCreate {
+                target: 1,
+                may_create: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.device().holder_of(0),
+            None,
+            "a reborn slot inherited its predecessor's device"
+        );
+        assert!(h.invariants_hold());
+    }
+
+    /// A device may not be assigned to a `Dead` slot — the inbound-reference mint gate.
+    ///
+    /// **What the verdict actually is, and why:** `Denied`, not `NotAlive`. A `Dead` domain has
+    /// no controller (teardown clears every edge into it), so the authority gate refuses first
+    /// — the same reason destroying a `Dead` peer is `Denied`, and the same non-disclosure. The
+    /// explicit `reject_dead_target` call in `device_assign` is therefore **unreachable today**,
+    /// and that is recorded rather than hidden: it is kept because "an assignment must name a
+    /// live domain" is a property of assignment, not a consequence of how authority happens to
+    /// be gated, and a guard that depends on another subsystem's invariant staying arranged as
+    /// it is has no teeth of its own.
+    #[test]
+    fn a_device_cannot_be_assigned_to_a_dead_slot() {
+        let mut h = hv();
+        h.dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .unwrap();
+        assert_eq!(h.life_of(1), Some(DomainLife::Dead));
+        assert_eq!(
+            h.dispatch(0, HvCall::DeviceAssign { dev: 0, to: 1 }),
+            Err(HvError::Denied)
+        );
+        assert_eq!(h.device().holder_of(0), None);
+        assert!(h.invariants_hold());
+    }
+
+    /// An assignment belongs to the **assignee**, not the assigner: revoking the delegated
+    /// control edge that licensed it does not take the device away, and the device survives its
+    /// assigner's own teardown. (The device axis is authority-gated at the *transition*, not
+    /// held up by a standing capability — the same shape as a frame allocated by a domain
+    /// outliving whoever authorized its creation.)
+    #[test]
+    fn a_device_outlives_the_control_edge_that_assigned_it() {
+        let mut h = hv();
+        // dom0 delegates control of 1 to 2, and 2 assigns the device to 1.
+        h.dispatch(0, HvCall::ControlGrant { target: 1, to: 2 })
+            .unwrap();
+        h.dispatch(2, HvCall::DeviceAssign { dev: 0, to: 1 })
+            .unwrap();
+        assert_eq!(h.device().holder_of(0), Some(1));
+        // Revoking 2's edge leaves 1 holding the device.
+        h.dispatch(0, HvCall::ControlRevoke { target: 1, from: 2 })
+            .unwrap();
+        assert_eq!(h.device().holder_of(0), Some(1));
+        assert!(h.invariants_hold());
+        // ... and so does tearing 2 down entirely.
+        h.dispatch(0, HvCall::DomainDestroy { target: 2, now: 0 })
+            .unwrap();
+        assert_eq!(h.device().holder_of(0), Some(1));
         assert!(h.invariants_hold());
     }
 }

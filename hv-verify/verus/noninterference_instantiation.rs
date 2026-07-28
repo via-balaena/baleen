@@ -22,13 +22,20 @@
 //! authorized to affect `a`, integrity *and* confidentiality — now stands as a closed Verus
 //! obligation, not a hand-composition.
 //!
-//! ## Scope of this file (all FIVE transition classes — GAP-C fully closed)
+//! ## Scope of this file (all SEVEN transition classes — GAP-C fully closed)
 //!
-//! `Trans` models **all five** Tier-D transition classes: `Create` (creation), `Send` (signal),
-//! `GrantMap` (consent + the confidentiality read-closure), `SetAffinity` (authority), and
-//! `Destroy` — the **`DomainDestroy` cascade**, the sole genuinely multi-domain transition
-//! (`unwinding_destroy.rs`). Both unwinding conditions are discharged, and both trace theorems
-//! (`ni_theorem_a`, `ni_theorem_b`) are premise-free, for all five.
+//! `Trans` models **all seven** Tier-D transition classes: `Create` (creation), `Send` (signal),
+//! `GrantMap` (consent + the confidentiality read-closure), `SetAffinity` (authority), `Destroy` —
+//! the **`DomainDestroy` cascade**, the sole genuinely multi-domain transition
+//! (`unwinding_destroy.rs`) — and, since the SMMU arc's rung 4, `DeviceAssign` / `DeviceRelease`
+//! (the **device axis**). Both unwinding conditions are discharged, and both trace theorems
+//! (`ni_theorem_a`, `ni_theorem_b`) are premise-free, for all seven.
+//!
+//! The device pair is here rather than argued by analogy on purpose. `DeviceRelease` really *is*
+//! `SetAffinity`'s shape (self-or-controller gate, write restricted to the gated domain's own
+//! resource), and it would have been easy to say so in prose and stop — which is precisely the
+//! move GAP-C existed to stamp out. Writing the carriers instead found something the analogy would
+//! have missed: see `ObsPlus::peer_live`.
 //!
 //! The cascade touches five `obs`/`obs⁺` components at once — `a`'s **ports** (`close_all`/
 //! `clear_unbound_into` drop links naming `c`), **grant rows** (`revoke_grants_to` clears active
@@ -134,6 +141,38 @@
 //! statement of the rung: **an unexercised offer is not a channel — the flow opens when the borrow
 //! does, not when the offer does.** `hv-core` is untouched; the relation now coincides term for term
 //! with `hv-sim::noninterference::Channels::authorized`.
+//!
+//! ## The SMMU arc's rung 4 — the device axis, and what writing its carriers found
+//!
+//! `DeviceAssign` / `DeviceRelease` add the one resource here that reaches a domain's memory with
+//! **no hypercall and no vCPU**: a bus master. `Obs` therefore gains `devs` (integrity — a device
+//! assigned to `a` writes `a`'s frames), and `ObsPlus` gains [`a_dev_view`] (confidentiality — the
+//! exclusivity guard reads a third domain's holding and reports it). `interferes` needs **no new
+//! term**: every transition that can move a domain's holdings is issued by that domain or by a
+//! controller of it, both already authorized. That is a result, not an assumption — the alternative
+//! is a device flow with no channel behind it, which is what `local_respect_holds`'s two new arms
+//! rule out.
+//!
+//! **The finding: `ObsPlus` was missing peer liveness, and had been since ⑥.** The real-code bridge
+//! has carried every domain's liveness since ⑥/F1 (four guards read a named peer's liveness and
+//! report it, gated by no capability — so it is factually public). This file did not, and nothing
+//! noticed for two arcs, because the guards that read a third domain's liveness wrote components
+//! `obs(·, a)` does not carry for a third `a` — `Create`'s `¬live[target]` moves `live[target]`,
+//! which is in nobody's observation but `target`'s. `DeviceAssign` is the first modeled transition
+//! whose *outcome* is visible in **every** domain's observation (a device becoming assigned changes
+//! the device view for all of them), so the omission finally bit: without `peer_live`, two
+//! `obs⁺`-agreeing states can differ on `live[to]`, fire the guard differently, and diverge. The
+//! composition was sound throughout; the surface was narrower than the bridge's and the two had
+//! silently drifted apart — the same shape ⑦ found in the other direction (design-lesson #66).
+//!
+//! **One probe refuses to fire, and it is recorded rather than buried** (design-lesson #72).
+//! Blinding [`a_dev_view`] to a bare taken/free bit, and emptying `peer_live`, each make Verus
+//! reject. **Removing the device sweep from the `Destroy` cascade does not** — and that is correct,
+//! not a hole: the sweep's content is the *safety* invariant "no device names a dead domain", which
+//! is `device_assignment_preservation.rs`'s job (dropping it there **does** make Verus reject) and
+//! the enumerator's. Non-interference asks a different question, and a surviving assignment moves
+//! no observation the cascade did not already move. The sweep is modeled here for fidelity — if it
+//! *had* opened a channel, this file is where that would have had to be accounted for.
 //!
 //! Run: `verus --crate-type=lib hv-verify/verus/noninterference_instantiation.rs` (exit 0 = all
 //! proven).
@@ -395,6 +434,11 @@ pub struct Sys {
     pub vowner: Map<int, Dom>,
     /// Per-vCPU **affinity mask** — `vaff[v]` (moved by `SchedSetAffinity`).
     pub vaff: Map<int, nat>,
+    /// **Device assignment** — `dev[d]` is the domain holding DMA-capable device `d`; a device
+    /// absent from the map is unassigned (`hv-core`'s `device::System`, the SMMU arc's rung 4).
+    /// A partial map rather than a total `Map<int, Option<Dom>>` for the same reason the code uses
+    /// `Option`: exclusivity is then a fact about the representation, with nothing to prove.
+    pub dev: Map<int, Dom>,
 }
 
 /// One grant-table entry, projected to what the memory channel and the read-closure read: the
@@ -446,6 +490,22 @@ pub enum Trans {
     /// `caller` can move a *third* domain's `obs` — the intransitive **teardown-reach** channel
     /// (`unwinding_destroy.rs`).
     Destroy { caller: Dom, target: Dom },
+    /// `DeviceAssign` — `caller` assigns DMA-capable device `d` to `to` (the SMMU arc's rung 4).
+    /// Guarded by `controls[caller][to]` — **with no self-exemption**, unlike every other control
+    /// operation here — plus `to` being `Live` and `d` not already held by a third domain. Writes
+    /// only `dev[d]`, which lies in `obs(to)`: the **authority** channel again, but pointed at a
+    /// resource the CPU-side surface cannot see at all, since a device writes memory with no
+    /// hypercall and no vCPU.
+    ///
+    /// Its exclusivity guard reads `dev[d]` — a *third* domain's holding — and reports the result
+    /// to the caller, which is why `ObsPlus` carries [`a_dev_view`]: the same declared-disclosure
+    /// shape as the peer-liveness guards (⑥/F1), and step consistency is false without it.
+    DeviceAssign { caller: Dom, d: int, to: Dom },
+    /// `DeviceRelease` — `caller` releases device `d` from `from`. Guarded by
+    /// `caller == from ∨ controls[caller][from]` — the *self-permitted* direction, exactly
+    /// [`Trans::SetAffinity`]'s shape, because releasing only ever removes an authority. `from` is
+    /// named rather than looked up so the guard settles before `dev[d]` is read.
+    DeviceRelease { caller: Dom, d: int, from: Dom },
 }
 
 /// The acting principal of an action — the `caller` of the `HvCall`.
@@ -456,7 +516,27 @@ pub open spec fn actor(t: Trans) -> Dom {
         Trans::GrantMap { mapper, .. } => mapper,
         Trans::SetAffinity { caller, .. } => caller,
         Trans::Destroy { caller, .. } => caller,
+        Trans::DeviceAssign { caller, .. } => caller,
+        Trans::DeviceRelease { caller, .. } => caller,
     }
+}
+
+/// The `DeviceAssign` guard, transcribed from `Hypervisor::device_assign`: the caller **controls**
+/// the assignee (no `caller == to` disjunct — that omission is the guard), the assignee is `Live`
+/// (the inbound-reference mint gate), and the device is free or already the assignee's (the
+/// exclusivity refusal, which is idempotent on a re-assignment to the current holder).
+pub open spec fn device_assign_guard(s: Sys, caller: Dom, d: int, to: Dom) -> bool {
+    &&& s.controls.contains((caller, to))
+    &&& s.live.contains(to)
+    &&& (!s.dev.dom().contains(d) || s.dev[d] == to)
+}
+
+/// The `DeviceRelease` guard, transcribed from `Hypervisor::device_release`: the caller is the
+/// holder or controls it, and the holder really is the named one.
+pub open spec fn device_release_guard(s: Sys, caller: Dom, d: int, from: Dom) -> bool {
+    &&& (caller == from || s.controls.contains((caller, from)))
+    &&& s.dev.dom().contains(d)
+    &&& s.dev[d] == from
 }
 
 /// The `SchedSetAffinity` guard: `vcpu` exists and `caller` is its owner or a controller of its
@@ -602,6 +682,20 @@ pub open spec fn step(s: Sys, t: Trans) -> Sys {
                 s
             }
         },
+        Trans::DeviceAssign { caller, d, to } => {
+            if device_assign_guard(s, caller, d, to) {
+                Sys { dev: s.dev.insert(d, to), ..s }
+            } else {
+                s
+            }
+        },
+        Trans::DeviceRelease { caller, d, from } => {
+            if device_release_guard(s, caller, d, from) {
+                Sys { dev: s.dev.remove(d), ..s }
+            } else {
+                s
+            }
+        },
         Trans::Destroy { caller, target } => {
             if destroy_guard(s, caller, target) {
                 let c = target;
@@ -625,6 +719,13 @@ pub open spec fn step(s: Sys, t: Trans) -> Sys {
                     // It keeps the guard a function of the actor's `obs`; the drain is invisible to
                     // `obs(a)` for `a ≠ c`, since a map over `c`'s frame is not one of `a`'s.)
                     maps: s.maps.filter(drain_pred(s.owner, c)),
+                    // devices: `release_all_of(c)` returns every device `c` held to the unassigned
+                    // pool (SMMU rung 4). The third kind of inbound reference the cascade must
+                    // clear, beside the ports and the grant rows above — and the only one whose
+                    // survival would leave a *bus master* aimed at whoever is reborn into the slot,
+                    // writing memory with no hypercall and no vCPU. Modeled as dropping every key
+                    // whose value is `c`, exactly the code's loop.
+                    dev: s.dev.remove_keys(s.dev.dom().filter(|k: int| s.dev[k] == c)),
                     ..s
                 }
             } else {
@@ -677,6 +778,14 @@ pub struct Obs {
     /// The actor observes its own destroy authority — without it `step_consistent` is false for the
     /// `DomainDestroy` channel (the outgoing analogue of the finding-#1 self-authority).
     pub controls_out: Set<(Dom, Dom)>,
+    /// `a`'s **devices** — the DMA-capable devices assigned to `a` (SMMU rung 4).
+    ///
+    /// On the **integrity** surface, not merely the confidentiality one, and for a reason no other
+    /// component here has: a device assigned to `a` writes `a`'s memory with no hypercall and no
+    /// vCPU, so leaving it out would put the one channel into `a`'s frames that every other
+    /// component is blind to outside the theorem entirely (design-lesson #66 — a green proof can
+    /// mean the surface cannot see the flow).
+    pub devs: Set<int>,
 }
 
 /// `obs(s, a)` — the projection of `s` onto what belongs to `a`.
@@ -693,7 +802,63 @@ pub open spec fn obs(s: Sys, a: Dom) -> Obs {
         aff: a_affinity(s, a),
         controllers: a_controllers(s, a),
         controls_out: a_controls_out(s, a),
+        devs: a_devices(s, a),
     }
+}
+
+/// `a`'s **devices** — the keys of the assignment map whose value is `a`.
+pub open spec fn a_devices(s: Sys, a: Dom) -> Set<int> {
+    s.dev.dom().filter(|d: int| s.dev[d] == a)
+}
+
+/// How far `a` can resolve a device's assignment — the tightest faithful projection of what the
+/// `DeviceAssign` exclusivity guard tells it. A device **absent from the map's domain is
+/// unassigned**, which `a` learns from an assignment succeeding, so the domain is itself part of
+/// the observable.
+pub enum DevView {
+    /// Held by a domain `a` neither is nor controls. `a` learns *that* it is held (the refusal)
+    /// but never **who** holds it: no outcome of any call `a` can issue distinguishes one
+    /// uncontrolled holder from another, so naming it would over-approximate the observable
+    /// exactly as ②′-(a)'s raw frame owner did.
+    Taken,
+    /// Held by `h`, where `h` is `a` itself or a domain `a` controls. The holder **is** named here,
+    /// and must be: `a` may assign to any of several domains it controls, and the outcome
+    /// (idempotent success versus `Busy`) differs per holder — so a two-valued free/taken bit
+    /// makes step consistency false.
+    Held(Dom),
+}
+
+/// **`a`'s holdings are a function of `a`'s device view.** `dev[k] == a` is precisely
+/// `view[k] == Held(a)` (a domain always resolves *itself*), so [`Obs::devs`] carries nothing the
+/// confidentiality view does not already determine — which is why the two components never have to
+/// be pinned separately in the step-consistency arms.
+pub proof fn devices_are_a_view_projection(s: Sys, a: Dom)
+    ensures
+        a_devices(s, a) == a_dev_view(s, a).dom().filter(
+            |k: int| a_dev_view(s, a)[k] == DevView::Held(a),
+        ),
+{
+    assert(a_devices(s, a) =~= a_dev_view(s, a).dom().filter(
+        |k: int| a_dev_view(s, a)[k] == DevView::Held(a),
+    ));
+}
+
+/// `a`'s **device view** — the assignment map projected through [`DevView`].
+///
+/// This is the confidentiality surface's device component, and the honest reading of it is that
+/// **Baleen's device namespace is free/taken-public to any domain holding a control edge**: a
+/// declared disclosure beside the public domid namespace (⑥/F1), not a closed channel. It is
+/// strictly narrower than that one — a domain controlling nothing is refused at the authority gate
+/// before the map is read, and learns nothing at all.
+pub open spec fn a_dev_view(s: Sys, a: Dom) -> Map<int, DevView> {
+    s.dev.map_values(
+        |h: Dom|
+            if h == a || s.controls.contains((a, h)) {
+                DevView::Held(h)
+            } else {
+                DevView::Taken
+            },
+    )
 }
 
 /// Domain `a`'s **confidentiality** observation, `obs⁺` — [`Obs`] extended with the read-closure.
@@ -712,13 +877,40 @@ pub struct ObsPlus {
     /// The integrity surface, carried entire — `obs⁺ ⊇ obs`.
     pub base: Obs,
     /// `a`'s **read-closure** — read-caps for grants naming `a` as grantee. The confidentiality
-    /// read direction (`read_closure.rs`), and the sole thing `obs⁺` adds.
+    /// read direction (`read_closure.rs`).
     pub read_caps: Map<int, ReadCap>,
+    /// `a`'s **device view** — how far `a` can resolve each device's assignment ([`a_dev_view`]).
+    /// The `DeviceAssign` exclusivity guard reads a third domain's holding and reports it, so this
+    /// is the confidentiality surface's rung-4 component and step consistency is *false* without
+    /// it.
+    pub dev_view: Map<int, DevView>,
+    /// **Every domain's liveness** — the declared disclosure ⑥/F1 recorded on the real-code bridge
+    /// (`hv-sim::noninterference`'s `Surface::peer_liveness`): four guards read a *named peer's*
+    /// liveness and report the result, gated by no capability, so domain liveness is factually
+    /// public in Baleen and `obs⁺` is the upper bound on what `a` can learn.
+    ///
+    /// **This component was missing here until the SMMU arc's rung 4, and that is a finding, not a
+    /// tidy-up.** The bridge has carried it since ⑥; this file did not, and nothing noticed —
+    /// because the guards that read a third domain's liveness (`Create`'s `¬live[target]`) wrote a
+    /// component `obs(·, a)` does not carry for `target ≠ a`, so their divergence was invisible.
+    /// `DeviceAssign` is the first modeled transition whose *outcome* is visible in every domain's
+    /// observation (a device becoming assigned changes [`a_dev_view`] for everyone), which is what
+    /// finally made the omission bite. The composition was sound throughout; the surface was
+    /// narrower than the bridge's, so the two had drifted apart — exactly the divergence ⑦ found
+    /// in the other direction (design-lesson #66: a green proof can mean the surface cannot see the
+    /// flow).
+    pub peer_live: Set<Dom>,
 }
 
-/// `obs⁺(s, a)` — the confidentiality projection: [`obs`] plus the read-closure.
+/// `obs⁺(s, a)` — the confidentiality projection: [`obs`] plus the read-closure and the device
+/// view.
 pub open spec fn obs_plus(s: Sys, a: Dom) -> ObsPlus {
-    ObsPlus { base: obs(s, a), read_caps: a_read_caps(s, a) }
+    ObsPlus {
+        base: obs(s, a),
+        read_caps: a_read_caps(s, a),
+        dev_view: a_dev_view(s, a),
+        peer_live: s.live,
+    }
 }
 
 /// `a` holds a port toward `b`: some interdomain port owned by `a` whose peer lies in domain `b`
@@ -1006,6 +1198,7 @@ pub proof fn interferes_shrank_strictly() -> (r: (Sys, Dom, Dom))
         controls: Set::empty(),
         vowner: Map::empty(),
         vaff: Map::empty(),
+        dev: Map::empty(),
     };
     assert(involution(s.peer));
     assert(map_identity(s));  // no live maps at all
@@ -1431,11 +1624,54 @@ pub proof fn local_respect_holds()
                     }
                     held_drain_preserves(s.maps, s.owner, a, c);
                     assert(obs(step(s, t), a).held == obs(s, a).held);
+                    // devices: the sweep returns `c`'s devices to the unassigned pool, which
+                    // touches `obs(a).devs` only if `c == a` — and `c == a` needs the destroy
+                    // guard, i.e. `caller == a` (excluded) or `controls[caller][a]` (an
+                    // `interferes` disjunct). So an unauthorized destroy cannot disarm `a`'s
+                    // devices, which is the device-axis half of "a teardown reaches only what its
+                    // authority names".
+                    assert(c != a);
+                    assert(a_devices(step(s, t), a) =~= a_devices(s, a));
                     // (Read-caps are not on the integrity surface — ⑦. Destroying `a`'s grantor
                     // *does* drop `a`'s read-cap, but that is a confidentiality event, carried by
                     // `step_consistent_holds` over `obs⁺`, which needs no channel relation. This is
                     // exactly why the blanket `reads_from` disjunct could leave `interferes`.)
                 }
+                assert(obs(step(s, t), a) == obs(s, a));
+            },
+            Trans::DeviceAssign { caller, d, to } => {
+                // The write is `dev[d] := to`, and it reaches `obs(a).devs` only if `to == a`.
+                // The guard requires `controls[caller][a]` in that case — which is an `interferes`
+                // disjunct verbatim — so ¬interferes rules the guard out. This is the shape
+                // `SetAffinity` has (the write-restriction *is* the authorization guard,
+                // design-lesson #9); what is new is only *which* resource it restricts, and it is
+                // the one resource that reaches `a`'s memory with no hypercall and no vCPU.
+                if to == a {
+                    assert(!s.controls.contains((caller, a)));  // else interferes, ⊥
+                    assert(!device_assign_guard(s, caller, d, to));
+                    assert(step(s, t) == s);
+                }
+                assert(a_devices(step(s, t), a) =~= a_devices(s, a));
+                assert(obs(step(s, t), a) == obs(s, a));
+            },
+            Trans::DeviceRelease { caller, d, from } => {
+                // The write is `dev.remove(d)`, reaching `obs(a).devs` only if `dev[d] == a` — in
+                // which case the guard needs `from == a`, hence `caller == a` (excluded by
+                // `actor(t) != a`) or `controls[caller][a]` (an `interferes` disjunct). The
+                // *self*-permitted direction is why the `actor(t) != a` exclusion is doing real
+                // work in this arm rather than being a formality.
+                if s.dev.dom().contains(d) && s.dev[d] == a && device_release_guard(
+                    s,
+                    caller,
+                    d,
+                    from,
+                ) {
+                    assert(from == a);
+                    assert(caller != a);
+                    assert(!s.controls.contains((caller, a)));  // else interferes, ⊥
+                    assert(false);
+                }
+                assert(a_devices(step(s, t), a) =~= a_devices(s, a));
                 assert(obs(step(s, t), a) == obs(s, a));
             },
         }
@@ -1738,6 +1974,41 @@ pub proof fn step_consistent_holds()
                                 && s.grants[g].grantee == u.grants[g].grantee);
                         }
                     });
+                    // devices: the cascade returns `c`'s devices to the unassigned pool, and the
+                    // swept key set is pinned by the *actor's* view — the destroy guard makes `c`
+                    // the caller itself or a domain it controls, so `a_dev_view(·, caller)` names
+                    // `c` as `Held(c)` on exactly the keys the sweep takes. A third observer `a`
+                    // sees those keys only as `Taken`, and cannot tell which of them were `c`'s;
+                    // it does not need to, because the successor components it observes are
+                    // functions of what it already had.
+                    let swept_s = s.dev.dom().filter(|k: int| s.dev[k] == c);
+                    let swept_u = u.dev.dom().filter(|k: int| u.dev[k] == c);
+                    assert(swept_s =~= swept_u) by {
+                        assert forall|k: int| swept_s.contains(k) == swept_u.contains(k) by {
+                            assert(a_dev_view(s, actor(t)).dom().contains(k)
+                                == s.dev.dom().contains(k));
+                            assert(a_dev_view(u, actor(t)).dom().contains(k)
+                                == u.dev.dom().contains(k));
+                            if s.dev.dom().contains(k) {
+                                assert(a_dev_view(s, actor(t))[k] == a_dev_view(u, actor(t))[k]);
+                                if s.dev[k] == c {
+                                    assert(a_dev_view(s, actor(t))[k] == DevView::Held(c));
+                                }
+                                if u.dev[k] == c {
+                                    assert(a_dev_view(u, actor(t))[k] == DevView::Held(c));
+                                }
+                            }
+                        }
+                    }
+                    assert_maps_equal!(a_dev_view(step(s, t), a), a_dev_view(step(u, t), a), k => {
+                        assert(a_dev_view(s, a).dom().contains(k) == s.dev.dom().contains(k));
+                        assert(a_dev_view(u, a).dom().contains(k) == u.dev.dom().contains(k));
+                        if s.dev.dom().contains(k) {
+                            assert(a_dev_view(s, a)[k] == a_dev_view(u, a)[k]);
+                        }
+                    });
+                    devices_are_a_view_projection(step(s, t), a);
+                    devices_are_a_view_projection(step(u, t), a);
                     assert(obs(step(s, t), a) == obs(step(u, t), a));
                     assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
                 } else {
@@ -1745,6 +2016,139 @@ pub proof fn step_consistent_holds()
                     assert(obs(step(s, t), a) == obs(step(u, t), a));
                     assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
                 }
+            },
+            Trans::DeviceAssign { caller, d, to } => {
+                broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
+                // **This arm is why `ObsPlus` carries a device view at all.** The guard reads
+                // `dev[d]` — a *third* domain's holding — and reports the result to `caller`, so
+                // the successor is a function of the actor's observation only if that observation
+                // says enough about who holds `d`. [`a_dev_view`] is exactly that projection, and
+                // no coarser one works: it must distinguish free (the assignment succeeds) from
+                // held-by-a-domain-`caller`-controls (succeeds, idempotently) from
+                // held-by-a-stranger (`Busy`) — and the middle case must **name** the holder,
+                // because `caller` may assign to any of several domains it controls.
+                let vc_s = a_dev_view(s, actor(t));
+                let vc_u = a_dev_view(u, actor(t));
+                assert(vc_s == vc_u);
+                assert(s.dev.dom() =~= u.dev.dom()) by {
+                    assert forall|k: int| s.dev.dom().contains(k) == u.dev.dom().contains(k) by {
+                        assert(vc_s.dom().contains(k) == s.dev.dom().contains(k));
+                        assert(vc_u.dom().contains(k) == u.dev.dom().contains(k));
+                    }
+                }
+                // The actor's own outgoing authority — the guard's first conjunct, and the one
+                // that decides whether the rest of the guard is even reached.
+                assert(s.controls.contains((caller, to)) == u.controls.contains((caller, to))) by {
+                    assert(obs(s, actor(t)).controls_out.contains((caller, to))
+                        == s.controls.contains((caller, to)));
+                    assert(obs(u, actor(t)).controls_out.contains((caller, to))
+                        == u.controls.contains((caller, to)));
+                }
+                if s.controls.contains((caller, to)) {
+                    // The assignee's liveness is a *third* domain's bit, pinned by the
+                    // peer-liveness component — the conjunct that forced that component into this
+                    // file at all (see `ObsPlus::peer_live`).
+                    assert(s.live =~= u.live);
+                    // The exclusivity conjunct. `to` is a domain `caller` controls, so a holder
+                    // equal to `to` shows up in the actor's view as `Held(to)` rather than
+                    // `Taken` — hence `Taken` witnesses `dev[d] != to` on both sides, and
+                    // `Held(h)` names the same `h` on both.
+                    if s.dev.dom().contains(d) {
+                        assert(vc_s[d] == vc_u[d]);
+                        if s.dev[d] == to {
+                            assert(vc_s[d] == DevView::Held(to));
+                            assert(vc_u[d] == DevView::Held(to));
+                        }
+                        if u.dev[d] == to {
+                            assert(vc_u[d] == DevView::Held(to));
+                            assert(vc_s[d] == DevView::Held(to));
+                        }
+                    }
+                }
+                assert(device_assign_guard(s, caller, d, to) == device_assign_guard(
+                    u,
+                    caller,
+                    d,
+                    to,
+                ));
+                // With the guards equal, both sides either insert `(d, to)` or neither does. The
+                // successor view is then `a`'s incoming view with at most one key rewritten, and
+                // how *that* key reads to `a` depends only on `a`'s own outgoing control edges —
+                // which `obs(a)` carries.
+                assert(s.controls.contains((a, to)) == u.controls.contains((a, to))) by {
+                    assert(obs(s, a).controls_out.contains((a, to)) == s.controls.contains(
+                        (a, to),
+                    ));
+                    assert(obs(u, a).controls_out.contains((a, to)) == u.controls.contains(
+                        (a, to),
+                    ));
+                }
+                assert_maps_equal!(a_dev_view(step(s, t), a), a_dev_view(step(u, t), a), k => {
+                    assert(a_dev_view(s, a).dom().contains(k) == s.dev.dom().contains(k));
+                    assert(a_dev_view(u, a).dom().contains(k) == u.dev.dom().contains(k));
+                    if k != d && s.dev.dom().contains(k) {
+                        assert(a_dev_view(s, a)[k] == a_dev_view(u, a)[k]);
+                    }
+                });
+                devices_are_a_view_projection(step(s, t), a);
+                devices_are_a_view_projection(step(u, t), a);
+                assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
+            },
+            Trans::DeviceRelease { caller, d, from } => {
+                broadcast use vstd::set::group_set_lemmas, vstd::map::group_map_lemmas;
+                // Simpler than the assign, and deliberately so: because the call **names** its
+                // holder, the guard reads only the actor's own authority over `from` plus whether
+                // `from` really holds `d` — and `from` is the actor or a domain it controls, so
+                // `a_dev_view(·, caller)` resolves that holder *by name*. A version taking only `d`
+                // and looking the holder up would have to read a stranger's holding to decide the
+                // gate, which is exactly the disclosure the real `HvCall`'s shape avoids.
+                let vc_s = a_dev_view(s, actor(t));
+                let vc_u = a_dev_view(u, actor(t));
+                assert(vc_s == vc_u);
+                assert(s.dev.dom() =~= u.dev.dom()) by {
+                    assert forall|k: int| s.dev.dom().contains(k) == u.dev.dom().contains(k) by {
+                        assert(vc_s.dom().contains(k) == s.dev.dom().contains(k));
+                        assert(vc_u.dom().contains(k) == u.dev.dom().contains(k));
+                    }
+                }
+                assert(s.controls.contains((caller, from)) == u.controls.contains((caller, from)))
+                    by {
+                    assert(obs(s, actor(t)).controls_out.contains((caller, from))
+                        == s.controls.contains((caller, from)));
+                    assert(obs(u, actor(t)).controls_out.contains((caller, from))
+                        == u.controls.contains((caller, from)));
+                }
+                if caller == from || s.controls.contains((caller, from)) {
+                    if s.dev.dom().contains(d) {
+                        assert(vc_s[d] == vc_u[d]);
+                        if s.dev[d] == from {
+                            assert(vc_s[d] == DevView::Held(from));
+                            assert(vc_u[d] == DevView::Held(from));
+                        }
+                        if u.dev[d] == from {
+                            assert(vc_u[d] == DevView::Held(from));
+                            assert(vc_s[d] == DevView::Held(from));
+                        }
+                    }
+                }
+                assert(device_release_guard(s, caller, d, from) == device_release_guard(
+                    u,
+                    caller,
+                    d,
+                    from,
+                ));
+                assert_maps_equal!(a_dev_view(step(s, t), a), a_dev_view(step(u, t), a), k => {
+                    assert(a_dev_view(s, a).dom().contains(k) == s.dev.dom().contains(k));
+                    assert(a_dev_view(u, a).dom().contains(k) == u.dev.dom().contains(k));
+                    if k != d && s.dev.dom().contains(k) {
+                        assert(a_dev_view(s, a)[k] == a_dev_view(u, a)[k]);
+                    }
+                });
+                devices_are_a_view_projection(step(s, t), a);
+                devices_are_a_view_projection(step(u, t), a);
+                assert(obs(step(s, t), a) == obs(step(u, t), a));
+                assert(obs_plus(step(s, t), a) == obs_plus(step(u, t), a));
             },
         }
     }

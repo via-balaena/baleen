@@ -1034,7 +1034,7 @@ mod foreign_link_state_machine {
     /// kind `UnauthorizedForeignLink` constrains — can exist at all (design-lesson #13f: confirm
     /// the tiny universe can build the feature's minimal witness).
     fn two_domain_world() -> Hypervisor {
-        let mut hv = Hypervisor::new(2, 1, 2, 1, 1, 3);
+        let mut hv = Hypervisor::new(2, 1, 2, 1, 1, 3, 2);
         assert!(hv
             .dispatch(
                 0,
@@ -1961,5 +1961,282 @@ mod smmu_stream_binding {
             assert!(b.regime.valid());
             assert!(b.s2ttb >> 52 == 0);
         }
+    }
+}
+/// **SMMU rung 4a — device assignment.** The ∀-value half of the device axis, on the shipped
+/// [`hv_core::device`] code and the shipped [`Hypervisor`] seam.
+///
+/// What is proven here is exactly what the enumerator cannot reach. `hv-sim`'s ∀-N sweep visits
+/// every state *reachable by a transition sequence* in one tiny config; these harnesses make the
+/// **whole assignment vector symbolic** and prove the transitions total, non-destructive and
+/// exactly-scoped over every vector at once — including the ones a short trace would take many
+/// steps to build. Bounded on the device *count* (the collection axis Kani must unwind), unbounded
+/// on nothing else: the domain ids are symbolic over the configured range.
+///
+/// The seam harnesses at the end cover the two facts that are **policy rather than invariant** —
+/// no self-assignment, and a release that reveals nothing to a stranger. Neither breaks any state
+/// predicate if it regresses, so a proof is the only thing that would notice.
+#[cfg(kani)]
+mod device_assignment {
+    use hv_core::device::{DeviceError, System};
+    use hv_core::{HvCall, HvError, Hypervisor};
+
+    /// Domains and devices in the harness universe. Two domains — enough for a controller and a
+    /// controlled peer, and see [`two_domain_world`] for why not more; two devices, so "exactly one
+    /// device moved" is a statement with content.
+    const NDOM: usize = 2;
+    const NDEV: usize = 2;
+
+    /// A device system in an **arbitrary** state: each device independently unassigned or held by
+    /// an arbitrary in-range domain.
+    ///
+    /// Built by real `assign` calls rather than by reaching into the struct, so the state space is
+    /// exactly the reachable one and the harness cannot prove something about a state the code can
+    /// never be in (design-lesson #13f). Every vector *is* reachable — from all-unassigned, one
+    /// `assign` per held device — so nothing is lost by construction either.
+    fn symbolic_system() -> System {
+        let mut s = System::new(NDOM, NDEV);
+        for dev in 0..NDEV as u16 {
+            if kani::any::<bool>() {
+                let to: u16 = kani::any();
+                kani::assume((to as usize) < NDOM);
+                assert!(s.assign(dev, to).is_ok());
+            }
+        }
+        s
+    }
+
+    /// Read the whole relation out, so "unchanged" can be stated about all of it at once.
+    fn snapshot(s: &System) -> [Option<u16>; NDEV] {
+        let mut out = [None; NDEV];
+        for (dev, slot) in out.iter_mut().enumerate() {
+            *slot = s.holder_of(dev as u16);
+        }
+        out
+    }
+
+    /// **`assign` is total, and a refusal writes nothing** — ∀ prior assignment vector, ∀ device,
+    /// ∀ assignee.
+    ///
+    /// Three arms, and the third is the one that matters: on `Busy` the relation must be
+    /// **bit-identical** to what it was. A refusal that re-pointed the device would not be a
+    /// weaker permission — it would aim a live bus master at a different domain's memory with the
+    /// previous holder never told (the same shape as `stage2_ste`'s refusal-not-truncation rule,
+    /// design-lesson #73).
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn assign_is_total_and_a_refusal_changes_nothing() {
+        let mut s = symbolic_system();
+        let before = snapshot(&s);
+
+        let dev: u16 = kani::any();
+        let to: u16 = kani::any();
+        let r = s.assign(dev, to);
+        let after = snapshot(&s);
+
+        match r {
+            Ok(()) => {
+                assert!((dev as usize) < NDEV && (to as usize) < NDOM);
+                assert!(after[dev as usize] == Some(to));
+                // The prior holder was nobody or `to` itself — never a third domain silently
+                // displaced.
+                assert!(before[dev as usize].is_none() || before[dev as usize] == Some(to));
+            }
+            Err(DeviceError::Busy) => {
+                assert!(before[dev as usize].is_some() && before[dev as usize] != Some(to));
+                assert!(
+                    after == before,
+                    "a Busy refusal must not re-point the device"
+                );
+            }
+            Err(DeviceError::BadDevice) => {
+                assert!((dev as usize) >= NDEV);
+                assert!(after == before);
+            }
+            Err(DeviceError::BadDomain) => {
+                assert!((to as usize) >= NDOM);
+                assert!(after == before);
+            }
+            Err(DeviceError::NotAssigned) => unreachable!("assign cannot report NotAssigned"),
+        }
+    }
+
+    /// **An assignment moves exactly one device** — ∀ prior vector, ∀ (dev, to), every *other*
+    /// device holds exactly what it held. The scoping half of the relation: assignment is
+    /// per-device, never a mode the whole system enters.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn an_assignment_moves_exactly_one_device() {
+        let mut s = symbolic_system();
+        let before = snapshot(&s);
+
+        let dev: u16 = kani::any();
+        let to: u16 = kani::any();
+        let _ = s.assign(dev, to);
+        let after = snapshot(&s);
+
+        for other in 0..NDEV {
+            if other != dev as usize {
+                assert!(after[other] == before[other]);
+            }
+        }
+    }
+
+    /// **`release` is total, and only the named holder's device moves** — ∀ prior vector,
+    /// ∀ (dev, from). A release naming the wrong holder is refused with the *same* error as one
+    /// naming a free device, and both leave the relation untouched.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn release_is_total_and_only_moves_the_named_holders_device() {
+        let mut s = symbolic_system();
+        let before = snapshot(&s);
+
+        let dev: u16 = kani::any();
+        let from: u16 = kani::any();
+        let r = s.release(dev, from);
+        let after = snapshot(&s);
+
+        match r {
+            Ok(()) => {
+                assert!(before[dev as usize] == Some(from));
+                assert!(after[dev as usize].is_none());
+            }
+            Err(DeviceError::NotAssigned) => {
+                assert!(before[dev as usize] != Some(from));
+                assert!(after == before);
+            }
+            Err(DeviceError::BadDevice) => {
+                assert!((dev as usize) >= NDEV);
+                assert!(after == before);
+            }
+            Err(DeviceError::BadDomain) => {
+                assert!((from as usize) >= NDOM);
+                assert!(after == before);
+            }
+            Err(DeviceError::Busy) => unreachable!("release cannot report Busy"),
+        }
+        for other in 0..NDEV {
+            if other != dev as usize {
+                assert!(after[other] == before[other]);
+            }
+        }
+    }
+
+    /// **The teardown sweep is exact** — ∀ prior assignment vector, ∀ holder:
+    /// [`System::release_all_of`] leaves **no** device naming that holder, and leaves **every**
+    /// device held by anyone else exactly where it was.
+    ///
+    /// Both halves are load-bearing and they fail in opposite directions. Too little and a bus
+    /// master outlives its holder into a reborn slot (the confused deputy this rung exists to
+    /// close); too much and destroying one domain silently disarms every other domain's devices —
+    /// a denial of service that no invariant would flag, because an under-assigned relation
+    /// violates nothing.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn the_sweep_takes_exactly_the_holders_devices() {
+        let mut s = symbolic_system();
+        let before = snapshot(&s);
+
+        let holder: u16 = kani::any();
+        kani::assume((holder as usize) < NDOM);
+        s.release_all_of(holder);
+        let after = snapshot(&s);
+
+        assert!(!s.any_device_of(holder));
+        for dev in 0..NDEV {
+            if before[dev] == Some(holder) {
+                assert!(after[dev].is_none());
+            } else {
+                assert!(
+                    after[dev] == before[dev],
+                    "the sweep took someone else's device"
+                );
+            }
+        }
+    }
+
+    /// A two-domain world: dom0 creates and therefore controls dom1.
+    ///
+    /// **Two, not three, and the size is a measured constraint rather than a preference.** Every
+    /// `dispatch` runs `first_cross_violation` under its `debug_assert`, an O(domains²) scan with a
+    /// provenance walk inside it; at three domains the two seam harnesses below did not converge in
+    /// **40 minutes**, against a 30-minute CI budget for the whole Kani suite. At two they are
+    /// seconds. Nothing is lost that the other layers do not cover better: the ∀-domain content
+    /// belongs to Verus (`device_assignment_preservation.rs`, arbitrary domain count) and to the
+    /// enumerator (every reachable state of a three-domain config), while what only Kani can give
+    /// — driving the **shipped** `dispatch` seam over symbolic inputs — needs just enough domains
+    /// to have a controller and a controlled peer.
+    fn two_domain_world() -> Hypervisor {
+        let mut hv = Hypervisor::new(NDOM, 1, 1, 1, 1, 1, NDEV);
+        assert!(hv
+            .dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: 1,
+                    may_create: false
+                }
+            )
+            .is_ok());
+        hv
+    }
+
+    /// **No domain can assign itself a device — for every domain, and every device.**
+    ///
+    /// The one whole-domain operation with no `caller == target` exemption. This is proven rather
+    /// than merely unit-tested because a self-assigned device is a **perfectly well-formed state**:
+    /// it breaks no invariant, so if the gate regressed, every state predicate in the repository
+    /// would stay green and only an explicit check would notice.
+    ///
+    /// Both domains are covered by the symbolic caller, and they fail the gate for different
+    /// reasons — nobody controls dom0 at all, while dom1 *is* controlled, but by dom0, and
+    /// `controls[1][1]` is the permanently-empty diagonal.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn no_domain_can_assign_itself_a_device() {
+        let mut hv = two_domain_world();
+
+        let caller: u16 = kani::any();
+        kani::assume((caller as usize) < NDOM);
+        let dev: u16 = kani::any();
+        kani::assume((dev as usize) < NDEV);
+
+        assert!(
+            hv.dispatch(caller, HvCall::DeviceAssign { dev, to: caller }) == Err(HvError::Denied)
+        );
+        assert!(hv.device().holder_of(dev).is_none());
+    }
+
+    /// **Teardown leaves no device naming the destroyed domain, whatever it held** — ∀ device,
+    /// driven through the real `dispatch` seam.
+    ///
+    /// The `first_cross_violation` assertion is the one that generalizes: it is the standing
+    /// `DeadDomainReferenced` predicate, which since this rung reads the assignment relation, so a
+    /// sweep that missed a device is caught as an invariant breach and not merely as a surprising
+    /// query result.
+    ///
+    /// The **target is concrete** here (dom1 is the only creatable slot in a two-domain world) —
+    /// see [`two_domain_world`] for why the world is that size. The ∀-target statement is Verus's
+    /// (`destroy_preserves`, arbitrary domain count) and the enumerator's; what this adds is that
+    /// the *shipped* teardown really does it.
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn destroying_a_domain_leaves_no_device_naming_it() {
+        let mut hv = two_domain_world();
+
+        let dev: u16 = kani::any();
+        kani::assume((dev as usize) < NDEV);
+
+        assert!(hv.dispatch(0, HvCall::DeviceAssign { dev, to: 1 }).is_ok());
+        assert!(hv.device().holder_of(dev) == Some(1));
+
+        assert!(hv
+            .dispatch(0, HvCall::DomainDestroy { target: 1, now: 0 })
+            .is_ok());
+
+        assert!(hv.device().holder_of(dev) != Some(1));
+        assert!(
+            hv.first_cross_violation().is_none(),
+            "a destroyed domain was left with a device assigned to it"
+        );
     }
 }

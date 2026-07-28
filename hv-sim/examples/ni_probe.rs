@@ -13,6 +13,7 @@ use hv_sim::noninterference::{check, Channels};
 fn cfg2(depth: u32) -> Config {
     Config {
         domains: 2,
+        devices: 0,
         ports: 2,
         grants: 2,
         vcpus: 1,
@@ -27,6 +28,7 @@ fn cfg2(depth: u32) -> Config {
         create: true,
         destroy: true,
         delegate: false,
+        device: false,
         async_agent: false,
         drive_execute: false,
         mediated_frames: false,
@@ -41,6 +43,7 @@ fn cfg2(depth: u32) -> Config {
 fn cfg3(depth: u32) -> Config {
     Config {
         domains: 3,
+        devices: 0,
         ports: 1,
         grants: 1,
         vcpus: 0,
@@ -55,6 +58,7 @@ fn cfg3(depth: u32) -> Config {
         create: true,
         destroy: true,
         delegate: false,
+        device: false,
         async_agent: false,
         drive_execute: false,
         mediated_frames: false,

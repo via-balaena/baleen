@@ -311,6 +311,14 @@ const PORTS_PER_DOMAIN: usize = 4;
 const GRANTS_PER_DOMAIN: usize = 4;
 const VCPUS_PER_DOMAIN: usize = 2;
 const NUM_PCPUS: usize = 2;
+/// DMA-capable devices in the model — the SMMU arc's rung-4 assignment axis.
+///
+/// One, because this machine has exactly one bus master baleen drives (QEMU's `edu`, at PCIe
+/// slot 1 ⇒ StreamID 8) and modelling devices that do not exist would put unassignable tokens in
+/// the relation the stream table is derived from. Every device boots **unassigned**, which the
+/// derivation refines to a *denying* stream-table entry — so the model's fail-closed default and
+/// the hardware's are the same default, not two that happen to agree.
+pub(crate) const NUM_DEVICES: usize = 1;
 /// Machine frames in the model. `pub(crate)` so [`guest`]'s per-frame fault-record array can
 /// compile-time-assert it covers every model frame (see `guest::NFRAMES`).
 #[cfg(not(feature = "real-linux"))]
@@ -348,6 +356,7 @@ pub(crate) fn build_hypervisor() -> Hypervisor {
         VCPUS_PER_DOMAIN,
         NUM_PCPUS,
         NUM_FRAMES,
+        NUM_DEVICES,
     )
 }
 

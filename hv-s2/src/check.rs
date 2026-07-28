@@ -327,7 +327,7 @@ mod tests {
     const CAP: usize = 8;
 
     fn hv() -> Hypervisor {
-        Hypervisor::new(4, 4, 4, 2, 2, CAP)
+        Hypervisor::new(4, 4, 4, 2, 2, CAP, 0)
     }
     fn ok(h: &mut Hypervisor, dom: DomId, call: HvCall) {
         assert!(h.dispatch(dom, call).is_ok(), "setup call failed: {call:?}");
