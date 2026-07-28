@@ -278,11 +278,11 @@ The decision, repo/CI shape, what is proven, and that finding live in
   closing its every port, offlining its every vCPU, unmapping its every grant map,
   revoking its every grant, and unpinning and freeing its every frame — an ordered
   sweep built entirely from the existing invariant-safe transitions, so it adds
-  ordering, not new mutation. It is **atomic, all-or-nothing, refuse-if-busy**: one
-  precondition gates everything — no *foreign* domain may hold a live grant map of one
-  of the target's frames (the one thing teardown can't do is yank a page out from under
-  another domain) — so it either refuses with a new `HvError::DomainBusy`, mutating
-  nothing, or every step past the precondition succeeds by construction, leaving an
+  ordering, not new mutation. It is **atomic and unconditional past the authority
+  gate**: a *foreign* reference into one of the target's frames — a live grant map, or a
+  live cross-domain page-table entry — does not block teardown, it is **force-reclaimed**
+  by it (the map is drained, the entry severed) before the frames are freed, so no domain
+  can veto another's destruction. Every step succeeds by construction, leaving an
   empty but still-existent shell (domain slots are fixed-size and never removed; a peer
   left `Unbound` still names a domain that exists). No new standing invariant: a
   destroyed domain is verified by *postcondition* (nothing live points into it), riding
@@ -614,7 +614,7 @@ The decision, repo/CI shape, what is proven, and that finding live in
   credit account's conservation, and the **~10 transition *guards*** proven differently (a guard is
   a no-op-on-refusal, not a state predicate — design-lesson #9): the caller-liveness gate, the
   `reject_dead_target` mint gate, the global `may_create` and per-target `controls` authority
-  gates, the revoke chain-restriction, the `StaleGrant`/`Unauthorized`/`DomainBusy` seam checks,
+  gates, the revoke chain-restriction, the `StaleGrant`/`Unauthorized` seam checks,
   the `grant_end_access` foreign-link block, and the `sched_block` deliverable re-check. Four
   passes. **(1) Gap hunt** — for every invariant, enumerate every transition that could move the
   system toward violating it (design-lesson #3) and confirm each is guarded or maintained by

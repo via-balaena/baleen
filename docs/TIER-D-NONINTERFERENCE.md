@@ -142,10 +142,22 @@ one extra term (`noninterference::Channels::teardown_reach`):
 
 > `∃ c: controls[b][c] ∧ (a granted to c ∨ a holds a port toward c)`.
 
-We did not guess this — **the bridge found it** (§4). Every resource-corrupting reach of
-`DomainDestroy(c)` is *blocked* when it would strand `a`: a live grant map of `c`'s frames by `a`
-makes destroy refuse (`DomainBusy`); the only reachable effect on `obs(a)` is the cleanup of `a`'s
-*own* outbound references to `c`, which is exactly what this term authorizes.
+We did not guess this — **the bridge found it** (§4).
+
+**Since ②′-(c) the term has a second, inbound half** (`Channels::teardown_borrow`):
+
+> `∃ c: controls[b][c] ∧ (a holds a live grant map over one of c's frames ∨ a has a page-table
+> edge into one)`.
+
+Originally this was unnecessary, and the reason is instructive: a live foreign hold on `c`'s frames
+made destroy *refuse* (`DomainBusy`), so the only reachable effect on `obs(a)` was the cleanup of
+`a`'s **own outbound** references to `c` — exactly what the first half authorizes. Replacing the
+refusal with force-reclaim (§4a-(c)) made the inbound direction reachable: teardown now breaks what
+`a` *borrowed from* `c`, and `a` observes the loss (a held map leaves its handle-indexed maptrack; a
+severed edge returns its own table's self-reference, moving its frame refcount). Same intransitive
+`b ⇝ c ↔ a` shape, with the `a↔c` reference pointing the other way. The bridge found this half too —
+it is the integrity twin of finding #3 (the read direction), and
+`dropping_teardown_borrow_is_caught` is its non-vacuity witness.
 
 ## 3. Design call #2 — tooling and the bridge
 
@@ -271,13 +283,44 @@ real code — the honest bridge↔composition division, `read_closure.rs` fideli
   (`step_consistency_holds_per_domain_handles_with_destroy`). Cross-domain handle confusion becomes
   unrepresentable (the `NotYours` error is gone). All Kani harnesses and Verus proofs (incl.
   `refcount_mismatch.rs`) stand verbatim.
-* **`DomainBusy` (②′-(c), next — now genuinely unmasked).** `DomainBusy` (which refuses a destroy
-  while a foreign domain maps `c`'s frames) depends, with a *fourth* domain as that mapper, on state
+* **`DomainBusy` (②′-(c)) — CLOSED by force-reclaim.** `DomainBusy` (which refused a destroy while
+  a foreign domain mapped `c`'s frames) depended, with a *fourth* domain as that mapper, on state
   neither `a` nor the actor observes — so at ≥4 domains step consistency for the destroy channel
-  rests on the instantiation's over-approximation of `DomainBusy` (§5g). It was masked behind (b) and
-  (d); with those closed it is the remaining read-closure fidelity edge — and, unlike (a)/(b)/(d), it
-  is a *design* question (refuse-with-availability-channel vs force-unmap-to-match-the-proven-model),
-  not an observation refinement.
+  rested on the instantiation's over-approximation of `DomainBusy` (§5g). It was masked behind (b)
+  and (d); with those closed it surfaced as the last read-closure fidelity edge — and, unlike
+  (a)/(b)/(d), it was a *design* question, not an observation refinement.
+
+  **Decision: force-reclaim.** `domain_destroy` no longer refuses. Past the authority gate it always
+  succeeds, draining every foreign grant map over the target's frames
+  (`grant::drain_foreign_maps_of`) and severing every inward foreign page-table link
+  (`p2m::unlink_all_into`) before reclaiming them; `HvError::DomainBusy` is removed outright, so no
+  code path can reproduce the refusal. Three reasons, in order of weight:
+
+  1. **The refusal was a denial of service.** One unprivileged mapper holding one grant map kept a
+     domain alive indefinitely, and the target's controller had no way to make it let go.
+  2. **It was an unobservable-state channel** — the step-consistency residual above. Draining closes
+     it *by construction*: the destroy is a total function of the actor's own observation, so there
+     is nothing for a hidden fourth domain to modulate.
+  3. **The proofs already modelled it this way.** `noninterference_instantiation.rs`'s destroy
+     carrier drops every map over a `c`-owned frame (`drain_pred`), documented as a sound
+     over-approximation of `DomainBusy`. Force-reclaim makes the code *coincide* with the
+     already-proven model instead of merely being covered by it — the abstraction adopted to keep
+     the proof honest turned out to be the right semantics.
+
+  **What it cost, and what it forced.** A foreign mapper loses a page it was using — but never
+  unsafely: its grant handle goes inactive (a later unmap is `BadHandle`, never a double release)
+  and its page-table entry becomes a hole (a fault, never a dangling reference to a reclaimed
+  frame). And it *forced a correction to the channel relation*: making the reclaim reachable created
+  an integrity flow the outbound-only teardown term did not name, which is the `teardown_borrow`
+  half added in §2.1. That correction is the arc's real finding — the same pattern as GAP-C's four
+  (design-lesson #57): changing the code to close one channel surfaced another that the old
+  semantics had made unreachable, and only the machine-check found it.
+
+  **Evidence.** `force_reclaim_closes_the_busy_channel_grant_map_direction` and its
+  `..._foreign_link_direction` twin pin the closure directly on real code (targeted, not swept: the
+  configuration sits at ~depth 9, past the sweep's reach); the enumerator's `forced_reclaims`
+  counter witnesses the new path is genuinely exercised rather than vacuously absent; all 14 Verus
+  proofs and all Kani harnesses stand verbatim.
 
 At ≤3 domains **without dynamic p2m** the sweep is clean (the committed `ni_cfg3` has no allocation),
 and the deep three-domain sweep runs in `deep-verify.yml`.
@@ -372,9 +415,13 @@ The proof discharges all three (`port_preserved`, `grant_row_preserved`,
 (`no_channel_no_reach_to_c`): `¬(b ⇝ a)` plus an authorized destroy of `c` (`b == c ∨
 controls[b][c]`) implies `a` has no reach to `c` — the peer case excluded by the teardown-reach
 term, the self case (`c == b`) by the direct grant/port channels. The *reverse* direction (`a`
-referencing `c`'s frames) cannot arise past a proceeding destroy: `DomainBusy` refuses teardown
-while any foreign domain holds a live map of, or a page-table link into, `c`'s frames
-(`hypervisor.rs:1178`).
+referencing `c`'s frames) could not arise past a proceeding destroy *when this was written*:
+`DomainBusy` refused teardown while any foreign domain held a live map of, or a page-table link
+into, `c`'s frames. Since ②′-(c) it can — teardown force-reclaims those holds — and the flow is
+named by the `teardown_borrow` half of the term (§2.1). The Verus file itself is unaffected: its
+`obs` projects the grant-map reference population over `a`'s **own** frames, and the drain only
+touches maps over `c`'s frames. The page-table half is outside that model entirely and rides the
+real-code bridge; `unwinding_destroy.rs`'s header records the divergence.
 
 **The finding — the cascade composes *both* channel kinds in one transition.** Its port and
 grant-revoke sub-ops are guard-shaped (a filtered clear on a directly-readable key); its
@@ -520,8 +567,8 @@ premises imply whole-run NI (meta-theorem)** — with no prose seam between them
    fires. The fix (the outgoing analogue of finding #1): `obs(a)` carries `controls[a][·]`. Also, the
    `DomainBusy` no-foreign-map precondition is a `c`-frames property invisible to `a`/`caller` and
    would break `step_consistent` the same way; the carrier instead has the drain *clean up* maps over
-   `c`'s frames — a sound over-approximation coinciding with `DomainBusy`-refusal on `obs(a)` for
-   `a ≠ c`.
+   `c`'s frames — then a sound over-approximation of `DomainBusy`-refusal on `obs(a)` for `a ≠ c`,
+   and since ②′-(c) an *exact* match for what the code does (§4a-(c)).
 
 ## 6. Honest scope, cost read, and the fork
 

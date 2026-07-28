@@ -95,7 +95,9 @@
 //! [`authorizes`] mirrors `grant::System::authorizes` (a scan of the grantor's live entries for a
 //! matching grantee + frame, read-write only if `!readonly`). Each lemma's hypotheses are the real
 //! guard, transcribed: `p2m_link`'s seam check, `grant_end_access`'s `is_foreign_linked_by` block,
-//! `domain_destroy`'s `has_foreign_link_into` precondition and its teardown ordering. The
+//! and `domain_destroy`'s teardown ordering. (`domain_destroy`'s foreign-link *precondition* was
+//! deliberately **not** transcribed — see the two non-firing mutations below — which is why
+//! ②′-(c) replacing it with `unlink_all_into` left this file untouched.) The
 //! enumerator pins the same invariant on the real `Hypervisor` at small size; Kani drives the real
 //! `Hypervisor` through `dispatch` at bounded size (`hv-verify::foreign_link_state_machine`).
 //!
@@ -107,9 +109,10 @@
 //!
 //! Two mutations **do not** fire, and both are recorded rather than buried, because each localizes
 //! a guard to the invariant that actually owns it. `domain_destroy`'s **`has_foreign_link_into`
-//! precondition** and its **`unlink_all`-before-`revoke_grants_to` ordering** were both written as
-//! hypotheses of `destroy_preserves` on the expectation that they were load-bearing — and removing
-//! either leaves the proof green. The reason is the same skip that makes `free` safe: `free_all`
+//! precondition** (as it then was — ②′-(c) has since replaced it with an `unlink_all_into` sweep,
+//! which this lemma likewise does not need) and its **`unlink_all`-before-`revoke_grants_to`
+//! ordering** were both written as hypotheses of `destroy_preserves` on the expectation that they
+//! were load-bearing — and removing either leaves the proof green. The reason is the same skip that makes `free` safe: `free_all`
 //! un-owns `target`'s frames, so every edge touching `target` is skipped, precondition or not. Both
 //! guards are therefore *not* hypotheses of the lemma (a lemma should require what it uses); they
 //! remain load-bearing for `MislevelledLink` (no dangling edge) and `DeadDomainReferenced` (a
@@ -437,7 +440,8 @@ proof fn allocate_preserves(
 /// own steps.
 ///
 /// The expectation going in was that two guards in the real `domain_destroy` would be load-bearing
-/// here: the **precondition** `!has_foreign_link_into(target)`, and the **ordering** that runs
+/// here: the **foreign-link guard** (then the precondition `!has_foreign_link_into(target)`; since
+/// ②′-(c), the `unlink_all_into(target)` sweep that replaced it), and the **ordering** that runs
 /// `unlink_all(target)` before `revoke_grants_to(target)` (whose rationale the source comments state
 /// explicitly). Both were stated as hypotheses, and **both were then measured to be unnecessary** —
 /// dropping either leaves the proof green (`hv-verify/verus/README.md`). They are therefore *not*

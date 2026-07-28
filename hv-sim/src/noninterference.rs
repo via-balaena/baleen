@@ -88,10 +88,15 @@
 //!   and the sweep finds a `DomainCreate` (or destroy/affinity) counterexample.
 //!
 //! Over three domains the read direction is live and step consistency **holds**, non-vacuously
-//! (see the tests). The one honest edge — a fourth domain mapping `c`'s frame makes
-//! `DomainBusy` (which refuses the destroy) depend on state neither `a` nor the actor observes,
-//! so step consistency there rests on the instantiation's over-approximation of `DomainBusy`;
-//! at ≤3 domains no such fourth mapper exists, so the sweep is clean.
+//! (see the tests). The four-domain edge that used to be declared here — a fourth domain `m`
+//! mapping `c`'s frame made `DomainBusy` (which *refused* the destroy) depend on state neither
+//! `a` nor the actor observes, so step consistency there rested on the instantiation's
+//! over-approximation of `DomainBusy` — is **closed** as of ②′-(c): teardown no longer refuses,
+//! it force-reclaims (`grant::drain_foreign_maps_of` + `p2m::unlink_all_into`), so the destroy is
+//! a total function of the actor's own `obs⁺` and `m` has nothing to modulate. The real code now
+//! *coincides with* the instantiation's drain carrier instead of being over-approximated by it.
+//! Pinned directly by `force_reclaim_closes_the_busy_channel_grant_map_direction` and its
+//! page-table twin (targeted, not swept: the configuration sits at ~depth 9).
 
 use std::collections::HashMap;
 
@@ -120,8 +125,17 @@ pub struct Channels {
     /// The creation channel: `b` may create and `a` is `Dead`.
     pub create: bool,
     /// The teardown-reach term for `DomainDestroy` (the one multi-domain transition):
-    /// `b` controls some `c` that `a` holds an outbound reference to.
+    /// `b` controls some `c` that `a` holds an **outbound** reference to (a grant `a` offered
+    /// `c`, a port `a` opened toward `c`) — the references `c`'s teardown *clears*.
     pub teardown_reach: bool,
+    /// The **inbound** half of the teardown-reach term, forced by ②′-(c)'s force-reclaim:
+    /// `b` controls some `c` that `a` holds a *borrowed* reference **into** (a live grant map
+    /// over one of `c`'s frames, or a page-table edge into one). Before force-reclaim these
+    /// could not be reached past a proceeding destroy — a foreign hold made the teardown
+    /// *refuse* — so the term was unnecessary. Now teardown breaks the borrow instead, which
+    /// `a` observes, so the channel is real. Split from [`Self::teardown_reach`] so the
+    /// non-vacuity test can drop exactly this sub-term and watch the flow it governs surface.
+    pub teardown_borrow: bool,
 }
 
 impl Channels {
@@ -134,6 +148,7 @@ impl Channels {
             control: true,
             create: true,
             teardown_reach: true,
+            teardown_borrow: true,
         }
     }
 
@@ -169,6 +184,13 @@ impl Channels {
         if self.teardown_reach && self.teardown_reach_to(hv, b, a) {
             return true;
         }
+        // Teardown borrow (②′-(c)): the inbound mirror of the above. Destroying `c` also
+        // force-reclaims what `a` *borrowed from* `c` — the maps and page-table edges `a` holds
+        // over `c`'s frames — which moves `obs(a)` just as clearing `a`'s outbound references
+        // does.
+        if self.teardown_borrow && self.teardown_borrow_from(hv, b, a) {
+            return true;
+        }
         false
     }
 
@@ -180,6 +202,33 @@ impl Channels {
         let n = hv.domain_count() as Dom;
         (0..n).any(|c| hv.controls(b, c) && (a_grants_to(hv, a, c) || a_port_toward(hv, a, c)))
     }
+
+    /// `∃ c: b controls c ∧ a holds a borrowed reference *into* c's frames` — the inbound half
+    /// of the two-hop teardown term, and the one ②′-(c) forced into existence.
+    ///
+    /// Teardown now force-reclaims every foreign hold on `c`'s frames
+    /// (`grant::drain_foreign_maps_of` + `p2m::unlink_all_into`) rather than refusing over it.
+    /// When the holder is `a`, that is a write to `obs(a)`: `a`'s handle-indexed held-maps lose
+    /// an entry, or `a`'s own page-table edges lose one. Under the old refuse-if-busy design
+    /// this was *unreachable* — a live foreign hold made the destroy a no-op — which is exactly
+    /// why the term did not exist before. The design change made the flow real, so the relation
+    /// has to name it: the same intransitive `b ⇝ c ↔ a` shape, with the `a↔c` reference
+    /// pointing the other way.
+    ///
+    /// **The quantifier includes `c == b` — the self-destroy case — and that is not a widening
+    /// for convenience.** [`Self::teardown_reach_to`] can omit it because when `b` tears *itself*
+    /// down, `a`'s outbound reference to `b` is a grant `a` offered `b` or a port `a` opened
+    /// toward `b` — already authorized by the *direct* consent and signal terms. The borrow
+    /// direction has no such direct term: `a` borrowing from `b` means **`b` granted to `a`**,
+    /// which is the opposite of the `grant` channel's `a_grants_to(a, b)`. So a domain
+    /// force-reclaiming, by dying, the page it had lent out would be an unauthorized flow with
+    /// nothing to name it. (The deep two-domain sweep found exactly this: `1` destroys itself
+    /// while `0` holds a map of `1`'s frame.) Self-authority is inherent rather than an edge —
+    /// `controls[b][b]` is always `Absent` — so it has to be spelled out here.
+    fn teardown_borrow_from(self, hv: &Hypervisor, b: Dom, a: Dom) -> bool {
+        let n = hv.domain_count() as Dom;
+        (0..n).any(|c| (c == b || hv.controls(b, c)) && a_borrows_from(hv, a, c))
+    }
 }
 
 /// Whether `a` has an active grant entry whose grantee is `b`.
@@ -187,6 +236,21 @@ fn a_grants_to(hv: &Hypervisor, a: Dom, b: Dom) -> bool {
     let g = hv.grant();
     (0..g.entry_count(a) as u32)
         .any(|gref| matches!(g.grant_entry(a, gref), Some((grantee, ..)) if grantee == b))
+}
+
+/// Whether `a` holds a live *borrowed* reference into one of `b`'s frames — a grant map whose
+/// grantor is `b`, or a page-table edge of `a`'s own rooted at a frame `b` owns. These are
+/// precisely what `b`'s teardown force-reclaims (②′-(c)), and both are in `obs(a)`: the first as
+/// `a`'s handle-indexed held-maps, the second as `a`'s own edge set.
+fn a_borrows_from(hv: &Hypervisor, a: Dom, b: Dom) -> bool {
+    let g = hv.grant();
+    let p = hv.p2m();
+    let mapped = (0..g.handle_slots(a) as u32)
+        .any(|h| matches!(g.mapping_at(a, h), Some((grantor, ..)) if grantor == b));
+    let linked = p.link_edges().into_iter().any(|(parent, _, child, ..)| {
+        p.owner_of(parent) == Some(a) && p.owner_of(child) == Some(b)
+    });
+    mapped || linked
 }
 
 /// Whether `a` holds an event-channel port bound to or awaiting `b`.
@@ -927,6 +991,130 @@ mod tests {
         );
     }
 
+    /// **②′-(c)'s forced finding — the teardown-*borrow* term, and it is load-bearing.**
+    /// Force-reclaim created an integrity channel that refuse-if-busy had made unreachable:
+    /// destroying `c` yanks the map `a` held over one of `c`'s frames, and `a` observes the
+    /// loss (its handle-indexed held-maps move). The actor `b` need have no direct channel to
+    /// `a` at all — only control of `c`. Dropping *only* this sub-term surfaces the flow.
+    ///
+    /// Built directly rather than swept: the witness needs four domains, a delegation (so the
+    /// actor controls `c` but *not* `a`), an allocation, a grant, a map and a destroy — deeper
+    /// than the sweep reaches. This is the integrity twin of PR #80's finding (3) (teardown
+    /// reach extends to the read direction), and it is the correction the design change forced.
+    #[test]
+    fn dropping_teardown_borrow_is_caught() {
+        use hv_core::HvCall;
+        let (a, b, c) = (1u16, 3u16, 2u16);
+        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+        for t in 1..4u16 {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        // `c` lends `a` a frame; `a` maps it — `a` now borrows *from* `c`.
+        h.dispatch(c, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        h.dispatch(
+            c,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: a,
+                frame: 0,
+                readonly: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            a,
+            HvCall::GrantMap {
+                grantor: c,
+                gref: 0,
+                writable: false,
+            },
+        )
+        .unwrap();
+        // dom0 delegates control of `c` to `b`, so `b` controls `c` but has no edge to `a`.
+        h.dispatch(0, HvCall::ControlGrant { target: c, to: b })
+            .unwrap();
+
+        // The relation *without* the new sub-term does not authorize `b` to move `obs(a)` —
+        // neither directly (no grant, port, control or creation edge b→a) nor through the
+        // outbound teardown term (`a` offered `c` nothing; `c` offered `a`).
+        let without = Channels {
+            teardown_borrow: false,
+            ..Channels::full()
+        };
+        assert!(
+            !without.authorized(&h, b, a),
+            "the outbound-only relation should not authorize b ⇝ a here"
+        );
+        // ...yet the destroy moves `obs(a)`. That is the violation the term must cover.
+        let before = obs(&h, a);
+        h.dispatch(b, HvCall::DomainDestroy { target: c, now: 0 })
+            .unwrap();
+        assert_ne!(
+            before,
+            obs(&h, a),
+            "force-reclaim should have moved obs(a) by yanking a's map of c's frame"
+        );
+    }
+
+    /// The positive half of the above: in the pre-state, the full relation *does* authorize
+    /// the flow — so widening the term is what restores local respect rather than merely
+    /// hiding the counterexample.
+    #[test]
+    fn teardown_borrow_authorizes_the_flow_it_names() {
+        use hv_core::HvCall;
+        let (a, b, c) = (1u16, 3u16, 2u16);
+        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+        for t in 1..4u16 {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        h.dispatch(c, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        h.dispatch(
+            c,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: a,
+                frame: 0,
+                readonly: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            a,
+            HvCall::GrantMap {
+                grantor: c,
+                gref: 0,
+                writable: false,
+            },
+        )
+        .unwrap();
+        h.dispatch(0, HvCall::ControlGrant { target: c, to: b })
+            .unwrap();
+        assert!(
+            Channels::full().authorized(&h, b, a),
+            "the full relation must authorize the teardown-borrow flow"
+        );
+        // And it is not authorizing everything: an unrelated peer that borrows nothing from
+        // any domain `b` controls is still unreachable.
+        assert!(
+            !Channels::full().authorized(&h, a, b),
+            "the term should not authorize the reverse, unrelated direction"
+        );
+    }
+
     /// **The bridge, green on three domains (deep sweep).** With the *full* relation —
     /// including the teardown-reach term — local respect holds over the three-domain
     /// universe too, where the intransitive teardown flow is live. Ignored by default
@@ -1287,5 +1475,190 @@ mod tests {
             out.violation.unwrap()
         );
         assert!(out.witnessed_classes > 10_000_000);
+    }
+
+    // ─── ②′-(c): the `DomainBusy` availability channel, closed by force-reclaim ──────────
+
+    /// Build the four-domain `DomainBusy` configuration. `dom0` is the caller (it controls
+    /// everyone it created), `c = 2` is the destroy target and owns frame 0, `a = 1` holds a
+    /// read-cap on that frame (a grant from `c`), and `m = 3` is the **hidden fourth domain**
+    /// whose hold over `c`'s frame used to decide whether the destroy fired at all. `m_holds`
+    /// selects the two runs that must be indistinguishable.
+    ///
+    /// `hold` is the direction of `m`'s hold: a live grant *map*, or a live inward page-table
+    /// *link*. Both were `DomainBusy` before ②′-(c); the link half is the one the Verus NI
+    /// instantiation does *not* model (it rides invariant preservation), so witnessing it on
+    /// real code matters most here.
+    fn busy_channel_state(m_holds: bool, link_not_map: bool) -> Hypervisor {
+        use hv_core::p2m::PtLevel;
+        use hv_core::HvCall;
+        let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+        for t in 1..4u16 {
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: t,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+        }
+        // `c` owns frame 0 and offers it to `a` (the read-cap under observation) and to `m`.
+        h.dispatch(2, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+        h.dispatch(
+            2,
+            HvCall::GrantAccess {
+                gref: 0,
+                grantee: 1,
+                frame: 0,
+                readonly: true,
+            },
+        )
+        .unwrap();
+        h.dispatch(
+            2,
+            HvCall::GrantAccess {
+                gref: 1,
+                grantee: 3,
+                frame: 0,
+                readonly: false,
+            },
+        )
+        .unwrap();
+        if m_holds {
+            if link_not_map {
+                // `m` maps `c`'s frame into its *own* page table — a live inward foreign link.
+                h.dispatch(3, HvCall::P2mAllocate { mfn: 1 }).unwrap();
+                h.dispatch(
+                    3,
+                    HvCall::P2mPin {
+                        mfn: 1,
+                        level: PtLevel::L1,
+                    },
+                )
+                .unwrap();
+                h.dispatch(
+                    3,
+                    HvCall::P2mLink {
+                        parent: 1,
+                        slot: 0,
+                        child: 0,
+                        writable: true,
+                        leaf: true,
+                        execute: false,
+                    },
+                )
+                .unwrap();
+            } else {
+                // `m` takes a live grant map of `c`'s frame.
+                h.dispatch(
+                    3,
+                    HvCall::GrantMap {
+                        grantor: 2,
+                        gref: 1,
+                        writable: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        h
+    }
+
+    /// The shared body: the two runs must be indistinguishable to both the observer `a` and the
+    /// caller, before *and* after the destroy.
+    fn assert_busy_channel_closed(link_not_map: bool) {
+        use hv_core::{HvCall, HvOutcome};
+        let (a, caller, c) = (1u16, 0u16, 2u16);
+        let mut held = busy_channel_state(true, link_not_map);
+        let mut free = busy_channel_state(false, link_not_map);
+
+        // The hidden state is real, and it is *exactly* the old guard's trigger: the busy
+        // predicate is true in one run and false in the other, so refuse-if-busy would have
+        // fired in precisely one of them. (Without this the test could pass vacuously on two
+        // identical states.)
+        let busy =
+            |h: &Hypervisor| h.grant().has_foreign_map(c) || h.p2m().has_foreign_link_into(c);
+        assert!(busy(&held), "m should hold c's frame in the `held` run");
+        assert!(!busy(&free), "m should hold nothing in the `free` run");
+
+        // Yet neither the observer nor the caller can see the difference: `m`'s hold lives in
+        // `c`'s grant row / `c`'s frame refcounts / `m`'s own tables, none of which are in
+        // `obs⁺(a)` or `obs⁺(caller)`.
+        assert_eq!(
+            obs_plus(&held, a),
+            obs_plus(&free, a),
+            "m's hold on c's frame leaked into obs⁺(a) before the destroy"
+        );
+        assert_eq!(
+            obs_plus(&held, caller),
+            obs_plus(&free, caller),
+            "m's hold on c's frame leaked into obs⁺(caller) before the destroy"
+        );
+
+        let before_a = obs_plus(&held, a);
+
+        // The step: the caller destroys `c`. Under refuse-if-busy this returned `DomainBusy` in
+        // the `held` run and `Done` in the `free` one — an availability difference decided by
+        // `m`, which is the step-consistency violation. Force-reclaim makes it total.
+        let call = HvCall::DomainDestroy { target: c, now: 0 };
+        assert_eq!(held.dispatch(caller, call), Ok(HvOutcome::Done));
+        assert_eq!(free.dispatch(caller, call), Ok(HvOutcome::Done));
+
+        // Non-vacuity: the step must genuinely *move* `obs⁺(a)` — `a`'s read-cap on `c` is
+        // dropped by the revoke. Without this the equality below could hold trivially because
+        // nothing observable happened in either run, which is precisely the failure mode the
+        // old design had in the `held` run (a refusal is a no-op).
+        assert_ne!(
+            before_a,
+            obs_plus(&held, a),
+            "the destroy left obs⁺(a) unchanged — the read-cap channel is not being exercised"
+        );
+
+        // Step consistency, discharged: `obs⁺`-equal states step to `obs⁺`-equal states. In
+        // particular `a`'s read-cap on `c` is dropped in *both* runs — `m` can no longer decide
+        // whether `a` keeps it.
+        assert_eq!(
+            obs_plus(&held, a),
+            obs_plus(&free, a),
+            "the destroy's effect on obs⁺(a) depended on m's hidden hold"
+        );
+        assert_eq!(
+            obs_plus(&held, caller),
+            obs_plus(&free, caller),
+            "the destroy's effect on obs⁺(caller) depended on m's hidden hold"
+        );
+        // And the reclaim really happened rather than the hold being tolerated.
+        assert!(!busy(&held) && !busy(&free));
+        assert!(held.invariants_hold() && free.invariants_hold());
+    }
+
+    /// **②′-(c): force-reclaim closes the `DomainBusy` availability channel — the grant-map
+    /// direction.** The residual (a) / (b) / (d) left standing: at ≥4 domains, whether a destroy
+    /// of `c` *fired* depended on whether an unrelated fourth domain `m` held a live map of `c`'s
+    /// frames — state neither the caller nor the observer `a` (a grantee of `c`) can see. Two
+    /// `obs⁺`-equal runs therefore stepped to *different* `obs⁺`, since `a`'s read-cap on `c`
+    /// survived in one and not the other: step consistency was **false** for the destroy channel.
+    ///
+    /// Making teardown force-reclaim instead of refuse closes it **by construction** — the
+    /// destroy is now a total function of the actor's own observation, so there is nothing for
+    /// `m` to modulate. Targeted rather than swept: reaching this configuration by brute
+    /// enumeration needs four live domains, an allocation, two grants, a map and a destroy —
+    /// about depth 9, far past what the sweep reaches (the deep 4-domain destroy sweep above
+    /// runs at depth 5). Same channel, pinned directly.
+    #[test]
+    fn force_reclaim_closes_the_busy_channel_grant_map_direction() {
+        assert_busy_channel_closed(false);
+    }
+
+    /// **②′-(c), the page-table half — and the one this bridge is the *primary* evidence for.**
+    /// The same channel with `m`'s hold being a live inward page-table link into `c`'s frame
+    /// rather than a grant map. This direction is **not** modelled by the Verus NI instantiation
+    /// (whose destroy carrier moves grants and frame-references, not page-table edges), so it
+    /// rides invariant preservation there; the real-code bridge is what actually witnesses that
+    /// the confidentiality direction is closed for it too.
+    #[test]
+    fn force_reclaim_closes_the_busy_channel_foreign_link_direction() {
+        assert_busy_channel_closed(true);
     }
 }

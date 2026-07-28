@@ -934,9 +934,8 @@ impl System {
     /// tables hold — including its *outward foreign* edges (a leaf onto, or a node share
     /// of, another domain's frame), dropping the reference each held on its child whoever
     /// owns it. It never touches an edge whose parent another domain owns, so a *foreign*
-    /// domain's share of one of `owner`'s frames is left intact — which is exactly why
-    /// teardown refuses up front while such an inward foreign link stands
-    /// ([`Self::has_foreign_link_into`]).
+    /// domain's share of one of `owner`'s frames is left intact — that inward direction is
+    /// [`Self::unlink_all_into`]'s job, and teardown runs both.
     pub fn unlink_all(&mut self, owner: DomId) {
         for idx in 0..self.links.len() {
             let link = self.links[idx];
@@ -944,6 +943,51 @@ impl System {
                 let r = self.unlink(owner, link.parent, link.slot);
                 debug_assert!(r.is_ok(), "unlink_all hit a non-removable entry: {r:?}");
             }
+        }
+    }
+
+    /// Remove every *inward foreign* page-table entry — an edge whose child is a frame
+    /// `owner` owns but whose parent belongs to another domain — the force-reclaim dual of
+    /// [`Self::unlink_all`] (which drops the edges `owner`'s own tables hold). Together they
+    /// clear every live edge touching `owner`'s frames at either end, which is what lets
+    /// [`Self::free_all`] find each frame unreferenced.
+    ///
+    /// Keyed on the *child*'s owner, so it removes exactly what
+    /// [`Self::has_foreign_link_into`] reports — and it removes only the *boundary* edge: a
+    /// foreign domain's share of one of `owner`'s tables is severed at the share, leaving
+    /// whatever hangs below it (all `owner`'s) to `unlink_all`. Level-agnostic, so a shared
+    /// interior node and a foreign leaf are torn out alike.
+    ///
+    /// Each removal is the ordinary [`Self::unlink`] transition issued on behalf of the
+    /// *parent*'s owner (the only domain permitted to edit that table), so both references
+    /// the edge held are mirrored back exactly as a voluntary unlink would, and none can
+    /// fail: the parent is a live table of a live domain, and the edge is recorded.
+    ///
+    /// The foreign mapper is left with a **hole** in its address space where the edge stood
+    /// — the page-table analogue of the stale handle
+    /// [`crate::grant::System::drain_foreign_maps_of`] leaves. That is deliberate: teardown
+    /// reclaims a dead domain's memory unconditionally rather than letting a foreign mapper
+    /// block it forever.
+    pub fn unlink_all_into(&mut self, owner: DomId) {
+        for idx in 0..self.links.len() {
+            let link = self.links[idx];
+            if !link.active || self.owner_of(link.child) != Some(owner) {
+                continue;
+            }
+            // The parent belongs to some *other* live domain — `unlink`'s ownership check is
+            // per-table, so the edge is removed under its own table's owner, not `owner`'s.
+            let Some(parent_owner) = self.owner_of(link.parent) else {
+                debug_assert!(false, "unlink_all_into found an edge from an unowned table");
+                continue;
+            };
+            if parent_owner == owner {
+                continue; // `owner`'s own edge — `unlink_all`'s job, not this one.
+            }
+            let r = self.unlink(parent_owner, link.parent, link.slot);
+            debug_assert!(
+                r.is_ok(),
+                "unlink_all_into hit a non-removable entry: {r:?}"
+            );
         }
     }
 
@@ -960,10 +1004,11 @@ impl System {
     }
 
     /// Free every frame `owner` owns — the final page step of teardown. By the time
-    /// this runs every reference into `owner`'s frames is gone: its own grant maps were
-    /// drained, its pins dropped by [`Self::unpin_all`], and the teardown refused up
-    /// front if any foreign map remained. So each [`Self::free`] succeeds by
-    /// construction.
+    /// this runs every reference into `owner`'s frames is gone: every grant map over them
+    /// was drained (`owner`'s own *and*, by force-reclaim, every foreign one), every edge
+    /// touching them was removed at both directions ([`Self::unlink_all`] +
+    /// [`Self::unlink_all_into`]), and its pins were dropped by [`Self::unpin_all`]. So each
+    /// [`Self::free`] succeeds by construction.
     pub fn free_all(&mut self, owner: DomId) {
         for mfn in 0..self.frames.len() as Mfn {
             if self.owner_of(mfn) == Some(owner) {
@@ -1099,8 +1144,11 @@ impl System {
     /// Whether any live page-table entry points at a frame `owner` owns *from a table
     /// another domain owns* — i.e. a foreign domain has one of `owner`'s frames mapped
     /// into its own page tables. The page-table cousin of
-    /// [`crate::grant::System::has_foreign_map`], and part of the domain-teardown
-    /// precondition: such a frame cannot be reclaimed out from under the foreign mapper.
+    /// [`crate::grant::System::has_foreign_map`]. This *was* half of the domain-teardown
+    /// precondition — such a frame could not be reclaimed out from under the foreign mapper,
+    /// so teardown refused. Teardown now severs those edges instead
+    /// ([`Self::unlink_all_into`]), so this is a pure query: the predicate teardown
+    /// *establishes* rather than the one it demanded.
     pub fn has_foreign_link_into(&self, owner: DomId) -> bool {
         self.links.iter().any(|l| {
             l.active
@@ -1724,6 +1772,51 @@ mod tests {
         }
         // Domain 1 is untouched.
         assert_eq!(s.child_at(6, 0), Some(7));
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn unlink_all_into_severs_the_inward_foreign_edges_only() {
+        let mut s = System::new(2, 8);
+        // Domain 0 owns a leaf (frame 1) under its own pinned L1 table (frame 0).
+        s.allocate(0, 0).unwrap();
+        s.allocate(0, 1).unwrap();
+        s.pin(0, 0, PtLevel::L1).unwrap();
+        s.link(0, 0, 0, 1, true, true, false).unwrap();
+        // Domain 1 has its own pinned L1 table (frame 6) with two entries: one onto its own
+        // leaf (frame 7) and one *into domain 0's* frame 1 — the inward foreign edge.
+        s.allocate(1, 6).unwrap();
+        s.allocate(1, 7).unwrap();
+        s.pin(1, 6, PtLevel::L1).unwrap();
+        s.link(1, 6, 0, 7, true, true, false).unwrap();
+        s.link(1, 6, 1, 1, true, true, false).unwrap();
+        assert!(s.has_foreign_link_into(0));
+        assert_eq!(s.active_links(), 3);
+
+        s.unlink_all_into(0);
+
+        // Only the boundary edge went. Domain 1 keeps its own entry; domain 0 keeps its own
+        // table and entry (that direction is `unlink_all`'s job, not this one).
+        assert!(!s.has_foreign_link_into(0), "the foreign edge is severed");
+        assert_eq!(s.active_links(), 2);
+        assert_eq!(s.child_at(6, 1), None, "a hole where the share stood");
+        assert_eq!(s.child_at(6, 0), Some(7), "domain 1's own entry survives");
+        assert_eq!(s.child_at(0, 0), Some(1), "domain 0's own entry survives");
+        // Domain 1's table kept the self-reference its *surviving* entry pins, and gave
+        // back the one the severed entry held — it is still a valid L1.
+        assert_eq!(s.current_type(6), Some(PageType::PageTable(PtLevel::L1)));
+        assert!(s.invariants_hold());
+
+        // Idempotent, and with domain 0's own direction torn down too, its frames free.
+        s.unlink_all_into(0);
+        assert_eq!(s.active_links(), 2);
+        s.unlink_all(0);
+        s.unpin(0, 0).unwrap();
+        assert!(
+            s.free(0, 1).is_ok(),
+            "the once-foreign-linked frame is freeable"
+        );
+        assert!(s.free(0, 0).is_ok());
         assert!(s.invariants_hold());
     }
 

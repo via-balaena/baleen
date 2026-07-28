@@ -399,11 +399,47 @@ impl System {
         released
     }
 
+    /// Unmap every live *foreign* mapping standing over a frame `target` owns — the
+    /// force-reclaim half of teardown, and the dual of [`Self::drain_maps_of`] (which
+    /// releases the maps `target` *holds*, this one the maps others hold *of* `target`).
+    /// Returns what each released so the caller can mirror the reverse page reference into
+    /// the page-type accounting, exactly as for the own-map drain.
+    ///
+    /// A grant map only ever stands over a frame its grantor owns (the seam refuses a stale
+    /// grant at map time), so keying on `grantor == target` is exactly "a map of a frame
+    /// `target` owns"; `grantee != target` leaves `target`'s own maps to
+    /// [`Self::drain_maps_of`]. Each release is the ordinary single-mapping transition
+    /// ([`Self::unmap`]) issued on behalf of the *grantee* that holds it, so the entry counts
+    /// stay consistent throughout and none can error.
+    ///
+    /// A drained grantee is left holding a **stale handle**, not a dangling one: its
+    /// mapping record goes inactive, so a later [`Self::unmap`] of it is a plain
+    /// [`GrantError::BadHandle`] and can never release a reference twice or name a
+    /// reclaimed frame. That is the whole cost of force-reclaim — a mapper loses a page it
+    /// was using — and it is the price of teardown always succeeding (see
+    /// [`crate::Hypervisor`]'s `domain_destroy`).
+    pub fn drain_foreign_maps_of(&mut self, target: DomId) -> Vec<Unmapped> {
+        let mut released = Vec::new();
+        // Collect (grantee, handle) pairs first — each `unmap` mutates `maps` — then release
+        // each under its own holder's handle namespace.
+        let held: Vec<(DomId, GrantHandle)> = self
+            .maps
+            .iter()
+            .filter(|m| m.active && m.grantor == target && m.grantee != target)
+            .map(|m| (m.grantee, m.handle))
+            .collect();
+        for (grantee, handle) in held {
+            released.push(self.unmap(grantee, handle).unwrap());
+        }
+        released
+    }
+
     /// Revoke *every* grant `grantor` offers — the last grant-side step of teardown.
-    /// By the time this runs each such grant has no live mappings: the caller has
-    /// already drained `grantor`'s own maps (its self-grants included) and refused the
-    /// teardown outright if any *foreign* map remained ([`Self::has_foreign_map`]). So
-    /// every [`Self::end_access`] here succeeds by construction.
+    /// By the time this runs each such grant has no live mappings: the caller has already
+    /// drained both the maps `grantor` holds (its self-grants included,
+    /// [`Self::drain_maps_of`]) and the foreign maps standing over its frames
+    /// ([`Self::drain_foreign_maps_of`]). So every [`Self::end_access`] here succeeds by
+    /// construction.
     pub fn revoke_all(&mut self, grantor: DomId) {
         for gref in 0..self.entry_count(grantor) as GrantRef {
             if self.is_granted(grantor, gref) {
@@ -454,14 +490,18 @@ impl System {
 
     // ─── queries ──────────────────────────────────────────────────────────────
 
-    /// Whether any grant `target` offers is currently mapped by a *different* domain —
-    /// the domain-teardown precondition. A live foreign map holds a page reference that
-    /// [`Self::end_access`] and [`crate::p2m::System::free`] would strand, so a domain
-    /// with one outstanding cannot be destroyed. A domain's maps of its *own* grants do
-    /// not count: teardown unmaps those itself (they are `target`'s to release), so only
-    /// a foreign grantee blocks it. A grant map only ever stands over a frame the
-    /// grantor owns (the seam refuses a stale grant at map time), so this is exactly
-    /// "a foreign domain holds a live map of a frame `target` owns".
+    /// Whether any grant `target` offers is currently mapped by a *different* domain — a
+    /// live foreign map holding a page reference that [`Self::end_access`] and
+    /// [`crate::p2m::System::free`] would otherwise strand. A domain's maps of its *own*
+    /// grants do not count: teardown releases those separately (they are `target`'s to
+    /// release). A grant map only ever stands over a frame the grantor owns (the seam
+    /// refuses a stale grant at map time), so this is exactly "a foreign domain holds a
+    /// live map of a frame `target` owns".
+    ///
+    /// This *was* the domain-teardown precondition — a domain with one outstanding could
+    /// not be destroyed (a since-removed `HvError::DomainBusy`). Teardown now
+    /// force-reclaims those maps instead ([`Self::drain_foreign_maps_of`]), so this is a
+    /// pure query: the predicate teardown *establishes* rather than the one it demanded.
     pub fn has_foreign_map(&self, target: DomId) -> bool {
         self.maps
             .iter()
@@ -871,6 +911,42 @@ mod tests {
         s.unmap(1, foreign_h).unwrap();
         assert!(!s.has_foreign_map(0));
         s.unmap(0, self_h).unwrap();
+        assert!(s.invariants_hold());
+    }
+
+    #[test]
+    fn drain_foreign_maps_of_takes_foreign_holds_and_leaves_self_maps() {
+        let mut s = sys();
+        // Domain 0 offers frame 100 to domain 1 and frame 200 to itself; domain 1 also
+        // offers frame 300 to domain 0 (a map that must survive — it is over *domain 1's*
+        // frame, so tearing domain 0 down does not touch it).
+        s.grant_access(0, 0, 1, 100, false).unwrap();
+        s.grant_access(0, 1, 0, 200, false).unwrap();
+        s.grant_access(1, 0, 0, 300, false).unwrap();
+        let foreign_h = s.map(1, 0, 0, true).unwrap();
+        let self_h = s.map(0, 0, 1, false).unwrap();
+        let other_way = s.map(0, 1, 0, false).unwrap();
+
+        let released = s.drain_foreign_maps_of(0);
+        // Exactly the one foreign hold came back, with the writability the map took — the
+        // caller needs both to mirror the page reference it must return.
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].frame, 100);
+        assert!(released[0].writable);
+        assert!(!s.has_foreign_map(0), "the foreign hold is gone");
+        // The self-map is untouched (it is `drain_maps_of`'s job) and so is domain 0's map
+        // of domain 1's frame.
+        assert!(s.holds_any_map(0));
+        assert_eq!(s.map_count(0, 1), Some(1), "the self-map still stands");
+        assert_eq!(s.map_count(1, 0), Some(1), "domain 0's map of 1's frame");
+        // The drained grantee holds a *stale* handle, never a dangling one.
+        assert_eq!(s.unmap(1, foreign_h), Err(GrantError::BadHandle));
+        assert!(s.invariants_hold());
+
+        // And it is idempotent: nothing foreign is left to take.
+        assert!(s.drain_foreign_maps_of(0).is_empty());
+        s.unmap(0, self_h).unwrap();
+        s.unmap(0, other_way).unwrap();
         assert!(s.invariants_hold());
     }
 

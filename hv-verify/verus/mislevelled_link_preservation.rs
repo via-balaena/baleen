@@ -80,19 +80,27 @@
 //! *establish* a type from `None` or *reinforce* the same one — never change it. That is the whole
 //! reason the additive half needs no counting.
 //!
-//! ## A finding: for `MislevelledLink`, `DomainDestroy`'s foreign-link guard is load-bearing
+//! ## A finding: for `MislevelledLink`, `DomainDestroy`'s foreign-link handling is load-bearing
 //!
-//! `foreign_link_preservation.rs` measured `domain_destroy`'s `has_foreign_link_into(target)`
-//! precondition and its `unlink_all`-before-`revoke` ordering to be **inert** for
-//! `UnauthorizedForeignLink` (that invariant *skips* an unowned-ended edge, so `free_all` alone
-//! carries teardown), and localized them to "other invariants — `MislevelledLink`'s no-dangling-edge
-//! content and `DeadDomainReferenced`". This file is where that localization is cashed: for
-//! `MislevelledLink`, a *surviving* foreign edge whose child is one of `target`'s freed frames would
-//! read `current_type == None` after `free_all` and break — exactly what `has_foreign_link_into`
-//! forbids. In the proof this lands as [`free_preserves`]'s `refs == 0` premise (which
-//! [`accounted`] turns into "no live edge references the freed frame", `!refd`): the guard is what
-//! makes every `free_all` frame satisfy it (see [`destroy_preserves_note`]), confirming the
-//! cross-file localization claim.
+//! `foreign_link_preservation.rs` measured `domain_destroy`'s foreign-link handling and its
+//! `unlink_all`-before-`revoke` ordering to be **inert** for `UnauthorizedForeignLink` (that
+//! invariant *skips* an unowned-ended edge, so `free_all` alone carries teardown), and localized
+//! them to "other invariants — `MislevelledLink`'s no-dangling-edge content and
+//! `DeadDomainReferenced`". This file is where that localization is cashed: for `MislevelledLink`,
+//! a *surviving* foreign edge whose child is one of `target`'s freed frames would read
+//! `current_type == None` after `free_all` and break. In the proof this lands as
+//! [`free_preserves`]'s `refs == 0` premise (which [`accounted`] turns into "no live edge
+//! references the freed frame", `!refd`): whatever makes every `free_all` frame satisfy that
+//! premise is load-bearing here (see [`destroy_preserves_note`]), confirming the cross-file
+//! localization claim.
+//!
+//! **What supplies it changed with ②′-(c), and the proof did not.** Originally it was the
+//! `has_foreign_link_into(target)` *precondition* — teardown refused while any foreign edge
+//! pointed into `target`'s frames, so none could survive to be dangled. Teardown now
+//! **force-reclaims** instead: `p2m::unlink_all_into(target)` severs every inward foreign edge
+//! before `free_all` runs, establishing the very same `refs == 0` by construction rather than by
+//! refusal. Both discharge [`free_preserves`]'s premise identically, which is why every lemma
+//! below stands verbatim — the file constrains *the state at each step*, not the reason it holds.
 //!
 //! ## Fidelity (a mirror, managed — the #21b discipline)
 //!
@@ -915,16 +923,19 @@ proof fn free_preserves(edges: Seq<Edge>, fs: Frames, fs2: Frames, r: Rest, m: M
     }
 }
 
-/// **`DomainDestroy` — covered by the loop primitives, with the foreign-link guard load-bearing.**
-/// Teardown is `unlink_all` (a loop of [`unlink_preserves`]) then `free_all` (a loop of
-/// [`free_preserves`]); each step preserves both `inv` and `accounted`, so the whole teardown does by
-/// induction — no separate lemma. The one non-mechanical fact is that every `free_all` frame has
-/// `refs == 0` when it runs: `unlink_all` first drops every edge `target` roots, and
-/// `domain_destroy`'s `has_foreign_link_into(target)` precondition refuses teardown while any
-/// *foreign* edge points into `target`'s frames — so by the time `free_preserves` runs on a frame,
-/// no live edge references it, exactly its `!refd`/`refs == 0` premise. This is where the guard
-/// `foreign_link_preservation.rs` measured inert for `UnauthorizedForeignLink` earns its keep for
-/// `MislevelledLink` (a surviving foreign edge into a freed frame would break the hierarchy).
+/// **`DomainDestroy` — covered by the loop primitives, with the foreign-link handling load-bearing.**
+/// Teardown is `unlink_all_into` + `unlink_all` (each a loop of [`unlink_preserves`]) then
+/// `free_all` (a loop of [`free_preserves`]); each step preserves both `inv` and `accounted`, so the
+/// whole teardown does by induction — no separate lemma. The one non-mechanical fact is that every
+/// `free_all` frame has `refs == 0` when it runs, and teardown clears edges in **both directions**
+/// to get there: `unlink_all(target)` drops every edge `target` roots, and (since ②′-(c))
+/// `unlink_all_into(target)` severs every *foreign* edge pointing into `target`'s frames — where the
+/// old design instead *refused* teardown while such an edge stood. Either way, by the time
+/// [`free_preserves`] runs on a frame no live edge references it, exactly its `!refd`/`refs == 0`
+/// premise. This is where what `foreign_link_preservation.rs` measured inert for
+/// `UnauthorizedForeignLink` earns its keep for `MislevelledLink` (a surviving foreign edge into a
+/// freed frame would break the hierarchy). Note the force-reclaim strictly *helps* this proof: it
+/// removes edges the refusal merely excluded, so the premise is established rather than assumed.
 proof fn destroy_preserves_note() {
 }
 
