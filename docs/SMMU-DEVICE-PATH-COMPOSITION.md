@@ -28,7 +28,9 @@ recorded here first so the rest of the document cannot quietly outrun them:
 
 **It did not read thin.** §2 is what writing it out found: four preconditions `encode` has always
 had, none of them stated, none of them checked, every one of them silently mis-mapping rather than
-failing. §5 records what is still *not* claimed.
+failing — plus **two real defects, each produced by a harness on its first run** (§2e and the walk's
+missing input-address ceiling). §4a records a third finding, about cost, that corrects the lesson
+this rung was expected to be governed by. §5 records what is still *not* claimed.
 
 ## 1. The finding, which is the whole reason the rung exists
 
@@ -76,6 +78,33 @@ Premise **d** is the one that matters most for this rung specifically, because i
 join: rung 3's `the_vttbr_seam_recovers_the_table_and_the_vmid` proves the round-trip **under
 `assume(pa >> 48 == 0)`**, and nothing discharged that assumption. The seam was proven; its premise
 was assumed in the harness and unchecked in the code.
+
+### 2e. And then the join harness found the reason that premise is not cosmetic
+
+Writing (d) as a check raised the obvious question — *what exactly is the field's width?* — and the
+answer was not one number:
+
+> **`STE.S2TTB` carries bits `[51:4]`. `VTTBR_EL2.BADDR` carries bits `[47:0]`.** The two fields
+> that must name **one table** are **four bits apart**.
+
+So a table base in `[2⁴⁸, 2⁵²)` is nameable by the *device's* field and silently truncated by the
+*CPU's*: the SMMU walks the table the emitter wrote, the CPU walks a different one, and rung 3's
+whole "one proven `p2m`, two consumers" claim is false in that range. `the_two_consumers_are_pointed_at_one_table`
+failed on its first run and produced exactly this.
+
+**Why nothing had seen it.** Rung 3's round-trip harness quantifies over bases it has already
+*assumed* representable, so the range where the two fields differ is outside what it ranges over.
+And the shipped code could not exhibit it either, because `register_domain_binding` obtained the
+`S2TTB` **by reading it back out of the `VTTBR_EL2` value** — which pre-truncates, so the two
+consumers agreed *because they had both already lost the same bits*. The property held for a reason
+nobody had stated, and the "one derivation" repair in §3b is precisely what would have broken it
+had the check not gone in with it. `HandleError::VttbrNarrowerThanSte` is where the asymmetry now
+lives, and `Layout::validate`'s `MAX_TABLE_PA` is the narrower of the two widths, deliberately.
+
+**The generalization worth keeping: two fields that carry "the same" address may not be the same
+width, and a derivation that routes *through* one of them hides the divergence by truncating first.**
+When two consumers must name one object, derive both from the **source** and refuse what *either*
+cannot carry.
 
 **The repair is where the other three checks already live.** `Layout::validate` gains
 [`EncodingViolation::WindowUnaligned`], [`RegionCrossesL1`] and [`TableUnnameable`], each fail-loud
