@@ -479,6 +479,46 @@ for local respect since Phase I-1c but never for confidentiality — and it is c
 (`step_consistency_holds_with_the_async_agent`): the raise reads only the target's own
 `(vcpu, virq)` port binding, with no guard over another principal's state.
 
+**F5 and F6 — two more, found by the deep sweeps *after* the first ⑥ pass merged.** The committed
+depth-3 configs were green; the depth-4 `#[ignore]`d twins were not. Both are the same audit pattern
+one level deeper, and both were **repaired the same way — observe**:
+
+* **F5 — incoming control-edge provenance.** ⑥'s first cut recorded `Root`/`Via` for `a`'s
+  *outgoing* edges only, arguing that `a` knows whether it created `c` itself but is passive in a
+  delegation *to* it. **That argument was wrong.** `sweep_orphaned_control_edges` cascades away an
+  **incoming** `Via(d)` edge when `d` is destroyed, while an incoming `Root` survives — so the
+  provenance of an edge pointing *at* `a` decides whether `a`'s own controller set moves. Two states
+  whose incoming rows agree as booleans take `DomainDestroy{target: d}` to different successors.
+  Provenance is now recorded on **both** rows (`control_tag`). This is the third instance of the
+  aggregate-projection trap (§4b/F3, ②′-(e)) — and it was made *in the commit that cites the trap as
+  a warning*, which is the honest measure of how easy the mistake is. Pinned depth-independently by
+  `incoming_control_provenance_is_observed`.
+* **F6 — the grant-map acquire guard leaks the grantor's frame type.** `hypervisor::grant_map` takes
+  the backing page reference on the **grantor's** frame (`get_type(frame, Writable)` for a writable
+  map, `get(frame)` for a read-only one) and hands the grantee the resulting `P2mError` verbatim. So
+  a grantee learns whether a frame *it does not own* is currently a live page table, executable, or
+  free: pin the grantor's granted frame as an L1 table and the grantee's writable map flips from
+  `Ok` to `TypePinned`. Observe, not remove — the guard is write-xor-pagetable, load-bearing for
+  isolation, and refusal strands nothing. Pinned by `the_grant_map_acquire_guard_is_observed` and
+  `dropping_the_acquire_guard_from_obs_plus_breaks_step_consistency`.
+
+  **F6 needed the one `hv-core` change in the whole ⑥ programme, and it is a fidelity change, not a
+  behaviour one.** Recording the guard's outcome means *reading it from the code the acquire runs*;
+  re-deriving the condition from `refs`/`type_refs`/… inside the observer would be a seam the shipped
+  path never calls — precisely the GAP-A gap of design-lesson #55. So `p2m` gained
+  **`can_acquire(mfn, ty)`**, a pure query returning exactly what `get`/`get_type` would, with the
+  guard itself factored into one private `acquire_check` that **all three** route through. Behaviour
+  is unchanged (188 `hv-core` tests, 29 Kani harnesses and all 14 Verus proofs stand verbatim); what
+  changes is that the observable and the guard can no longer drift apart.
+
+  **And the repair had to be gated, which is ②′-(a)'s trap from the other side.** Recording the
+  acquire outcome *unconditionally* broke step consistency in the opposite direction: `grant_map`
+  short-circuits on `StaleGrant` *before* the acquire, so on a stale grant the grantee learns
+  nothing about the frame — and an ungated tag leaked whether some **third** domain had allocated
+  that frame yet (free acquires `WrongState`, allocated `Ok`). The tag is therefore recorded only
+  when the grantor still owns the frame. **Under-recording hides a channel; over-recording invents
+  one.** Both directions are step-consistency failures, and only the exact observable passes.
+
 **Config-flag coverage is now a first-class artifact of this section.** Four of the six holes ⑥ found
 were not missing *code* but missing *transitions in the swept universe* — `delegate`, `sched`,
 `levels`, `async_agent` all defaulted off in every step-consistency config, and a green sweep over a

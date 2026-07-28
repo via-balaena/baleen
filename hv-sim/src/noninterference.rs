@@ -501,6 +501,10 @@ pub struct Surface {
     /// toward `a`, which `EvtchnBindInterdomain`'s guard reads (⑥). The event-channel twin of the
     /// grant read-closure. See [`obs_plus`].
     pub invitations: bool,
+    /// **The acquire outcome on each read-cap's frame** — what `hypervisor::grant_map`'s backing
+    /// `p2m` acquire would return, which the grantee reads off its own map (⑥). Carries the
+    /// grantor's frame *type* state to the grantee. See [`obs_plus`].
+    pub acquire_guard: bool,
 }
 
 impl Surface {
@@ -511,7 +515,38 @@ impl Surface {
             provenance: true,
             peer_liveness: true,
             invitations: true,
+            acquire_guard: true,
         }
+    }
+}
+
+/// A control edge's observation tag: `0` absent, `1` present-as-`Root`, `2` present-as-`Via`. With
+/// `provenance` off it degrades to bare presence (`0`/`1`) — the pre-⑥ projection the non-vacuity
+/// test uses. Never records the delegator's *identity* inside `Via(d)`: a domain is passive in a
+/// `ControlGrant` naming it and learns no `d` from any outcome, so that would over-approximate the
+/// observable exactly as ②′-(a)'s raw frame owner did.
+fn control_tag(hv: &Hypervisor, holder: Dom, target: Dom, provenance: bool) -> u64 {
+    match (provenance, hv.control_edge(holder, target)) {
+        (_, hv_core::hypervisor::Control::Absent) => 0,
+        (false, _) => 1, // presence only
+        (true, hv_core::hypervisor::Control::Root) => 1,
+        (true, hv_core::hypervisor::Control::Via(_)) => 2,
+    }
+}
+
+/// The **acquire outcome** a grantee learns by mapping a grant over `frame` — `0` for `Ok`, and a
+/// distinct tag per rejection, since `hypervisor::grant_map` hands the caller the specific
+/// `P2mError` back. Read straight off `p2m::can_acquire`, the seam the acquire itself routes
+/// through, so the observable cannot drift from the guard (#55).
+fn acquire_tag(hv: &Hypervisor, frame: u32, ty: Option<PageType>) -> u64 {
+    use hv_core::p2m::P2mError;
+    match hv.p2m().can_acquire(frame, ty) {
+        Ok(()) => 0,
+        Err(P2mError::WrongState) => 1,
+        Err(P2mError::TypePinned) => 2,
+        Err(P2mError::WxConflict) => 3,
+        Err(P2mError::Overflow) => 4,
+        Err(_) => 5,
     }
 }
 
@@ -533,8 +568,16 @@ fn obs_plus_impl(hv: &Hypervisor, a: Dom, surface: Surface) -> Vec<u64> {
     if surface.authority {
         k.push(0xD_0007);
         k.push(hv.may_create(a) as u64);
+        // Incoming: who controls `a` — **also with provenance**. The first cut of ⑥ recorded
+        // provenance for the outgoing row only, on the argument that `a` knows whether it created
+        // `c` itself but is passive in a delegation *to* it. That was wrong, and the depth-4
+        // delegation sweep proved it: the orphan-sweep cascades away an incoming `Via(d)` edge when
+        // `d` is destroyed, while an incoming `Root` survives — so two states whose incoming rows
+        // agree as booleans take `DomainDestroy{target: d}` to different successors. `a` observes
+        // the difference (it is `a`'s own controller set, in `obs`), so the faithful record is the
+        // provenance, on **both** rows. Same aggregate-projection trap as ②′-(e), made twice.
         for b in 0..n {
-            k.push(hv.controls(b, a) as u64); // incoming: who controls a
+            k.push(control_tag(hv, b, a, surface.provenance));
         }
         for c in 0..n {
             // Outgoing: whom `a` controls — and **with what provenance** (⑥). Presence alone is
@@ -551,12 +594,7 @@ fn obs_plus_impl(hv: &Hypervisor, a: Dom, surface: Surface) -> Vec<u64> {
             // is passive in `ControlGrant{to: a}` and learns no `d` from any outcome, so
             // recording it would over-approximate the observable exactly as the raw frame owner
             // did in ②′-(a). `Root` vs `Via` is the tightest faithful projection.
-            k.push(match (surface.provenance, hv.control_edge(a, c)) {
-                (_, hv_core::hypervisor::Control::Absent) => 0,
-                (false, _) => 1, // presence only
-                (true, hv_core::hypervisor::Control::Root) => 1,
-                (true, hv_core::hypervisor::Control::Via(_)) => 2,
-            });
+            k.push(control_tag(hv, a, c, surface.provenance));
         }
     }
 
@@ -624,7 +662,7 @@ fn obs_plus_impl(hv: &Hypervisor, a: Dom, surface: Surface) -> Vec<u64> {
     }
 
     k.push(0xD_0006);
-    let mut rcaps: Vec<[u64; 5]> = Vec::new();
+    let mut rcaps: Vec<[u64; 7]> = Vec::new();
     for grantor in 0..n {
         for gref in 0..g.entry_count(grantor) as u32 {
             if let Some((grantee, frame, ro, ..)) = g.grant_entry(grantor, gref) {
@@ -639,12 +677,45 @@ fn obs_plus_impl(hv: &Hypervisor, a: Dom, surface: Surface) -> Vec<u64> {
                     // unowned frame), breaks step consistency (a peer's invisible allocation flips
                     // the owner). The boolean is the faithful confidentiality surface.
                     let owns = (p.owner_of(frame) == Some(grantor)) as u64;
+                    // The **acquire outcome** on the grantor's frame — the second half of what a
+                    // `GrantMap` tells `a`, and the one the first cut of ⑥ missed (the depth-4
+                    // page-table sweep found it). `hypervisor::grant_map` takes the backing page
+                    // reference on the **grantor's** frame — `get_type(frame, Writable)` for a
+                    // writable map, `get(frame)` for a read-only one — and hands `a` the resulting
+                    // `P2mError` verbatim. So `a` learns whether that frame is currently a live
+                    // page table, executable, or free, *without owning it*: pin the grantor's frame
+                    // as an L1 table and `a`'s writable map flips from `Ok` to `TypePinned`.
+                    //
+                    // Both variants are recorded because `a` chooses `writable` per call and so can
+                    // read either. The tags come from `p2m::can_acquire`, the seam `get`/`get_type`
+                    // themselves route through, so the observable cannot drift from the guard (#55)
+                    // — and it is the *outcome*, not the frame's counts, keeping this the tightest
+                    // faithful projection (②′-(a)).
+                    //
+                    // **Gated on `owns`, because `grant_map` short-circuits.** The `StaleGrant`
+                    // check runs *before* the acquire, so on a stale grant `a` is told `StaleGrant`
+                    // and learns nothing whatever about the frame's type. Recording the acquire
+                    // outcome unconditionally therefore over-approximates — and breaks step
+                    // consistency in the other direction, by leaking whether some *third* domain
+                    // has allocated that frame yet (a free frame acquires `WrongState`, an
+                    // allocated one `Ok`). Exactly ②′-(a)'s trap, reached from the opposite side:
+                    // under-recording hides a channel, over-recording invents one.
+                    let (acq_w, acq_r) = if owns == 1 && surface.acquire_guard {
+                        (
+                            acquire_tag(hv, frame, Some(PageType::Writable)),
+                            acquire_tag(hv, frame, None),
+                        )
+                    } else {
+                        (0, 0)
+                    };
                     rcaps.push([
                         u64::from(grantor),
                         u64::from(gref),
                         u64::from(frame),
                         ro as u64,
                         owns,
+                        acq_w,
+                        acq_r,
                     ]);
                 }
             }
@@ -1885,6 +1956,197 @@ mod tests {
         assert!(
             out.violation.is_some(),
             "dropping control-edge provenance from obs⁺ should break step consistency (F3)"
+        );
+    }
+
+    /// **The grant-map acquire guard is observed (⑥ / F6, depth-independent).** `grant_map` takes
+    /// the backing page reference on the **grantor's** frame and hands the grantee the resulting
+    /// `P2mError` verbatim — so a grantee learns whether a frame *it does not own* is currently a
+    /// live page table. Two worlds differing only in whether the grantor pinned its granted frame
+    /// as an L1 table are otherwise `obs⁺(grantee)`-equal, yet the grantee's writable `GrantMap`
+    /// succeeds in one and is refused `TypePinned` in the other.
+    ///
+    /// **Observe, not remove** (design-lesson #62): the guard is write-xor-pagetable, load-bearing
+    /// for isolation, and refusal strands nothing. The recorded tag comes from `p2m::can_acquire`,
+    /// the seam `get`/`get_type` route through, so the observable cannot drift from the guard (#55).
+    ///
+    /// The depth-4 sweep found this; the depth-3 committed config could not reach it (it needs
+    /// create + allocate + grant + pin before the map). This probe is depth-independent.
+    #[test]
+    fn the_grant_map_acquire_guard_is_observed() {
+        use hv_core::p2m::PtLevel;
+        use hv_core::HvCall;
+        // dom1 owns frame 0 and grants it read-write to dom0; in one world it also pins that
+        // frame as an L1 page table, which dom0 has no way to see except by mapping.
+        fn world(pinned: bool) -> Hypervisor {
+            let mut h = Hypervisor::new(2, 1, 1, 1, 1, 2);
+            h.dispatch(
+                0,
+                HvCall::DomainCreate {
+                    target: 1,
+                    may_create: false,
+                },
+            )
+            .unwrap();
+            h.dispatch(1, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+            h.dispatch(
+                1,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 0,
+                    frame: 0,
+                    readonly: false,
+                },
+            )
+            .unwrap();
+            if pinned {
+                h.dispatch(
+                    1,
+                    HvCall::P2mPin {
+                        mfn: 0,
+                        level: PtLevel::L1,
+                    },
+                )
+                .unwrap();
+            }
+            h
+        }
+        let mut plain = world(false);
+        let mut pinned = world(true);
+
+        // Without the acquire tag the two worlds are indistinguishable to the grantee: the frame
+        // is not dom0's, so none of `obs(0)`'s owned-frame fields cover it, and the read-cap
+        // records only (grantor, gref, frame, ro, owns) — all identical.
+        let bare = Surface {
+            acquire_guard: false,
+            ..Surface::full()
+        };
+        assert_eq!(
+            obs_plus_impl(&plain, 0, bare),
+            obs_plus_impl(&pinned, 0, bare),
+            "the two worlds must be indistinguishable to the grantee without the acquire tag"
+        );
+        assert_ne!(
+            obs_plus(&plain, 0),
+            obs_plus(&pinned, 0),
+            "obs⁺(grantee) must record the acquire outcome, or grant_map leaks the frame's type"
+        );
+
+        // And the guard outcome really does diverge.
+        let map = HvCall::GrantMap {
+            grantor: 1,
+            gref: 0,
+            writable: true,
+        };
+        assert_eq!(plain.dispatch(0, map), Ok(hv_core::HvOutcome::Handle(0)));
+        assert_eq!(
+            pinned.dispatch(0, map),
+            Err(hv_core::HvError::P2m(hv_core::p2m::P2mError::TypePinned))
+        );
+    }
+
+    /// **Non-vacuity: `obs⁺` must carry the acquire outcome (⑥ / F6).** Drop it and step
+    /// consistency breaks over the page-table config — the sweep's confirmation of the probe above.
+    #[test]
+    fn dropping_the_acquire_guard_from_obs_plus_breaks_step_consistency() {
+        let cfg = Config {
+            pcpus: 2,
+            mediated_frames: true,
+            mediated_pcpus: true,
+            ..ni_cfg(4)
+        };
+        let out = check_step_consistency_with(&cfg, |hv, a| {
+            obs_plus_impl(
+                hv,
+                a,
+                Surface {
+                    acquire_guard: false,
+                    ..Surface::full()
+                },
+            )
+        });
+        assert!(
+            out.violation.is_some(),
+            "dropping the acquire outcome from obs⁺ should break step consistency (F6)"
+        );
+    }
+
+    /// **Incoming control-edge provenance is observed (⑥ / F5, depth-independent).** The first cut
+    /// of ⑥ recorded provenance for `a`'s *outgoing* control edges only, arguing that `a` is
+    /// passive in a delegation *to* it. The depth-4 delegation sweep refuted that: the
+    /// orphan-sweep cascades away an incoming `Via(d)` edge when `d` is destroyed, while an
+    /// incoming `Root` survives — so the provenance of an edge pointing *at* `a` decides whether
+    /// `a`'s own controller set moves, and `a` observes that.
+    ///
+    /// Two worlds in which dom0's control of dom1 is `Root` versus `Via(2)`, otherwise
+    /// `obs⁺(1)`-equal; destroying dom2 strips it in one and not the other.
+    #[test]
+    fn incoming_control_provenance_is_observed() {
+        use hv_core::HvCall;
+        // Both worlds end with dom1's incoming controller *set* equal — {dom0, dom2} — and differ
+        // only in which of the two edges is the `Root`. (These are the deep sweep's own two
+        // traces.) `via` names which world: false = dom0 holds `Root` over dom1, true = dom2 does
+        // and dom0's edge is `Via(2)`.
+        fn world(via: bool) -> Hypervisor {
+            let mut h = Hypervisor::new(3, 1, 1, 1, 1, 2);
+            let mk = |t: u16, mc: bool| HvCall::DomainCreate {
+                target: t,
+                may_create: mc,
+            };
+            if via {
+                h.dispatch(0, mk(2, true)).unwrap(); // controls[0][2] = Root
+                h.dispatch(2, mk(1, false)).unwrap(); // controls[2][1] = Root
+                h.dispatch(0, HvCall::ControlGrant { target: 2, to: 1 })
+                    .unwrap();
+                h.dispatch(2, HvCall::ControlGrant { target: 1, to: 0 })
+                    .unwrap(); // controls[0][1] = Via(2)
+            } else {
+                h.dispatch(0, mk(1, false)).unwrap(); // controls[0][1] = Root
+                h.dispatch(0, mk(2, true)).unwrap(); // controls[0][2] = Root
+                h.dispatch(0, HvCall::ControlGrant { target: 1, to: 2 })
+                    .unwrap(); // controls[2][1] = Via(0)
+                h.dispatch(0, HvCall::ControlGrant { target: 2, to: 1 })
+                    .unwrap();
+            }
+            h
+        }
+        let mut root = world(false);
+        let mut via = world(true);
+
+        // Both of dom1's controllers are present in both worlds, so the boolean projection of the
+        // incoming row cannot separate them — only the provenance can.
+        assert!(root.controls(0, 1) && via.controls(0, 1));
+        assert!(root.controls(2, 1) && via.controls(2, 1));
+        let bare = Surface {
+            provenance: false,
+            ..Surface::full()
+        };
+        assert_eq!(
+            obs_plus_impl(&root, 1, bare),
+            obs_plus_impl(&via, 1, bare),
+            "the two worlds must be indistinguishable to dom1 without incoming provenance"
+        );
+        assert_ne!(
+            obs_plus(&root, 1),
+            obs_plus(&via, 1),
+            "obs⁺ must record the provenance of edges pointing AT `a`, not just out of it"
+        );
+
+        // dom1 destroys dom2 (it controls it in both worlds). That clears every edge touching
+        // dom2 — including `controls[2][1]` — and then orphan-sweeps whatever hung off it. In the
+        // `root` world dom0's edge over dom1 is a `Root` and stands; in the `via` world it is
+        // `Via(2)`, whose delegator just died, so it is swept. dom1's own controller set therefore
+        // moves differently in the two worlds: the flow the boolean projection hid.
+        let destroy = HvCall::DomainDestroy { target: 2, now: 1 };
+        root.dispatch(1, destroy).unwrap();
+        via.dispatch(1, destroy).unwrap();
+        assert!(
+            root.controls(0, 1),
+            "a Root edge survives its peer's teardown"
+        );
+        assert!(
+            !via.controls(0, 1),
+            "a Via(2) edge is orphan-swept when its delegator dies"
         );
     }
 
