@@ -317,6 +317,20 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
     // `a`'s grant table rows (`a` as grantor) — including the *live-map counts*, which peers
     // `a` has granted to legitimately move. Their movement under an authorized peer is
     // exactly what the channel relation permits.
+    //
+    // The last component is the row's **foreign-linked status** — whether this grant's grantee
+    // currently has a page-table entry into the granted frame (`p2m::is_foreign_linked_by`).
+    // It is here because `a` genuinely *learns* it: that predicate is exactly what
+    // `hypervisor::grant_end_access` refuses on, so `a` reads it off `InUse` vs `Done` when it
+    // tries to revoke. Leaving it out makes step consistency **false** — two states in which
+    // *different* grantees of the same frame have linked it are `obs`-equal without it (the
+    // frame's aggregate `refs` moves identically), yet `GrantEndAccess{gref}` refuses in one
+    // and succeeds in the other. Same shape as the `DomainBusy` residual ②′-(c) closed, but
+    // resolved the other way: the destroy guard read *another* domain's frames and had to go,
+    // whereas this guard reads `a`'s **own** frame, so it is legitimate — it just has to be
+    // *observed*. (Design-lesson #59: record what the principal LEARNS. Only a domain `a` has
+    // granted to can move this bit, which the consent channel already authorizes, so local
+    // respect is unaffected.)
     for gref in 0..g.entry_count(a) as u32 {
         match g.grant_entry(a, gref) {
             Some((grantee, frame, ro, maps, wmaps)) => k.extend([
@@ -326,8 +340,9 @@ pub fn obs(hv: &Hypervisor, a: Dom) -> Vec<u64> {
                 ro as u64,
                 u64::from(maps),
                 u64::from(wmaps),
+                p.is_foreign_linked_by(frame, grantee) as u64,
             ]),
-            None => k.extend([0, 0, 0, 0, 0, 0]),
+            None => k.extend([0, 0, 0, 0, 0, 0, 0]),
         }
     }
     k.push(0xD_0002);
@@ -1649,6 +1664,130 @@ mod tests {
     #[test]
     fn force_reclaim_closes_the_busy_channel_grant_map_direction() {
         assert_busy_channel_closed(false);
+    }
+
+    /// **②′-(e): the revoke guard's foreign-linked status is observed, not leaked.** Found while
+    /// ruling on the ②′-(c) asymmetry (`GrantEndAccess` still refuses while a foreign entry relies
+    /// on a grant, though `DomainDestroy` now force-reclaims). The refusal predicate is
+    /// `p2m::is_foreign_linked_by(frame, grantee)` — *which* grantee linked — and the grantor could
+    /// not distinguish that from `obs⁺` alone: two states in which **different** grantees of the
+    /// same frame have linked it move the frame's aggregate `refs` identically. So `obs⁺(grantor)`
+    /// was equal while `GrantEndAccess{gref:0}` refused in one and succeeded in the other — the same
+    /// step-consistency shape as the `DomainBusy` residual, at a depth (~7) the sweep never reaches.
+    ///
+    /// Resolved the *opposite* way to ②′-(c), and that is the point: `DomainBusy` read **another
+    /// domain's** frames, which the caller has no business observing, so the guard had to go;
+    /// this guard reads the caller's **own** frame, so it is legitimate and merely had to be
+    /// *observed*. `obs` now carries the per-row boolean — the faithful observable, since the
+    /// grantor learns exactly this bit off `InUse` vs `Done`.
+    #[test]
+    fn the_revoke_guards_foreign_linked_status_is_in_obs() {
+        use hv_core::p2m::PtLevel;
+        use hv_core::{HvCall, HvOutcome};
+        // caller = 1 owns frame 0 and grants it to BOTH dom2 (gref 0) and dom3 (gref 1).
+        // Exactly one of them links it into its own table.
+        fn linked_by(linker: Dom) -> Hypervisor {
+            let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+            for t in 1..4u16 {
+                h.dispatch(
+                    0,
+                    HvCall::DomainCreate {
+                        target: t,
+                        may_create: false,
+                    },
+                )
+                .unwrap();
+            }
+            h.dispatch(1, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+            for (gref, grantee) in [(0u32, 2u16), (1, 3)] {
+                h.dispatch(
+                    1,
+                    HvCall::GrantAccess {
+                        gref,
+                        grantee,
+                        frame: 0,
+                        readonly: false,
+                    },
+                )
+                .unwrap();
+            }
+            h.dispatch(linker, HvCall::P2mAllocate { mfn: 1 }).unwrap();
+            h.dispatch(
+                linker,
+                HvCall::P2mPin {
+                    mfn: 1,
+                    level: PtLevel::L1,
+                },
+            )
+            .unwrap();
+            h.dispatch(
+                linker,
+                HvCall::P2mLink {
+                    parent: 1,
+                    slot: 0,
+                    child: 0,
+                    writable: true,
+                    leaf: true,
+                    execute: false,
+                },
+            )
+            .unwrap();
+            h
+        }
+        let mut by2 = linked_by(2);
+        let mut by3 = linked_by(3);
+
+        // The states really are the awkward pair: the frame's aggregate reference count — what
+        // `obs` carried *before* the boolean — is identical, so nothing else distinguishes them.
+        assert_eq!(
+            by2.p2m().refs(0),
+            by3.p2m().refs(0),
+            "the two states must be indistinguishable by frame refcount alone"
+        );
+        // With the boolean, `obs⁺(grantor)` separates them — so the differing guard outcome is
+        // determined by the observation, which is step consistency for this transition.
+        assert_ne!(
+            obs_plus(&by2, 1),
+            obs_plus(&by3, 1),
+            "obs⁺(grantor) must record WHICH grant is foreign-linked, or the revoke guard leaks"
+        );
+        assert_eq!(
+            by2.dispatch(1, HvCall::GrantEndAccess { gref: 0 }),
+            Err(hv_core::HvError::Grant(hv_core::grant::GrantError::InUse))
+        );
+        assert_eq!(
+            by3.dispatch(1, HvCall::GrantEndAccess { gref: 0 }),
+            Ok(HvOutcome::Done)
+        );
+
+        // Non-vacuity: the boolean is not constant-true — an unlinked grant reads false, and it
+        // is per-row, not per-frame (gref 1 names dom3, who has not linked in the `by2` world).
+        let clean = {
+            let mut h = Hypervisor::new(4, 1, 2, 1, 1, 2);
+            for t in 1..4u16 {
+                h.dispatch(
+                    0,
+                    HvCall::DomainCreate {
+                        target: t,
+                        may_create: false,
+                    },
+                )
+                .unwrap();
+            }
+            h.dispatch(1, HvCall::P2mAllocate { mfn: 0 }).unwrap();
+            h.dispatch(
+                1,
+                HvCall::GrantAccess {
+                    gref: 0,
+                    grantee: 2,
+                    frame: 0,
+                    readonly: false,
+                },
+            )
+            .unwrap();
+            h
+        };
+        assert!(!clean.p2m().is_foreign_linked_by(0, 2));
     }
 
     /// **②′-(c), the page-table half — and the one this bridge is the *primary* evidence for.**

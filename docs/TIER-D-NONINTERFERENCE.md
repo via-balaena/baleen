@@ -322,6 +322,39 @@ real code — the honest bridge↔composition division, `read_closure.rs` fideli
   counter witnesses the new path is genuinely exercised rather than vacuously absent; all 14 Verus
   proofs and all Kani harnesses stand verbatim.
 
+* **The revoke guard's foreign-linked status (②′-(e)) — CLOSED by observing it.** Ruling on the
+  asymmetry (c) left behind — `GrantEndAccess` still refuses (`InUse`) while a foreign page-table
+  entry relies on a grant, though `DomainDestroy` now force-reclaims — turned up a **third residual
+  of the same family**. The refusal predicate is `p2m::is_foreign_linked_by(frame, grantee)`:
+  *which* grantee linked. The grantor could not distinguish that from its observation, because two
+  grantees of the same frame move its aggregate `refs` identically. So two `obs⁺(grantor)`-equal
+  states had `GrantEndAccess{gref}` refuse in one and succeed in the other — step consistency false
+  for the revoke channel, at a depth (~7: four domains, two grants of one frame, an allocation, a
+  pin and a link) the sweep never reaches.
+
+  **Resolved the OPPOSITE way to (c), and the contrast is the finding.** Both are guards whose
+  predicate the caller could not fully observe, but they differ in *whose* state the guard reads:
+
+  | | `DomainBusy` (c) | revoke's foreign-link guard (e) |
+  |---|---|---|
+  | Guard reads | the **target's** frames | the **caller's own** frame + its own grant |
+  | Caller entitled to observe it? | **No** | **Yes** |
+  | Refusal strands a resource? | **Yes** — target's frames unreclaimable, controller powerless | **No** — grantor keeps the frame, can retry |
+  | Fix | **remove the guard** (force-reclaim) | **observe the predicate** |
+
+  So the rule the two jointly establish: **a refusal conditioned on state the caller can see is a
+  legitimate error; one conditioned on state it cannot see is a covert channel.** The repair
+  follows from *which* — remove the guard when it reads another principal's state, surface the
+  predicate when it reads the caller's own. Consistency of *mechanism* between the two operations
+  was never the right target; consistency of *principle* is.
+
+  Fix: `obs`'s grant rows gain a per-row foreign-linked boolean — the faithful observable, since the
+  grantor learns exactly that bit off `InUse` vs `Done` (design-lesson #59). **Model-side only**:
+  `hv-core` behaviour is unchanged, so no proof or harness moves. Only a domain the grantor has
+  granted to can move the bit, which the consent channel already authorizes, so local respect is
+  unaffected (deep sweeps re-run green). Pinned by
+  `the_revoke_guards_foreign_linked_status_is_in_obs`.
+
 At ≤3 domains **without dynamic p2m** the sweep is clean (the committed `ni_cfg3` has no allocation),
 and the deep three-domain sweep runs in `deep-verify.yml`.
 
