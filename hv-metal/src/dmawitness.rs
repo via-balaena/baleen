@@ -299,7 +299,12 @@ pub(crate) fn witness(uart: &mut Pl011) {
     #[cfg(feature = "smmu")]
     {
         let (aborting, s2, idr0, idr1, present) = smmu_state;
-        let ok = present && aborting && device_live && a.aborted();
+        // `s2` is REQUIRED, not merely reported. It was reported-only from rung 1 until rung 3 found
+        // out the hard way: CI's QEMU 8.2 advertises `IDR0.S2P = 0`, the boot printed `stage2=false`
+        // for two rungs, and nothing cared — a check whose result changed nothing (design-lesson
+        // #71). The whole arc rests on the SMMU being able to translate through a domain's own
+        // Stage-2 tables, so a machine that cannot is a machine this witness must not report on.
+        let ok = present && aborting && s2 && device_live && a.aborted();
         if ok {
             let _ = writeln!(
                 uart,
@@ -310,7 +315,7 @@ pub(crate) fn witness(uart: &mut Pl011) {
         } else {
             let _ = writeln!(
                 uart,
-                "baleen: smmu rung1 DEFAULT-DENY FAIL (present={present} aborting={aborting} live={device_live} retired={retired} landed={landed} before={before:#x} after={after:#x}); halting"
+                "baleen: smmu rung1 DEFAULT-DENY FAIL (present={present} aborting={aborting} stage2={s2} idr0={idr0:#010x} live={device_live} retired={retired} landed={landed} before={before:#x} after={after:#x}); halting"
             );
             crate::park();
         }

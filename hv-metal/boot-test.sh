@@ -382,8 +382,23 @@ boot_and_check "dma-control" "" \
 #     aborted, and the first domain's memory untouched; that STE then reaches the other domain's own
 #     frame, and rebinding reaches the first's again.
 #   * RESTORED — unbound, and the table denies every StreamID again.
+#
+# `-global arm-smmuv3.stage=2` is not decoration either, and it is the difference between this boot
+# and the CI runner's. QEMU advertises `SMMU_IDR0.S2P` only when the SMMU device's `stage` property
+# says so, and the two ends of the version range disagree about who sets it:
+#
+#   * QEMU >= 10.0: `virt`'s `create_smmu()` sets `stage = "nested"` itself, so S1P|S2P are both
+#     advertised — and because the machine sets it AFTER `qdev_new`, it also OVERRIDES this `-global`,
+#     which is why the flag is a harmless no-op there (measured: `stage=1`, `2` and `nested` all give
+#     the identical `IDR0 = 0x0d44101b`).
+#   * QEMU 8.2 (what `ubuntu-24.04` runners ship): `create_smmu()` sets nothing, the property defaults
+#     to stage 1, `IDR0 = 0x0d44101a` — **S2P clear** — and a `Config = 0b110` STE is correctly
+#     rejected with `C_BAD_STE`. Nothing overrides `-global` there, so this is what turns it on.
+#
+# The metal now REQUIRES `IDR0.S2P` before rung 3 runs, so a machine that does not implement stage 2
+# fails loudly and by name rather than reporting a wall of unexplained `C_BAD_STE`.
 MACHINE_EXTRA=",iommu=smmuv3"
-EXTRA_QEMU="-m 2048 -device edu,dma_mask=0xffffffffff"
+EXTRA_QEMU="-m 2048 -global arm-smmuv3.stage=2 -device edu,dma_mask=0xffffffffff"
 boot_and_check "smmu" "--features smmu" \
     "hv-metal alive" \
     "smmu rung1 DEFAULT-DENY OK" \
