@@ -193,12 +193,17 @@ jobs:
   real-linux-boot:
     name: real-linux boot (QEMU)
     runs-on: ubuntu-latest
-    # A real kernel under cross-arch TCG. Locally (native-arch TCG, M4 Pro) the whole task is 2.3 s
-    # including the incremental build and dtc; the runner is slower and this budget is deliberately
-    # loose, since the cost of a tight cap on a REQUIRED gate is intermittent redness. The inner wait
-    # cap (`LINUX_WAIT_SECS_DEFAULT`, 300 s) is what actually decides a hung boot, and it reports the
-    # serial log; this timeout is only the backstop.
-    timeout-minutes: 25
+    # MEASURED on this job's first run (PR #97), not guessed — and it is cheap: **49 s end to end on a
+    # COLD cache**. Breakdown: 11 s apt (qemu/dtc/cpio) · 3 s to fetch, checksum and unwrap both
+    # artifacts (the runner's link to dl-cdn is fast; the cache below is an outage hedge, not a speed
+    # one) · 15 s for the boot step itself, which includes the hv-metal cross-build and dtc. So a real
+    # kernel under CROSS-ARCH TCG costs about what the synthetic `metal boot (QEMU)` job costs (42 s),
+    # and this is affordable as a required check. Locally, on native-arch TCG, the whole task is 2.3 s.
+    #
+    # 15 minutes matches `metal boot (QEMU)` and is ~18x the measured cost. It is only a backstop: a
+    # HUNG boot is caught by the inner wait cap (`LINUX_WAIT_SECS_DEFAULT`, 300 s), which kills QEMU
+    # and dumps the serial log — a diagnosable failure rather than a job that ran out of wall clock.
+    timeout-minutes: 15
     env:
       BALEEN_LINUX_DIR: ${{ github.workspace }}/.baleen-linux
     steps:

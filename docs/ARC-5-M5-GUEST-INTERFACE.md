@@ -111,6 +111,18 @@ price of the alternative being decorative. What is deliberately not done is lett
 pass green — a job that goes green when it could not obtain the kernel would stay green if the kernel
 were deleted (design-lesson #71).
 
+**Measured cost (PR #97, the job's first run): 49 s end to end on a COLD cache** — 11 s of apt, 3 s to
+fetch/checksum/unwrap both artifacts, 15 s for the boot including the hv-metal cross-build. About what
+the synthetic `metal boot (QEMU)` job costs (42 s), so being required is cheap. The cache is an outage
+hedge rather than a speed one.
+
+**Reproduced independently on the runner**, which is the part worth keeping: the x86-64 Linux runner's
+unwrap produced `Image` sha256 `8b216f74…` — byte-identical to the macOS/arm64 laptop's — and all
+eleven markers appeared under the runner's **QEMU 8.2**, a different QEMU generation from the local
+11.0.3. Two hosts, two architectures, two QEMU generations, one result. (The cpio archive differs in
+size between them, 4029394 vs 4021398 bytes, exactly as the non-reproducibility note above predicts —
+and it does not matter, because its inputs are what is pinned.)
+
 ## Scope and honesty
 
 - **Plumbing, no isolation content.** Arc 5 adds capabilities; the thesis (Arc 0–4) is untouched.
