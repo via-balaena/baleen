@@ -158,10 +158,21 @@ fn qemu_linux(check: bool) -> bool {
     };
     let initrd_size = std::fs::metadata(&initrd).map(|m| m.len()).unwrap_or(0);
     let initrd_end = LINUX_INITRD_ADDR + initrd_size;
-    let patched = dts.replace(
-        &format!("linux,initrd-end = <0x{LINUX_INITRD_ADDR:x}>;"),
-        &format!("linux,initrd-end = <0x{initrd_end:x}>;"),
-    );
+    let needle = format!("linux,initrd-end = <0x{LINUX_INITRD_ADDR:x}>;");
+    let patched = dts.replace(&needle, &format!("linux,initrd-end = <0x{initrd_end:x}>;"));
+    // `String::replace` that matches NOTHING returns the string unchanged — so if this constant and
+    // `guest.dts` ever drift, the DTB silently ships `initrd-end == initrd-start`, i.e. a zero-length
+    // initramfs, and the failure surfaces as a kernel that reaches no userspace. ⑬'s markers do catch
+    // that (`Run /init` and `BALEEN-STEP0-OK` go red), so it is not a hole — but it is caught a layer
+    // away from its cause. Refuse here instead, and name the two things that disagree (⑭b).
+    if patched == dts {
+        eprintln!(
+            "xtask {task}: guest.dts has no `{needle}` to patch — `LINUX_INITRD_ADDR` \
+             (0x{LINUX_INITRD_ADDR:x}) and hv-metal/linux/guest.dts's `linux,initrd-start` have \
+             drifted apart. The DTB would ship a zero-length initramfs."
+        );
+        return false;
+    }
     let dts_out = dir.join("guest.patched.dts");
     let dtb_out = dir.join("guest.dtb");
     if let Err(e) = std::fs::write(&dts_out, patched) {
@@ -461,7 +472,20 @@ fn metal_lint() -> bool {
         // queues and a five-phase witness behind `smmu` — a feature gate is exactly where a
         // dead-code or clippy finding hides, since the default build cannot see it.
         && metal_clippy(&["--features", "smmu"])
+        // ⑭b — THE INVARIANT THIS LIST HAS TO HOLD: **every configuration that is BUILT AND BOOTED
+        // is linted.** It did not. This list carried `real-linux`, which nothing ships, while
+        // `qemu-linux`/`qemu-linux-test` build `real-linux,selftest` — so the binary the REQUIRED
+        // `real-linux boot (QEMU)` job boots was linted by nothing at all. Probed: a constant behind
+        // `#[cfg(all(feature = "real-linux", feature = "selftest"))]` left `metal-lint` green while
+        // the shipped build warned. That is ⑭'s own finding one level up — ⑭ asked "which config
+        // lints `linux.rs`?" and fixed it, but not "does the linted set EQUAL the shipped set?".
+        //
+        // Where the shipped set is defined, so a new config has an obvious home here:
+        //   default · selftest · smmu   -> `hv-metal/boot-test.sh`'s `boot_and_check` invocations
+        //   real-linux,selftest         -> `metal_build_linux` below
+        // `real-linux` alone is kept too: it is seconds, and it covers the non-selftest path.
         && metal_clippy(&["--features", "real-linux"])
+        && metal_clippy(&["--features", "real-linux,selftest"])
 }
 
 /// Run clippy over `hv-metal` for the bare-metal target with `extra` cargo args, denying warnings.
