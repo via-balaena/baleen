@@ -50,6 +50,8 @@ unmodified kernel unchanged:
   (`0x4800_0000..0x8000_0000`, Normal WB) plus the GICv3 + PL011 device pages, with `HCR_EL2.IMO=0`
   so the kernel drives the real GIC / arch-timer / PL011 directly (the vGIC injection path is the
   *multi-guest* mechanism, unused here). hv-metal owns the low 128 MiB; the guest never maps it.
+  (**Superseded in part by §5g:** the PL011 is no longer passed through — it is emulated in EL2, so
+  the window is 16 MiB and covers the GIC alone. The GIC and `IMO=0` are unchanged.)
 - **DTB.** A minimal device tree (`hv-metal/linux/guest.dts`) — only the nodes the guest drives (psci
   `method="hvc"`, memory, GICv3, PL011, timer, cpu, chosen), so Linux probes only what is passed
   through. `x0` = the DTB per the arm64 boot protocol; the kernel `Image` + initramfs are placed in
@@ -122,6 +124,79 @@ eleven markers appeared under the runner's **QEMU 8.2**, a different QEMU genera
 11.0.3. Two hosts, two architectures, two QEMU generations, one result. (The cpio archive differs in
 size between them, 4029394 vs 4021398 bytes, exactly as the non-reproducibility note above predicts —
 and it does not matter, because its inputs are what is pinned.)
+
+## 5g — the guest's console stops being the machine's (③-a1)
+
+**Say what this is: INTEGRATION, boot-witnessed, not a machine-checked rung.** It is the first step of
+③ (two real guests), and it is deliberately a different kind of work from the twelve merges that
+preceded it. It touches `hv-metal` only, so it green-skips the Kani/Verus gates.
+
+**The ledger named the wrong blocker.** ③ was recorded as blocked on the singular hardcoded guest-RAM
+window. That is real but it is a rename. The blocker that is a *rewrite* is device ownership: §5e's
+guest owns the **real** PL011 and the **real** GIC (`IMO=0`, pass-through, `guest.dts` handing it
+`pl011@9000000` as `stdout-path`), and two guests cannot both own one UART. `linux.rs`'s own module
+doc said as much and nobody had cashed it.
+
+**The probe that inverted the obvious call.** Reusing `crate::virtio`'s proven console — the ring as
+a grant — was the natural move and is **impossible** with an unmodified kernel: the shipped Alpine
+`-virt` config has `CONFIG_VIRTIO_MMIO=m`, a module, and this initramfs ships no `/lib/modules`, so
+the built-in `CONFIG_VIRTIO_CONSOLE=y` has no bus to attach to. A console that appears only after
+userspace loads modules is not a console. `CONFIG_SERIAL_AMBA_PL011=y` and `_CONSOLE=y` *are* built
+in — so emulating the device the guest already believes it has works from the first `earlycon` byte,
+and it retracts the predicted cost of losing `earlycon`.
+
+**What landed.**
+
+1. **An `EC=0x24` data-abort path in `handle_linux_sync`.** Before this, `HVC` was serviced and every
+   other trap was fatal — no mediated device could exist. The `ESR_EL2.ISS` field decode now lives in
+   `hv-metal/src/abort.rs`, shared with the synthetic guest's virtio path, because two decodes of one
+   architectural fact is exactly the shape ⑭ spent a rung removing.
+2. **The pass-through window shrank 32 MiB → 16 MiB**, and is now *derived* from the GIC's own
+   addresses (`gic::GICD_BASE .. gic::GICR_END`) rather than written as a pair of literals. On QEMU
+   `virt` the redistributor region ends at exactly `0x0900_0000`, so the PL011 falls out of the window
+   with **`guest.dts` completely unchanged**.
+3. **`hv-metal/src/vpl011.rs`** — a PL011 register file in EL2, transmit bytes relayed to the real
+   UART. `unsafe`-free (it hands the caller a byte rather than touching MMIO). The AMBA bus probe
+   binds against its identification registers: the guest reports
+   `9000000.pl011: ttyAMA0 at MMIO 0x9000000 … is a PL011 rev1`.
+
+**Two facts the COMPILER now checks**, because a boot marker can only witness what a boot exercises:
+the emulated PL011 sits at the machine's real PL011 address, and **the pass-through window does not
+cover it**. Restoring the 32 MiB window is a build error, not a silent return to pass-through.
+
+**The witness, and why the existing ten markers could not be it.** Every §5f marker is a statement
+about the kernel, and the kernel prints the same bytes whether its UART is emulated or passed
+through. **Measured: with the 32 MiB window restored (and the compile-time assertion defeated), ten
+of the twelve markers stayed green.** So the device model produces its own: it watches its `DR`
+stream for userspace's `BALEEN-STEP0-OK` and reports at `SYSTEM_OFF`. That claim is deliberately
+**ingress** — a probe that deleted the relay to the real UART left it green while seven kernel
+markers went red, so the wording was corrected to say what the mechanism checks. The egress half is
+those seven, which the kernel cannot print unless the emulator relays them.
+
+**Probed load-bearing: six mutations, six red.** The 32 MiB window (a *compile* error; with the
+assertion defeated, three assertions red including the new forbidden `vpl011 FAIL` reporting
+`0 register traps`) · removing the `EC=0x24` arm (nine red, `LINUX GUEST TRAP` fires) · dropping the
+relay to the real UART (seven red) · skipping the `ELR_EL2` advance (the guest re-executes the
+faulting store forever; the boot times out) · using `FAR_EL2` as the fault IPA instead of
+`HPFAR_EL2` (timeout) · writing the load result into the wrong guest register (timeout).
+
+**The address arithmetic is not the synthetic path's, and probe 5 is why.** `guest.rs` takes the whole
+faulting address from `FAR_EL2`, sound *there* because the synthetic guests run stage-1 off. A real
+kernel enables its MMU within milliseconds, after which `FAR_EL2` holds a guest **virtual** address —
+the probe-2 trap report shows `FAR=0xffffffffff5fd018`. The IPA comes from `HPFAR_EL2` (`IPA[47:12]`)
+joined with `FAR_EL2[11:0]` for the in-page register offset, which a 4 KiB granule leaves untranslated.
+
+**Behaviour, measured.** The kernel's 200-line boot log is line-for-line identical to a `main`
+worktree's; the only changes are the window marker (32 → 16 MiB) and the new witness line. 30 621
+register traps, 11 436 bytes relayed, and the local gate goes from ~1 s to ~2 s.
+
+**Declared residue, not hidden.** There is **no receive**: `FR.RXFE` is permanently set, because
+delivering a received byte means delivering an *interrupt* and this rung keeps `IMO=0`. The guest is
+non-interactive (its `/init` prints markers and powers off), so neither the demo nor the gate needs
+it, but a human typing at `cargo xtask qemu-linux` will not be heard until **③-a2** (`IMO=1` + vGIC
+list-register injection, reusing Arcs 7a–8b/III-3). **③-b** — the second RAM window, the second
+guest, and each faulting on the peer's memory — is where the thesis content is; ③-a exists to make
+③-b a one-variable change.
 
 ## Scope and honesty
 

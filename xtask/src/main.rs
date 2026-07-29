@@ -276,6 +276,14 @@ fn qemu_linux(check: bool) -> bool {
 /// * **`Run /init as init process` + `BALEEN-STEP0-OK` + `baleen-guest-ram: …`** — the kernel
 ///   unpacked OUR initramfs from `0x4c00_0000` and reached userspace, which then reports the RAM
 ///   window from INSIDE the guest (`/proc/iomem`) — the guest-side half of the memory contract.
+/// * **`vpl011 OK: the guest's console is EMULATED …`** — ③-a1's own witness, and the only one here
+///   that can tell an EMULATED PL011 from a passed-through one. Every marker above it is a statement
+///   about the kernel, and the kernel prints the same bytes either way: **measured — with the
+///   pre-③ 32 MiB pass-through window restored, ten of the twelve markers below stayed green.** This
+///   one is printed by `hv-metal`'s own device model, and only if the userspace marker's bytes
+///   arrived at its `DR` register — so widening the window back over `0x0900_0000` fails it. It is
+///   deliberately an INGRESS claim; the egress half is the nine markers above, which the kernel
+///   cannot print unless the emulator relays its bytes to the real UART.
 /// * **`linux guest issued PSCI SYSTEM_OFF …`** — the whole round trip, and the reason the boot
 ///   terminates rather than parking: busybox `poweroff -f` -> the kernel's PSCI -> `HVC` -> EL2.
 const LINUX_MARKERS: &[&str] = &[
@@ -288,7 +296,7 @@ const LINUX_MARKERS: &[&str] = &[
     "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest \
      (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x80000000)",
     "baleen: linux model built — 448 super-span leaves (896 MiB of guest RAM) across 56 L2-pinned tables",
-    "448 super-span 2 MiB block(s) emitted and decoded; device window 32 MiB",
+    "448 super-span 2 MiB block(s) emitted and decoded; device window 16 MiB",
     // The kernel, behind the proven emitter.
     "Linux version 6.18.",
     "Machine model: baleen-metal-guest",
@@ -298,6 +306,9 @@ const LINUX_MARKERS: &[&str] = &[
     // Userspace, out of our initramfs.
     "########## BALEEN-STEP0-OK ##########",
     "baleen-guest-ram: 48000000-7fffffff:SystemRAM",
+    // ③-a1: the console the ten markers above travelled over is EMULATED.
+    "baleen: vpl011 OK: the guest's console is EMULATED — userspace's 'BALEEN-STEP0-OK' was \
+     written to the emulated PL011's DR register in EL2",
     // The round trip home.
     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
 ];
@@ -308,10 +319,15 @@ const LINUX_MARKERS: &[&str] = &[
 /// exception that is not an `HVC` — i.e. for every Stage-2 abort. A mis-emitted descriptor, a missing
 /// device-window mapping, or a permission bit the kernel needs and does not get all land here. It is
 /// what makes this job an assertion about the EMITTER and not merely about Linux.
+///
+/// `baleen: vpl011 FAIL` is the negative half of ③-a1's witness: the device model prints it, with
+/// its counters, whenever the boot ended without the guest's console having gone through it. A
+/// missing marker and a printed failure are different failures, and both are worth naming.
 const LINUX_FORBIDDEN: &[&str] = &[
     "baleen: LINUX GUEST TRAP",
     "Kernel panic",
     "baleen: linux model setup",
+    "baleen: vpl011 FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
