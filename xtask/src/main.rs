@@ -49,6 +49,7 @@ fn main() {
         "qemu-linux" => qemu_linux(false),
         "qemu-linux-test" => qemu_linux(true),
         "metal-lint" => metal_lint(),
+        "doc-markers" => doc_markers(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run(
@@ -64,22 +65,29 @@ fn main() {
                 )
                 && run("cargo", &["test", "--workspace"])
                 && doc()
+                && doc_markers()
         }
         other => {
             if !other.is_empty() {
                 eprintln!("xtask: unknown task {other:?}\n");
             }
+            // The config COUNT is interpolated from `METAL_LINT_CONFIGS`, not typed: this line
+            // said "all four" while `metal_lint` ran five, because ⑭b added `real-linux,selftest`
+            // and the prose stayed. A number a human retypes is a claim that drifts; a number the
+            // compiler derives from the list it describes cannot.
             eprintln!(
                 "usage: cargo xtask <task>\n  \
                  test   run the workspace test suite\n  \
                  check  type-check the workspace\n  \
                  doc    build docs, denying broken links\n  \
-                 ci     fmt --check, clippy -D warnings, test, then doc\n  \
+                 ci     fmt --check, clippy -D warnings, test, doc, then doc-markers\n  \
+                 doc-markers  assert every boot marker a doc QUOTES is still one the gates check\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
-                 metal-lint fmt --check + clippy -D warnings for hv-metal (all four feature configs)"
+                 metal-lint fmt --check + clippy -D warnings for hv-metal ({} feature configs)",
+                METAL_LINT_CONFIGS.len()
             );
             exit(2);
         }
@@ -256,13 +264,15 @@ fn qemu_linux(check: bool) -> bool {
 ///   `Hypervisor::dispatch`, halting on the first `Err`. The three numbers are the memory contract:
 ///   shrink `LINUX_RAM_END`, change the granule, or change the span the emitter picks, and they move.
 /// * **`selftest: Stage-2 encoding verified …`** — `verify_encoding` re-decodes the descriptors the
-///   proven emitter actually wrote for THIS guest (448 blocks + the 32 MiB device window) and asserts
+///   proven emitter actually wrote for THIS guest (448 blocks + the 16 MiB device window) and asserts
 ///   every other slot is dead. The one real guest's emission is the one that would otherwise never be
 ///   checked at runtime (M5 Arc 6b).
 /// * **`Machine model: baleen-metal-guest`** — a string that exists only in `hv-metal/linux/
 ///   guest.dts`, echoed by the kernel. The kernel can only print it by READING the DTB at
-///   `0x4b00_0000` through the emitted Stage-2 map AND driving the PL011 in the pass-through device
-///   window. Un-forgeable in the same way `ro=0x5eed` is on the synthetic path.
+///   `0x4b00_0000` through the emitted Stage-2 map AND driving the PL011 — which since ③-a1 is
+///   **emulated in EL2**, not in the pass-through window, so the bytes additionally have to survive
+///   `vpl011`'s relay to the real UART. Un-forgeable in the same way `ro=0x5eed` is on the synthetic
+///   path.
 /// * **`node   0: [mem 0x0000000048000000-0x000000007fffffff]`** — THE MEMORY CONTRACT, in one
 ///   string. It is the kernel reporting the window it got from our DTB, and it must equal
 ///   `LINUX_RAM_BASE..LINUX_RAM_END` in `hv-metal/src/linux.rs` (what the emitter maps) and the
@@ -471,6 +481,35 @@ fn metal_build_linux() -> bool {
 ///
 /// Note: no `--all-targets` — a `#![no_std] #![no_main]` bare-metal bin has no buildable `test`
 /// target (the test harness needs `std`), so `--all-targets` would fail to compile it.
+/// Every `hv-metal` feature configuration `metal-lint` covers — the ONE place the set is written
+/// down, so anything that wants to state its size (the usage text) derives the number instead of
+/// repeating it.
+///
+/// Every feature config that has code of its own is here, or that config's code is linted by
+/// nobody. `smmu` and `real-linux` were both unlinted until the SMMU arc put a stream table, two
+/// queues and a five-phase witness behind `smmu` — a feature gate is exactly where a dead-code or
+/// clippy finding hides, since the default build cannot see it.
+///
+/// ⑭b — THE INVARIANT THIS LIST HAS TO HOLD: **every configuration that is BUILT AND BOOTED is
+/// linted.** It did not. The list carried `real-linux`, which nothing ships, while `qemu-linux`/
+/// `qemu-linux-test` build `real-linux,selftest` — so the binary the REQUIRED `real-linux boot
+/// (QEMU)` job boots was linted by nothing at all. Probed: a constant behind
+/// `#[cfg(all(feature = "real-linux", feature = "selftest"))]` left `metal-lint` green while the
+/// shipped build warned. That is ⑭'s own finding one level up — ⑭ asked "which config lints
+/// `linux.rs`?" and fixed it, but not "does the linted set EQUAL the shipped set?".
+///
+/// Where the shipped set is defined, so a new config has an obvious home here:
+///   default · selftest · smmu   -> `hv-metal/boot-test.sh`'s `boot_and_check` invocations
+///   real-linux,selftest         -> `metal_build_linux` below
+/// `real-linux` alone is kept too: it is seconds, and it covers the non-selftest path.
+const METAL_LINT_CONFIGS: &[&[&str]] = &[
+    &[],
+    &["--features", "selftest"],
+    &["--features", "smmu"],
+    &["--features", "real-linux"],
+    &["--features", "real-linux,selftest"],
+];
+
 fn metal_lint() -> bool {
     run(
         "cargo",
@@ -481,27 +520,7 @@ fn metal_lint() -> bool {
             "--",
             "--check",
         ],
-    ) && metal_clippy(&[])
-        && metal_clippy(&["--features", "selftest"])
-        // Every feature config that has code of its own, or that config's code is linted by nobody.
-        // `smmu` and `real-linux` were both unlinted until the SMMU arc put a stream table, two
-        // queues and a five-phase witness behind `smmu` — a feature gate is exactly where a
-        // dead-code or clippy finding hides, since the default build cannot see it.
-        && metal_clippy(&["--features", "smmu"])
-        // ⑭b — THE INVARIANT THIS LIST HAS TO HOLD: **every configuration that is BUILT AND BOOTED
-        // is linted.** It did not. This list carried `real-linux`, which nothing ships, while
-        // `qemu-linux`/`qemu-linux-test` build `real-linux,selftest` — so the binary the REQUIRED
-        // `real-linux boot (QEMU)` job boots was linted by nothing at all. Probed: a constant behind
-        // `#[cfg(all(feature = "real-linux", feature = "selftest"))]` left `metal-lint` green while
-        // the shipped build warned. That is ⑭'s own finding one level up — ⑭ asked "which config
-        // lints `linux.rs`?" and fixed it, but not "does the linted set EQUAL the shipped set?".
-        //
-        // Where the shipped set is defined, so a new config has an obvious home here:
-        //   default · selftest · smmu   -> `hv-metal/boot-test.sh`'s `boot_and_check` invocations
-        //   real-linux,selftest         -> `metal_build_linux` below
-        // `real-linux` alone is kept too: it is seconds, and it covers the non-selftest path.
-        && metal_clippy(&["--features", "real-linux"])
-        && metal_clippy(&["--features", "real-linux,selftest"])
+    ) && METAL_LINT_CONFIGS.iter().all(|cfg| metal_clippy(cfg))
 }
 
 /// Run clippy over `hv-metal` for the bare-metal target with `extra` cargo args, denying warnings.
@@ -541,6 +560,235 @@ fn doc() -> bool {
         &["doc", "--workspace", "--no-deps"],
         &[("RUSTDOCFLAGS", "-D warnings")],
     )
+}
+
+// ─── The doc-marker drift check ─────────────────────────────────────────────────────────────────
+//
+// WHY THIS EXISTS. A doc that QUOTES a boot marker is asserting that the build still emits that
+// exact string — and that is a claim a machine can check, so it should not be left to a reader.
+// It had already gone false: `docs/ARC6B-LINUX-ON-THE-PROVEN-EMITTER.md` quoted `… device window
+// 32 MiB` as its `verify_encoding` evidence, and ③-a1 shrank the window to 16 MiB. That is the ⑭
+// class exactly (a comment claiming something the code stopped doing), one scope out from code.
+//
+// THE RULE, which is TOTAL over the gate list and needs no annotation in the docs. For every gate
+// marker, wherever a doc's backtick-quoted span contains that marker's first [`DOC_MARKER_STEM`]
+// characters, the span must go on matching it until one of three things happens:
+//   * the marker is exhausted        — the doc quotes it in full;
+//   * the quoted span ends           — a legal truncation (`\`448 super-span 2 MiB block(s)\``);
+//   * an explicit elision appears    — `…` or `...`, which makes the abridgement visible.
+// Anything else is the doc asserting a string the gates no longer contain, and fails.
+//
+// WHY IT DOES NOT FALSE-ALARM. Nothing here guesses which prose "looks like a marker" — the check
+// is driven entirely FROM the marker list, and a 24-character stem of a boot marker does not occur
+// in prose by accident. The one real hazard is sibling markers that differ only in an index
+// (`Mfn 4`/`Mfn 5`, `tenant 0`/`tenant 1`): a doc quoting one would diverge from the other. So
+// candidates are grouped by the OFFSET their stem matched, and a divergence is drift only when
+// EVERY candidate at that offset diverges. Measured on the tree that introduced this check: 114
+// markers × 31 docs, 2 findings, 0 false positives.
+//
+// WHAT IT DOES NOT COVER, stated rather than implied: a doc that PARAGRAPHS a marker instead of
+// quoting it is invisible here. `ARC6B`'s "32 MiB, GICv3 + PL011" table row was found by reading,
+// not by this check, and a future one would be too. This closes the quoted half.
+
+/// How much of a marker must appear verbatim in a doc before the doc counts as quoting it.
+/// Long enough that prose cannot collide with it; short enough that most markers are covered.
+const DOC_MARKER_STEM: usize = 24;
+
+/// The other half of the gate corpus: `boot-test.sh`'s marker arguments. `LINUX_MARKERS` and
+/// `LINUX_FORBIDDEN` need no parsing — they are consts in this binary — but the synthetic gate's
+/// markers live in the shell script, so they are read from it.
+const BOOT_TEST: &str = "hv-metal/boot-test.sh";
+
+/// Assert that every boot marker a doc QUOTES is still a marker the gates check. See the block
+/// comment above for the rule and its limits.
+fn doc_markers() -> bool {
+    eprintln!("$ xtask doc-markers");
+
+    // The gate corpus.
+    let mut gate: Vec<String> = LINUX_MARKERS
+        .iter()
+        .chain(LINUX_FORBIDDEN.iter())
+        .map(|m| collapse(m))
+        .collect();
+    let script = match std::fs::read_to_string(BOOT_TEST) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("doc-markers: cannot read {BOOT_TEST}: {e}");
+            return false;
+        }
+    };
+    for line in script.lines() {
+        if let Some(s) = shell_string(line) {
+            gate.push(collapse(&s));
+        }
+    }
+    gate.sort();
+    gate.dedup();
+
+    // The docs.
+    let mut docs = vec![std::path::PathBuf::from("README.md")];
+    match std::fs::read_dir("docs") {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    docs.push(path);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("doc-markers: cannot read docs/: {e}");
+            return false;
+        }
+    }
+    docs.sort();
+
+    let (mut quoted, mut findings) = (0usize, 0usize);
+    for path in &docs {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("doc-markers: cannot read {}: {e}", path.display());
+                return false;
+            }
+        };
+        for (line, span) in quoted_spans(&text) {
+            // Candidates grouped by the offset their stem matched (see the block comment).
+            let mut by_offset: Vec<(usize, bool, &str, usize)> = Vec::new();
+            for marker in &gate {
+                let stem: String = marker.chars().take(DOC_MARKER_STEM).collect();
+                let Some(at) = span.find(&stem) else { continue };
+                let rest = &span[at..];
+                let matched = rest
+                    .chars()
+                    .zip(marker.chars())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let tail: String = rest.chars().skip(matched).collect();
+                let tail = tail.trim_start();
+                let ok = matched == marker.chars().count()   // quoted in full
+                    || matched == rest.chars().count()       // truncated at the span's end
+                    || tail.starts_with('…')
+                    || tail.starts_with("...");
+                by_offset.push((at, ok, marker.as_str(), matched));
+            }
+            let offsets: Vec<usize> = {
+                let mut v: Vec<usize> = by_offset.iter().map(|c| c.0).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            for at in offsets {
+                let here: Vec<_> = by_offset.iter().filter(|c| c.0 == at).collect();
+                if here.iter().any(|c| c.1) {
+                    quoted += 1;
+                    continue;
+                }
+                // Report the closest candidate — the marker this quote was plainly derived from.
+                let worst = here.iter().max_by_key(|c| c.3).expect("non-empty");
+                let doc_has: String = span[at..].chars().take(120).collect();
+                eprintln!(
+                    "doc-markers: FAIL {}:{line} — quotes a marker the gates no longer contain\n  \
+                     gate has: {}\n  doc has : {}\n  (diverges after {} characters)",
+                    path.display(),
+                    worst.2,
+                    doc_has,
+                    worst.3
+                );
+                findings += 1;
+            }
+        }
+    }
+
+    if findings == 0 {
+        eprintln!(
+            "doc-markers: OK — {} gate markers, {} docs, {quoted} quoted marker(s) still exact",
+            gate.len(),
+            docs.len()
+        );
+        true
+    } else {
+        eprintln!(
+            "doc-markers: {findings} doc(s) quote a boot marker the build no longer emits. \
+             Update the doc to the marker's current text, or make the abridgement explicit with `…`."
+        );
+        false
+    }
+}
+
+/// Collapse every run of whitespace to a single space, so a marker that wraps across source lines
+/// (a `\`-continued Rust literal, a `>`-prefixed blockquote) compares equal to its printed form.
+fn collapse(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The double-quoted string a `boot-test.sh` marker line consists of, if this line is one.
+/// Markers are one per line and the line starts with the quote, which is what makes this reliable
+/// without a shell parser.
+fn shell_string(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?),
+            '"' => return Some(out),
+            _ => out.push(c),
+        }
+    }
+    None
+}
+
+/// Every backtick-quoted span in a markdown file, with the line its paragraph starts on.
+///
+/// Flattened per PARAGRAPH rather than per line: these docs wrap quoted markers across lines and
+/// behind `>` blockquote prefixes, and a per-line scan silently misses them — which is how the
+/// `device window 32 MiB` claim survived a first, per-line pass. A markdown code span cannot cross
+/// a blank line, so paragraphs are the widest unit in which backticks still pair correctly.
+/// Fenced code blocks are skipped: their backticks would offset the pairing of everything after.
+fn quoted_spans(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut para: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut fenced = false;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.starts_with("```") {
+            fenced = !fenced;
+            flush_paragraph(&para, start, &mut out);
+            para.clear();
+        } else if fenced {
+            continue;
+        } else if line.is_empty() {
+            flush_paragraph(&para, start, &mut out);
+            para.clear();
+        } else {
+            if para.is_empty() {
+                start = i + 1;
+            }
+            para.push(raw);
+        }
+    }
+    flush_paragraph(&para, start, &mut out);
+    out
+}
+
+/// Join one paragraph into a single line (dropping blockquote prefixes) and emit its backtick
+/// spans — the odd-numbered pieces of a split on the backtick.
+fn flush_paragraph(para: &[&str], start: usize, out: &mut Vec<(usize, String)>) {
+    if para.is_empty() {
+        return;
+    }
+    let joined = para
+        .iter()
+        .map(|l| l.trim_start().trim_start_matches('>').trim_start())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (n, piece) in joined.split('`').enumerate() {
+        if n % 2 == 1 {
+            out.push((start, collapse(piece)));
+        }
+    }
 }
 
 /// Run a command inheriting stdio, returning whether it succeeded.
