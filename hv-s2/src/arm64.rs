@@ -1586,8 +1586,30 @@ pub fn decode_vtcr_el2(v: u64) -> Option<(Stage2Regime, VmidBits)> {
 mod tests {
     use super::*;
 
-    /// The metal's layout, so the goldens below are the values that actually run.
-    fn layout() -> Layout {
+    /// A layout that populates **every** emitted region at once — guest image, base-span data,
+    /// super-span data, and the device pass-through window — so the goldens below cover every
+    /// branch of `encode` in one fixture.
+    ///
+    /// **It deliberately mirrors NO shipped configuration, and the comment that used to claim it
+    /// was "the metal's layout, so the goldens are the values that actually run" was false.** The
+    /// two configurations that ship are disjoint from it and from each other
+    /// (`hv-metal::stage2::windows()`): the **synthetic** build emits `device_len: 0` — no device
+    /// window at all — and the **real-Linux** build emits `0x0800_0000 .. 0x0900_0000` (16 MiB,
+    /// the GIC alone since ③-a1) over a completely different RAM window (`sup_ipa_base` at
+    /// `0x4800_0000`, 448 super frames, not `0xC000_0000`/8). A fixture that exercises paths no
+    /// single shipped config reaches is the RIGHT thing for a golden test — claiming it is the
+    /// deployed one is not, and it is the shape design-lesson #92b names: a correspondence asserted
+    /// in prose that nothing checks, which then drifts.
+    ///
+    /// **Where the shipped values ARE bound:** `hv-s2` cannot depend on `hv-metal` (it is
+    /// workspace-excluded and does not link for the host), so this seam cannot be made
+    /// compile-time — the same cross-crate seam ⑭ met with `xtask`, bound the same way, at RUN
+    /// time. `hv-metal`'s `verify_encoding` re-decodes the descriptors the emitter actually wrote
+    /// and prints the window it found; `xtask::LINUX_MARKERS` asserts that string
+    /// (`device window 16 MiB`) in the required `real-linux boot (QEMU)` job. The theorems
+    /// themselves quantify over `Layout` (`hv-verify`'s symbolic-layout harnesses), so nothing here
+    /// rests on the fixture's particular numbers.
+    fn every_region_layout() -> Layout {
         Layout {
             l1_pa: 0x4010_0000,
             l2_code_pa: 0x4010_1000,
@@ -1695,7 +1717,7 @@ mod tests {
 
     #[test]
     fn skeleton_indices_and_descriptors() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         encode(
             &[None; 8],
@@ -1724,7 +1746,7 @@ mod tests {
 
     #[test]
     fn leaves_encode_at_their_permission_and_pa() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
@@ -1754,7 +1776,7 @@ mod tests {
     /// Re-encoding into the SAME tables for a different tenant leaves no stale leaf.
     #[test]
     fn re_encode_clears_stale_leaves() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut first = [None; 8];
         first[2] = Some(Perm::Rw);
@@ -1797,7 +1819,7 @@ mod tests {
     /// restatement. A change to any attribute bit shows up here as a diff, not a silent re-derivation.
     #[test]
     fn golden_descriptor_words_are_literal() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
@@ -1900,7 +1922,7 @@ mod tests {
 
     /// Encode a representative map and hand back the tables, for the verifier tests below.
     fn encoded() -> Fixture {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
@@ -1944,7 +1966,7 @@ mod tests {
     /// descriptors, mapping 1/512th of what the model authorized.
     #[test]
     fn super_leaf_encodes_as_a_block_and_verifies() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut sup = [None; 8];
         sup[1] = Some(Perm::Rw);
@@ -1991,7 +2013,7 @@ mod tests {
     /// round-trips. Executability follows the model's leaf permission, not a config flag.
     #[test]
     fn rx_leaves_encode_executable_and_verify() {
-        let l = layout(); // sup_wx_exempt: false — Rx executability is model-driven, not the exemption
+        let l = every_region_layout(); // sup_wx_exempt: false — Rx executability is model-driven, not the exemption
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[4] = Some(Perm::Rx); // a base read-execute leaf
@@ -2039,7 +2061,7 @@ mod tests {
     /// the same leaf is execute-never. Base leaves are never exempt.
     #[test]
     fn wx_exempt_makes_only_writable_super_leaves_executable() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.sup_wx_exempt = true;
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
@@ -2105,7 +2127,7 @@ mod tests {
     /// model's execute bit strictly, with no exemption.
     #[test]
     fn verify_catches_a_base_data_leaf_that_gained_execute() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut leaves = [None; 8];
         leaves[2] = Some(Perm::Rw);
@@ -2142,7 +2164,7 @@ mod tests {
     /// standard the `L3` leaves are held to, so the new table is not a hole in `verify_encoding`.
     #[test]
     fn verify_catches_a_tampered_or_spurious_super_block() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         let mut sup = [None; 8];
         sup[1] = Some(Perm::Ro);
@@ -2199,14 +2221,14 @@ mod tests {
     /// unrepresentable.
     #[test]
     fn super_window_must_not_collide_or_overlap() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.sup_ipa_base = l.data_ipa_base; // same L1 entry as the data region
         assert!(matches!(
             l.validate(),
             Err(EncodingViolation::RegionsCollide { .. })
         ));
 
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.sup_pa_base = l.data_pa_base; // distinct L1 entry, but the PA windows alias
         assert!(matches!(
             l.validate(),
@@ -2219,7 +2241,7 @@ mod tests {
     /// re-deriving the word we just wrote.
     #[test]
     fn device_region_encodes_and_verifies() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         encode(
             &[None; 8],
@@ -2234,7 +2256,9 @@ mod tests {
                 l2_dev: &mut l2dv,
             },
         );
-        // 32 MiB of window = 16 blocks, starting at slot (0x0800_0000 >> 21) & 0x1ff = 64.
+        // The FIXTURE's 32 MiB window = 16 blocks, starting at slot (0x0800_0000 >> 21) & 0x1ff =
+        // 64. (Not a deployed size: the synthetic build has no device window and the real-Linux
+        // build's is 16 MiB — see `every_region_layout`.)
         let first = ((l.device_base >> 21) & 0x1ff) as usize;
         assert_eq!(
             decode_device_block(l2dv[first]),
@@ -2267,7 +2291,7 @@ mod tests {
     /// speculatively accessible, or an instruction source.
     #[test]
     fn verify_catches_a_normal_or_executable_device_block() {
-        let l = layout();
+        let l = every_region_layout();
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         encode(
             &[None; 8],
@@ -2315,7 +2339,7 @@ mod tests {
     /// a checked statement about the emitted tables, not a silent skip.
     #[test]
     fn absent_guest_image_leaves_its_tables_dead() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.guest_image_pa = None;
         let (mut l1, mut l2c, mut l2d, mut l3, mut l2s, mut l2dv) = tables();
         encode(
@@ -2364,14 +2388,14 @@ mod tests {
     /// and a length that is a whole number of blocks (else the emit loop under-maps the tail).
     #[test]
     fn device_window_must_be_aligned_and_disjoint() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.device_len = BLOCK_SIZE + 1;
         assert!(matches!(
             l.validate(),
             Err(EncodingViolation::DeviceWindowUnaligned { .. })
         ));
 
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.device_base = l.sup_ipa_base; // same L1 entry as the super window
         assert!(matches!(
             l.validate(),
@@ -2517,10 +2541,16 @@ mod tests {
     /// The layout preconditions `encode` silently assumed are now checked.
     #[test]
     fn layout_validate_catches_collisions_and_overlap() {
-        assert_eq!(layout().validate(), Ok(()), "the real layout is sound");
+        assert_eq!(
+            every_region_layout().validate(),
+            Ok(()),
+            "the fixture must be a VALID layout, or every negative case below is vacuous — \
+             note this is the fixture's soundness, not the deployed layout's, which \
+             `hv-metal`'s boot-time `verify_encoding` is what checks"
+        );
 
         // Data region moved into the SAME 1 GiB as the guest image -> one L1 entry for both.
-        let mut collide = layout();
+        let mut collide = every_region_layout();
         collide.data_ipa_base = 0x4060_0000;
         assert!(matches!(
             collide.validate(),
@@ -2528,7 +2558,7 @@ mod tests {
         ));
 
         // Data frames backed INSIDE the 2 MiB image block -> private data aliases the shared image.
-        let mut overlap = layout();
+        let mut overlap = every_region_layout();
         overlap.data_pa_base = overlap.guest_image_pa.unwrap() + 0x1000;
         assert!(matches!(
             overlap.validate(),
@@ -2538,7 +2568,7 @@ mod tests {
 
     #[test]
     fn frame_addresses_are_linear() {
-        let l = layout();
+        let l = every_region_layout();
         assert_eq!(frame_pa(&l, 0), 0x4060_0000);
         assert_eq!(frame_pa(&l, 3), 0x4060_3000);
         assert_eq!(frame_ipa(&l, 0), 0x8000_0000);
@@ -2597,7 +2627,7 @@ mod tests {
     /// frame 0's address lands on frame 1's bytes, at frame 1's permission, with no fault anywhere.
     #[test]
     fn an_unaligned_data_window_mismaps_every_frame() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.data_ipa_base = 0x8000_1000; // one page off the block boundary
         let mut t = tables();
         // Frame 0 read-only, frame 1 read/write: the mis-map is a *permission* escalation too.
@@ -2628,7 +2658,7 @@ mod tests {
     /// which wraps: the frames past the boundary land in the *low* slots of the same table.
     #[test]
     fn a_super_window_that_crosses_its_l1_entry_maps_an_unauthorized_address() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         // 2 MiB below a 1 GiB boundary, in the one `L1` entry no other region of this fixture
         // occupies (the image is at 1, the data window at 2, the device window at 0).
         l.sup_ipa_base = 0xFFE0_0000;
@@ -2658,7 +2688,7 @@ mod tests {
     /// arithmetic (`base + m * frame_size`) describe different mappings.
     #[test]
     fn a_granule_the_emitter_does_not_write_is_refused() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.frame_size = 0x4000; // 16 KiB
         assert!(matches!(
             l.validate(),
@@ -2671,13 +2701,13 @@ mod tests {
     /// `encode` never wrote — and agreeing with each other while they do it.
     #[test]
     fn a_table_base_no_register_can_name_is_refused() {
-        let mut l = layout();
+        let mut l = every_region_layout();
         l.l1_pa = 1 << 48;
         assert!(matches!(
             l.validate(),
             Err(EncodingViolation::TableUnnameable { table: "l1", .. })
         ));
-        let mut m = layout();
+        let mut m = every_region_layout();
         m.l3_data_pa += 8; // not page-aligned: the table descriptor's own mask drops it
         assert!(matches!(
             m.validate(),
@@ -2693,7 +2723,7 @@ mod tests {
     /// defect `the_walk_lands_where_the_windows_say` produced on its first run, pinned as a test.
     #[test]
     fn an_address_beyond_the_addressable_space_reaches_nothing() {
-        let l = layout();
+        let l = every_region_layout();
         let mut t = tables();
         let supers = [Some(Perm::Rw)];
         emit(&l, &mut t, &[], &supers);

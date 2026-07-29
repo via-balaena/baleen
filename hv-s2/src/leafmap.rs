@@ -293,9 +293,19 @@ mod tests {
     const DOM1: DomId = 1;
     const CAP: usize = 8;
 
-    /// A hypervisor sized like the metal's bring-up config.
+    /// A hypervisor sized exactly like the metal's **default** bring-up config
+    /// (`hv-metal::build_hypervisor`: 4 domains, 4 ports, 4 grants, 2 vCPUs, 2 pCPUs, 8 frames,
+    /// 1 device). The `real-linux` build differs only in frame count (it sizes `NUM_FRAMES` to its
+    /// 448 super frames plus their tables), which these leaf-map tests do not turn on.
+    ///
+    /// The device count was `0` here and `1` in the metal from rung 4a (#94) onward — a claim that
+    /// silently stopped being true, in the small. It is made true again rather than hedged: an
+    /// unassigned device slot changes nothing these tests observe, and a correspondence that is
+    /// real beats one that is described (⑭). Nothing enforces it across the crate boundary
+    /// (`hv-s2` cannot depend on the workspace-excluded `hv-metal`), so it is checked by reading —
+    /// which is the argument for keeping it short and exact.
     fn hv() -> Hypervisor {
-        Hypervisor::new(4, 4, 4, 2, 2, CAP, 0)
+        Hypervisor::new(4, 4, 4, 2, 2, CAP, 1)
     }
 
     fn ok(hv: &mut Hypervisor, dom: DomId, call: HvCall) {

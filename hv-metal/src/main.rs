@@ -48,6 +48,7 @@
 // discriminate (design-lesson #71); allowing the root says "this entry point is displaced", which is
 // the true statement.
 
+mod abort;
 mod blk;
 mod cell;
 mod dmawitness;
@@ -66,6 +67,8 @@ mod stage2;
 mod teardown;
 mod time;
 mod virtio;
+#[cfg(feature = "real-linux")]
+mod vpl011;
 
 use core::arch::global_asm;
 use core::fmt::Write;
@@ -111,7 +114,11 @@ _start:
 );
 
 /// Base of the PL011 UART on the QEMU `virt` machine.
-const UART0_BASE: usize = 0x0900_0000;
+///
+/// `pub(crate)` since ③-a1: the real-Linux guest's PL011 is **emulated** at this same address
+/// ([`vpl011`]), and that module compile-time-asserts the two agree — the guest is offered the
+/// device `guest.dts` already names, so the DTB needed no edit.
+pub(crate) const UART0_BASE: usize = 0x0900_0000;
 
 /// Construct a handle to the `virt` PL011.
 ///

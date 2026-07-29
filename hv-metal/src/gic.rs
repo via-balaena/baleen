@@ -315,10 +315,30 @@ pub(crate) fn write_lr(n: usize, v: u64) {
 // be initialized, plus the EL2 physical CPU interface enabled. QEMU `virt` GICv3 memory map:
 
 /// GICv3 distributor base (QEMU `virt`).
-const GICD_BASE: u64 = 0x0800_0000;
+///
+/// `pub(crate)`: since ③-a1 the real-Linux guest's Stage-2 pass-through window is **derived from
+/// the GIC region** rather than written out as its own pair of literals — the window exists to give
+/// the guest the interrupt controller, so the interrupt controller's own addresses are what should
+/// define it. `guest.dts`'s `intc@8000000` names the same base.
+pub(crate) const GICD_BASE: u64 = 0x0800_0000;
 /// GICv3 redistributor RD_base for CPU 0 (QEMU `virt`); the SGI/PPI frame is the next 64 KiB frame.
-const GICR_RD_BASE: u64 = 0x080A_0000;
+pub(crate) const GICR_RD_BASE: u64 = 0x080A_0000;
 const GICR_SGI_BASE: u64 = GICR_RD_BASE + 0x1_0000;
+
+/// Length of the whole GICv3 redistributor region (QEMU `virt`: 0xf60000, enough for every CPU's
+/// RD + SGI frame pair), matching the second `reg` entry of `guest.dts`'s `intc@8000000`.
+///
+/// `real-linux` only: it exists to size the Stage-2 pass-through window, and only that build maps
+/// one (the synthetic guests reach the GIC through EL2, never through their own Stage-2). Gated
+/// rather than allowed, so each configuration lints exactly what it compiles (⑭/⑭b).
+#[cfg(feature = "real-linux")]
+pub(crate) const GICR_LEN: u64 = 0x00f6_0000;
+
+/// Exclusive end of the GICv3 MMIO the guest is given — and, on QEMU `virt`, **exactly** the address
+/// the PL011 starts at. That coincidence is what let ③-a1 drop the UART out of the pass-through
+/// window without touching `guest.dts`: the window still ends where the GIC does.
+#[cfg(feature = "real-linux")]
+pub(crate) const GICR_END: u64 = GICR_RD_BASE + GICR_LEN;
 
 /// `GICD_CTLR` — `ARE_NS` (bit 4, affinity routing) + `EnableGrp1NS` (bit 1).
 const GICD_CTLR_ARE_GRP1: u32 = (1 << 4) | (1 << 1);

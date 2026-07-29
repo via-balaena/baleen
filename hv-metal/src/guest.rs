@@ -2749,11 +2749,12 @@ fn read_esr_hpfar() -> (u64, u64) {
     (esr, hpfar)
 }
 
-/// The faulting IPA from `HPFAR_EL2`: `FIPA` is `HPFAR_EL2[43:4]` holding `IPA[47:12]`, so the address
-/// is `(HPFAR_EL2 & mask) << 8` (bit 4 → bit 12). The in-page offset (`IPA[11:0]`) is not in `HPFAR`;
-/// 4 KiB-aligned is all the per-frame test needs. (Blind-auditor-confirmed; see the audit.)
+/// The page-aligned faulting IPA from `HPFAR_EL2` — 4 KiB-aligned is all the per-frame test needs.
+/// The field decode itself is [`crate::abort::page_ipa`], shared with the real-Linux handler, which
+/// additionally recovers the in-page offset (which `HPFAR` does not carry) for register-level
+/// emulation. (Blind-auditor-confirmed; see the audit.)
 fn faulting_ipa(hpfar: u64) -> u64 {
-    (hpfar & 0x0000_0fff_ffff_fff0) << 8
+    crate::abort::page_ipa(hpfar)
 }
 
 /// Read `(ESR_EL2, FAR_EL2)` for a Stage-2 data abort (M5 Arc 3, MMIO). `FAR_EL2` holds the faulting
@@ -2778,7 +2779,11 @@ fn read_esr_far() -> (u64, u64) {
 /// Advance `ELR_EL2` past the faulting instruction (a fixed 4-byte A64 instruction), so `eret` resumes
 /// the guest at the *next* instruction rather than re-executing the faulting access. Unlike an `HVC`
 /// (whose preferred return is already the next instruction), a data abort returns to the faulting one.
-fn advance_elr_past_fault() {
+///
+/// `pub(crate)` since ③-a1: the real-Linux handler resumes past an emulated PL011 access the same
+/// way. One derivation — "past a fault" is a fact about A64 instruction width, and two copies of it
+/// is the shape ⑭ spent a rung removing.
+pub(crate) fn advance_elr_past_fault() {
     // SAFETY: `ELR_EL2` is RW at EL2; adding one instruction width is the architected resume-past-abort
     // for a synchronous exception we choose to skip. No memory effect.
     unsafe {
@@ -2835,7 +2840,7 @@ extern "C" fn handle_guest_sync(frame: *mut GuestFrame) {
 
     match esr_el2_ec() {
         0x16 => service_hvc(frame, &mut uart), // returns to resume, or diverges on the final report
-        0x24 => handle_data_abort(frame, &mut uart), // MMIO trap-and-emulate, or an isolation probe
+        crate::abort::EC_DATA_ABORT => handle_data_abort(frame, &mut uart), // MMIO emulate / probe
         ec => {
             let _ = writeln!(
                 uart,
@@ -2963,9 +2968,12 @@ fn handle_data_abort(frame: &mut GuestFrame, uart: &mut Pl011) {
 /// result back into the guest's saved register frame, and advance `ELR` past the faulting instruction.
 /// A `QueueNotify` write triggers the backend's queue processing (wired in a later step).
 fn handle_mmio(frame: &mut GuestFrame, esr: u64, far: u64, uart: &mut Pl011) {
-    let iss = esr & 0x01ff_ffff; // ESR_EL2.ISS[24:0]
-    let isv = (iss >> 24) & 1; // instruction syndrome valid
-    if isv == 0 {
+    // The field decode is `crate::abort`'s, shared with the real-Linux guest's emulated PL011
+    // (③-a1) — the bit positions of `ESR_EL2.ISS` are one architectural fact and belong in one
+    // place. The *policy* below stays here: this device file is 32-bit only, which the PL011's is
+    // not, so each emulator states its own acceptable accesses.
+    let a = crate::abort::DataAbort::decode(esr);
+    if !a.isv {
         // No decoded syndrome (e.g. a non-GP-register or misaligned access) — we cannot emulate it.
         let _ = writeln!(
             uart,
@@ -2977,23 +2985,23 @@ fn handle_mmio(frame: &mut GuestFrame, esr: u64, far: u64, uart: &mut Pl011) {
     // than emulate at a garbage address. `SAS` (ISS[23:22]) — the virtio-mmio register file is 32-bit;
     // a byte/half/dword access would be mis-emulated at word width, so refuse it (a real Linux driver
     // reads the registers word-wide, but the config space may differ — the Arc-5 capstone widens this).
-    if (iss >> 10) & 1 != 0 {
+    if a.fnv {
         let _ = writeln!(
             uart,
             "baleen: virtio-mmio abort with FnV (FAR invalid); halting"
         );
         crate::park();
     }
-    let sas = (iss >> 22) & 0b11;
-    if sas != 0b10 {
+    if a.access_bytes() != 4 {
         let _ = writeln!(
             uart,
-            "baleen: virtio-mmio abort at 0x{far:016x} with non-word access size (SAS={sas}); halting"
+            "baleen: virtio-mmio abort at 0x{far:016x} with non-word access size ({} bytes); halting",
+            a.access_bytes()
         );
         crate::park();
     }
-    let srt = ((iss >> 16) & 0x1f) as usize; // target GP register (31 = XZR/discard)
-    let wnr = (iss >> 6) & 1 != 0; // write-not-read
+    let srt = a.srt; // target GP register (31 = XZR/discard)
+    let wnr = a.wnr; // write-not-read
     let offset = far - crate::virtio::VIRTIO_MMIO_BASE;
 
     // Route to whichever virtio device the current phase installed at this window (console in Arc 3,
@@ -3007,8 +3015,10 @@ fn handle_mmio(frame: &mut GuestFrame, esr: u64, far: u64, uart: &mut Pl011) {
         crate::park();
     }
     if wnr {
-        // A store: the value is the guest's source register (XZR reads as 0).
-        let value = if srt < 31 { frame.x[srt] } else { 0 } as u32;
+        // A store: the value is the guest's source register (XZR reads as 0), narrowed to the bits
+        // the access actually carries — derived from the syndrome rather than a hardcoded `as u32`,
+        // which is the same value here only because the width check above already passed.
+        let value = (if srt < 31 { frame.x[srt] } else { 0 } & a.value_mask()) as u32;
         let notify = match active {
             ActiveVirtio::Console => virtio_dev().mmio_write(offset, value),
             ActiveVirtio::Blk => blk_dev().mmio_write(offset, value),

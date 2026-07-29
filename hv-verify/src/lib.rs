@@ -2662,10 +2662,21 @@ mod device_path_composition {
                 l3_data_pa: self.base + 0x3000,
                 l2_sup_pa: self.base + 0x4000,
                 l2_dev_pa: self.base + 0x5000,
-                // The metal's synthetic windows. Every domain is emitted at the SAME guest IPA
-                // layout — what differs between two domains is which leaves are mapped, which is
-                // exactly why "the wrong domain's tables" is a live hazard rather than an obvious
-                // address mismatch.
+                // A fixture that populates every emitted region at once. Every domain is emitted at
+                // the SAME guest IPA layout — what differs between two domains is which leaves are
+                // mapped, which is exactly why "the wrong domain's tables" is a live hazard rather
+                // than an obvious address mismatch.
+                //
+                // These numbers mirror NO shipped configuration, and the comment that used to call
+                // them "the metal's synthetic windows" was wrong: the synthetic build emits
+                // `device_len: 0` (no device window at all) and the real-Linux build emits a
+                // 16 MiB one at `0x0800_0000` over a different RAM window entirely. Exercising a
+                // combination no single config ships is the right thing here — the theorems these
+                // harnesses carry quantify over the `Layout` (see the symbolic-layout harnesses
+                // above, which take `device_base` from `bounded()`), so nothing rests on these
+                // particular values. What must not happen is a reader taking them for deployed
+                // ones; the deployed window is bound at run time by `hv-metal`'s `verify_encoding`
+                // and asserted by `xtask::LINUX_MARKERS` in the `real-linux boot (QEMU)` job.
                 guest_image_pa: Some(0x4020_0000),
                 data_ipa_base: 0x8000_0000,
                 data_pa_base: 0x4040_0000,

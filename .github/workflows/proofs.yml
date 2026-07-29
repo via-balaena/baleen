@@ -128,15 +128,31 @@ jobs:
     name: kani proofs (PR)
     needs: changes
     runs-on: ubuntu-latest
-    # MEASURED, not guessed (SMMU rung 4a, PR #94). The suite passed at **29m50s** against a
-    # 30-minute wall — ten seconds of headroom on a REQUIRED gate, i.e. green by luck. The job log
-    # gives the breakdown: 1662.7 s of verification over 53 harnesses, of which
-    # `foreign_link_state_machine` alone is 792 s (two harnesses, ~48% of the suite) and rung 4a's
-    # six device harnesses are 99 s. So the budget was already spent before that rung; it merely
-    # consumed the last of it. 45 minutes is ~50% headroom over the measured total, for a job whose
-    # cost grows with every rung that drives the real `dispatch` seam.
+    # THE WALL WAS HIT TWICE, AND THE FIX IS PARALLELISM — measured 2026-07-29 (PR #101).
     #
-    # If this starts creeping again, the lever is the harness *world size*, not the timeout: a seam
+    # History: raised 30 -> 45 at rung 4a (#94), which had passed at 29m50s against the 30-minute
+    # wall — ten seconds of headroom on a REQUIRED gate, i.e. green by luck. 45 was then killed
+    # TWICE: once on the byte-identical no-op #58 (a re-run cleared it, which was papering over
+    # it), and once on #101, where the log is unambiguous — 42 harnesses started, **41 SUCCEEDED,
+    # ZERO FAILED**, and `Terminate orphan process: (cbmc)` at 45m15s. A timeout, never a proof
+    # break; the identical tree verified 65/65 locally.
+    #
+    # What the #101 log showed, and why the timeout was NOT the thing to raise: the suite is
+    # ~926 s of verification locally and the CI runner is **2.6-2.8x slower** than the dev laptop
+    # (`foreign_link_state_machine::real_revoke…` = 169 s local vs **440 s** measured on CI), so a
+    # SEQUENTIAL run genuinely needs ~40-43 min. 45 minutes was not generous, it was under-set.
+    #
+    # So: run the harnesses IN PARALLEL rather than buying more wall or cutting world size.
+    # `-j` needs `--output-format=terse`, which loses nothing that matters — all 65 harness names
+    # and all 65 per-harness `Verification Time` lines survive, which is what made this diagnosis
+    # possible in the first place. MEASURED locally on the same tree: **975 s sequential -> 435 s
+    # at `-j 4`**, 65/65, 0 failures. `-j 4` matches ubuntu-latest's 4 vCPUs. Extrapolated to the
+    # runner that is ~15-20 min, i.e. the 45-minute wall goes from under-set to ~2.5x headroom,
+    # with NO proof weakened, NO world size cut, and no second required context to add to branch
+    # protection.
+    #
+    # The floor this cannot go below is the LONGEST SINGLE harness (~440 s on CI), so if the suite
+    # keeps growing the next lever is still the harness *world size*, not the timeout: a seam
     # harness is priced by `first_cross_violation` inside `dispatch` (O(domains²) with a provenance
     # walk), so one extra domain is worth minutes — rung 4a measured two of its own harnesses going
     # from 21 s/42 s at two domains to non-terminating at three. Push ∀-domain content to Verus and
@@ -173,9 +189,12 @@ jobs:
           cargo install --locked kani-verifier@0.67.0
           cargo kani setup
 
+      # `-j 4` matches the runner's 4 vCPUs; `--output-format=terse` is REQUIRED by `-j` (Kani
+      # refuses the combination otherwise) and costs no diagnostics — every harness name and every
+      # per-harness `Verification Time` still appears. See the timeout comment for the measurement.
       - name: cargo kani -p hv-verify (preservation proofs)
         if: needs.changes.outputs.run == 'true'
-        run: cargo kani -p hv-verify
+        run: cargo kani -p hv-verify -j 4 --output-format=terse
 
   # Tier C, the ∀-N step: the Verus preservation proofs in hv-verify/verus — preservation over
   # ARBITRARY table size (the scalar↔Vec-length axis Kani can only `unwind`). ALWAYS runs so the

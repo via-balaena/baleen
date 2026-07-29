@@ -67,8 +67,9 @@ jobs:
   kani:
     name: kani preservation proofs
     runs-on: ubuntu-latest
-    # Kept in lockstep with proofs.yml's `kani proofs (PR)` job, which carries the measurement
-    # behind this number (the suite ran 29m50s against the previous 30-minute wall).
+    # Kept in lockstep with proofs.yml's `kani proofs (PR)` job, which carries the measurements
+    # behind this number — including the two occasions the 45-minute wall killed a run that had
+    # not failed a single harness, and the parallelism that fixed it (975 s -> 435 s at `-j 4`).
     timeout-minutes: 45
     steps:
       - name: Harden the runner (audit egress)
@@ -93,8 +94,11 @@ jobs:
           cargo install --locked kani-verifier@0.67.0
           cargo kani setup
 
+      # In lockstep with proofs.yml's PR gate, which carries the measurement: `-j 4` (the runner's
+      # vCPU count) took the same 65 harnesses from 975 s to 435 s locally, and `--output-format=
+      # terse` is what `-j` requires — no diagnostics lost, every per-harness time still printed.
       - name: cargo kani -p hv-verify (preservation proofs)
-        run: cargo kani -p hv-verify
+        run: cargo kani -p hv-verify -j 4 --output-format=terse
 
   # Tier C, the ∀-N step: the Verus preservation proofs in hv-verify/verus. Where Kani makes a
   # refcount symbolic and proves over all 2^32 MAGNITUDES on the real code (bounded on Vec

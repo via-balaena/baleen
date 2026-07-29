@@ -171,9 +171,18 @@ pub const fn windows() -> Windows {
             // 896 MiB of guest RAM in 2 MiB blocks — under `TABLE_ENTRIES`, so ONE L2 covers it.
             sup_frames: (LINUX_RAM_END - LINUX_RAM_BASE)
                 / (hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE),
-            // GICv3 distributor + redistributor + PL011, as pass-through MMIO.
-            device_base: 0x0800_0000,
-            device_len: 0x0200_0000,
+            // The GICv3 distributor + redistributor, as pass-through MMIO — and NOTHING else.
+            //
+            // ③-a1 shrank this from 32 MiB (`0x0800_0000 .. 0x0a00_0000`) to 16 MiB. The 32 MiB
+            // form also covered the **PL011 at `0x0900_0000`**, so the guest drove the real UART
+            // directly; that is fine for one guest and impossible for two, since a UART is not a
+            // shareable resource. It is now derived from the GIC's own addresses — the window
+            // exists to hand the guest an interrupt controller — and the GIC redistributor region
+            // happens to END exactly at the PL011's base, so the UART falls out of the window with
+            // `guest.dts` completely unchanged and is emulated instead ([`crate::vpl011`], which
+            // carries the compile-time assertion that this window does not cover it).
+            device_base: crate::gic::GICD_BASE,
+            device_len: crate::gic::GICR_END - crate::gic::GICD_BASE,
         }
     }
 }
