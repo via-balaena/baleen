@@ -121,10 +121,10 @@ pub const QUEUE_NUM_MAX_VAL: u32 = 8;
 /// driver programs during negotiation live here; the queue-processing (Arc-3 steps 3-4) reads the ring
 /// addresses back out.
 ///
-/// `allow(dead_code)`: the register file is defined once as a coherent unit, but its fields are *read*
-/// incrementally across Arc-3's steps — step 1 wires the identity registers, step 2 the negotiation
-/// handshake, steps 3-4 the ring addresses. The allow is removed once every field is live (step 4).
-#[allow(dead_code)]
+/// (Arc 3 carried an `#[allow(dead_code)]` here while the register file was wired up incrementally,
+/// promising "the allow is removed once every field is live (step 4)". Step 4 landed; the allow did
+/// not. Removed in ⑭b's sweep — measured to suppress nothing, and a dormant allow on a struct is
+/// what silently absorbs the NEXT dead field.)
 pub struct VirtioConsole {
     /// `DeviceFeaturesSel` — which 32-bit word of the device features the driver is reading.
     pub device_features_sel: u32,
