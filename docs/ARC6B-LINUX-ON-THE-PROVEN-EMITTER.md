@@ -26,8 +26,17 @@ that is the two-emitters problem this arc exists to end. So the windows became *
 |---|---|---|
 | guest image | `Some(__guest_ram_start)`, RO+X block | **`None`** — the kernel is inside the mapped RAM |
 | super window | 1 frame, own reserved 2 MiB | **448 frames, identity at `0x4800_0000`** |
-| device region | none (virtio is trapped, not mapped) | **32 MiB, GICv3 + PL011, Device-nGnRnE + XN** |
+| device region | none (virtio is trapped, not mapped) | **16 MiB, GICv3 only, Device-nGnRnE + XN** |
 | RAM executable | no | **yes — declared, see §2.2** |
+
+> **Superseded in part by ③-a1** (`docs/ARC-5-M5-GUEST-INTERFACE.md` §5g). As this arc shipped, the
+> device region was **32 MiB and covered the PL011 as well as the GIC**. ③-a1 emulates the PL011 in
+> EL2 instead of passing it through, so the window shrank to 16 MiB and is now *derived* from
+> `gic::GICD_BASE .. gic::GICR_END` rather than written as a literal — and a compile-time assertion
+> makes restoring the wider window a **build error** rather than a silent return to pass-through.
+> The numbers above and the marker quoted in §3 and §5 are stated in their current form, because
+> `cargo xtask doc-markers` checks quoted markers against the gate lists and a historical string
+> here would read as a live claim.
 
 ---
 
@@ -76,7 +85,7 @@ assumed (#12's habit).
 
 > `selftest: Stage-2 encoding verified (set 0: tables decode to exactly the authorized leaf map;
 > image block absent (tables asserted dead); 448 super-span 2 MiB block(s) emitted and decoded;
-> device window 32 MiB)`
+> device window 16 MiB)`
 
 The whole emitted structure decoded back and every other slot asserted dead, on the real hardware
 tables the kernel then runs behind.
@@ -91,7 +100,7 @@ something the run did not check is worse than no marker.
 
 | # | Mutation | Result |
 |---|---|---|
-| 1 | Remove the device pass-through region | **CAUGHT** — `LINUX GUEST TRAP: EC=0x24` (the kernel cannot reach its GIC/UART) |
+| 1 | Remove the device pass-through region | **CAUGHT** — `LINUX GUEST TRAP: EC=0x24` (the kernel cannot reach its GIC/UART — as measured for *this* arc; since ③-a1 the UART is emulated, so only the GIC is at stake) |
 | 2 | Guest RAM made execute-never (Arc 6a's default) | **CAUGHT** — `EC=0x20`, the fault that found §2.2 in the first place |
 | 3 | Device blocks emitted as **Normal memory** | **CAUGHT** — `ENCODING VIOLATION` on the **real emitted tables**, which is exactly what §3 bought |
 
@@ -107,7 +116,7 @@ mapped as cacheable Normal memory would have booted fine and been wrong.
   configs).~~ **CLOSED (⑬).** The boot is now the `real-linux boot (QEMU)` required check: the guest
   artifacts are built by `hv-metal/linux/fetch-guest-image.sh` from checksum-pinned official Alpine
   downloads, and `cargo xtask qemu-linux-test` asserts the markers — including `448 super-span 2 MiB
-  block(s) emitted and decoded; device window 32 MiB`, i.e. **this arc's `verify_encoding` on the one
+  block(s) emitted and decoded; device window 16 MiB`, i.e. **this arc's `verify_encoding` on the one
   real guest's emission is now checked on every PR** rather than only whenever someone remembered to
   run it. See `docs/ARC-5-M5-GUEST-INTERFACE.md` §5f. No isolation content — it makes the existing
   demonstration re-runnable, nothing more.

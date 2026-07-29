@@ -53,9 +53,13 @@ unmodified kernel unchanged:
   (**Superseded in part by §5g:** the PL011 is no longer passed through — it is emulated in EL2, so
   the window is 16 MiB and covers the GIC alone. The GIC and `IMO=0` are unchanged.)
 - **DTB.** A minimal device tree (`hv-metal/linux/guest.dts`) — only the nodes the guest drives (psci
-  `method="hvc"`, memory, GICv3, PL011, timer, cpu, chosen), so Linux probes only what is passed
-  through. `x0` = the DTB per the arm64 boot protocol; the kernel `Image` + initramfs are placed in
-  guest RAM by QEMU `-device loader`.
+  `method="hvc"`, memory, GICv3, PL011, timer, cpu, chosen), so Linux probes only what the
+  hypervisor presents. `x0` = the DTB per the arm64 boot protocol; the kernel `Image` + initramfs are
+  placed in guest RAM by QEMU `-device loader`.
+  (**Superseded in part by §5g:** "presents" is no longer a synonym for "passes through". The PL011
+  node is still in the DTB and `earlycon=pl011` still works, but that device is now **emulated in
+  EL2** rather than mapped — the DTB is byte-for-byte unchanged across that shift, which is the
+  point. Everything else in the list is still pass-through.)
 - **PSCI over HVC.** `PSCI_VERSION` / `FEATURES` / `SYSTEM_OFF` serviced; unknown FIDs (e.g. the
   kernel's `MIGRATE_INFO_TYPE` probe) return `NOT_SUPPORTED` and the kernel continues.
 
