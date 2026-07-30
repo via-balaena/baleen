@@ -135,6 +135,24 @@ const KERNEL_ENTRY: u64 = GUEST_RAM_BASE;
 /// derived.
 const DTB_ADDR: u64 = 0x4b00_0000;
 
+/// The kernel and the DTB must land inside the RUNNING guest's half of the window (③-b2a).
+///
+/// `KERNEL_ENTRY` is `LINUX_RAM_BASE` by derivation so it is safe by construction, but `DTB_ADDR` is
+/// a bare literal — the one address here with no authoritative source under the fence. Before the
+/// split it only had to be inside a 896 MiB window and could not plausibly fall out; now it has to
+/// be inside a 448 MiB one, and a further split would put it in the PEER's half, where the kernel
+/// would be handed a pointer its own Stage-2 cannot translate. That failure looks like a kernel that
+/// dies before its first console byte, with nothing naming the cause. True or the build fails (#97).
+const _: () = assert!(
+    KERNEL_ENTRY >= stage2::LINUX_RAM_BASE && KERNEL_ENTRY < stage2::LINUX_RAM_SPLIT,
+    "the kernel image must load inside the running guest's half of the window"
+);
+const _: () = assert!(
+    DTB_ADDR >= stage2::LINUX_RAM_BASE && DTB_ADDR < stage2::LINUX_RAM_SPLIT,
+    "the DTB must load inside the running guest's half of the window — a DTB in the peer's half is \
+     a pointer the guest's Stage-2 cannot translate"
+);
+
 // The Stage-2 descriptor encodings, the device window and the translation regime used to be declared
 // HERE, alongside a 40-line identity mapper. M5 Arc 6b deleted the mapper and moved the emission to
 // `crate::stage2` — but only the mapper actually went: TEN constants (`DEV_BASE`, `DEV_END`,
@@ -273,19 +291,29 @@ fn build_model_and_stage2(
 }
 
 /// **③-b2a's proven half: walk BOTH emitted images and assert each reaches exactly its own frames
-/// and nothing of the peer's** — over the whole window, in both IPA and PA.
+/// and nothing of the peer's**, over every frame of the guest-RAM window, plus three probes that
+/// neither image maps anything outside it.
 ///
 /// **Why a walk and not layout arithmetic.** Computing "what A should reach" from the same constants
 /// the emitter used would make a wrong emission and a wrong expectation agree — design-lesson #36,
 /// and the reason `walk_stage2` exists at all. This reads the descriptor bytes the hardware itself
-/// walks, so the check is a second, independent reading of what was actually written.
+/// walks, so the check is a second, independent reading of what was actually written. Because the
+/// super window's IPA and PA bases are equal, `reach.pa == ipa` checks the identity property and the
+/// destination in one comparison.
 ///
-/// **What it is NOT.** It is a boot-time check on two concrete images, not a theorem: `hv-metal` is
-/// not a Kani target. The ∀-address statement it instantiates is already proven in `hv-verify`
-/// (`emitted_leaf_map_is_always_authorized`, `an_unauthorized_frame_is_never_mapped`,
-/// `the_walk_lands_where_the_windows_say`) — what is new here is that the two images belong to two
-/// domains one of which is a **real Linux kernel**, which is the part the synthetic Arc-2 pair could
-/// not say. Stated that way in the marker, too.
+/// **What it is NOT — and the citation is stated precisely, because compressing it is the failure
+/// this project watches for.** This is a boot-time check on two concrete images, not a theorem;
+/// `hv-metal` is not a Kani target. What `hv-verify` proves, and at which quantifier:
+/// * `emitted_leaf_map_is_always_authorized` — ∀ edge set / target domain / table capacity, the
+///   emitted map is authorized frame by frame, or fails loudly. Not ∀-address.
+/// * `an_unauthorized_frame_is_never_mapped` — the isolation corollary in its negative form: a frame
+///   a domain neither owns nor holds a grant for is **not in the table at all**. Also ∀-frame.
+/// * `the_walk_lands_where_the_windows_say` — ∀ *address*, but on one **fixture** `Layout`, not
+///   ∀-layout.
+///
+/// So the proofs cover the *relation* ∀-frame and the *walk* ∀-address-on-a-fixture; this check is
+/// what ties them to the two `Layout`s actually deployed. **What is new is that one of the two
+/// domains is a real Linux kernel** — the part the synthetic Arc-2 pair could not say.
 fn report_disjointness(vttbr_a: u64, vttbr_b: u64, uart: &mut Pl011) {
     let l1_a = hv_s2::arm64::vttbr_table(vttbr_a);
     let l1_b = hv_s2::arm64::vttbr_table(vttbr_b);
@@ -334,12 +362,45 @@ fn report_disjointness(vttbr_a: u64, vttbr_b: u64, uart: &mut Pl011) {
         }
     }
 
+    // **Nothing OUTSIDE the guest-RAM window may be mapped by either image.** The loop above only
+    // walks the 448 RAM frames, so on its own "DISJOINT" would be a claim about that window and
+    // silent about everything else — and the `Layout` has other windows the emitter could populate
+    // (`data_ipa_base`, and the synthetic super window a shared constant still names). The address
+    // that matters most is the one just BELOW guest RAM: that is hv-metal's own memory, and an image
+    // reaching it is a guest reaching the hypervisor, not merely a peer.
+    //
+    // Three probes, not ∀-address — a boot check cannot be exhaustive, and the ∀ statement is
+    // `hv-verify`'s (`the_walk_lands_where_the_windows_say`). What these catch is a LAYOUT change
+    // that starts emitting somewhere new, which is the realistic failure.
+    let outside: [(u64, &str); 3] = [
+        (
+            stage2::LINUX_RAM_BASE - stage2::SUP_FRAME_BYTES,
+            "hv-metal's own memory",
+        ),
+        (stage2::DATA_IPA_BASE, "the base-span data window"),
+        (stage2::SUP_IPA_BASE, "the synthetic super window"),
+    ];
+    for (ipa, what) in outside {
+        for (l1, dom) in [(l1_a, GUEST_A), (l1_b, GUEST_B)] {
+            if stage2::walk_stage2(l1, ipa).is_some() {
+                let _ = writeln!(
+                    uart,
+                    "baleen: peer FAIL: dom {dom}'s image maps 0x{ipa:08x} — {what}, which is \
+                     outside the guest-RAM window and must be unmapped in BOTH images"
+                );
+                crate::park();
+            }
+        }
+    }
+
     if a_own == per && b_own == per && a_peer == 0 && b_peer == 0 {
         let _ = writeln!(
             uart,
-            "baleen: peer OK: two domains, two Stage-2 images, DISJOINT — dom {GUEST_A} reaches its \
-             {a_own} frames and 0 of dom {GUEST_B}'s; dom {GUEST_B} reaches its {b_own} and 0 of \
-             dom {GUEST_A}'s (walked from the emitted descriptors, {} frames checked in both)",
+            "baleen: peer OK: two domains, two Stage-2 images, DISJOINT over the guest-RAM window \
+             — dom {GUEST_A} reaches its {a_own} frames and 0 of dom {GUEST_B}'s; dom {GUEST_B} \
+             reaches its {b_own} and 0 of dom {GUEST_A}'s; and neither maps hv-metal's memory or \
+             any window outside guest RAM ({} frames + 3 out-of-window probes, walked from the \
+             emitted descriptors)",
             stage2::NUM_SUP_FRAMES
         );
     } else {

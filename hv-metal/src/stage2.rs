@@ -168,7 +168,10 @@ pub const fn windows() -> Windows {
             // `/memory` node both assume. The emitter needs no new mechanism for this — it maps
             // `base + m*size` in both spaces, so equal bases give identity for free.
             sup_ipa_base: LINUX_RAM_BASE,
-            // 896 MiB of guest RAM in 2 MiB blocks — under `TABLE_ENTRIES`, so ONE L2 covers it.
+            // The whole 896 MiB window in 2 MiB blocks — under `TABLE_ENTRIES`, so ONE L2 covers
+            // it. This is the BACKING, not one guest's allowance: since ③-b2a the window is shared
+            // by two domains owning `LINUX_SUP_FRAMES_PER_GUEST` frames each, and what keeps them
+            // apart is which frames each OWNS in the model, not two separate reservations.
             sup_frames: (LINUX_RAM_END - LINUX_RAM_BASE)
                 / (hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE),
             // **NO device pass-through window at all** — the real-Linux guest reaches no real
@@ -228,6 +231,19 @@ pub const LINUX_TABLES_PER_GUEST: u64 =
 /// running kernel's DTB `/memory` node stops at, and the first address it must NOT be able to reach.
 #[cfg(feature = "real-linux")]
 pub const LINUX_RAM_SPLIT: u64 = LINUX_RAM_BASE + LINUX_SUP_FRAMES_PER_GUEST * SUP_FRAME_BYTES;
+
+/// The window must halve EXACTLY. With an odd frame count `LINUX_SUP_FRAMES_PER_GUEST` floors, the
+/// top frame ends up owned by neither domain — and the disjointness walk, which infers ownership
+/// from the midpoint, would believe dom 2 owns it, find it unmapped, and park with a message about
+/// identity mapping that says nothing about the real cause. Silent today (448 is even) and a
+/// misleading boot hang the moment the RAM window changes, which is the shape design-lesson #97
+/// exists for: put the structural half in a `const assert!`, not in a runtime message.
+#[cfg(feature = "real-linux")]
+const _: () = assert!(
+    NUM_SUP_FRAMES.is_multiple_of(2),
+    "the guest-RAM window must split into two equal halves — an odd super-frame count leaves one \
+     frame owned by neither domain"
+);
 
 /// The two guests' table frames must both fit the model, or the second domain's `P2mAllocate` walks
 /// off the end of a frame space sized for one. True or the build fails (design-lesson #97).
@@ -651,6 +667,11 @@ pub(crate) type Resolved = hv_s2::arm64::Reach;
 
 /// Walk the Stage-2 tables rooted at `l1_pa` for `ipa`, in software, through `hv-s2`'s **decode**
 /// seam.
+///
+/// **Two consumers since ③-b2a**: the SMMU rung's DMA-landing control (below), and the real-Linux
+/// path's two-image disjointness check (`crate::linux::report_disjointness`). Both need the same
+/// thing — an independent reading of what the emitter actually wrote — which is why the `cfg` is a
+/// union rather than the SMMU feature alone.
 ///
 /// **Why this exists, and why it is not layout arithmetic.** Rung 3's positive control has to assert
 /// that a device's DMA landed *where the table says*, and the only honest source for "where the table

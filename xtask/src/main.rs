@@ -363,7 +363,9 @@ const LINUX_MARKERS: &[&str] = &[
     "baleen: vgic OK: the guest's interrupt controller is EMULATED —",
     // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
     // rather than recomputed from the layout constants the emitter used (design-lesson #36).
-    "baleen: peer OK: two domains, two Stage-2 images, DISJOINT —",
+    // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
+    // frames plus three out-of-window probes, not ∀-address. The ∀ statement is `hv-verify`'s.
+    "baleen: peer OK: two domains, two Stage-2 images, DISJOINT over the guest-RAM window —",
     // The round trip home.
     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
 ];
