@@ -305,7 +305,15 @@ pub(crate) fn deactivate_physical(intid: u32) {
 /// guest enable. Taking a device away from a guest means inheriting its job.
 #[cfg(feature = "real-linux")]
 pub(crate) fn set_ppi_enabled(intid: u32, enabled: bool) {
-    debug_assert!(intid < 32, "ISENABLER0/ICENABLER0 cover INTIDs 0..31");
+    // `ISENABLER0`/`ICENABLER0` cover INTIDs 0..31 only, and `1u32 << intid` for a wider INTID does
+    // not fail loudly — release builds MASK the shift, so it would enable a *different* interrupt
+    // silently. A `debug_assert!` is no use here either: the binary that boots is `--release`, where
+    // it compiles to nothing. The real protection is the `const assert!` on [`VTIMER_INTID`] below,
+    // which makes this branch unreachable for the only caller; the guard just keeps the unreachable
+    // case inert instead of harmful.
+    if intid >= 32 {
+        return;
+    }
     let reg = if enabled { 0x0100 } else { 0x0180 };
     // SAFETY: the redistributor SGI frame is device memory on the `virt` machine, addressed directly
     // at EL2 (MMU off). `GICR_ISENABLER0`/`GICR_ICENABLER0` are write-1-to-act, so writing a single
@@ -486,9 +494,14 @@ pub(crate) const GICR_LEN: u64 = 0x00f6_0000;
 #[cfg(feature = "real-linux")]
 pub(crate) const GICD_LEN: u64 = 0x0001_0000;
 
-/// Exclusive end of the GICv3 MMIO the guest is given — and, on QEMU `virt`, **exactly** the address
-/// the PL011 starts at. That coincidence is what let ③-a1 drop the UART out of the pass-through
-/// window without touching `guest.dts`: the window still ends where the GIC does.
+/// Exclusive end of the GICv3 MMIO region `guest.dts` describes — and, on QEMU `virt`, **exactly**
+/// the address the PL011 starts at.
+///
+/// That coincidence is what let ③-a1 drop the UART out of the *pass-through* window without touching
+/// `guest.dts`. **Since ③-b1 there is no pass-through window at all** (`windows().device_len == 0`),
+/// so this now bounds the **emulated** GIC's trap window in [`crate::vgic::in_window`] instead — the
+/// address still matters, but for the opposite reason: it is where EL2 stops claiming faults, not
+/// where it stops forwarding them to hardware.
 #[cfg(feature = "real-linux")]
 pub(crate) const GICR_END: u64 = GICR_RD_BASE + GICR_LEN;
 
@@ -509,6 +522,16 @@ pub(crate) const VTIMER_INTID: u32 = 27;
 const _: () = assert!(
     VTIMER_INTID < (1 << LR_PINTID_BITS),
     "the forwarded timer PPI must fit ICH_LR<n>_EL2.pINTID — a wider INTID cannot be hardware-mapped"
+);
+
+/// ③-b1's structural half. [`set_ppi_enabled`] mirrors the guest's enable of this INTID onto the
+/// physical redistributor through `GICR_ISENABLER0`/`ICENABLER0`, which reach INTIDs **0..31** only.
+/// A wider INTID would need the distributor's banked registers instead, and — because a `u32` shift
+/// past 31 is masked rather than trapped in a release build — would silently mirror onto the wrong
+/// interrupt. True or the build fails (design-lesson #97).
+const _: () = assert!(
+    VTIMER_INTID < 32,
+    "the mirrored timer INTID must be an SGI/PPI: GICR_ISENABLER0 reaches INTIDs 0..31 only"
 );
 
 /// The GIC **maintenance interrupt** — PPI 9 = INTID 25 on QEMU `virt` (`ARCH_GIC_MAINT_IRQ`). The

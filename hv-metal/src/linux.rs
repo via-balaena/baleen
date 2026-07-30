@@ -10,25 +10,30 @@
 //! carries an unmodified kernel. `hv-core`/`hv-hal` are untouched; this whole module is behind the
 //! `real-linux` feature, so the default build (the CI boot-test) is byte-for-byte unchanged.
 //!
-//! ## The model — mostly pass-through, and one emulated device (③-a1)
+//! ## The model — the guest owns its RAM, and NOTHING else
 //!
-//! A *single* guest still owns most of the real hardware: hv-metal maps the guest RAM window and
-//! the **GICv3** device pages through Stage-2, and lets the kernel drive the real GIC. Its
-//! **interrupts are no longer its own** — ③-a2 sets `HCR_EL2.IMO=1`, so every physical IRQ the guest
-//! would have taken is delivered to EL2 and handed on as a *virtual* interrupt through the list
-//! registers ([`handle_linux_irq`]).
+//! hv-metal maps the guest's RAM window through Stage-2 and **no device MMIO whatsoever**:
+//! `stage2::windows().device_len == 0`, which [`crate::vgic`] asserts at compile time. Every device
+//! the kernel drives is EL2 state, and its interrupts are EL2's too. That took three rungs, one
+//! device at a time — the window shrank 32 MiB → 16 MiB → 0:
 //!
-//! **The PL011 is no longer among them.** Arc 5e passed a 32 MiB device window through
-//! (`0x0800_0000 .. 0x0a00_0000`), which covered the UART at `0x0900_0000` — so the guest wrote its
-//! console bytes straight to the hardware. That is the model this doc used to describe as
-//! "pass-through, not virtualization", and it is also the reason a *second* guest could not exist:
-//! two guests cannot both own one UART. ③-a1 shrank the window to 16 MiB (it now ends exactly where
-//! the GIC redistributor region does, which on QEMU `virt` is exactly where the PL011 begins), so a
-//! guest access to the UART faults to EL2 and is **trap-and-emulated** by [`crate::vpl011`].
+//! | rung | what stopped being the machine's | window |
+//! |---|---|---|
+//! | Arc 5e | — (the guest owned the UART and the GIC) | 32 MiB |
+//! | ③-a1 | the **console** — an emulated PL011 ([`crate::vpl011`]) | 16 MiB |
+//! | ③-a2 | interrupt **delivery** — `HCR_EL2.IMO=1`, forwarded through list registers | 16 MiB |
+//! | ③-b1 | the interrupt **controller** — an emulated GICv3 ([`crate::vgic`]) | **0** |
 //!
-//! So three things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` **Stage-2
-//! data abort**, which [`handle_linux_sync`] routes to the emulated PL011 or reports as a bring-up
-//! fault, and — since ③-a2 — every **physical IRQ**, which [`handle_linux_irq`] forwards.
+//! Each shrink was free of `guest.dts` edits, which is the property that makes the guest genuinely
+//! unmodified: ③-a1 worked because the GIC redistributor region ends exactly where the PL011 begins
+//! on QEMU `virt`, and ③-b1 because the emulated distributor reports a `GICD_TYPER` covering the
+//! INTIDs the existing DTB already names.
+//!
+//! So **four** things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` Stage-2
+//! **data abort**, which [`handle_linux_sync`] routes to the emulated GIC or the emulated PL011 and
+//! otherwise reports as a bring-up fault; an `EC=0x18` **trapped system register**
+//! ([`handle_linux_sysreg_trap`], the guest's `ICC_SGI1R_EL1` writes); and every **physical IRQ**
+//! ([`handle_linux_irq`]).
 //!
 //! ## ③-a2: the guest's interrupts stop being its own
 //!
@@ -46,12 +51,10 @@
 //! physical interrupt (`gic::inject_hw`, with `ICC_CTLR_EL1.EOImode=1` at EL2 so EL2's own EOI drops
 //! priority without deactivating). This is how KVM forwards the arch timer.
 //!
-//! **Still `IMO`-only.** The GICD/GICR remain pass-through, so the guest programs the *real*
-//! distributor while EL2 injects through list registers. That is workable for one guest and cannot be
-//! for two — two guests can no more share one interrupt controller than one UART — so ③-b needs the
-//! GIC emulated, exactly as ③-a1 did for the PL011. The emulated UART is still transmit-only: its RX
-//! path needs a forwarded SPI, which this rung's machinery now supports but does not yet wire (see
-//! [`crate::vpl011`]'s module docs).
+//! **③-a2 left the GICD/GICR pass-through and ③-b1 closed that** — see [`crate::vgic`], which also
+//! carries the mediation seam this file now consults before forwarding ([`handle_linux_irq`]).
+//! The emulated UART is still transmit-only: its RX path needs a forwarded SPI, which ③-a2's
+//! machinery supports but nothing yet wires (see [`crate::vpl011`]'s module docs).
 //!
 //! ## The memory contract (shared with `cargo xtask qemu-linux`)
 //!
@@ -489,6 +492,20 @@ static VPL011: BootCell<VirtPl011> = BootCell::new("VPL011", VirtPl011::new());
 /// The emulated GICv3 the guest drives (③-b1). One instance: one guest — and giving the *second*
 /// guest its own is the whole reason the distributor had to become EL2 state, exactly as ③-a1 made
 /// the console EL2 state for the same reason.
+///
+/// **⚠ This is the first [`BootCell`] on this path borrowed from BOTH a synchronous and an
+/// ASYNCHRONOUS handler, which is `crate::cell`'s class-3 hazard — so the I1 argument is written out
+/// rather than left implicit.** [`handle_vgic_access`] borrows it from the data-abort path;
+/// [`handle_linux_irq`] borrows it from the IRQ path to consult the mediation seam. Those cannot
+/// overlap: **taking any exception to EL2 sets `PSTATE.I`**, so while either handler runs a physical
+/// IRQ cannot be delivered, and **no EL2 path here unmasks it** — EL2 executes only inside handlers
+/// on this configuration, never in a loop between them. So a borrow is never live when the other
+/// claimant starts, and `BootCell`'s conflict halt is unreachable rather than merely unlikely.
+///
+/// This is the same argument `guest.rs` makes for `handle_guest_irq` touching `GUEST_HV`. Note what
+/// it turns on: if a future rung ever unmasks IRQs inside an EL2 handler, or adds an EL2 idle loop,
+/// **this borrow becomes a halt** — which is why `VCPU_PENDING` next door uses plain atomics
+/// instead. A counter would; a register file that must be read consistently would not.
 static VGIC: BootCell<VirtGic> = BootCell::new("VGIC", VirtGic::new());
 
 /// How many physical timer interrupts EL2 has forwarded to the guest as virtual ones (③-a2).
@@ -630,7 +647,7 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
             }
             PSCI_SYSTEM_OFF_FID => {
                 report_vpl011(&mut uart);
-                report_timer_forwarding(&mut uart);
+                report_interrupt_mediation(&mut uart);
                 let _ = writeln!(
                     uart,
                     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut \
@@ -915,7 +932,12 @@ fn report_vpl011(uart: &mut Pl011) {
     }
 }
 
-/// Report ③-a2's forwarding witness at the guest's `SYSTEM_OFF`.
+/// Report the interrupt-mediation witnesses at the guest's `SYSTEM_OFF` — ③-a2's two (timer
+/// forwarding, SGI mediation) and ③-b1's (the emulated distributor).
+///
+/// Three mechanisms reached by three different paths — the IRQ vector, an `EC=0x18` system-register
+/// trap, and a Stage-2 data abort — so each reports its own line. Merging them into one counter
+/// would let the witness stay green with any single path dead.
 ///
 /// **The ingress half, and it is the only half EL2 can claim.** The count is incremented in
 /// [`handle_linux_irq`], which runs *only* because `HCR_EL2.IMO` routed a physical interrupt to EL2 —
@@ -928,7 +950,7 @@ fn report_vpl011(uart: &mut Pl011) {
 /// this line green and hang the boot: a Linux guest whose scheduler tick never arrives does not reach
 /// `Run /init`, so `BALEEN-STEP0-OK` and every marker after it go red. Neither half claims the other's
 /// ground.
-fn report_timer_forwarding(uart: &mut Pl011) {
+fn report_interrupt_mediation(uart: &mut Pl011) {
     let n = TIMER_FORWARDED.load(Ordering::Relaxed);
     if n > 0 {
         let _ = writeln!(
@@ -946,10 +968,9 @@ fn report_timer_forwarding(uart: &mut Pl011) {
         );
     }
 
-    // The SGI half is a SEPARATE mechanism reached by a separate trap (`EC=0x18`, not the IRQ
-    // vector), so it gets its own line rather than being folded into the count above. A witness that
-    // merged them could stay green with either path dead.
-    // ③-b1: the interrupt CONTROLLER the guest programmed was ours too.
+    // ③-b1: the interrupt CONTROLLER the guest programmed was ours too — a THIRD mechanism, reached
+    // by a third path (a Stage-2 data abort on the GIC window). Each of the three gets its own line
+    // for the same reason: a witness that merged them could stay green with any one path dead.
     let (gic_traps, gic_enables) = VGIC.borrow_mut().witness();
     if gic_traps > 0 && gic_enables > 0 {
         let _ = writeln!(
@@ -966,6 +987,8 @@ fn report_timer_forwarding(uart: &mut Pl011) {
         );
     }
 
+    // The SGI half is a SEPARATE mechanism reached by a separate trap (`EC=0x18`, not the IRQ
+    // vector), so it gets its own line rather than being folded into the timer count above.
     let sgis = SGIS_DELIVERED.load(Ordering::Relaxed);
     if sgis > 0 {
         let _ = writeln!(
