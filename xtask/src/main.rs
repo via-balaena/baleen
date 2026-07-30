@@ -274,11 +274,16 @@ fn qemu_linux(check: bool) -> bool {
 ///   **emulated in EL2**, not in the pass-through window, so the bytes additionally have to survive
 ///   `vpl011`'s relay to the real UART. Un-forgeable in the same way `ro=0x5eed` is on the synthetic
 ///   path.
-/// * **`node   0: [mem 0x0000000048000000-0x000000007fffffff]`** — THE MEMORY CONTRACT, in one
-///   string. It is the kernel reporting the window it got from our DTB, and it must equal
-///   `LINUX_RAM_BASE..LINUX_RAM_END` in `hv-metal/src/linux.rs` (what the emitter maps) and the
-///   `-device loader` addresses above (where the blobs land). Four places that must agree; this is
-///   the assertion that goes red when they stop agreeing.
+/// * **`node   0: [mem 0x0000000048000000-0x0000000063ffffff]`** — THE MEMORY CONTRACT, in one
+///   string. It is the kernel reporting the window it got from our DTB, and it must equal what the
+///   emitter maps for **this domain** and the `-device loader` addresses above (where the blobs
+///   land). Four places that must agree; this is the assertion that goes red when they stop.
+///
+///   **It ends at `0x63ffffff`, not `0x7fffffff`, since ③-b2a split the window** — the running
+///   kernel is dom 1 and owns `LINUX_RAM_BASE..LINUX_RAM_SPLIT`, dom 2 the upper half. Note that
+///   `xtask doc-markers` does NOT scan `.rs` files, only `docs/*.md`, so a stale marker quote in
+///   THIS doc comment is caught by a human reading the diff or not at all — which is how the
+///   `0x7fffffff` above survived one rung too long.
 /// * **`Linux version 6.18.`** — an unmodified upstream Alpine kernel, not a stub that prints
 ///   markers.
 /// * **`linux PSCI FID 0x84000006 -> NOT_SUPPORTED`** — the kernel's `MIGRATE_INFO_TYPE` probe
@@ -294,8 +299,10 @@ fn qemu_linux(check: bool) -> bool {
 ///   stayed green.** This
 ///   one is printed by `hv-metal`'s own device model, and only if the userspace marker's bytes
 ///   arrived at its `DR` register — so widening the window back over `0x0900_0000` fails it. It is
-///   deliberately an INGRESS claim; the egress half is the nine markers above, which the kernel
-///   cannot print unless the emulator relays its bytes to the real UART.
+///   deliberately an INGRESS claim; the egress half is **every kernel/userspace marker above**,
+///   which the kernel cannot print unless the emulator relays its bytes to the real UART. (Stated
+///   as "the markers above" rather than a count: the count has changed twice since it was written,
+///   and a number nothing checks is a claim waiting to go stale.)
 /// * **`vtimer OK: the guest's scheduler tick is FORWARDED …`** and **`vsgi OK: … SGIs MEDIATED …`**
 ///   — ③-a2's witnesses, and they exist for exactly the reason ③-a1's does: **every marker above
 ///   this point is satisfied identically with `HCR_EL2.IMO=0`**, because a kernel taking its timer
@@ -318,23 +325,29 @@ const LINUX_MARKERS: &[&str] = &[
     // can bind the two — ⑭ folded the contract into one declaration everywhere it *could* reach, and
     // this marker is what binds the remaining cross-crate seam. Change `LINUX_KERNEL_ADDR` or
     // `LINUX_DTB_ADDR` without changing hv-metal and this goes red here rather than hanging a guest.
-    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest \
-     (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x80000000)",
-    "baleen: linux model built — 448 super-span leaves (896 MiB of guest RAM) across 56 L2-pinned tables",
-    // `device window 0 MiB` is ③-b1's structural claim in the emitter's own voice: the guest gets
-    // NO device pass-through at all. It was 32 MiB at Arc 5e, 16 MiB after ③-a1 dropped the PL011
-    // out, and zero now that the GIC is emulated too.
-    "448 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB",
+    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as EL1 guest dom 1 \
+     (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x64000000; peer dom 2 owns \
+     0x64000000..0x80000000)",
+    // ③-b2a: 224 leaves each, not 448 — the window is split. BOTH domains are asserted, so a
+    // build that quietly stopped emitting the peer would redden here and not only at `peer OK`.
+    "baleen: linux model built for dom 1 — 224 super-span leaves (448 MiB at 0x48000000) across 28 L2-pinned tables, into stage-2 set 0",
+    "baleen: linux model built for dom 2 — 224 super-span leaves (448 MiB at 0x64000000) across 28 L2-pinned tables, into stage-2 set 1",
+    // Two claims in one pair of strings. `device window 0 MiB` is ③-b1's, in the emitter's own
+    // voice: the guest gets NO device pass-through at all (32 MiB at Arc 5e, 16 MiB once ③-a1
+    // dropped the PL011 out, zero once ③-b1 emulated the GIC). The `set 0`/`set 1` split is
+    // ③-b2a's: `verify_encoding` runs per set, so both images are read back independently.
+    "(set 0: tables decode to exactly the authorized leaf map; image block absent (tables asserted dead); 224 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB)",
+    "(set 1: tables decode to exactly the authorized leaf map; image block absent (tables asserted dead); 224 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB)",
     // The kernel, behind the proven emitter.
     "Linux version 6.18.",
     "Machine model: baleen-metal-guest",
-    "node   0: [mem 0x0000000048000000-0x000000007fffffff]",
+    "node   0: [mem 0x0000000048000000-0x0000000063ffffff]",
     "baleen: linux PSCI FID 0x84000006 -> NOT_SUPPORTED",
     "Run /init as init process",
     // Userspace, out of our initramfs.
     "########## BALEEN-STEP0-OK ##########",
-    "baleen-guest-ram: 48000000-7fffffff:SystemRAM",
-    // ③-a1: the console the ten markers above travelled over is EMULATED.
+    "baleen-guest-ram: 48000000-63ffffff:SystemRAM",
+    // ③-a1: the console every marker above travelled over is EMULATED.
     "baleen: vpl011 OK: the guest's console is EMULATED — userspace's 'BALEEN-STEP0-OK' was \
      written to the emulated PL011's DR register in EL2",
     // ③-a2: the interrupts that DROVE the boot above are EL2's now. Same discipline as the vpl011
@@ -348,6 +361,11 @@ const LINUX_MARKERS: &[&str] = &[
     // it was still driving. Counted by the emulator, so a pass-through configuration cannot produce
     // it: the writes would never have been seen.
     "baleen: vgic OK: the guest's interrupt controller is EMULATED —",
+    // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
+    // rather than recomputed from the layout constants the emitter used (design-lesson #36).
+    // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
+    // frames plus three out-of-window probes, not ∀-address. The ∀ statement is `hv-verify`'s.
+    "baleen: peer OK: two domains, two Stage-2 images, DISJOINT over the guest-RAM window —",
     // The round trip home.
     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
 ];
@@ -375,6 +393,9 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // ③-b1's negative half: the guest's GIC accesses did not reach the emulator, i.e. the
     // distributor is being passed through again.
     "baleen: vgic FAIL",
+    // ③-b2a: the two images overlap, one of them never got emitted, or an owned frame did not
+    // resolve to its own identity mapping.
+    "baleen: peer FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch

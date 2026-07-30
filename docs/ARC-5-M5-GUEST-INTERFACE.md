@@ -97,10 +97,15 @@ same script a developer with an empty `$BALEEN_LINUX_DIR` runs.
 output captured, requiring every marker in `LINUX_MARKERS` and none in `LINUX_FORBIDDEN`. The per-marker
 reasoning lives on those constants. Two are worth repeating here:
 
-- **`node   0: [mem 0x0000000048000000-0x000000007fffffff]`** is the memory contract in one string.
-  It is the kernel reporting the window it read from *our* DTB, and it must equal `LINUX_RAM_BASE..
-  LINUX_RAM_END` (what the emitter maps) and xtask's `-device loader` addresses (where the blobs
-  land). Four places that have to agree, previously kept in agreement by hand.
+- **`node   0: [mem 0x0000000048000000-0x0000000063ffffff]`** is the memory contract in one string.
+  It is the kernel reporting the window it read from *our* DTB, and it must equal what the emitter
+  maps for this domain and xtask's `-device loader` addresses (where the blobs land). Four places
+  that have to agree, previously kept in agreement by hand.
+
+  **It ends at `0x63ffffff`, not `0x7fffffff`, since ③-b2a split the window**: the running kernel is
+  dom 1 and owns `LINUX_RAM_BASE..LINUX_RAM_SPLIT`, while dom 2 owns the upper half and has its own
+  emitted Stage-2 image. The `baleen: peer OK` marker is the statement that the two images are
+  disjoint, walked from the descriptors.
 - **`baleen: LINUX GUEST TRAP`** is forbidden. `handle_linux_sync` prints it for any lower-EL
   synchronous exception that is not an `HVC` — i.e. for every Stage-2 abort — so an emitter
   mis-mapping lands there. It is what makes this an assertion about the emitter rather than about
