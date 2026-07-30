@@ -13,8 +13,10 @@
 //! ## The model — mostly pass-through, and one emulated device (③-a1)
 //!
 //! A *single* guest still owns most of the real hardware: hv-metal maps the guest RAM window and
-//! the **GICv3** device pages through Stage-2, sets `HCR_EL2.IMO=0` so physical interrupts are
-//! delivered straight to the guest's EL1, and lets the kernel drive the real GIC and arch-timer.
+//! the **GICv3** device pages through Stage-2, and lets the kernel drive the real GIC. Its
+//! **interrupts are no longer its own** — ③-a2 sets `HCR_EL2.IMO=1`, so every physical IRQ the guest
+//! would have taken is delivered to EL2 and handed on as a *virtual* interrupt through the list
+//! registers ([`handle_linux_irq`]).
 //!
 //! **The PL011 is no longer among them.** Arc 5e passed a 32 MiB device window through
 //! (`0x0800_0000 .. 0x0a00_0000`), which covered the UART at `0x0900_0000` — so the guest wrote its
@@ -24,11 +26,32 @@
 //! the GIC redistributor region does, which on QEMU `virt` is exactly where the PL011 begins), so a
 //! guest access to the UART faults to EL2 and is **trap-and-emulated** by [`crate::vpl011`].
 //!
-//! So two things trap to EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), and an `EC=0x24`
-//! **Stage-2 data abort**, which [`handle_linux_sync`] routes to the emulated PL011 or reports as a
-//! bring-up fault. The vGIC list-register injection path (`gic.rs`) is the *multi-guest* interrupt
-//! mechanism and is still not used here — that is ③-a2, and until it lands the emulated UART is
-//! transmit-only (see [`crate::vpl011`]'s module docs, which say so rather than implying otherwise).
+//! So three things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` **Stage-2
+//! data abort**, which [`handle_linux_sync`] routes to the emulated PL011 or reports as a bring-up
+//! fault, and — since ③-a2 — every **physical IRQ**, which [`handle_linux_irq`] forwards.
+//!
+//! ## ③-a2: the guest's interrupts stop being its own
+//!
+//! `IMO=1` is not a free addition; it **takes away something that worked**. Under `IMO=0` the kernel
+//! took its arch-timer PPI (INTID 27) directly, and that is what drove its scheduler. Routing it to
+//! EL2 makes hv-metal responsible for giving it back, and a guest that does not get its tick does not
+//! boot — so the timer, not the UART, is the load-bearing half of this rung.
+//!
+//! **The mechanism is `ICH_LR<n>_EL2.HW`, and the synthetic path's answer does not carry over.**
+//! `guest.rs` answers the timer PPI with `gic::disable_vtimer()` — a one-shot, which is all a
+//! synthetic guest wants and is fatal to a kernel that needs a periodic tick. The arch timer's PPI is
+//! **level-triggered**, so it stays asserted until the guest reprograms `CNTV_CVAL_EL0`; EL2 must
+//! therefore leave the physical interrupt Active until the guest has done so, and EL2 has no way to
+//! know when that is. A hardware-mapped list register makes the guest's own EOI deactivate the
+//! physical interrupt (`gic::inject_hw`, with `ICC_CTLR_EL1.EOImode=1` at EL2 so EL2's own EOI drops
+//! priority without deactivating). This is how KVM forwards the arch timer.
+//!
+//! **Still `IMO`-only.** The GICD/GICR remain pass-through, so the guest programs the *real*
+//! distributor while EL2 injects through list registers. That is workable for one guest and cannot be
+//! for two — two guests can no more share one interrupt controller than one UART — so ③-b needs the
+//! GIC emulated, exactly as ③-a1 did for the PL011. The emulated UART is still transmit-only: its RX
+//! path needs a forwarded SPI, which this rung's machinery now supports but does not yet wire (see
+//! [`crate::vpl011`]'s module docs).
 //!
 //! ## The memory contract (shared with `cargo xtask qemu-linux`)
 //!
@@ -52,6 +75,7 @@
 
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::{Mfn, PtLevel};
@@ -59,6 +83,7 @@ use hv_core::{HvCall, Hypervisor};
 
 use crate::abort::{self, DataAbort, EC_DATA_ABORT};
 use crate::cell::BootCell;
+use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, HCR_EL2_VM, LINUX_RAM_BASE, LINUX_RAM_END, VTCR_EL2};
 use crate::vpl011::{self, VirtPl011};
@@ -212,12 +237,17 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
     stage2::build_stage2_from_p2m(hv, GUEST, 0)
 }
 
-/// Program + enable Stage-2: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM` (leaving `IMO=0`), then
-/// TLB-invalidate for the VMID and synchronize. Load-bearing on silicon, invisible under QEMU/TCG.
+/// Program + enable Stage-2: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM`, then TLB-invalidate for
+/// the VMID and synchronize. Load-bearing on silicon, invisible under QEMU/TCG.
+///
+/// `IMO` is deliberately NOT set here — `gic::enable_el2` sets it at the very end of [`run`], after the
+/// Linux vector table is installed, because it is the instruction that starts routing physical IRQs to
+/// EL2 and they must have somewhere correct to land.
 fn enable_stage2(vttbr: u64) {
     // SAFETY: all EL2-legal system registers; `HCR_EL2` read-modify-write adds `VM` while keeping the
-    // Arc-3 `RW` bit and leaving `IMO`/`FMO` clear (physical interrupts to EL1). Stage-2 affects only
-    // EL1&0, never EL2's own MMU-off/identity accesses.
+    // Arc-3 `RW` bit and leaving `IMO`/`FMO` untouched (③-a2's `gic::enable_el2` adds `IMO` later, by
+    // the same read-modify-write discipline). Stage-2 affects only EL1&0, never EL2's own
+    // MMU-off/identity accesses.
     unsafe {
         asm!(
             "msr vtcr_el2, {vtcr}",
@@ -310,7 +340,10 @@ __linux_vectors:
     // trampoline (must not clobber the guest's x0 = PSCI function id).
     .balign 0x80
     b       __linux_sync_entry
-    lventry 9    // 0x480 Lower EL AArch64 — IRQ (dormant: IMO=0 routes guest IRQs to EL1)
+    // 0x480 Lower EL AArch64 — IRQ. ③-a2 made this live: `HCR_EL2.IMO` routes EVERY physical IRQ
+    // the guest would have taken to EL2 instead, and this is where they arrive.
+    .balign 0x80
+    b       __linux_irq_entry
     lventry 10
     lventry 11
     lventry 12
@@ -375,8 +408,59 @@ __linux_sync_entry:
     "#
 );
 
+// The lower-EL IRQ trampoline (③-a2). Same save/restore discipline as the sync one, and for the same
+// reason — the Rust handler clobbers caller-saved registers the interrupted guest is still using. It
+// differs from the sync path in one way that matters: an IRQ's preferred return address is the
+// INTERRUPTED instruction, which `ELR_EL2` already holds, so there is no `advance_elr_past_fault`
+// here. Advancing it would silently skip one guest instruction per timer tick.
+global_asm!(
+    r#"
+    .section .text
+    .balign 0x40
+    .global __linux_irq_entry
+__linux_irq_entry:
+    sub     sp, sp, #(16 * 16)
+    stp     x0, x1,   [sp, #(16 * 0)]
+    stp     x2, x3,   [sp, #(16 * 1)]
+    stp     x4, x5,   [sp, #(16 * 2)]
+    stp     x6, x7,   [sp, #(16 * 3)]
+    stp     x8, x9,   [sp, #(16 * 4)]
+    stp     x10, x11, [sp, #(16 * 5)]
+    stp     x12, x13, [sp, #(16 * 6)]
+    stp     x14, x15, [sp, #(16 * 7)]
+    stp     x16, x17, [sp, #(16 * 8)]
+    stp     x18, x19, [sp, #(16 * 9)]
+    stp     x20, x21, [sp, #(16 * 10)]
+    stp     x22, x23, [sp, #(16 * 11)]
+    stp     x24, x25, [sp, #(16 * 12)]
+    stp     x26, x27, [sp, #(16 * 13)]
+    stp     x28, x29, [sp, #(16 * 14)]
+    str     x30,      [sp, #(16 * 15)]
+    bl      handle_linux_irq
+    ldp     x0, x1,   [sp, #(16 * 0)]
+    ldp     x2, x3,   [sp, #(16 * 1)]
+    ldp     x4, x5,   [sp, #(16 * 2)]
+    ldp     x6, x7,   [sp, #(16 * 3)]
+    ldp     x8, x9,   [sp, #(16 * 4)]
+    ldp     x10, x11, [sp, #(16 * 5)]
+    ldp     x12, x13, [sp, #(16 * 6)]
+    ldp     x14, x15, [sp, #(16 * 7)]
+    ldp     x16, x17, [sp, #(16 * 8)]
+    ldp     x18, x19, [sp, #(16 * 9)]
+    ldp     x20, x21, [sp, #(16 * 10)]
+    ldp     x22, x23, [sp, #(16 * 11)]
+    ldp     x24, x25, [sp, #(16 * 12)]
+    ldp     x26, x27, [sp, #(16 * 13)]
+    ldp     x28, x29, [sp, #(16 * 14)]
+    ldr     x30,      [sp, #(16 * 15)]
+    add     sp, sp, #(16 * 16)
+    eret
+    "#
+);
+
 extern "C" {
     fn __linux_sync_entry() -> !;
+    fn __linux_irq_entry() -> !;
     static __linux_vectors: u8;
 }
 // `handle_exception` (the diagnostic reporter the vector stubs above `bl` into) is deliberately NOT
@@ -400,6 +484,82 @@ const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
 /// The emulated PL011 the guest drives (③-a1). One instance: one guest. ③-b gives each guest its
 /// own, which is the whole point of the device having become EL2 state instead of hardware.
 static VPL011: BootCell<VirtPl011> = BootCell::new("VPL011", VirtPl011::new());
+
+/// How many physical timer interrupts EL2 has forwarded to the guest as virtual ones (③-a2).
+///
+/// **This is the arc's ingress witness, and it exists because nothing else can see the change**
+/// (design-lesson #99). A guest whose scheduler tick arrives by EL2 list-register injection prints
+/// exactly what a guest taking the PPI directly prints — every kernel marker in the ⑬ gate is
+/// satisfied identically either way, which is the same trap ③-a1 fell into and had to bring its own
+/// witness for. Only EL2 can count what only EL2 now sees.
+///
+/// Plain atomic, not a [`BootCell`]: this is written from an asynchronous EL2 exception handler, which
+/// is `crate::cell`'s class-3 hazard. An atomic has no borrow to overlap, so the hazard does not arise
+/// — the same reasoning `guest.rs`'s `VCPU_PENDING` records.
+static TIMER_FORWARDED: AtomicU64 = AtomicU64::new(0);
+
+/// How many guest-generated SGIs EL2 has mediated and delivered (③-a2) — the second thing `IMO=1`
+/// made EL2 responsible for. Same standing as [`TIMER_FORWARDED`]: written from a trap handler, so an
+/// atomic rather than a [`BootCell`].
+static SGIS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+
+/// The Linux-mode lower-EL **IRQ** handler (③-a2) — the guest's device interrupts, taken at EL2
+/// because `HCR_EL2.IMO` routes them there, and handed on as *virtual* interrupts.
+///
+/// **The timer is the load-bearing case, and it is why this is not the synthetic path.**
+/// `guest.rs`'s handler answers the arch-timer PPI with [`gic::disable_vtimer`] — a **one-shot**: it
+/// clears `CNTV_CTL_EL0` so the level-triggered interrupt de-asserts and cannot immediately re-fire.
+/// A synthetic guest wanting one tick is served by that; Linux, whose scheduler needs a *periodic*
+/// tick it re-arms itself, is destroyed by it. So the level has to be dropped by the GUEST reprogramming
+/// `CNTV_CVAL_EL0`, which means the physical interrupt must stay **Active** until it does — and EL2
+/// gets no signal when that happens. [`gic::inject_hw`] is the answer: the guest's own EOI of the
+/// virtual interrupt deactivates the physical one, with no EL2 involvement. See [`gic::LR_HW`].
+///
+/// Anything that is not the timer is a bring-up fault, reported with its INTID and parked, on the same
+/// reasoning as [`handle_linux_data_abort`]: with `IMO=1` EVERY physical interrupt now arrives here, so
+/// silently completing an unexpected one would hide exactly the routing bug this path can have.
+///
+/// # Safety
+/// Called from the IRQ trampoline with the guest's registers saved; it takes no frame because it needs
+/// no guest register (an interrupt, unlike a trapped instruction, carries no operands).
+#[no_mangle]
+extern "C" fn handle_linux_irq() {
+    let intid = gic::ack_physical();
+
+    if intid == gic::VTIMER_INTID {
+        if !gic::inject_hw(gic::VTIMER_INTID, gic::VTIMER_INTID) {
+            // Unreachable with one guest forwarding one interrupt into a bank of four — and reported
+            // rather than dropped anyway, because a lost timer tick is a guest that stops scheduling,
+            // which presents as a hang with no cause on the console.
+            let mut uart = crate::uart();
+            let _ = writeln!(
+                uart,
+                "baleen: LINUX GUEST TRAP: the list-register bank is full — cannot forward the timer \
+                 interrupt (INTID {intid}); halting"
+            );
+            crate::park();
+        }
+        TIMER_FORWARDED.fetch_add(1, Ordering::Relaxed);
+        // Priority drop ONLY (`EOImode=1`): the interrupt stays Active, so its still-asserted level
+        // cannot re-signal and storm EL2, while EL2's running priority returns to idle. The guest's
+        // EOI of the virtual interrupt is what deactivates this one.
+        gic::eoi_physical(intid);
+        return;
+    }
+
+    // 1020..=1023 are the architectural special INTIDs; 1023 is "spurious" and must NOT be completed.
+    if intid >= 1020 {
+        return;
+    }
+
+    let mut uart = crate::uart();
+    let _ = writeln!(
+        uart,
+        "baleen: LINUX GUEST TRAP: unexpected physical interrupt INTID {intid} routed to EL2 by \
+         HCR_EL2.IMO — no forwarding rule; halting"
+    );
+    crate::park();
+}
 
 /// The Linux-mode lower-EL synchronous handler. `HVC` → service PSCI (Linux's `method = "hvc"`); an
 /// `EC=0x24` **Stage-2 data abort** → the emulated PL011, if that is what the guest touched.
@@ -425,6 +585,14 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
         return;
     }
 
+    // EC 0x18 = a trapped MSR/MRS. Under `IMO=1` the guest's `ICC_SGI1R_EL1` writes land here (③-a2).
+    if ec == EC_SYSREG {
+        // SAFETY: the trampoline gave us its on-stack frame; single-CPU, non-nested.
+        let frame = unsafe { &mut *frame };
+        handle_linux_sysreg_trap(frame, esr, elr, far, &mut uart);
+        return;
+    }
+
     // EC 0x16 = HVC (AArch64).
     if ec == 0x16 {
         // SAFETY: the trampoline gave us its on-stack frame; single-CPU, non-nested.
@@ -440,6 +608,7 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
             }
             PSCI_SYSTEM_OFF_FID => {
                 report_vpl011(&mut uart);
+                report_timer_forwarding(&mut uart);
                 let _ = writeln!(
                     uart,
                     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut \
@@ -544,6 +713,67 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
     crate::guest::advance_elr_past_fault();
 }
 
+/// `ESR_EL2.EC` for a **trapped MSR/MRS or System instruction** in AArch64 state.
+const EC_SYSREG: u64 = 0x18;
+
+/// The `ICC_SGI1R_EL1` system-register encoding as it appears in an `EC=0x18` ISS: `Op0=3, Op1=0,
+/// CRn=12, CRm=11, Op2=5`, direction = write. Matched as one packed value rather than six field
+/// comparisons, so a register this port has NOT thought about cannot fall through into the SGI path.
+const ISS_SYSREG_FIELDS: u64 = 0x003f_ffff;
+const ISS_ICC_SGI1R_EL1_WRITE: u64 = (3 << 20) | (5 << 17) | (12 << 10) | (11 << 1);
+
+/// Route a guest **trapped system-register access** (`EC=0x18`) — a class of trap that did not exist
+/// on this path before ③-a2, because `IMO=0` left the guest's GIC CPU interface untrapped.
+///
+/// The only member of the class this port has a rule for is a write to `ICC_SGI1R_EL1`: the guest
+/// raising a software-generated interrupt. See [`gic::sgi1r_intid`] for why the architecture routes it
+/// here and what the single-vCPU emulation is. Everything else is reported with the decoded register
+/// encoding and parked — the same discipline as an abort outside every emulated device, and for the
+/// same reason: a silently-ignored system-register write leaves the guest believing something took
+/// effect that did not.
+fn handle_linux_sysreg_trap(
+    frame: &mut LinuxFrame,
+    esr: u64,
+    elr: u64,
+    far: u64,
+    uart: &mut Pl011,
+) {
+    let iss = esr & 0x01ff_ffff;
+
+    if iss & ISS_SYSREG_FIELDS == ISS_ICC_SGI1R_EL1_WRITE && iss & 1 == 0 {
+        // `Rt` is ISS[9:5]; 31 is `XZR`, which reads zero.
+        let rt = ((iss >> 5) & 0x1f) as usize;
+        let value = if rt < 31 { frame.x[rt] } else { 0 };
+        let intid = gic::sgi1r_intid(value);
+        if !gic::inject(intid) {
+            let _ = writeln!(
+                uart,
+                "baleen: LINUX GUEST TRAP: the list-register bank is full — cannot deliver the \
+                 guest's SGI {intid}; halting"
+            );
+            crate::park();
+        }
+        SGIS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+        // A trapped instruction's preferred return is the instruction ITSELF; resume past it or the
+        // guest re-executes the `msr` forever.
+        crate::guest::advance_elr_past_fault();
+        return;
+    }
+
+    let _ = writeln!(
+        uart,
+        "baleen: LINUX GUEST TRAP: unhandled system-register access (Op0={} Op1={} CRn={} CRm={} \
+         Op2={} {}) ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x} — halting",
+        (iss >> 20) & 0x3,
+        (iss >> 14) & 0x7,
+        (iss >> 10) & 0xf,
+        (iss >> 1) & 0xf,
+        (iss >> 17) & 0x7,
+        if iss & 1 == 0 { "write" } else { "read" },
+    );
+    crate::park();
+}
+
 /// Read `HPFAR_EL2` — the architectural source of the faulting **IPA** for a Stage-2 abort.
 fn read_hpfar() -> u64 {
     let hpfar: u64;
@@ -587,6 +817,56 @@ fn report_vpl011(uart: &mut Pl011) {
             "baleen: vpl011 FAIL: the guest's console did not go through the emulator \
              ({traps} register traps, {dr_writes} bytes forwarded) — the PL011 is being passed \
              through, or the transmit path is broken"
+        );
+    }
+}
+
+/// Report ③-a2's forwarding witness at the guest's `SYSTEM_OFF`.
+///
+/// **The ingress half, and it is the only half EL2 can claim.** The count is incremented in
+/// [`handle_linux_irq`], which runs *only* because `HCR_EL2.IMO` routed a physical interrupt to EL2 —
+/// under `IMO=0` this function is unreachable and the count is zero. So a non-zero count cannot be
+/// produced by a guest taking its timer directly, which is exactly what the twelve kernel markers
+/// cannot distinguish (design-lesson #99).
+///
+/// **The EGRESS half is the kernel markers, and they are un-forgeable in their own way** — the same
+/// split ③-a1 settled on, stated the same way. Forwarding an interrupt EL2 never delivers would leave
+/// this line green and hang the boot: a Linux guest whose scheduler tick never arrives does not reach
+/// `Run /init`, so `BALEEN-STEP0-OK` and every marker after it go red. Neither half claims the other's
+/// ground.
+fn report_timer_forwarding(uart: &mut Pl011) {
+    let n = TIMER_FORWARDED.load(Ordering::Relaxed);
+    if n > 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: vtimer OK: the guest's scheduler tick is FORWARDED — {n} physical timer \
+             interrupts (INTID {}) taken at EL2 under HCR_EL2.IMO=1 and injected as hardware-mapped \
+             virtual interrupts",
+            gic::VTIMER_INTID
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vtimer FAIL: EL2 forwarded no timer interrupt — the guest is taking the PPI \
+             directly (IMO=0), or the physical CPU interface never delivered one"
+        );
+    }
+
+    // The SGI half is a SEPARATE mechanism reached by a separate trap (`EC=0x18`, not the IRQ
+    // vector), so it gets its own line rather than being folded into the count above. A witness that
+    // merged them could stay green with either path dead.
+    let sgis = SGIS_DELIVERED.load(Ordering::Relaxed);
+    if sgis > 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: vsgi OK: {sgis} guest SGIs MEDIATED at EL2 — ICC_SGI1R_EL1 writes trap under \
+             HCR_EL2.IMO=1 and are delivered as virtual interrupts"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vsgi FAIL: EL2 mediated no SGI — the guest reached its own SGI generation \
+             register, which HCR_EL2.IMO=1 is supposed to make impossible"
         );
     }
 }
@@ -697,6 +977,26 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
         let vec = core::ptr::addr_of!(__linux_vectors) as u64;
         asm!("msr vbar_el2, {v}", "isb", v = in(reg) vec, options(nomem, nostack));
     }
+
+    // ③-a2: take the guest's interrupts at EL2 and forward them. **Strictly after the vector install
+    // above** — `enable_el2` sets `HCR_EL2.IMO`, and from that instruction on a physical IRQ lands on
+    // whatever `VBAR_EL2` currently points at. Enabling first would put a window, however short,
+    // where a timer PPI would be dispatched through the synthetic path's table.
+    //
+    // Note what is NOT called: `gic::init_physical_vtimer()`. The GICD/GICR are pass-through mapped,
+    // so it is the KERNEL that enables PPI 27 at the redistributor — and with `IMO=1` that same
+    // enable is what makes the interrupt reach EL2. Re-initializing the distributor here would fight
+    // the guest for a device the guest owns. Only EL2's own CPU interface needs setting up.
+    gic::enable_physical_cpu_interface_el2();
+    gic::set_eoi_mode_split();
+    gic::enable_el2();
+
+    let _ = writeln!(
+        uart,
+        "baleen: EL2 takes the guest's interrupts — HCR_EL2.IMO=1, timer PPI {} forwarded by \
+         hardware-mapped list-register injection",
+        gic::VTIMER_INTID
+    );
 
     let _ = writeln!(uart, "baleen: entering EL1 — the kernel takes the machine");
 

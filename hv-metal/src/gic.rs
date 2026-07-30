@@ -62,7 +62,39 @@ const LR_PRIORITY_SHIFT: u64 = 48;
 const LR_GROUP1: u64 = 1 << 60;
 /// State = Pending, bits [63:62] = 0b01.
 const LR_STATE_PENDING: u64 = 0b01 << 62;
-// HW (bit 61) is left 0: a pure *virtual* interrupt not mapped to a physical one.
+
+/// `ICH_LR<n>_EL2.HW` (bit 61) — this virtual interrupt is **mapped to a physical one**, named by
+/// [`LR_PINTID_SHIFT`]. Left 0 by [`inject`] (a pure virtual interrupt, deactivated entirely in the
+/// virtual interface); set by [`inject_hw`], which is what a *forwarded* physical interrupt needs.
+///
+/// **Why the bit exists, and why ③-a2 cannot work without it.** A forwarded device interrupt has a
+/// physical lifecycle (Pending → Active → Inactive) that only a *deactivate* ends, and for a
+/// **level-triggered** source — the arch timer's PPI, asserted while `CNTV_CTL_EL0.ISTATUS` is set —
+/// deactivating it while the level is still high makes the GIC re-assert immediately. So EL2 cannot
+/// deactivate on the guest's behalf: it must wait until the guest has serviced the device and dropped
+/// the level, and EL2 gets no signal when that happens. `HW=1` is the hardware's answer: the guest's
+/// own EOI of the *virtual* interrupt deactivates the *physical* interrupt named by `pINTID`, with no
+/// EL2 involvement at all. This is how KVM forwards the arch timer, for the same reason.
+const LR_HW: u64 = 1 << 61;
+/// `ICH_LR<n>_EL2.pINTID`, bits [41:32] — the **physical** INTID a `HW=1` list register is mapped to.
+/// Ten bits, so it names INTIDs 0..=1023 (the SPI/PPI/SGI range); LPIs are out of its reach and out of
+/// this port's scope.
+const LR_PINTID_SHIFT: u64 = 32;
+/// Width of the `pINTID` field — an INTID that does not fit cannot be named by a `HW=1` LR, so
+/// [`inject_hw`] refuses rather than silently truncating into a *different* physical interrupt.
+const LR_PINTID_BITS: u32 = 10;
+
+/// `ICC_CTLR_EL1.EOImode` (bit 1) — **split priority-drop from deactivate.** With `EOImode=0` (the
+/// reset value, and what the synthetic path uses) a write to `ICC_EOIR1_EL1` does both. With it set,
+/// `ICC_EOIR1_EL1` drops the running priority ONLY, and deactivation must come from elsewhere.
+///
+/// **The real-Linux forwarding path requires it set at EL2**, and the requirement is not a style
+/// choice: EL2 must return to a low running priority so *other* interrupts can be taken, while leaving
+/// the forwarded interrupt **Active** so its still-asserted level cannot re-signal. Deactivation then
+/// arrives from the guest through [`LR_HW`]. With `EOImode=0` those two needs are in direct conflict —
+/// drop the priority and you deactivate; keep it Active and EL2 stays at the interrupt's priority.
+#[cfg(feature = "real-linux")]
+const ICC_CTLR_EL1_EOIMODE: u64 = 1 << 1;
 
 /// A moderate priority for injected interrupts — below `ICC_PMR_EL1 = 0xff`, so it passes the mask.
 const INJECT_PRIORITY: u64 = 0x80;
@@ -179,12 +211,25 @@ pub(crate) fn underflow_interrupt_armed() -> bool {
 /// this function claims.
 #[must_use]
 pub(crate) fn inject(intid: u32) -> bool {
-    let lr = LR_STATE_PENDING
+    place(encode_lr(intid, None))
+}
+
+/// **The ONE list-register encoder** (#55). `hw` is `Some(pintid)` for a *forwarded* physical
+/// interrupt — see [`LR_HW`] for why that case exists — and `None` for a purely virtual one.
+fn encode_lr(vintid: u32, hw: Option<u32>) -> u64 {
+    let base = LR_STATE_PENDING
         | LR_GROUP1
         | (INJECT_PRIORITY << LR_PRIORITY_SHIFT)
-        | ((intid as u64) << LR_VINTID_SHIFT);
-    let n = num_list_registers();
-    for i in 0..n {
+        | ((vintid as u64) << LR_VINTID_SHIFT);
+    match hw {
+        Some(pintid) => base | LR_HW | ((pintid as u64) << LR_PINTID_SHIFT),
+        None => base,
+    }
+}
+
+/// Place an encoded list-register value in the first free LR. `false` = the bank is full.
+fn place(lr: u64) -> bool {
+    for i in 0..num_list_registers() {
         if lr_is_free(read_lr(i)) {
             // `write_lr` `isb`s, so the injection is in effect before the following `eret`.
             write_lr(i, lr);
@@ -192,6 +237,71 @@ pub(crate) fn inject(intid: u32) -> bool {
         }
     }
     false
+}
+
+/// Inject `vintid` as a **hardware-mapped** virtual interrupt: the guest's EOI of it will deactivate
+/// the physical interrupt `pintid` (see [`LR_HW`]). This is the ③-a2 forwarding primitive — EL2 takes
+/// the guest's device interrupt because `HCR_EL2.IMO` routes it there, and hands it on without ever
+/// having to decide *when* the device stopped asserting.
+///
+/// Returns `false` if the bank is full **or** if `pintid` does not fit [`LR_PINTID_BITS`]. The second
+/// case is refused rather than truncated: a truncated `pINTID` would name a *different* physical
+/// interrupt, so the guest's EOI would deactivate someone else's — silent, and far worse than a
+/// refusal the caller reports.
+#[must_use]
+#[cfg(feature = "real-linux")]
+pub(crate) fn inject_hw(vintid: u32, pintid: u32) -> bool {
+    if pintid >= (1 << LR_PINTID_BITS) {
+        return false;
+    }
+    place(encode_lr(vintid, Some(pintid)))
+}
+
+/// The SGI id a write to `ICC_SGI1R_EL1` requests — bits [27:24], so 0..=15 (the whole SGI range).
+///
+/// **Why EL2 sees this write at all.** `HCR_EL2.IMO=1` redirects EL1's *interrupt-handling* `ICC_*`
+/// accesses to the virtual CPU interface, but `ICC_SGI1R_EL1` is not one of them: generating an SGI
+/// names its targets by **physical affinity** (`Aff1..3` + a target list, or "all but self"), which is
+/// a statement about real PEs that a guest must not be allowed to make. So the architecture traps it
+/// to EL2 instead, and the hypervisor decides what it means. That trap is unavoidable under `IMO=1` —
+/// it is not something this port opted into — and leaving it unhandled is a dead guest the moment the
+/// kernel raises its first IPI.
+///
+/// **What ③-a2 does with it, and the honest bound.** One guest, one vCPU: every SGI a guest can
+/// generate is addressed to itself, so the faithful emulation is to make that SGI pending as a purely
+/// *virtual* interrupt ([`inject`], `HW=0` — the guest invented it, so there is no physical interrupt
+/// to deactivate and a hardware mapping would be a lie). **The affinity fields are deliberately not
+/// read**, because with a single vCPU there is no other target they could name; ③-b, which has a
+/// second guest and may have a second vCPU, is where routing them becomes a real decision rather than
+/// a degenerate one.
+#[cfg(feature = "real-linux")]
+pub(crate) fn sgi1r_intid(value: u64) -> u32 {
+    ((value >> 24) & 0xf) as u32
+}
+
+/// Put EL2's **physical** CPU interface into split priority-drop/deactivate mode
+/// ([`ICC_CTLR_EL1_EOIMODE`]), so [`eoi_physical`] drops the running priority without deactivating.
+///
+/// Real-Linux only, and deliberately not folded into [`enable_physical_cpu_interface_el2`]: the
+/// synthetic path shares that function and *depends* on `EOImode=0`, because it deactivates the timer
+/// PPI itself after [`disable_vtimer`] has already dropped the level. Two configurations, two
+/// lifecycles, one explicit call — rather than a mode flip the synthetic arcs would inherit silently.
+#[cfg(feature = "real-linux")]
+pub(crate) fn set_eoi_mode_split() {
+    // SAFETY: `ICC_CTLR_EL1` at EL2 is the physical CPU-interface control. Read-modify-write of the
+    // single `EOImode` bit preserves every other control; `isb` orders it before an interrupt can be
+    // taken and completed under the new mode. No memory effect.
+    unsafe {
+        asm!(
+            "mrs {t}, ICC_CTLR_EL1",
+            "orr {t}, {t}, {m}",
+            "msr ICC_CTLR_EL1, {t}",
+            "isb",
+            t = out(reg) _,
+            m = in(reg) ICC_CTLR_EL1_EOIMODE,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
 }
 
 /// Enable just enough of the EL2 virtual CPU interface to *access* the list registers as system
@@ -349,6 +459,15 @@ const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 /// The EL1 architected **virtual timer** interrupt — PPI 11 = INTID 27 (Arm ARM / GIC spec). This is the
 /// interrupt the guest's `CNTV` raises; the guest also sees it as vINTID 27 after we inject.
 pub(crate) const VTIMER_INTID: u32 = 27;
+
+/// The STRUCTURAL half of ③-a2's witness, in a `const assert!` rather than a boot marker
+/// (design-lesson #97): the timer PPI must be nameable in a `HW=1` list register's `pINTID` field, or
+/// [`inject_hw`] would refuse it at run time and the forwarding path would be dead on arrival. A boot
+/// marker can only witness what a boot exercises; this is true or the build fails.
+const _: () = assert!(
+    VTIMER_INTID < (1 << LR_PINTID_BITS),
+    "the forwarded timer PPI must fit ICH_LR<n>_EL2.pINTID — a wider INTID cannot be hardware-mapped"
+);
 
 /// The GIC **maintenance interrupt** — PPI 9 = INTID 25 on QEMU `virt` (`ARCH_GIC_MAINT_IRQ`). The
 /// virtual CPU interface raises it at EL2 when a condition enabled in `ICH_HCR_EL2` holds; III-1 enables
