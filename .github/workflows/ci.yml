@@ -204,8 +204,6 @@ jobs:
     # HUNG boot is caught by the inner wait cap (`LINUX_WAIT_SECS_DEFAULT`, 300 s), which kills QEMU
     # and dumps the serial log — a diagnosable failure rather than a job that ran out of wall clock.
     timeout-minutes: 15
-    env:
-      BALEEN_LINUX_DIR: ${{ github.workspace }}/.baleen-linux
     steps:
       - name: Harden the runner (audit egress)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -235,6 +233,12 @@ jobs:
       # changing a pin necessarily changes the key and cannot be satisfied by a stale entry. The
       # script re-verifies the restored `Image` against `IMAGE_SHA256` regardless, so a cache hit is
       # checked rather than believed.
+      # This path must track fetch-guest-image.sh's default ($repo/.baleen-linux), which
+      # in CI resolves to $GITHUB_WORKSPACE/.baleen-linux. The job deliberately no longer
+      # sets BALEEN_LINUX_DIR, so CI exercises that default instead of pinning a second
+      # copy of it (#103). actions/cache needs a literal, so this one duplication remains:
+      # if the default ever moves, the failure mode is a cache MISS and a re-fetch, not the
+      # silent local-vs-CI divergence that pinning the env var would reintroduce.
       - name: Cache the guest kernel + initramfs
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
