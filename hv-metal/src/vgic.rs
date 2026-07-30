@@ -87,6 +87,13 @@ const WORDS: usize = NUM_INTIDS / 32;
 /// redistributor's SGI frame rather than the distributor.
 const FIRST_SPI: usize = 32;
 
+/// The redistributor-banked INTIDs must fill whole words of BOTH bank shapes, or `dist_word_index`
+/// would exclude a fraction of a word — leaving part of INTIDs 0..31 reachable from the distributor.
+const _: () = assert!(
+    FIRST_SPI.is_multiple_of(32) && FIRST_SPI.is_multiple_of(16),
+    "the redistributor-banked INTIDs must fill whole words of every distributor bank shape"
+);
+
 const _: () = assert!(
     NUM_INTIDS.is_multiple_of(32),
     "the INTID space must fill whole registers"
@@ -94,6 +101,20 @@ const _: () = assert!(
 const _: () = assert!(
     (crate::gic::VTIMER_INTID as usize) < NUM_INTIDS,
     "the forwarded timer INTID must exist in the emulated distributor"
+);
+
+/// **The distributor's register banks must not overlap.** Each `*ENABLER`/`*PENDR`/`*ACTIVER`/
+/// `IGROUPR` bank is `4 * WORDS` bytes from its base, and the bases are 0x80 apart — so a bank
+/// overruns its neighbour once `WORDS > 32`, i.e. `NUM_INTIDS > 1024`. The GICv3 maximum SPI is 1020
+/// so the architecture already forbids it, but nothing in THIS file said so, and a bank silently
+/// overlapping its neighbour is a decode that writes the wrong register: `word_index` would map an
+/// offset into two different banks depending on which `if` ran first.
+///
+/// `IPRIORITYR` is byte-per-INTID rather than word-per-32, so it is checked against `ICFGR` too.
+const _: () = assert!(
+    4 * WORDS as u64 <= GICD_ICENABLER - GICD_ISENABLER
+        && GICD_IPRIORITYR + NUM_INTIDS as u64 <= GICD_ICFGR,
+    "the distributor's register banks overlap — a decode would write the wrong register"
 );
 
 /// **The ③-b1 headline, as a compile-time fact.** The real-Linux guest gets NO Stage-2 device
@@ -245,7 +266,12 @@ impl VirtGic {
     /// Service a guest **read** of the emulated GIC at `ipa`, `size` bytes wide.
     pub(crate) fn mmio_read(&mut self, ipa: u64, size: u64) -> Result<u64, Unhandled> {
         self.traps += 1;
-        let (frame, off) = frame_of(ipa);
+        let Some((frame, off)) = frame_of(ipa) else {
+            return Err(Unhandled {
+                frame: "outside every emulated GIC frame",
+                offset: ipa,
+            });
+        };
         match frame {
             Frame::Dist => self.dist_read(off, size),
             Frame::Redist => self.redist_read(off),
@@ -260,7 +286,12 @@ impl VirtGic {
     /// Service a guest **write** of the emulated GIC at `ipa`, `size` bytes wide.
     pub(crate) fn mmio_write(&mut self, ipa: u64, size: u64, value: u64) -> Result<(), Unhandled> {
         self.traps += 1;
-        let (frame, off) = frame_of(ipa);
+        let Some((frame, off)) = frame_of(ipa) else {
+            return Err(Unhandled {
+                frame: "outside every emulated GIC frame",
+                offset: ipa,
+            });
+        };
         let ok = match frame {
             Frame::Dist => self.dist_write(off, size, value),
             Frame::Redist => self.redist_write(off, value as u32),
@@ -297,30 +328,32 @@ impl VirtGic {
 
     /// The banked per-INTID registers of the distributor, which all index by INTID off a base.
     fn dist_bank_read(&self, off: u64, _size: u64) -> Option<u64> {
-        if let Some(w) = word_index(off, GICD_IGROUPR, WORDS) {
+        if let Some(w) = dist_word_index(off, GICD_IGROUPR, WORDS, 32) {
             return Some(self.group[w] as u64);
         }
         // Set and clear registers read back the same underlying bank.
-        if let Some(w) = word_index(off, GICD_ISENABLER, WORDS) {
+        if let Some(w) = dist_word_index(off, GICD_ISENABLER, WORDS, 32) {
             return Some(self.enabled[w] as u64);
         }
-        if let Some(w) = word_index(off, GICD_ICENABLER, WORDS) {
+        if let Some(w) = dist_word_index(off, GICD_ICENABLER, WORDS, 32) {
             return Some(self.enabled[w] as u64);
         }
         // Pending/active: declared residue — accepted, always read as zero. See the module docs.
-        if word_index(off, GICD_ISPENDR, WORDS).is_some()
-            || word_index(off, GICD_ICPENDR, WORDS).is_some()
-            || word_index(off, GICD_ISACTIVER, WORDS).is_some()
-            || word_index(off, GICD_ICACTIVER, WORDS).is_some()
+        if dist_word_index(off, GICD_ISPENDR, WORDS, 32).is_some()
+            || dist_word_index(off, GICD_ICPENDR, WORDS, 32).is_some()
+            || dist_word_index(off, GICD_ISACTIVER, WORDS, 32).is_some()
+            || dist_word_index(off, GICD_ICACTIVER, WORDS, 32).is_some()
         {
             return Some(0);
         }
-        if let Some(w) = word_index(off, GICD_ICFGR, NUM_INTIDS / 16) {
+        if let Some(w) = dist_word_index(off, GICD_ICFGR, NUM_INTIDS / 16, 16) {
             return Some(self.icfgr[w] as u64);
         }
-        if (GICD_IPRIORITYR..GICD_IPRIORITYR + NUM_INTIDS as u64).contains(&off) {
+        if (GICD_IPRIORITYR + FIRST_SPI as u64..GICD_IPRIORITYR + NUM_INTIDS as u64).contains(&off)
+        {
             // Priority is byte-addressed but usually accessed a word at a time; return the word the
-            // offset falls in, assembled from the bytes.
+            // offset falls in, assembled from the bytes. Starts at the first SPI: the distributor's
+            // copies of INTIDs 0..31 are RES0 (see `dist_word_index`).
             let base = (off - GICD_IPRIORITYR) as usize & !3;
             let mut v = 0u64;
             for k in 0..4 {
@@ -346,30 +379,31 @@ impl VirtGic {
             GICD_TYPER | GICD_IIDR | GICD_TYPER2 | GICD_PIDR2 => return true,
             _ => {}
         }
-        if let Some(w) = word_index(off, GICD_IGROUPR, WORDS) {
+        if let Some(w) = dist_word_index(off, GICD_IGROUPR, WORDS, 32) {
             self.group[w] = v;
             return true;
         }
-        if let Some(w) = word_index(off, GICD_ISENABLER, WORDS) {
+        if let Some(w) = dist_word_index(off, GICD_ISENABLER, WORDS, 32) {
             self.set_enabled(w, v);
             return true;
         }
-        if let Some(w) = word_index(off, GICD_ICENABLER, WORDS) {
+        if let Some(w) = dist_word_index(off, GICD_ICENABLER, WORDS, 32) {
             self.enabled[w] &= !v;
             return true;
         }
-        if word_index(off, GICD_ISPENDR, WORDS).is_some()
-            || word_index(off, GICD_ICPENDR, WORDS).is_some()
-            || word_index(off, GICD_ISACTIVER, WORDS).is_some()
-            || word_index(off, GICD_ICACTIVER, WORDS).is_some()
+        if dist_word_index(off, GICD_ISPENDR, WORDS, 32).is_some()
+            || dist_word_index(off, GICD_ICPENDR, WORDS, 32).is_some()
+            || dist_word_index(off, GICD_ISACTIVER, WORDS, 32).is_some()
+            || dist_word_index(off, GICD_ICACTIVER, WORDS, 32).is_some()
         {
             return true; // declared residue
         }
-        if let Some(w) = word_index(off, GICD_ICFGR, NUM_INTIDS / 16) {
+        if let Some(w) = dist_word_index(off, GICD_ICFGR, NUM_INTIDS / 16, 16) {
             self.icfgr[w] = v;
             return true;
         }
-        if (GICD_IPRIORITYR..GICD_IPRIORITYR + NUM_INTIDS as u64).contains(&off) {
+        if (GICD_IPRIORITYR + FIRST_SPI as u64..GICD_IPRIORITYR + NUM_INTIDS as u64).contains(&off)
+        {
             let base = (off - GICD_IPRIORITYR) as usize & !3;
             for k in 0..4 {
                 self.priority[base + k] = (value >> (8 * k)) as u8;
@@ -490,23 +524,32 @@ impl Frame {
     }
 }
 
-/// Split a guest IPA into `(frame, offset within frame)`.
+/// Split a guest IPA into `(frame, offset within frame)`, or `None` if it is in no frame at all.
 ///
 /// The redistributor region `guest.dts` declares is much larger than the two frames a single-CPU
 /// guest has (it is sized for the machine's maximum CPU count). Everything past the SGI frame is
 /// therefore *in the window* but in no frame, and lands on the `Unhandled` path — reported, not
 /// silently absorbed, because an access there means the guest believes in a redistributor that does
 /// not exist.
-fn frame_of(ipa: u64) -> (Frame, u64) {
+fn frame_of(ipa: u64) -> Option<(Frame, u64)> {
+    // **Total, not caller-guarded.** This used to subtract `GICD_BASE` unconditionally, which
+    // UNDERFLOWS for any address below the distributor — wrapping in release to a huge offset that
+    // happened to fall through to `Unhandled`. It failed closed by luck, and only because
+    // [`in_window`] — a *separate* function the caller had to remember — kept such an address out.
+    // A device model reached with a guest-derived address should not have preconditions its own
+    // entry points do not enforce.
+    if !in_window(ipa) {
+        return None;
+    }
     if ipa < GICR_RD_BASE {
-        return (Frame::Dist, ipa - GICD_BASE);
+        return Some((Frame::Dist, ipa - GICD_BASE));
     }
     let off = ipa - GICR_RD_BASE;
-    if off < GICR_FRAME {
+    Some(if off < GICR_FRAME {
         (Frame::Redist, off)
     } else {
         (Frame::Sgi, off - GICR_FRAME)
-    }
+    })
 }
 
 /// If `off` names a `GICD_IROUTER<n>` entry, its index into [`VirtGic::irouter`].
@@ -523,6 +566,31 @@ fn irouter_index(off: u64) -> Option<usize> {
         return None;
     }
     Some(((off - first) / 8) as usize)
+}
+
+/// If `off` names a word of a DISTRIBUTOR bank, its index — **excluding word 0**.
+///
+/// **The distributor does not own INTIDs 0..31.** With `GICD_CTLR.ARE_NS` set (which this model
+/// forces), SGIs and PPIs are banked *per redistributor*, and the distributor's copies of them are
+/// RES0. Before this guard `GICD_ISENABLER0` and `GICR_ISENABLER0` both reached `enabled[0]`, so a
+/// write the architecture reserves could change the guest's PPI enables — and, worse for the proofs,
+/// it meant the two frames deliberately SHARED state, which makes "the decode is a partition" false
+/// as a theorem rather than merely hard to state.
+///
+/// Behaviour-preserving for the shipped guest, and that is measured, not assumed: the ③-b1 register
+/// trace shows the kernel's `GICD_ISENABLER`/`IGROUPR`/`ICFGR` writes starting at word 1 and its
+/// `GICD_IPRIORITYR` writes at `0x420` (INTID 32) — it never touches the distributor's copies of
+/// 0..31, because Linux knows they are reserved too.
+fn dist_word_index(off: u64, base: u64, count: usize, intids_per_word: usize) -> Option<usize> {
+    // How many whole words the redistributor-banked INTIDs occupy. **`intids_per_word` is not always
+    // 32**: the `*ENABLER`/`*PENDR`/`*ACTIVER`/`IGROUPR` banks are one bit per INTID (32 per word),
+    // but `ICFGR` is TWO bits (16 per word) — so INTIDs 0..31 span its words 0 AND 1. Excluding only
+    // word 0, as the first cut of this guard did, left `GICD_ICFGR1` still aliasing `GICR_ICFGR1`.
+    let banked_words = FIRST_SPI / intids_per_word;
+    match word_index(off, base, count) {
+        Some(w) if w >= banked_words => Some(w),
+        _ => None,
+    }
 }
 
 /// If `off` names a word of a `count`-word register bank based at `base`, its index.
