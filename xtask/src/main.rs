@@ -290,11 +290,20 @@ fn qemu_linux(check: bool) -> bool {
 /// * **`vpl011 OK: the guest's console is EMULATED …`** — ③-a1's own witness, and the only one here
 ///   that can tell an EMULATED PL011 from a passed-through one. Every marker above it is a statement
 ///   about the kernel, and the kernel prints the same bytes either way: **measured — with the
-///   pre-③ 32 MiB pass-through window restored, ten of the twelve markers below stayed green.** This
+///   pre-③ 32 MiB pass-through window restored, ten of the twelve markers that existed at ③-a1
+///   stayed green.** This
 ///   one is printed by `hv-metal`'s own device model, and only if the userspace marker's bytes
 ///   arrived at its `DR` register — so widening the window back over `0x0900_0000` fails it. It is
 ///   deliberately an INGRESS claim; the egress half is the nine markers above, which the kernel
 ///   cannot print unless the emulator relays its bytes to the real UART.
+/// * **`vtimer OK: the guest's scheduler tick is FORWARDED …`** and **`vsgi OK: … SGIs MEDIATED …`**
+///   — ③-a2's witnesses, and they exist for exactly the reason ③-a1's does: **every marker above
+///   this point is satisfied identically with `HCR_EL2.IMO=0`**, because a kernel taking its timer
+///   PPI directly prints the same bytes as one taking an injected virtual interrupt. These two are
+///   counters incremented only inside EL2 trap handlers that `IMO=1` is what makes reachable, so
+///   `IMO=0` sets both to zero and prints the `FAIL` twin instead (which `LINUX_FORBIDDEN` also
+///   catches). They are INGRESS claims; the egress half is every marker above, which a guest with no
+///   scheduler tick never reaches — a Linux guest that is not ticking does not get to `Run /init`.
 /// * **`linux guest issued PSCI SYSTEM_OFF …`** — the whole round trip, and the reason the boot
 ///   terminates rather than parking: busybox `poweroff -f` -> the kernel's PSCI -> `HVC` -> EL2.
 const LINUX_MARKERS: &[&str] = &[
@@ -320,6 +329,13 @@ const LINUX_MARKERS: &[&str] = &[
     // ③-a1: the console the ten markers above travelled over is EMULATED.
     "baleen: vpl011 OK: the guest's console is EMULATED — userspace's 'BALEEN-STEP0-OK' was \
      written to the emulated PL011's DR register in EL2",
+    // ③-a2: the interrupts that DROVE the boot above are EL2's now. Same discipline as the vpl011
+    // marker and for the same reason — a guest whose scheduler tick arrives by list-register
+    // injection prints exactly what one taking the PPI directly prints, so every marker above this
+    // point survives `IMO=0` unchanged. These two are printed by hv-metal's own counters, which
+    // only the forwarding path increments.
+    "baleen: vtimer OK: the guest's scheduler tick is FORWARDED —",
+    "baleen: vsgi OK:",
     // The round trip home.
     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
 ];
@@ -339,6 +355,11 @@ const LINUX_FORBIDDEN: &[&str] = &[
     "Kernel panic",
     "baleen: linux model setup",
     "baleen: vpl011 FAIL",
+    // ③-a2's negative halves. `vtimer FAIL` means EL2 never took a timer interrupt — with `IMO=1`
+    // that is a guest running on a tick it should not have been able to receive. `vsgi FAIL` means
+    // no `ICC_SGI1R_EL1` write ever trapped, i.e. the guest reached its own SGI generation register.
+    "baleen: vtimer FAIL",
+    "baleen: vsgi FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
