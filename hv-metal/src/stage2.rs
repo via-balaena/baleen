@@ -203,6 +203,50 @@ pub const LINUX_RAM_BASE: u64 = 0x4800_0000;
 #[cfg(feature = "real-linux")]
 pub const LINUX_RAM_END: u64 = 0x8000_0000;
 
+/// Bytes a super-span frame covers — one 2 MiB Stage-2 block.
+#[cfg(feature = "real-linux")]
+pub const SUP_FRAME_BYTES: u64 = hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE;
+
+/// **③-b2a: the window is now SPLIT.** Super-span frames each real-Linux guest owns — half the
+/// backed window each, so the two domains' frame sets are disjoint **by construction** rather than
+/// by a runtime check.
+///
+/// The backing itself ([`NUM_SUP_FRAMES`]) is unchanged and covers the whole window: what makes the
+/// two guests disjoint is not two separate reservations but **which frames each domain owns in the
+/// model**, exactly as the synthetic Arc-2 pair works. Ownership is the isolation mechanism; the PA
+/// window is shared arithmetic.
+#[cfg(feature = "real-linux")]
+pub const LINUX_SUP_FRAMES_PER_GUEST: u64 = NUM_SUP_FRAMES / 2;
+
+/// `L2`-pinned model tables ONE guest needs for its own leaves — [`NUM_LINUX_TABLES`] is the total
+/// across both.
+#[cfg(feature = "real-linux")]
+pub const LINUX_TABLES_PER_GUEST: u64 =
+    LINUX_SUP_FRAMES_PER_GUEST.div_ceil(hv_core::p2m::TABLE_SLOTS as u64);
+
+/// Exclusive end of the FIRST guest's RAM, and the base of the second's. This is the address the
+/// running kernel's DTB `/memory` node stops at, and the first address it must NOT be able to reach.
+#[cfg(feature = "real-linux")]
+pub const LINUX_RAM_SPLIT: u64 = LINUX_RAM_BASE + LINUX_SUP_FRAMES_PER_GUEST * SUP_FRAME_BYTES;
+
+/// The two guests' table frames must both fit the model, or the second domain's `P2mAllocate` walks
+/// off the end of a frame space sized for one. True or the build fails (design-lesson #97).
+#[cfg(feature = "real-linux")]
+const _: () = assert!(
+    2 * LINUX_TABLES_PER_GUEST <= NUM_LINUX_TABLES,
+    "two guests' page tables must fit the frame space NUM_FRAMES reserves"
+);
+
+/// The split must land on a frame boundary and inside the window — otherwise one guest's last leaf
+/// would straddle into the other's, which is the one thing this whole rung is about.
+#[cfg(feature = "real-linux")]
+const _: () = assert!(
+    LINUX_RAM_SPLIT > LINUX_RAM_BASE
+        && LINUX_RAM_SPLIT < LINUX_RAM_END
+        && (LINUX_RAM_SPLIT - LINUX_RAM_BASE).is_multiple_of(SUP_FRAME_BYTES),
+    "the guest-RAM split must be a super-frame boundary strictly inside the window"
+);
+
 // ─── the Stage-2 enable parameters, for EVERY path that enables Stage-2 ──────────────────────────
 
 /// `VTCR_EL2` = `0x8002_3559`: 4 KiB granule, 39-bit IPA (T0SZ=25), start level 1 (SL0=0b01), Normal
@@ -602,7 +646,7 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
 /// proven pure function under the fence, and it is the same function the composition theorem is
 /// stated over — so the boot witness's expectation and the proof cannot be about two different
 /// walks.
-#[cfg(feature = "smmu")]
+#[cfg(any(feature = "smmu", feature = "real-linux"))]
 pub(crate) type Resolved = hv_s2::arm64::Reach;
 
 /// Walk the Stage-2 tables rooted at `l1_pa` for `ipa`, in software, through `hv-s2`'s **decode**
@@ -624,7 +668,7 @@ pub(crate) type Resolved = hv_s2::arm64::Reach;
 /// address beyond the tables' 512 GiB reach wrapped back into them and resolved to real memory
 /// (`docs/SMMU-DEVICE-PATH-COMPOSITION.md` §2). Dereferencing a raw pointer is what this crate is
 /// for; deciding what the descriptors mean is not.
-#[cfg(feature = "smmu")]
+#[cfg(any(feature = "smmu", feature = "real-linux"))]
 pub(crate) fn walk_stage2(l1_pa: u64, ipa: u64) -> Option<Resolved> {
     hv_s2::arm64::walk(l1_pa, ipa, |table_pa, index| {
         // SAFETY: `table_pa` came from `VTTBR_EL2`/a table descriptor this hypervisor emitted, so it

@@ -88,12 +88,27 @@ use crate::abort::{self, DataAbort, EC_DATA_ABORT};
 use crate::cell::BootCell;
 use crate::gic;
 use crate::pl011::Pl011;
-use crate::stage2::{self, HCR_EL2_VM, LINUX_RAM_BASE, LINUX_RAM_END, VTCR_EL2};
+use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
 use crate::vgic::{self, VirtGic};
 use crate::vpl011::{self, VirtPl011};
 
 /// The control domain.
 const DOM0: DomId = 0;
+
+/// The domain the real Linux kernel boots as, and the Stage-2 set it runs on.
+const GUEST_A: DomId = 1;
+const SET_A: usize = 0;
+/// The PEER domain (③-b2a). It owns the second half of the guest-RAM window and has a fully emitted
+/// Stage-2 image, but does not execute — running it is ③-b2b, which needs a scheduler this path does
+/// not have. What it exists for here is to make the negative test meaningful: see [`run`].
+const GUEST_B: DomId = 2;
+const SET_B: usize = 1;
+
+/// The first model frame holding an `L2` page table — just above the super partition, in the base
+/// partition, and never mapped (a page table is model state, not a leaf). Each domain gets its own
+/// contiguous run of `LINUX_TABLES_PER_GUEST`.
+const FIRST_TABLE_A: Mfn = stage2::NUM_SUP_FRAMES as Mfn;
+const FIRST_TABLE_B: Mfn = FIRST_TABLE_A + stage2::LINUX_TABLES_PER_GUEST as Mfn;
 
 // ─── the memory contract ─────────────────────────────────────────────────────────────────────────
 //
@@ -154,25 +169,32 @@ const SCTLR_EL1_ENABLES: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 <<
 /// the ∀-N refinement theorem behind it could only address 2 MiB and so could not host a kernel. Arc
 /// 6a gave that emitter superpages; this makes the kernel use it.
 ///
-/// The model: one domain owning an `L2`-pinned page table, with one **leaf edge per 2 MiB of guest
-/// RAM**. A leaf out of an `L2` table is a superpage (`hv_s2::Span::Super`), so the emitter writes
-/// 2 MiB blocks — and because the super window's IPA and PA bases are both `LINUX_RAM_BASE`, the
-/// mapping is identity, as the arm64 boot protocol and the DTB's `/memory` node require.
+/// The model: `guest` owns `LINUX_TABLES_PER_GUEST` `L2`-pinned page tables, with one **leaf edge
+/// per 2 MiB** of its half of the window, starting at model frame `first_frame`. A leaf out of an
+/// `L2` table is a superpage (`hv_s2::Span::Super`), so the emitter writes 2 MiB blocks — and
+/// because the super window's IPA and PA bases are both `LINUX_RAM_BASE`, the mapping is identity,
+/// as the arm64 boot protocol and the DTB's `/memory` node require.
 ///
-/// The device pass-through window is **infrastructure**, not model-driven — no `p2m` edge describes
-/// MMIO — and the emitter maps it Device-nGnRnE + execute-never under its own checked invariant.
-fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
-    /// The domain the Linux guest runs as. `0` is the control domain.
-    const GUEST: DomId = 1;
-    /// The first model frame holding an `L2` page table — just above the super partition, in the
-    /// base partition, and never mapped (a page table is model state, not a leaf).
-    const FIRST_TABLE: Mfn = stage2::NUM_SUP_FRAMES as Mfn;
-
+/// **③-b2a made this per-domain.** It used to hard-code one domain, one set and the whole window;
+/// now the domain, its frame range, its table range and its Stage-2 set are all parameters, which is
+/// what lets [`run`] build a peer with a real image of its own.
+///
+/// **There is no device pass-through window to describe any more** — this doc used to explain how
+/// the emitter maps one as infrastructure, which stopped being true at ③-b1 when the GIC became
+/// EL2 state and `windows().device_len` went to zero (`crate::vgic` asserts it at compile time).
+fn build_model_and_stage2(
+    hv: &mut Hypervisor,
+    uart: &mut Pl011,
+    guest: DomId,
+    first_frame: Mfn,
+    first_table: Mfn,
+    set: usize,
+) -> u64 {
     let mut go = |caller: DomId, call: HvCall, what: &str| {
         if let Err(e) = crate::teardown::dispatch(hv, caller, call) {
             let _ = writeln!(
                 uart,
-                "baleen: linux model setup '{what}' failed: {e:?}; halting"
+                "baleen: linux model setup '{what}' failed for dom {guest}: {e:?}; halting"
             );
             crate::park();
         }
@@ -181,24 +203,30 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
     go(
         DOM0,
         HvCall::DomainCreate {
-            target: GUEST,
+            target: guest,
             may_create: false,
         },
         "create the linux domain",
     );
 
-    // One super-span leaf per 2 MiB of guest RAM, spread across `NUM_LINUX_TABLES` `L2`-pinned
-    // tables because `hv_core::TABLE_SLOTS` is 8 (see `crate::NUM_FRAMES`). Each table is allocated
-    // and pinned before its leaves are linked.
-    for t in 0..stage2::NUM_LINUX_TABLES {
-        let table = FIRST_TABLE + t as Mfn;
+    // One super-span leaf per 2 MiB of THIS guest's half of the window, spread across
+    // `LINUX_TABLES_PER_GUEST` `L2`-pinned tables because `hv_core::TABLE_SLOTS` is 8 (see
+    // `crate::NUM_FRAMES`). Each table is allocated and pinned before its leaves are linked.
+    //
+    // **③-b2a: the frame range is a PARAMETER, and that is the whole isolation mechanism.** The two
+    // guests are disjoint because each links a different half of the frame space — not because of a
+    // check somewhere, but because neither ever names the other's frames. `hv-core` then refuses any
+    // later attempt to (a frame is owned by at most one domain), and the emitter maps exactly the
+    // leaves it finds, so the Stage-2 images inherit the disjointness rather than re-deriving it.
+    for t in 0..stage2::LINUX_TABLES_PER_GUEST {
+        let table = first_table + t as Mfn;
         go(
-            GUEST,
+            guest,
             HvCall::P2mAllocate { mfn: table },
             "allocate a table",
         );
         go(
-            GUEST,
+            guest,
             HvCall::P2mPin {
                 mfn: table,
                 level: PtLevel::L2,
@@ -206,17 +234,18 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
             "pin a table at L2",
         );
         for slot in 0..hv_core::p2m::TABLE_SLOTS {
-            let m = (t * hv_core::p2m::TABLE_SLOTS as u64 + slot as u64) as Mfn;
-            if m >= stage2::NUM_SUP_FRAMES as Mfn {
+            let offset = t * hv_core::p2m::TABLE_SLOTS as u64 + slot as u64;
+            if offset >= stage2::LINUX_SUP_FRAMES_PER_GUEST {
                 break;
             }
+            let m = first_frame + offset as Mfn;
             go(
-                GUEST,
+                guest,
                 HvCall::P2mAllocate { mfn: m },
                 "allocate a RAM frame",
             );
             go(
-                GUEST,
+                guest,
                 HvCall::P2mLink {
                     parent: table,
                     slot,
@@ -230,15 +259,97 @@ fn build_model_and_stage2(hv: &mut Hypervisor, uart: &mut Pl011) -> u64 {
         }
     }
 
+    let base = stage2::LINUX_RAM_BASE + first_frame as u64 * stage2::SUP_FRAME_BYTES;
     let _ = writeln!(
         uart,
-        "baleen: linux model built — {} super-span leaves ({} MiB of guest RAM) across {} L2-pinned tables",
-        stage2::NUM_SUP_FRAMES,
-        (LINUX_RAM_END - LINUX_RAM_BASE) / (1024 * 1024),
-        stage2::NUM_LINUX_TABLES
+        "baleen: linux model built for dom {guest} — {} super-span leaves ({} MiB at \
+         0x{base:08x}) across {} L2-pinned tables, into stage-2 set {set}",
+        stage2::LINUX_SUP_FRAMES_PER_GUEST,
+        stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES / (1024 * 1024),
+        stage2::LINUX_TABLES_PER_GUEST
     );
 
-    stage2::build_stage2_from_p2m(hv, GUEST, 0)
+    stage2::build_stage2_from_p2m(hv, guest, set)
+}
+
+/// **③-b2a's proven half: walk BOTH emitted images and assert each reaches exactly its own frames
+/// and nothing of the peer's** — over the whole window, in both IPA and PA.
+///
+/// **Why a walk and not layout arithmetic.** Computing "what A should reach" from the same constants
+/// the emitter used would make a wrong emission and a wrong expectation agree — design-lesson #36,
+/// and the reason `walk_stage2` exists at all. This reads the descriptor bytes the hardware itself
+/// walks, so the check is a second, independent reading of what was actually written.
+///
+/// **What it is NOT.** It is a boot-time check on two concrete images, not a theorem: `hv-metal` is
+/// not a Kani target. The ∀-address statement it instantiates is already proven in `hv-verify`
+/// (`emitted_leaf_map_is_always_authorized`, `an_unauthorized_frame_is_never_mapped`,
+/// `the_walk_lands_where_the_windows_say`) — what is new here is that the two images belong to two
+/// domains one of which is a **real Linux kernel**, which is the part the synthetic Arc-2 pair could
+/// not say. Stated that way in the marker, too.
+fn report_disjointness(vttbr_a: u64, vttbr_b: u64, uart: &mut Pl011) {
+    let l1_a = hv_s2::arm64::vttbr_table(vttbr_a);
+    let l1_b = hv_s2::arm64::vttbr_table(vttbr_b);
+    if l1_a == l1_b {
+        let _ = writeln!(
+            uart,
+            "baleen: peer FAIL: both domains were emitted into ONE table set — there is no second \
+             image to be isolated from"
+        );
+        crate::park();
+    }
+
+    let per = stage2::LINUX_SUP_FRAMES_PER_GUEST;
+    let (mut a_own, mut b_own, mut a_peer, mut b_peer) = (0u64, 0u64, 0u64, 0u64);
+
+    for m in 0..stage2::NUM_SUP_FRAMES {
+        let ipa = stage2::LINUX_RAM_BASE + m * stage2::SUP_FRAME_BYTES;
+        let mine_is_a = m < per;
+        let ra = stage2::walk_stage2(l1_a, ipa);
+        let rb = stage2::walk_stage2(l1_b, ipa);
+
+        // The identity property the arm64 boot protocol needs, checked from the DESCRIPTORS: an
+        // owned frame must resolve to its own IPA, not merely to something.
+        for (r, owns, own_count, peer_count) in [
+            (ra, mine_is_a, &mut a_own, &mut a_peer),
+            (rb, !mine_is_a, &mut b_own, &mut b_peer),
+        ] {
+            match (r, owns) {
+                (Some(reach), true) if reach.pa == ipa => *own_count += 1,
+                (None, false) => {}
+                // The isolation failure: a PEER's frame that resolved at all. Counted rather than
+                // parked on, so the report says how MANY leaked instead of only where the first one
+                // was — an image mapping one stray frame and one mapping the peer's whole half are
+                // different bugs. The owned-frame failures below park immediately because they mean
+                // the image is malformed, and every later reading of it would be noise.
+                (Some(_), false) => *peer_count += 1,
+                _ => {
+                    let _ = writeln!(
+                        uart,
+                        "baleen: peer FAIL: frame {m} (IPA 0x{ipa:08x}) did not resolve to its own \
+                         identity mapping in its owner's image"
+                    );
+                    crate::park();
+                }
+            }
+        }
+    }
+
+    if a_own == per && b_own == per && a_peer == 0 && b_peer == 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: peer OK: two domains, two Stage-2 images, DISJOINT — dom {GUEST_A} reaches its \
+             {a_own} frames and 0 of dom {GUEST_B}'s; dom {GUEST_B} reaches its {b_own} and 0 of \
+             dom {GUEST_A}'s (walked from the emitted descriptors, {} frames checked in both)",
+            stage2::NUM_SUP_FRAMES
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: peer FAIL: the two images are NOT disjoint — dom {GUEST_A} own={a_own} \
+             peer={a_peer}, dom {GUEST_B} own={b_own} peer={b_peer} (expected own={per}, peer=0)"
+        );
+        crate::park();
+    }
 }
 
 /// Program + enable Stage-2: write `VTCR_EL2`/`VTTBR_EL2`, set `HCR_EL2.VM`, then TLB-invalidate for
@@ -1076,8 +1187,10 @@ extern "C" {
 pub(crate) fn run(uart: &mut Pl011) -> ! {
     let _ = writeln!(
         uart,
-        "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest \
-         (Image@0x{KERNEL_ENTRY:08x}, DTB@0x{DTB_ADDR:08x}, RAM 0x{GUEST_RAM_BASE:08x}..0x{GUEST_RAM_END:08x})"
+        "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as EL1 guest dom {GUEST_A} \
+         (Image@0x{KERNEL_ENTRY:08x}, DTB@0x{DTB_ADDR:08x}, RAM 0x{GUEST_RAM_BASE:08x}..0x{split:08x}; \
+         peer dom {GUEST_B} owns 0x{split:08x}..0x{GUEST_RAM_END:08x})",
+        split = stage2::LINUX_RAM_SPLIT
     );
 
     // Build the guest's model and emit its Stage-2 through the PROVEN emitter (M5 Arc 6b).
@@ -1087,9 +1200,26 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
         Some(hv) => hv,
         None => crate::park(),
     };
-    let vttbr = build_model_and_stage2(hv, uart);
+    // ③-b2a — TWO domains, TWO Stage-2 images, one running kernel.
+    //
+    // Domain A is the guest that boots; domain B owns the other half of the window and has a real
+    // emitted image it could run from. Building B is not decoration: it is what makes the negative
+    // test below a statement about a *peer's live mapping* rather than about unmapped space. An
+    // address that is simply not backed faults for a boring reason; an address that IS mapped, by a
+    // real Stage-2 image, at real RAM the emitter authorized — and still faults for A — is the
+    // isolation claim.
+    let vttbr_a = build_model_and_stage2(hv, uart, GUEST_A, 0, FIRST_TABLE_A, SET_A);
+    let vttbr_b = build_model_and_stage2(
+        hv,
+        uart,
+        GUEST_B,
+        stage2::LINUX_SUP_FRAMES_PER_GUEST as Mfn,
+        FIRST_TABLE_B,
+        SET_B,
+    );
+    report_disjointness(vttbr_a, vttbr_b, uart);
     drop(cell);
-    enable_stage2(vttbr);
+    enable_stage2(vttbr_a);
     enable_guest_hw_access();
     init_guest_el1();
 

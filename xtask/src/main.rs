@@ -318,22 +318,28 @@ const LINUX_MARKERS: &[&str] = &[
     // can bind the two — ⑭ folded the contract into one declaration everywhere it *could* reach, and
     // this marker is what binds the remaining cross-crate seam. Change `LINUX_KERNEL_ADDR` or
     // `LINUX_DTB_ADDR` without changing hv-metal and this goes red here rather than hanging a guest.
-    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest \
-     (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x80000000)",
-    "baleen: linux model built — 448 super-span leaves (896 MiB of guest RAM) across 56 L2-pinned tables",
+    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as EL1 guest dom 1 \
+     (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x64000000; peer dom 2 owns \
+     0x64000000..0x80000000)",
+    // ③-b2a: 224 leaves each, not 448 — the window is split. BOTH domains are asserted, so a
+    // build that quietly stopped emitting the peer would redden here and not only at `peer OK`.
+    "baleen: linux model built for dom 1 — 224 super-span leaves (448 MiB at 0x48000000) across 28 L2-pinned tables, into stage-2 set 0",
+    "baleen: linux model built for dom 2 — 224 super-span leaves (448 MiB at 0x64000000) across 28 L2-pinned tables, into stage-2 set 1",
     // `device window 0 MiB` is ③-b1's structural claim in the emitter's own voice: the guest gets
     // NO device pass-through at all. It was 32 MiB at Arc 5e, 16 MiB after ③-a1 dropped the PL011
     // out, and zero now that the GIC is emulated too.
-    "448 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB",
+    // `verify_encoding` runs per SET, so both images are read back independently.
+    "(set 0: tables decode to exactly the authorized leaf map; image block absent (tables asserted dead); 224 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB)",
+    "(set 1: tables decode to exactly the authorized leaf map; image block absent (tables asserted dead); 224 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB)",
     // The kernel, behind the proven emitter.
     "Linux version 6.18.",
     "Machine model: baleen-metal-guest",
-    "node   0: [mem 0x0000000048000000-0x000000007fffffff]",
+    "node   0: [mem 0x0000000048000000-0x0000000063ffffff]",
     "baleen: linux PSCI FID 0x84000006 -> NOT_SUPPORTED",
     "Run /init as init process",
     // Userspace, out of our initramfs.
     "########## BALEEN-STEP0-OK ##########",
-    "baleen-guest-ram: 48000000-7fffffff:SystemRAM",
+    "baleen-guest-ram: 48000000-63ffffff:SystemRAM",
     // ③-a1: the console the ten markers above travelled over is EMULATED.
     "baleen: vpl011 OK: the guest's console is EMULATED — userspace's 'BALEEN-STEP0-OK' was \
      written to the emulated PL011's DR register in EL2",
@@ -348,6 +354,9 @@ const LINUX_MARKERS: &[&str] = &[
     // it was still driving. Counted by the emulator, so a pass-through configuration cannot produce
     // it: the writes would never have been seen.
     "baleen: vgic OK: the guest's interrupt controller is EMULATED —",
+    // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
+    // rather than recomputed from the layout constants the emitter used (design-lesson #36).
+    "baleen: peer OK: two domains, two Stage-2 images, DISJOINT —",
     // The round trip home.
     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
 ];
@@ -375,6 +384,9 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // ③-b1's negative half: the guest's GIC accesses did not reach the emulator, i.e. the
     // distributor is being passed through again.
     "baleen: vgic FAIL",
+    // ③-b2a: the two images overlap, one of them never got emitted, or an owned frame did not
+    // resolve to its own identity mapping.
+    "baleen: peer FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch

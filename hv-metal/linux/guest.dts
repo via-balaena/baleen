@@ -46,10 +46,14 @@
 		};
 	};
 
-	/* Guest RAM: 0x4800_0000 .. 0x8000_0000 (896 MiB). hv-metal owns 0x4000_0000..0x4800_0000. */
+	/* This guest's RAM: 0x4800_0000 .. 0x6400_0000 (448 MiB) — half the 896 MiB window, since
+	   ③-b2a split it with a peer domain. hv-metal owns 0x4000_0000..0x4800_0000. */
 	memory@48000000 {
 		device_type = "memory";
-		reg = <0x00 0x48000000 0x00 0x38000000>;
+		// ③-b2a: 448 MiB, not 896 — the window is SPLIT and dom 2 owns the upper half
+		// (0x64000000..0x80000000). Must match `stage2::LINUX_RAM_SPLIT`; the boot banner
+		// prints both halves and `xtask::LINUX_MARKERS` asserts that line.
+		reg = <0x00 0x48000000 0x00 0x1c000000>;
 	};
 
 	apb-pclk {
