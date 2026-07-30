@@ -1,0 +1,207 @@
+# First real-Linux boot on hv-metal's EL2 — M5 Arc 5e, 2026-07-24.
+#
+# Verbatim terminal transcript, with one edit: absolute paths under the
+# developer's home directory were rewritten to $BALEEN_LINUX_DIR / <repo> so this
+# public repo carries no local usernames. Nothing else was altered.
+#
+# This is HISTORY, not a gate. The claim it makes is asserted on every CI run by
+# `cargo xtask qemu-linux-test`, which checks these same markers — see
+# docs/ARC-5-M5-GUEST-INTERFACE.md. It is kept because it is the only record of
+# the first time this worked; the paths in it no longer exist.
+#
+$ dtc -I dts -O dtb $BALEEN_LINUX_DIR/guest.patched.dts -o $BALEEN_LINUX_DIR/guest.dtb
+$BALEEN_LINUX_DIR/guest.patched.dts:78.3-28: Warning (clocks_property): /pl011@9000000:clocks: cell 0 is not a phandle reference
+$BALEEN_LINUX_DIR/guest.patched.dts:78.3-28: Warning (clocks_property): /pl011@9000000:clocks: cell 1 is not a phandle reference
+$ cargo build --release --target aarch64-unknown-none-softfloat --manifest-path hv-metal/Cargo.toml --features real-linux
+   Compiling hv-metal v0.0.0 (<repo>/hv-metal)
+    Finished `release` profile [optimized] target(s) in 0.33s
+$ qemu-system-aarch64 -M virt,virtualization=on,gic-version=3 -cpu cortex-a72 -smp 1 -m 1024 -nographic -net none -semihosting -kernel hv-metal/target/aarch64-unknown-none-softfloat/release/hv-metal -device loader,file=$BALEEN_LINUX_DIR/Image,addr=0x48000000,force-raw=on -device loader,file=$BALEEN_LINUX_DIR/guest.dtb,addr=0x4b000000,force-raw=on -device loader,file=$BALEEN_LINUX_DIR/custom-initramfs.gz,addr=0x4c000000,force-raw=on
+baleen: hv-metal alive (arc3) — the proven brain runs on the metal
+baleen: CurrentEL = EL2 (running at the hypervisor level)
+baleen: VBAR_EL2 installed — exception vectors live (VBAR=0x0000000040090800)
+baleen: HCR_EL2.RW=1 (EL1=AArch64) — value=0x0000000080000000
+baleen: generic timer live: CNTFRQ=62500000 Hz, CNTPCT 69812 -> 70187 (monotonic)
+baleen: HvCall CreditGrant(100) -> balance=100 (hv-core serviced it on the metal)
+baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x80000000)
+baleen: entering EL1 — the kernel takes the machine
+[    0.000000] Booting Linux on physical CPU 0x0000000000 [0x410fd083]
+[    0.000000] Linux version 6.18.35-0-virt (buildozer@build-3-24-aarch64) (cc (Alpine 15.2.0) 15.2.0, GNU ld (GNU Binutils) 2.45.1) #1-Alpine SMP PREEMPT_DYNAMIC 2026-06-09 12:34:47
+[    0.000000] Machine model: baleen-metal-guest
+[    0.000000] earlycon: pl11 at MMIO 0x0000000009000000 (options '')
+[    0.000000] printk: legacy bootconsole [pl11] enabled
+[    0.000000] efi: UEFI not found.
+[    0.000000] OF: reserved mem: Reserved memory: No reserved-memory node in the DT
+[    0.000000] NUMA: Faking a node at [mem 0x0000000048000000-0x000000007fffffff]
+[    0.000000] NODE_DATA(0) allocated [mem 0x7fc43cc0-0x7fc4617f]
+[    0.000000] Zone ranges:
+[    0.000000]   DMA      [mem 0x0000000048000000-0x000000007fffffff]
+[    0.000000]   DMA32    empty
+[    0.000000]   Normal   empty
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000048000000-0x000000007fffffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000048000000-0x000000007fffffff]
+[    0.000000] psci: probing for conduit method from DT.
+[    0.000000] psci: PSCIv1.1 detected in firmware.
+[    0.000000] psci: Using standard PSCI v0.2 function IDs
+baleen: linux PSCI FID 0x84000006 -> NOT_SUPPORTED
+[    0.000000] psci: MIGRATE_INFO_TYPE not supported.
+[    0.000000] psci: SMC Calling Convention v1.0
+[    0.000000] percpu: Embedded 34 pages/cpu s99544 r8192 d31528 u139264
+[    0.000000] pcpu-alloc: s99544 r8192 d31528 u139264 alloc=34*4096
+[    0.000000] pcpu-alloc: [0] 0 
+[    0.000000] Detected PIPT I-cache on CPU0
+[    0.000000] CPU features: detected: GICv3 CPU interface
+[    0.000000] CPU features: detected: Spectre-v2
+[    0.000000] CPU features: detected: Spectre-v4
+[    0.000000] CPU features: detected: Spectre-BHB
+[    0.000000] CPU features: detected: ARM erratum 1742098
+[    0.000000] CPU features: detected: ARM errata 1165522, 1319367, or 1530923
+[    0.000000] alternatives: applying boot alternatives
+[    0.000000] Kernel command line: earlycon=pl011,0x9000000 console=ttyAMA0 loglevel=8
+[    0.000000] printk: log buffer data + meta data: 131072 + 458752 = 589824 bytes
+[    0.000000] Dentry cache hash table entries: 131072 (order: 8, 1048576 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 65536 (order: 7, 524288 bytes, linear)
+[    0.000000] software IO TLB: SWIOTLB bounce buffer size adjusted to 0MB
+[    0.000000] software IO TLB: area num 1.
+[    0.000000] software IO TLB: mapped [mem 0x000000007eb80000-0x000000007ec80000] (1MB)
+[    0.000000] Fallback order for Node 0: 0 
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 229376
+[    0.000000] Policy zone: DMA
+[    0.000000] mem auto-init: stack:all(zero), heap alloc:on, heap free:off
+[    0.000000] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] Dynamic Preempt: none
+[    0.000000] rcu: Preemptible hierarchical RCU implementation.
+[    0.000000] rcu: 	RCU restricting CPUs from NR_CPUS=4096 to nr_cpu_ids=1.
+[    0.000000] 	Trampoline variant of Tasks RCU enabled.
+[    0.000000] 	Tracing variant of Tasks RCU enabled.
+[    0.000000] rcu: RCU calculated value of scheduler-enlistment delay is 100 jiffies.
+[    0.000000] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=1
+[    0.000000] RCU Tasks: Setting shift to 0 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=1.
+[    0.000000] RCU Tasks Trace: Setting shift to 0 and lim to 1 rcu_task_cb_adjust=1 rcu_task_cpu_ids=1.
+[    0.000000] NR_IRQS: 64, nr_irqs: 64, preallocated irqs: 0
+[    0.000000] GICv3: 256 SPIs implemented
+[    0.000000] GICv3: 0 Extended SPIs implemented
+[    0.000000] Root IRQ handler: gic_handle_irq
+[    0.000000] GICv3: GICv3 features: 16 PPIs
+[    0.000000] GICv3: GICD_CTLR.DS=1, SCR_EL3.FIQ=0
+[    0.000000] GICv3: CPU0: found redistributor 0 region 0:0x00000000080a0000
+[    0.000000] ITS: No ITS available, not enabling LPIs
+[    0.000000] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+[    0.000000] arch_timer: cp15 timer running at 62.50MHz (virt).
+[    0.000000] clocksource: arch_sys_counter: mask: 0x1ffffffffffffff max_cycles: 0x1cd42e208c, max_idle_ns: 881590405314 ns
+[    0.000030] sched_clock: 57 bits at 63MHz, resolution 16ns, wraps every 4398046511096ns
+[    0.003284] kfence: initialized - using 2097152 bytes for 255 objects at 0x(____ptrval____)-0x(____ptrval____)
+[    0.007008] Console: colour dummy device 80x25
+[    0.008706] Calibrating delay loop (skipped), value calculated using timer frequency.. 125.00 BogoMIPS (lpj=62500)
+[    0.008940] pid_max: default: 32768 minimum: 301
+[    0.011420] LSM: initializing lsm=lockdown,capability,landlock,yama
+[    0.013950] landlock: Up and running.
+[    0.014036] Yama: becoming mindful.
+[    0.015304] Mount-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.015450] Mountpoint-cache hash table entries: 2048 (order: 2, 16384 bytes, linear)
+[    0.033966] cacheinfo: Unable to detect cache hierarchy for CPU 0
+[    0.041116] rcu: Hierarchical SRCU implementation.
+[    0.041246] rcu: 	Max phase no-delay instances is 400.
+[    0.043624] EFI services will not be available.
+[    0.044388] smp: Bringing up secondary CPUs ...
+[    0.045060] smp: Brought up 1 node, 1 CPU
+[    0.045144] SMP: Total of 1 processors activated.
+[    0.045246] CPU: All CPU(s) started at EL1
+[    0.045448] CPU features: detected: 32-bit EL0 Support
+[    0.045556] CPU features: detected: 32-bit EL1 Support
+[    0.045686] CPU features: detected: CRC32 instructions
+[    0.052954] alternatives: applying system-wide alternatives
+[    0.063100] Memory: 852996K/917504K available (13248K kernel code, 1990K rwdata, 8392K rodata, 2048K init, 9281K bss, 60440K reserved, 0K cma-reserved)
+[    0.077588] devtmpfs: initialized
+[    0.088320] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 1911260446275000 ns
+[    0.088844] posixtimers hash table entries: 512 (order: 1, 8192 bytes, linear)
+[    0.089160] futex hash table entries: 256 (16384 bytes on 1 NUMA nodes, total 16 KiB, linear).
+[    0.089894] 23952 pages in range for non-PLT usage
+[    0.089926] 515472 pages in range for PLT usage
+[    0.091680] pinctrl core: initialized pinctrl subsystem
+[    0.092996] DMI not present or invalid.
+[    0.102470] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+[    0.104882] DMA: preallocated 128 KiB GFP_KERNEL pool for atomic allocations
+[    0.105228] DMA: preallocated 128 KiB GFP_KERNEL|GFP_DMA pool for atomic allocations
+[    0.105472] DMA: preallocated 128 KiB GFP_KERNEL|GFP_DMA32 pool for atomic allocations
+[    0.105742] audit: initializing netlink subsys (disabled)
+[    0.108090] thermal_sys: Registered thermal governor 'step_wise'
+[    0.108612] audit: type=2000 audit(0.074:1): state=initialized audit_enabled=0 res=1
+[    0.109438] cpuidle: using governor ladder
+[    0.109598] cpuidle: using governor menu
+[    0.110246] hw-breakpoint: found 6 breakpoint and 4 watchpoint registers.
+[    0.110566] ASID allocator initialised with 65536 entries
+[    0.111450] Serial: AMBA PL011 UART driver
+[    0.122346] 9000000.pl011: ttyAMA0 at MMIO 0x9000000 (irq = 13, base_baud = 0) is a PL011 rev1
+[    0.123330] printk: console [ttyAMA0] enabled
+[    0.123330] printk: console [ttyAMA0] enabled
+[    0.123952] printk: legacy bootconsole [pl11] disabled
+[    0.123952] printk: legacy bootconsole [pl11] disabled
+[    0.134538] HugeTLB: registered 1.00 GiB page size, pre-allocated 0 pages
+[    0.134818] HugeTLB: 0 KiB vmemmap can be freed for a 1.00 GiB page
+[    0.134836] HugeTLB: registered 32.0 MiB page size, pre-allocated 0 pages
+[    0.134842] HugeTLB: 0 KiB vmemmap can be freed for a 32.0 MiB page
+[    0.134850] HugeTLB: registered 2.00 MiB page size, pre-allocated 0 pages
+[    0.134854] HugeTLB: 0 KiB vmemmap can be freed for a 2.00 MiB page
+[    0.134860] HugeTLB: registered 64.0 KiB page size, pre-allocated 0 pages
+[    0.134866] HugeTLB: 0 KiB vmemmap can be freed for a 64.0 KiB page
+[    0.144852] ACPI: Interpreter disabled.
+[    0.145488] iommu: Default domain type: Translated
+[    0.145532] iommu: DMA domain TLB invalidation policy: lazy mode
+[    0.163700] clocksource: Switched to clocksource arch_sys_counter
+[    0.166936] VFS: Disk quotas dquot_6.6.0
+[    0.167032] VFS: Dquot-cache hash table entries: 512 (order 0, 4096 bytes)
+[    0.173110] pnp: PnP ACPI: disabled
+[    0.190278] NET: Registered PF_INET protocol family
+[    0.190866] IP idents hash table entries: 16384 (order: 5, 131072 bytes, linear)
+[    0.231854] tcp_listen_portaddr_hash hash table entries: 512 (order: 1, 8192 bytes, linear)
+[    0.231978] Table-perturb hash table entries: 65536 (order: 6, 262144 bytes, linear)
+[    0.232036] TCP established hash table entries: 8192 (order: 4, 65536 bytes, linear)
+[    0.232184] TCP bind hash table entries: 8192 (order: 6, 262144 bytes, linear)
+[    0.232278] TCP: Hash tables configured (established 8192 bind 8192)
+[    0.233234] MPTCP token hash table entries: 1024 (order: 3, 24576 bytes, linear)
+[    0.233456] UDP hash table entries: 512 (order: 3, 32768 bytes, linear)
+[    0.233594] UDP-Lite hash table entries: 512 (order: 3, 32768 bytes, linear)
+[    0.234496] NET: Registered PF_UNIX/PF_LOCAL protocol family
+[    0.234768] NET: Registered PF_XDP protocol family
+[    0.234954] PCI: CLS 0 bytes, default 64
+[    0.239794] Unpacking initramfs...
+[    0.245908] kvm [1]: HYP mode not available
+[    0.247504] Initialise system trusted keyrings
+[    0.252492] workingset: timestamp_bits=44 max_order=18 bucket_order=0
+[    0.278858] Key type asymmetric registered
+[    0.278936] Asymmetric key parser 'x509' registered
+[    0.279234] Block layer SCSI generic (bsg) driver version 0.4 loaded (major 248)
+[    0.309274] io scheduler mq-deadline registered
+[    0.309356] io scheduler kyber registered
+[    0.309568] io scheduler bfq registered
+[    0.314532] Serial: 8250/16550 driver, 4 ports, IRQ sharing enabled
+[    0.324732] hv_vmbus: registering driver hyperv_keyboard
+[    0.326296] NET: Registered PF_INET6 protocol family
+[    0.336132] Segment Routing with IPv6
+[    0.336246] In-situ OAM (IOAM) with IPv6
+[    0.364676] registered taskstats version 1
+[    0.366092] Loading compiled-in X.509 certificates
+[    0.399830] Freeing initrd memory: 3924K
+[    0.441050] Loaded X.509 cert 'alpinelinux.org: Alpine Linux kernel key: 87fa969a47f3e2a6aa35859eb932a17c95abcd82'
+[    0.451262] Demotion targets for Node 0: null
+[    0.452054] Key type .fscrypt registered
+[    0.452076] Key type fscrypt-provisioning registered
+[    0.465610] clk: Disabling unused clocks
+[    0.465798] PM: genpd: Disabling unused power domains
+[    0.492464] Freeing unused kernel memory: 2048K
+[    0.493230] Run /init as init process
+[    0.493296]   with arguments:
+[    0.493352]     /init
+[    0.493366]   with environment:
+[    0.493378]     HOME=/
+[    0.493386]     TERM=linux
+
+########## BALEEN-STEP0-OK ##########
+Linux (none) 6.18.35-0-virt #1-Alpine SMP PREEMPT_DYNAMIC 2026-06-09 12:34:47 aarch64 Linux
+virtio devices: 
+cmdline: earlycon=pl011,0x9000000 console=ttyAMA0 loglevel=8
+########## poweroff ##########
+[    0.535966] reboot: Power down
+baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2 (M5 Arc 5e)
