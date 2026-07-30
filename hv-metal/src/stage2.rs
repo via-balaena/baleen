@@ -171,18 +171,22 @@ pub const fn windows() -> Windows {
             // 896 MiB of guest RAM in 2 MiB blocks — under `TABLE_ENTRIES`, so ONE L2 covers it.
             sup_frames: (LINUX_RAM_END - LINUX_RAM_BASE)
                 / (hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE),
-            // The GICv3 distributor + redistributor, as pass-through MMIO — and NOTHING else.
+            // **NO device pass-through window at all** — the real-Linux guest reaches no real
+            // device MMIO whatsoever.
             //
-            // ③-a1 shrank this from 32 MiB (`0x0800_0000 .. 0x0a00_0000`) to 16 MiB. The 32 MiB
-            // form also covered the **PL011 at `0x0900_0000`**, so the guest drove the real UART
-            // directly; that is fine for one guest and impossible for two, since a UART is not a
-            // shareable resource. It is now derived from the GIC's own addresses — the window
-            // exists to hand the guest an interrupt controller — and the GIC redistributor region
-            // happens to END exactly at the PL011's base, so the UART falls out of the window with
-            // `guest.dts` completely unchanged and is emulated instead ([`crate::vpl011`], which
-            // carries the compile-time assertion that this window does not cover it).
-            device_base: crate::gic::GICD_BASE,
-            device_len: crate::gic::GICR_END - crate::gic::GICD_BASE,
+            // The history is one window shrinking to nothing, one device at a time. Arc 5e mapped
+            // 32 MiB (`0x0800_0000 .. 0x0a00_0000`), which covered the **PL011 at `0x0900_0000`**,
+            // so the guest drove the real UART. ③-a1 shrank it to the GIC alone (16 MiB) and
+            // emulated the UART ([`crate::vpl011`]); the GIC redistributor region ends exactly at
+            // the PL011's base, so that cost `guest.dts` nothing. ③-b1 removed the rest: the
+            // distributor is emulated too ([`crate::vgic`]), because a guest that reaches the real
+            // `GICD_ISENABLER` can enable and route interrupts belonging to someone else — not
+            // merely a shared resource but a control channel, and the thing blocking a second guest.
+            //
+            // `crate::vgic` carries the compile-time assertion that this is zero, which is ③-b1's
+            // headline as a build-time fact.
+            device_base: 0,
+            device_len: 0,
         }
     }
 }

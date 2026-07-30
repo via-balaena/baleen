@@ -86,6 +86,7 @@ use crate::cell::BootCell;
 use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, HCR_EL2_VM, LINUX_RAM_BASE, LINUX_RAM_END, VTCR_EL2};
+use crate::vgic::{self, VirtGic};
 use crate::vpl011::{self, VirtPl011};
 
 /// The control domain.
@@ -485,6 +486,11 @@ const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
 /// own, which is the whole point of the device having become EL2 state instead of hardware.
 static VPL011: BootCell<VirtPl011> = BootCell::new("VPL011", VirtPl011::new());
 
+/// The emulated GICv3 the guest drives (③-b1). One instance: one guest — and giving the *second*
+/// guest its own is the whole reason the distributor had to become EL2 state, exactly as ③-a1 made
+/// the console EL2 state for the same reason.
+static VGIC: BootCell<VirtGic> = BootCell::new("VGIC", VirtGic::new());
+
 /// How many physical timer interrupts EL2 has forwarded to the guest as virtual ones (③-a2).
 ///
 /// **This is the arc's ingress witness, and it exists because nothing else can see the change**
@@ -527,6 +533,22 @@ extern "C" fn handle_linux_irq() {
     let intid = gic::ack_physical();
 
     if intid == gic::VTIMER_INTID {
+        // ③-b1 — THE MEDIATION SEAM. Before this rung EL2 forwarded the timer unconditionally, which
+        // was correct with one guest and is exactly the decision that has to become per-guest for
+        // two. Now the interrupt is delivered only if the guest asked for it **in its own emulated
+        // distributor**, which lives in EL2 memory the guest cannot reach. A guest that has not
+        // enabled INTID 27 does not get INTID 27 — and, come ③-b, cannot enable anyone else's.
+        if !VGIC.borrow_mut().is_enabled(intid) {
+            // Not an error — the guest legitimately runs with its timer masked. Mask it PHYSICALLY
+            // too before completing it: the timer PPI is level-triggered, so deactivating while the
+            // level is high would re-signal immediately and storm EL2. `handle_vgic_access` re-enables
+            // it the moment the guest enables the INTID, so this is self-healing rather than a
+            // one-way door.
+            gic::set_ppi_enabled(intid, false);
+            gic::eoi_physical(intid);
+            gic::deactivate_physical(intid);
+            return;
+        }
         if !gic::inject_hw(gic::VTIMER_INTID, gic::VTIMER_INTID) {
             // Unreachable with one guest forwarding one interrupt into a bank of four — and reported
             // rather than dropped anyway, because a lost timer tick is a guest that stops scheduling,
@@ -652,6 +674,13 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
     let hpfar = read_hpfar();
     let ipa = abort::full_ipa(hpfar, far);
 
+    // ③-b1: the emulated GIC. Checked before the PL011 only because it is the busier device; the
+    // two windows are disjoint, so the order is arbitrary.
+    if vgic::in_window(ipa) {
+        handle_vgic_access(frame, &a, ipa, esr, elr, far, uart);
+        return;
+    }
+
     if !vpl011::in_window(ipa) {
         let _ = writeln!(
             uart,
@@ -710,6 +739,71 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
 
     // Unlike an `HVC`, a data abort's preferred return is the FAULTING instruction — resume past it
     // or the guest re-executes the access forever.
+    crate::guest::advance_elr_past_fault();
+}
+
+/// Service a guest access to the **emulated GIC** (③-b1).
+///
+/// Structurally the PL011 path's twin, and it repeats that path's two refusals deliberately rather
+/// than sharing a helper: an undecodable access is fatal (emulating the wrong register is worse than
+/// halting with the syndrome), and so is a register [`crate::vgic`] does not model — a guest using a
+/// register this distributor lacks is a guest whose expectations we would be silently violating.
+#[allow(clippy::too_many_arguments)]
+fn handle_vgic_access(
+    frame: &mut LinuxFrame,
+    a: &DataAbort,
+    ipa: u64,
+    esr: u64,
+    elr: u64,
+    far: u64,
+    uart: &mut Pl011,
+) {
+    if !a.isv || a.fnv || a.s1ptw {
+        let _ = writeln!(
+            uart,
+            "baleen: LINUX GUEST TRAP: undecodable GIC access at IPA=0x{ipa:016x} \
+             (ISV={} FnV={} S1PTW={}) ESR=0x{esr:08x} — halting",
+            a.isv as u8, a.fnv as u8, a.s1ptw as u8
+        );
+        crate::park();
+    }
+
+    let mut dev = VGIC.borrow_mut();
+    let outcome = if a.wnr {
+        let value = if a.srt < 31 { frame.x[a.srt] } else { 0 } & a.value_mask();
+        dev.mmio_write(ipa, a.access_bytes(), value).map(|()| 0)
+    } else {
+        dev.mmio_read(ipa, a.access_bytes()).inspect(|&value| {
+            if a.srt < 31 {
+                frame.x[a.srt] = if a.sf { value } else { value & 0xffff_ffff };
+            }
+        })
+    };
+    // Mirror the guest's timer enable onto the PHYSICAL redistributor. The guest's writes no longer
+    // reach hardware, so if EL2 did not carry this across, a guest enabling its timer would change
+    // nothing and one that disabled it would keep being interrupted. Read back from the model rather
+    // than interpreting the write, so one place decides what "enabled" means.
+    let timer_enabled = dev.is_enabled(gic::VTIMER_INTID);
+    drop(dev);
+    if a.wnr {
+        gic::set_ppi_enabled(gic::VTIMER_INTID, timer_enabled);
+    }
+
+    if let Err(u) = outcome {
+        let _ = writeln!(
+            uart,
+            "baleen: LINUX GUEST TRAP: unmodelled {} register at offset 0x{:04x} \
+             (IPA=0x{ipa:016x} {} {} bytes) ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x} \
+             — halting",
+            u.frame,
+            u.offset,
+            if a.wnr { "write" } else { "read" },
+            a.access_bytes()
+        );
+        crate::park();
+    }
+
+    // A data abort's preferred return is the FAULTING instruction.
     crate::guest::advance_elr_past_fault();
 }
 
@@ -855,6 +949,23 @@ fn report_timer_forwarding(uart: &mut Pl011) {
     // The SGI half is a SEPARATE mechanism reached by a separate trap (`EC=0x18`, not the IRQ
     // vector), so it gets its own line rather than being folded into the count above. A witness that
     // merged them could stay green with either path dead.
+    // ③-b1: the interrupt CONTROLLER the guest programmed was ours too.
+    let (gic_traps, gic_enables) = VGIC.borrow_mut().witness();
+    if gic_traps > 0 && gic_enables > 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: vgic OK: the guest's interrupt controller is EMULATED — {gic_traps} GICD/GICR \
+             register traps in EL2, {gic_enables} INTIDs enabled in a distributor the guest cannot \
+             reach (Stage-2 device pass-through window: 0 bytes)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vgic FAIL: the guest's GIC accesses did not go through the emulator \
+             ({gic_traps} traps, {gic_enables} enables) — the distributor is being passed through"
+        );
+    }
+
     let sgis = SGIS_DELIVERED.load(Ordering::Relaxed);
     if sgis > 0 {
         let _ = writeln!(
@@ -983,10 +1094,13 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // whatever `VBAR_EL2` currently points at. Enabling first would put a window, however short,
     // where a timer PPI would be dispatched through the synthetic path's table.
     //
-    // Note what is NOT called: `gic::init_physical_vtimer()`. The GICD/GICR are pass-through mapped,
-    // so it is the KERNEL that enables PPI 27 at the redistributor — and with `IMO=1` that same
-    // enable is what makes the interrupt reach EL2. Re-initializing the distributor here would fight
-    // the guest for a device the guest owns. Only EL2's own CPU interface needs setting up.
+    // ③-b1 INVERTED ③-a2's note here, and the inversion is the rung in one line. Under ③-a2 the
+    // GICD/GICR were pass-through, so the KERNEL enabled PPI 27 at the redistributor and — with
+    // `IMO=1` — that same enable was what made the interrupt reach EL2; calling this would have
+    // fought the guest for a device the guest owned. Now the guest's GIC writes land in
+    // `crate::vgic` and touch no hardware, so **EL2 owns the physical distributor** and must
+    // initialize it itself. Taking a device away from a guest means inheriting its job.
+    gic::init_physical_vtimer();
     gic::enable_physical_cpu_interface_el2();
     gic::set_eoi_mode_split();
     gic::enable_el2();

@@ -66,6 +66,8 @@ mod smmu;
 mod stage2;
 mod teardown;
 mod time;
+#[cfg(feature = "real-linux")]
+mod vgic;
 mod virtio;
 #[cfg(feature = "real-linux")]
 mod vpl011;

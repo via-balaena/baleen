@@ -279,6 +279,42 @@ pub(crate) fn sgi1r_intid(value: u64) -> u32 {
     ((value >> 24) & 0xf) as u32
 }
 
+/// **Deactivate** a physical interrupt EL2 handled itself (`ICC_DIR_EL1`).
+///
+/// Only meaningful with [`set_eoi_mode_split`] in effect: there, [`eoi_physical`] drops the running
+/// priority and this ends the interrupt's Active state. A *forwarded* interrupt never comes here —
+/// the guest's EOI deactivates it through [`LR_HW`] — so this is for the interrupts EL2 consumes or
+/// declines, where nobody else will ever do it and the entry would otherwise stay Active forever.
+#[cfg(feature = "real-linux")]
+pub(crate) fn deactivate_physical(intid: u32) {
+    // SAFETY: `ICC_DIR_EL1` at EL2 is the physical CPU interface's deactivate register; writing an
+    // INTID EL2 has acknowledged ends its Active state. No memory effect.
+    unsafe {
+        asm!("msr ICC_DIR_EL1, {i}", i = in(reg) intid as u64, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Enable or disable a **physical** SGI/PPI at this CPU's redistributor (`GICR_ISENABLER0` /
+/// `GICR_ICENABLER0`).
+///
+/// **③-b1 is what made this necessary, and the reason is worth stating.** Until the distributor was
+/// emulated, the guest's own writes reached the real redistributor through the pass-through window,
+/// so the guest enabling its timer PPI was also what made that interrupt reach EL2. With the window
+/// gone those writes land in [`crate::vgic`] and touch no hardware at all — **so EL2 has to program
+/// the physical GIC itself**, both at init ([`init_physical_vtimer`]) and whenever it mirrors a
+/// guest enable. Taking a device away from a guest means inheriting its job.
+#[cfg(feature = "real-linux")]
+pub(crate) fn set_ppi_enabled(intid: u32, enabled: bool) {
+    debug_assert!(intid < 32, "ISENABLER0/ICENABLER0 cover INTIDs 0..31");
+    let reg = if enabled { 0x0100 } else { 0x0180 };
+    // SAFETY: the redistributor SGI frame is device memory on the `virt` machine, addressed directly
+    // at EL2 (MMU off). `GICR_ISENABLER0`/`GICR_ICENABLER0` are write-1-to-act, so writing a single
+    // bit affects exactly that INTID and no other. Aliases no Rust memory.
+    unsafe {
+        core::ptr::write_volatile((GICR_SGI_BASE + reg) as *mut u32, 1 << intid);
+    }
+}
+
 /// Put EL2's **physical** CPU interface into split priority-drop/deactivate mode
 /// ([`ICC_CTLR_EL1_EOIMODE`]), so [`eoi_physical`] drops the running priority without deactivating.
 ///
@@ -443,6 +479,12 @@ const GICR_SGI_BASE: u64 = GICR_RD_BASE + 0x1_0000;
 /// rather than allowed, so each configuration lints exactly what it compiles (⑭/⑭b).
 #[cfg(feature = "real-linux")]
 pub(crate) const GICR_LEN: u64 = 0x00f6_0000;
+
+/// Length of the GICv3 **distributor** frame — `guest.dts`'s `reg = <… 0x8000000 … 0x10000 …>`, i.e.
+/// 64 KiB. `real-linux` only, and it exists for the same reason [`GICR_LEN`] does: to size a window.
+/// Since ③-b1 that window is the **emulated** one ([`crate::vgic`]) rather than a pass-through.
+#[cfg(feature = "real-linux")]
+pub(crate) const GICD_LEN: u64 = 0x0001_0000;
 
 /// Exclusive end of the GICv3 MMIO the guest is given — and, on QEMU `virt`, **exactly** the address
 /// the PL011 starts at. That coincidence is what let ③-a1 drop the UART out of the pass-through
