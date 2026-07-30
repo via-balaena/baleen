@@ -70,7 +70,17 @@ init_src="$here/guest-init.sh"
 force=0
 [ "${1:-}" = "--force" ] && force=1
 
-dir="${BALEEN_LINUX_DIR:-$HOME/forge/baleen-metal-linux/alpine}"
+# Default INSIDE the repo, at the path .gitignore already reserves (`/.baleen-linux`) and CI already
+# uses (`$GITHUB_WORKSPACE/.baleen-linux`). Built from `$here` above, not $PWD, so it is correct from
+# any working directory.
+#
+# It used to default to `$HOME/forge/baleen-metal-linux/alpine`, which is where the hand-made
+# artifacts already sat when this script was written (#97) — pointing at them made that transition
+# seamless and then outlived its purpose. The cost was that local runs and CI used different
+# directories, which is precisely the local-vs-CI split #97 set out to close, and that the default
+# assumed a developer's checkout lives under ~/forge.
+repo_root="$(cd "$here/../.." && pwd)"
+dir="${BALEEN_LINUX_DIR:-$repo_root/.baleen-linux}"
 mkdir -p "$dir"
 
 # ─── portable helpers ────────────────────────────────────────────────────────────────────────────

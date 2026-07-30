@@ -124,9 +124,9 @@ const LINUX_INITRD_ADDR: u64 = 0x4c00_0000; // initramfs (DTB /chosen linux,init
 /// the SAME QEMU line, with the output captured and [`LINUX_MARKERS`] / [`LINUX_FORBIDDEN`] asserted
 /// against it. One derivation, so the gate cannot pass against a boot the demo does not perform.
 ///
-/// The `Image` and `initramfs` come from `$BALEEN_LINUX_DIR` (default
-/// `~/forge/baleen-metal-linux/alpine`); `hv-metal/linux/fetch-guest-image.sh` builds both from
-/// checksum-pinned official Alpine downloads.
+/// The `Image` and `initramfs` come from `$BALEEN_LINUX_DIR` (default `.baleen-linux`, relative to
+/// the repo root like every other path in this file, and the same location CI uses);
+/// `hv-metal/linux/fetch-guest-image.sh` builds both from checksum-pinned official Alpine downloads.
 fn qemu_linux(check: bool) -> bool {
     use std::path::PathBuf;
 
@@ -135,10 +135,11 @@ fn qemu_linux(check: bool) -> bool {
     } else {
         "qemu-linux"
     };
-    let dir = std::env::var("BALEEN_LINUX_DIR").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/forge/baleen-metal-linux/alpine")
-    });
+    // Relative, matching `hv-metal/linux/guest.dts` below and every other path here: xtask is run
+    // from the repo root. Previously an absolute `~/forge/baleen-metal-linux/alpine`, which put local
+    // runs in a different directory from CI's `$GITHUB_WORKSPACE/.baleen-linux` — see the note in
+    // fetch-guest-image.sh for why that default existed and why it stopped making sense.
+    let dir = std::env::var("BALEEN_LINUX_DIR").unwrap_or_else(|_| ".baleen-linux".to_string());
     let dir = PathBuf::from(dir);
     let image = dir.join("Image");
     let initrd = dir.join("custom-initramfs.gz");
