@@ -85,7 +85,12 @@ assumed (#12's habit).
 
 > `selftest: Stage-2 encoding verified (set 0: tables decode to exactly the authorized leaf map;
 > image block absent (tables asserted dead); 448 super-span 2 MiB block(s) emitted and decoded;
-> device window 16 MiB)`
+> device window 0 MiB)`
+
+**The window was 16 MiB when this was written and is 0 now** — ③-a1 emulated the PL011, ③-b1
+emulated the GIC, and the real-Linux guest ended up with no device pass-through at all. The quote
+tracks the gate rather than the history because `xtask doc-markers` checks it (it is what caught
+this line); the history lives in `crate::stage2::windows`.
 
 The whole emitted structure decoded back and every other slot asserted dead, on the real hardware
 tables the kernel then runs behind.
@@ -116,7 +121,7 @@ mapped as cacheable Normal memory would have booted fine and been wrong.
   configs).~~ **CLOSED (⑬).** The boot is now the `real-linux boot (QEMU)` required check: the guest
   artifacts are built by `hv-metal/linux/fetch-guest-image.sh` from checksum-pinned official Alpine
   downloads, and `cargo xtask qemu-linux-test` asserts the markers — including `448 super-span 2 MiB
-  block(s) emitted and decoded; device window 16 MiB`, i.e. **this arc's `verify_encoding` on the one
+  block(s) emitted and decoded; device window 0 MiB`, i.e. **this arc's `verify_encoding` on the one
   real guest's emission is now checked on every PR** rather than only whenever someone remembered to
   run it. See `docs/ARC-5-M5-GUEST-INTERFACE.md` §5f. No isolation content — it makes the existing
   demonstration re-runnable, nothing more.

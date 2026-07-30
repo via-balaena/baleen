@@ -304,6 +304,11 @@ fn qemu_linux(check: bool) -> bool {
 ///   `IMO=0` sets both to zero and prints the `FAIL` twin instead (which `LINUX_FORBIDDEN` also
 ///   catches). They are INGRESS claims; the egress half is every marker above, which a guest with no
 ///   scheduler tick never reaches — a Linux guest that is not ticking does not get to `Run /init`.
+/// * **`vgic OK: the guest's interrupt controller is EMULATED …`** — ③-b1, and the completion of the
+///   set: the guest now drives **no real device MMIO at all**. Its counters come from
+///   `hv-metal`'s own distributor model, which a pass-through configuration could not increment
+///   because the writes would never reach EL2. Paired with the emitter's own `device window 0 MiB`
+///   above, which says the same thing from the Stage-2 side.
 /// * **`linux guest issued PSCI SYSTEM_OFF …`** — the whole round trip, and the reason the boot
 ///   terminates rather than parking: busybox `poweroff -f` -> the kernel's PSCI -> `HVC` -> EL2.
 const LINUX_MARKERS: &[&str] = &[
@@ -316,7 +321,10 @@ const LINUX_MARKERS: &[&str] = &[
     "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as a single EL1 guest \
      (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x80000000)",
     "baleen: linux model built — 448 super-span leaves (896 MiB of guest RAM) across 56 L2-pinned tables",
-    "448 super-span 2 MiB block(s) emitted and decoded; device window 16 MiB",
+    // `device window 0 MiB` is ③-b1's structural claim in the emitter's own voice: the guest gets
+    // NO device pass-through at all. It was 32 MiB at Arc 5e, 16 MiB after ③-a1 dropped the PL011
+    // out, and zero now that the GIC is emulated too.
+    "448 super-span 2 MiB block(s) emitted and decoded; device window 0 MiB",
     // The kernel, behind the proven emitter.
     "Linux version 6.18.",
     "Machine model: baleen-metal-guest",
@@ -336,6 +344,10 @@ const LINUX_MARKERS: &[&str] = &[
     // only the forwarding path increments.
     "baleen: vtimer OK: the guest's scheduler tick is FORWARDED —",
     "baleen: vsgi OK:",
+    // ③-b1: the interrupt CONTROLLER the guest programmed was EL2 state too — the last real device
+    // it was still driving. Counted by the emulator, so a pass-through configuration cannot produce
+    // it: the writes would never have been seen.
+    "baleen: vgic OK: the guest's interrupt controller is EMULATED —",
     // The round trip home.
     "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
 ];
@@ -360,6 +372,9 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // no `ICC_SGI1R_EL1` write ever trapped, i.e. the guest reached its own SGI generation register.
     "baleen: vtimer FAIL",
     "baleen: vsgi FAIL",
+    // ③-b1's negative half: the guest's GIC accesses did not reach the emulator, i.e. the
+    // distributor is being passed through again.
+    "baleen: vgic FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
