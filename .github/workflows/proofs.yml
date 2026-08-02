@@ -86,7 +86,14 @@ jobs:
           # hv-core -> hv-hal. Plus the workspace manifest and this gate file. Kept deliberately
           # BROAD — including a path that a given proof does not read only ever runs that proof
           # unnecessarily; it can never cause a false skip.
-          PROOF_PATHS='^(hv-hal|hv-core|hv-s2|hv-verify)/|^Cargo\.toml$|^\.github/workflows/proofs\.yml$'
+          #
+          # `hv-vdev` (⑯) is listed AHEAD of `hv-verify` depending on it. That is the safe
+          # direction and the deliberate one: while the harnesses are still being added, a PR
+          # touching only the device models runs the gate for nothing, which costs ~16 min. The
+          # alternative — adding the path in the same commit as the dependency — risks the one
+          # failure mode this filter must never have, a device-model change that green-skips the
+          # gate that exists to check it.
+          PROOF_PATHS='^(hv-hal|hv-core|hv-s2|hv-vdev|hv-verify)/|^Cargo\.toml$|^\.github/workflows/proofs\.yml$'
           ZERO='0000000000000000000000000000000000000000'
 
           if [ "$EVENT" = "pull_request" ]; then
