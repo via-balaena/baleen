@@ -89,7 +89,7 @@ use crate::cell::BootCell;
 use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
-use crate::vgic::{self, VirtGic};
+use crate::vgic::{self, DeployedGic};
 use crate::vpl011::{self, DeployedPl011};
 
 /// The control domain.
@@ -678,7 +678,7 @@ static VPL011: BootCell<DeployedPl011> = BootCell::new("VPL011", DeployedPl011::
 /// it turns on: if a future rung ever unmasks IRQs inside an EL2 handler, or adds an EL2 idle loop,
 /// **this borrow becomes a halt** — which is why `VCPU_PENDING` next door uses plain atomics
 /// instead. A counter would; a register file that must be read consistently would not.
-static VGIC: BootCell<VirtGic> = BootCell::new("VGIC", VirtGic::new());
+static VGIC: BootCell<DeployedGic> = BootCell::new("VGIC", DeployedGic::new());
 
 /// How many physical timer interrupts EL2 has forwarded to the guest as virtual ones (③-a2).
 ///
