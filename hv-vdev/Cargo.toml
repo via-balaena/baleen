@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[package]
+name = "hv-vdev"
+description = "The emulated device models a guest drives — register files as pure no_std code with zero unsafe, so they can be proven rather than only boot-witnessed."
+# Internal workspace crate — not for crates.io. Guards against an accidental publish.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# No dependencies at all — not even `hv-core`. A device register file is a function from
+# (offset, width, value) to state; it needs no model of domains, frames or grants, and taking
+# one would give Kani a larger world to reason about for nothing. Contrast `hv-s2`, whose whole
+# job is to refine `hv-core`'s `p2m`.
+[dependencies]
+
+[lints]
+workspace = true

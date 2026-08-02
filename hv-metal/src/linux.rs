@@ -90,7 +90,7 @@ use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
 use crate::vgic::{self, VirtGic};
-use crate::vpl011::{self, VirtPl011};
+use crate::vpl011::{self, DeployedPl011};
 
 /// The control domain.
 const DOM0: DomId = 0;
@@ -659,7 +659,7 @@ const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
 
 /// The emulated PL011 the guest drives (③-a1). One instance: one guest. ③-b gives each guest its
 /// own, which is the whole point of the device having become EL2 state instead of hardware.
-static VPL011: BootCell<VirtPl011> = BootCell::new("VPL011", VirtPl011::new());
+static VPL011: BootCell<DeployedPl011> = BootCell::new("VPL011", DeployedPl011::new());
 
 /// The emulated GICv3 the guest drives (③-b1). One instance: one guest — and giving the *second*
 /// guest its own is the whole reason the distributor had to become EL2 state, exactly as ③-a1 made
