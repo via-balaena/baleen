@@ -3163,3 +3163,444 @@ mod device_path_composition {
         );
     }
 }
+
+/// # ⑯ — the emulated device models, over EVERY offset a guest can name
+///
+/// **The gap these close.** Arc ③ moved the guest's entire device-facing surface out of a proven
+/// artifact (Stage-2, with an ∀-frame refinement behind it) and into two register files. Those are
+/// checked by a boot witness, and a boot witness can only see what a boot exercises: the shipped
+/// Alpine kernel touches the emulated GIC exactly 410 times across a small, regular set, and never
+/// offers an offset the model did not expect. **It is not an adversary.** The guest chooses the
+/// offset, and the decode turns that offset into an array index.
+///
+/// **What is proven here is STRUCTURE, not CONFORMANCE** — see `hv_vdev`'s crate docs. A model that
+/// decodes every offset perfectly and returns architecturally wrong *values* satisfies every
+/// property below. Conformance is the boot, and should be.
+#[cfg(kani)]
+mod device_models {
+    use hv_vdev::gicv3::{GicFrame, GicLayout, VirtGic, NUM_INTIDS};
+    use hv_vdev::pl011::{NeedleMatcher, VirtPl011};
+
+    // ─── the deployed address map, mirrored from `hv-metal::gic` ─────────────────────────────────
+    //
+    // These are the numbers `hv-metal` builds its `LAYOUT` from. `hv-metal` is workspace-EXCLUDED,
+    // so no compile-time derivation can bind the two — the same irreducible seam `LINUX_MARKERS`
+    // covers for the memory contract. `a_symbolic_layout_still_decodes_in_range` is what keeps that
+    // from mattering: the load-bearing properties are proven for ∀ layout, not just this one.
+    const GICD_BASE: u64 = 0x0800_0000;
+    const GICD_LEN: u64 = 0x0001_0000;
+    const GICR_RD_BASE: u64 = 0x080A_0000;
+    const GICR_END: u64 = 0x0900_0000;
+
+    /// The layout the metal deploys.
+    fn deployed() -> GicLayout {
+        GicLayout::new(GICD_BASE, GICD_LEN, GICR_RD_BASE, GICR_END)
+    }
+
+    /// A free layout, bounded only enough to keep the decode's interval arithmetic overflow-free.
+    fn symbolic_layout() -> GicLayout {
+        let bounded = || -> u64 {
+            let a: u64 = kani::any();
+            kani::assume(a < (1u64 << 44));
+            a
+        };
+        GicLayout::new(bounded(), bounded(), bounded(), bounded())
+    }
+
+    // ─── the enable-register spec, DERIVED INDEPENDENTLY of the model ────────────────────────────
+
+    /// Offsets of the two distributor enable registers and the two redistributor ones.
+    const ISENABLER: u64 = 0x0100;
+    const ICENABLER: u64 = 0x0180;
+
+    /// **Which accesses are ALLOWED to change `is_enabled(i)`** — written out here from the GICv3
+    /// register layout rather than by calling anything in `hv_vdev`.
+    ///
+    /// The independence is deliberate and is the point (design-lesson #36, and #106 on why a
+    /// spec/checker pair wants two derivations where an *emitter* pair wants one). If this predicate
+    /// called the model's own `dist_word_index`, `a_write_changes_only_the_enables_it_names` would
+    /// hold by construction and prove nothing.
+    ///
+    /// Note what it says about INTIDs 0..31: **only the redistributor's SGI frame may touch them.**
+    /// That is the property #108 had to repair before it was true at all — the distributor's copies
+    /// of 0..31 are RES0 under `GICD_CTLR.ARE_NS`, which this model forces.
+    fn may_change_enable(l: &GicLayout, ipa: u64, i: u32) -> bool {
+        let Some((frame, off)) = l.frame_of(ipa) else {
+            return false;
+        };
+        let word = u64::from(i / 32);
+        match frame {
+            // The distributor owns the SPIs only.
+            GicFrame::Dist => {
+                i >= 32 && (off == ISENABLER + 4 * word || off == ICENABLER + 4 * word)
+            }
+            // The SGI frame owns exactly INTIDs 0..31, in word 0 of its own banks.
+            GicFrame::Sgi => i < 32 && (off == ISENABLER || off == ICENABLER),
+            GicFrame::Redist => false,
+        }
+    }
+
+    // ─── H3 · totality ───────────────────────────────────────────────────────────────────────────
+
+    /// **∀ (ipa, size, value): neither entry point panics — the strongest property here.**
+    ///
+    /// A guest-controlled out-of-bounds index in a device model is a guest→hypervisor memory-safety
+    /// bug, and Kani proves panic-freedom by default. Today the decode is guarded by hand-written
+    /// range checks; this makes totality a theorem.
+    ///
+    /// The write runs FIRST and at an independent address, so the read is serviced from a state an
+    /// arbitrary write already perturbed — that is what makes this ∀-state rather than ∀-from-reset.
+    /// (Every index in the model derives from the *offset*, never from stored state, so reset-only
+    /// would in fact have sufficed; proving it over a perturbed state costs little and does not rely
+    /// on that argument being right.)
+    #[kani::proof]
+    fn gic_mmio_is_total_for_every_guest_offset() {
+        let l = deployed();
+        let mut g = VirtGic::new(l);
+        let (w_ipa, w_size, w_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(w_ipa, w_size, w_val);
+        let (r_ipa, r_size): (u64, u64) = (kani::any(), kani::any());
+        let _ = g.mmio_read(r_ipa, r_size);
+    }
+
+    /// The same totality for a **symbolic layout**: no address map at all can make the decode index
+    /// out of range. `validate` is deliberately NOT assumed — a layout the metal would reject must
+    /// still be memory-safe, because "fails closed" is worth more than "is never reached".
+    #[kani::proof]
+    fn gic_mmio_is_total_for_every_layout() {
+        let l = symbolic_layout();
+        let mut g = VirtGic::new(l);
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(ipa, size, value);
+        let _ = g.mmio_read(ipa, size);
+    }
+
+    // ─── H1 · fail-closed ────────────────────────────────────────────────────────────────────────
+
+    /// **`Err` ⇒ the device is bit-identical to before.**
+    ///
+    /// Load-bearing: `hv-metal`'s `handle_vgic_access` **parks the machine** when a write returns
+    /// `Err`, on the reasoning that an unmodelled register must not be half-applied — "report and
+    /// park, never guess". True by construction today; exactly what a future mutate-then-`return
+    /// None` arm would break silently.
+    ///
+    /// **This is the theorem ⑯ steps 1–2 were rearranged to make stateable.** While a trap counter
+    /// lived in the struct it was simply false, and the best available statement was "identical
+    /// except these fields" — a hand-drawn partition a reader had to trust. It now compares the
+    /// whole of `VirtGic`.
+    ///
+    /// The read direction needs no proof: `mmio_read` takes `&self`.
+    ///
+    /// **Declared limitation, measured not guessed.** The prior state here is one symbolic enable
+    /// word, not an arbitrary device state: a *fully* symbolic perturbing write pushes the
+    /// whole-struct comparison past **10 minutes** on this laptop (killed at 600 s), which at CI's
+    /// 2.6–2.8× would not fit the gate at all. Comparing ~2.3 KB of state bit-for-bit against a
+    /// fully symbolic predecessor is what costs; against a mostly-concrete one it is ~8 s. What is
+    /// *not* covered is therefore an `Err` write from a deeply-perturbed state — believed
+    /// uninteresting because every index in the decode derives from the offset and never from
+    /// stored state, but that is an ARGUMENT, recorded as one, not a thing this harness proves.
+    #[kani::proof]
+    fn a_failed_write_changes_nothing() {
+        let l = deployed();
+        let mut g = VirtGic::new(l);
+
+        // Perturb into a non-reset state cheaply: a CONCRETE enable register, a SYMBOLIC value. A
+        // fully symbolic perturbing write makes the whole-struct comparison below cost >10 minutes
+        // (measured); this keeps the prior state genuinely non-trivial for ~2 s more.
+        let seed: u64 = kani::any();
+        let _ = g.mmio_write(GICD_BASE + ISENABLER + 4, 4, seed);
+
+        let before = g.clone();
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        if g.mmio_write(ipa, size, value).is_err() {
+            assert!(
+                g == before,
+                "a write this model refused must have changed nothing — the caller parks on Err \
+                 and assumes exactly that"
+            );
+        }
+    }
+
+    // ─── H2 · the mediation predicate's write-locality ───────────────────────────────────────────
+
+    /// **∀ (ipa, size, value, i): a write changes `is_enabled(i)` only at an enable register whose
+    /// word covers `i`.**
+    ///
+    /// The isolation-relevant one. `hv-metal`'s `handle_linux_irq` gates injection on `is_enabled`,
+    /// so a decode bug aliasing e.g. `IPRIORITYR` onto the enable bank would silently change which
+    /// interrupts the guest can be given — with no panic, no `Err`, and nothing a boot could show.
+    ///
+    /// Stated as "changes only state its own group and index own", NOT as "distinct offsets do not
+    /// interfere": `ISENABLER`/`ICENABLER` alias the same bank *by design*, so the naive phrasing
+    /// would be false of a correct model.
+    #[kani::proof]
+    fn a_write_changes_only_the_enables_it_names() {
+        let l = deployed();
+        let mut g = VirtGic::new(l);
+        let (p_ipa, p_size, p_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(p_ipa, p_size, p_val);
+
+        let i: u32 = kani::any();
+        kani::assume((i as usize) < NUM_INTIDS);
+        let before = g.is_enabled(i);
+
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(ipa, size, value);
+
+        assert!(
+            g.is_enabled(i) == before || may_change_enable(&l, ipa, i),
+            "an access that is not an enable register covering this INTID changed its \
+             deliverability"
+        );
+    }
+
+    // ─── H4 · the decode is a partition ──────────────────────────────────────────────────────────
+
+    /// **The distributor does not own INTIDs 0..31 — the theorem #108 had to repair before it was
+    /// true.**
+    ///
+    /// With `GICD_CTLR.ARE_NS` set (which this model forces), SGIs and PPIs are banked per
+    /// redistributor and the distributor's copies are RES0. Before #108 `GICD_ISENABLER0` and
+    /// `GICR_ISENABLER0` both reached `enabled[0]`, so a write the architecture reserves could change
+    /// the guest's PPI enables — and the two frames deliberately SHARED state, which made "the
+    /// decode is a partition" **false as a theorem** rather than merely hard to state.
+    ///
+    /// **This harness observes ENABLES ONLY, and that is not the whole partition.** For the enable
+    /// banks `intids_per_word` is 32, so #108's `banked_words` works out to 1 — the same value its
+    /// buggy first cut hardcoded. Reverting that fix would therefore leave this harness GREEN. The
+    /// `ICFGR` half of the aliasing is caught by
+    /// [`the_distributor_frame_cannot_change_anything_the_sgi_frame_reads`] instead; the two
+    /// together are the partition. (Found by running the probe, not by reading the code.)
+    #[kani::proof]
+    fn the_distributor_cannot_reach_a_redistributor_banked_intid() {
+        let l = deployed();
+        let mut g = VirtGic::new(l);
+        let (p_ipa, p_size, p_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(p_ipa, p_size, p_val);
+
+        let i: u32 = kani::any();
+        kani::assume(i < 32);
+        let before = g.is_enabled(i);
+
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        kani::assume(matches!(l.frame_of(ipa), Some((GicFrame::Dist, _))));
+        let _ = g.mmio_write(ipa, size, value);
+
+        assert!(
+            g.is_enabled(i) == before,
+            "a DISTRIBUTOR access changed a redistributor-banked INTID's enable: the two frames \
+             are sharing state the architecture reserves"
+        );
+    }
+
+    /// **THE PARTITION, over the whole SGI read surface — not just the enables.**
+    ///
+    /// ∀ (distributor access, SGI-frame offset): the write cannot change *anything* the SGI frame
+    /// reads back. This is the statement #108's repair actually makes true, and the one that covers
+    /// its `ICFGR` half: `ICFGR` is TWO bits per INTID, so INTIDs 0..31 span its words 0 **and** 1,
+    /// and the guard's buggy first cut — excluding only word 0 — left `GICD_ICFGR1` aliasing
+    /// `GICR_ICFGR1`. Reverting the `intids_per_word` parameterisation turns THIS harness red.
+    ///
+    /// Written after the enable-only harnesses above were probed and found unable to see it.
+    #[kani::proof]
+    fn the_distributor_frame_cannot_change_anything_the_sgi_frame_reads() {
+        let l = deployed();
+        let mut g = VirtGic::new(l);
+
+        // Bounded so the harness's own address arithmetic cannot overflow — the `frame_of` assume
+        // below is what actually pins it into the SGI frame.
+        let sgi_off: u64 = kani::any();
+        kani::assume(sgi_off < REDIST_FRAME_BYTES);
+        let sgi_ipa = GICR_RD_BASE + REDIST_FRAME_BYTES + sgi_off;
+        kani::assume(matches!(l.frame_of(sgi_ipa), Some((GicFrame::Sgi, _))));
+
+        let before = g.mmio_read(sgi_ipa, 4).ok();
+
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        kani::assume(matches!(l.frame_of(ipa), Some((GicFrame::Dist, _))));
+        let _ = g.mmio_write(ipa, size, value);
+
+        assert!(
+            g.mmio_read(sgi_ipa, 4).ok() == before,
+            "a DISTRIBUTOR write changed what the redistributor's SGI frame reads: the two frames \
+             are sharing state the architecture banks per-redistributor"
+        );
+    }
+
+    /// The converse: the redistributor's SGI frame owns *only* INTIDs 0..31 and cannot reach an SPI.
+    #[kani::proof]
+    fn the_sgi_frame_cannot_reach_an_spi() {
+        let l = deployed();
+        let mut g = VirtGic::new(l);
+        let (p_ipa, p_size, p_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(p_ipa, p_size, p_val);
+
+        let i: u32 = kani::any();
+        kani::assume(i >= 32 && (i as usize) < NUM_INTIDS);
+        let before = g.is_enabled(i);
+
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        kani::assume(matches!(l.frame_of(ipa), Some((GicFrame::Sgi, _))));
+        let _ = g.mmio_write(ipa, size, value);
+
+        assert!(
+            g.is_enabled(i) == before,
+            "an SGI-frame access changed an SPI's enable"
+        );
+    }
+
+    // ─── H6 · the layout precondition, stated honestly ───────────────────────────────────────────
+
+    /// **∀ layout accepted by `validate`, a decoded offset is inside the frame it names.**
+    ///
+    /// **Say what this is and is not.** It adds no memory safety — the two totality harnesses above
+    /// already cover every layout, valid or not. What it checks is that a *valid* layout decodes to
+    /// frames that mean what their names say, which is the precondition `hv-metal` relied on without
+    /// ever writing down: `frame_of` resolves anything below `gicr_rd_base` to the distributor, and
+    /// that is only right if the distributor's window ends first. The weakest harness in this module.
+    #[kani::proof]
+    fn a_valid_layout_decodes_within_the_frame_it_names() {
+        let l = symbolic_layout();
+        kani::assume(l.validate());
+        let ipa: u64 = kani::any();
+
+        // The property `validate` actually buys: an address in the DISTRIBUTOR's window decodes as
+        // the distributor. Without `gicd_base + gicd_len <= gicr_rd_base` an overlapping map would
+        // send part of it to the redistributor instead — silently, and without any memory error.
+        if ipa >= l.gicd_base() && ipa - l.gicd_base() < l.gicd_len() {
+            assert!(
+                matches!(l.frame_of(ipa), Some((GicFrame::Dist, _))),
+                "an address inside the distributor window did not decode as the distributor"
+            );
+        }
+
+        // And every decoded offset lies inside the frame it names.
+        if let Some((frame, off)) = l.frame_of(ipa) {
+            match frame {
+                GicFrame::Dist => assert!(off < l.gicd_len()),
+                GicFrame::Redist => assert!(off < REDIST_FRAME_BYTES),
+                // `validate` guarantees room for both frames, so this subtraction cannot wrap.
+                GicFrame::Sgi => {
+                    assert!(off < l.gicr_end() - l.gicr_rd_base() - REDIST_FRAME_BYTES)
+                }
+            }
+        }
+    }
+
+    /// One redistributor frame, stated here independently of the model's own constant.
+    const REDIST_FRAME_BYTES: u64 = 0x1_0000;
+
+    // ─── non-vacuity ─────────────────────────────────────────────────────────────────────────────
+
+    /// **The harnesses above are all of the form "nothing bad happens", which a model that handles
+    /// NOTHING would satisfy.** This is the witness that the decode is really being reached: a
+    /// concrete `GICD_ISENABLER1` write enables INTID 32, is reported as one newly-enabled INTID,
+    /// and reads back.
+    #[kani::proof]
+    fn the_decode_is_reached_and_does_something() {
+        let l = deployed();
+        let mut g = VirtGic::new(l);
+        assert!(!g.is_enabled(32));
+        let ok = g.mmio_write(GICD_BASE + ISENABLER + 4, 4, 1);
+        assert!(
+            matches!(ok, Ok(1)),
+            "GICD_ISENABLER1 bit 0 must newly enable exactly INTID 32"
+        );
+        assert!(
+            g.is_enabled(32),
+            "the enable must be observable through the mediation seam"
+        );
+        assert!(
+            matches!(g.mmio_read(GICD_BASE + ISENABLER + 4, 4), Ok(1)),
+            "and must read back"
+        );
+    }
+
+    // ─── H5 · the PL011 ──────────────────────────────────────────────────────────────────────────
+
+    /// **∀ (offset, width, value): the PL011 model is total.**
+    ///
+    /// The target is the identification-register read, the one place a guest-chosen offset becomes
+    /// an array index — and it is in bounds *only* because two range checks are exactly one block
+    /// wide. Widening either by a single word reads past the eight-element table.
+    #[kani::proof]
+    fn pl011_mmio_is_total_for_every_guest_offset() {
+        let mut d = VirtPl011::new();
+        let (w_off, w_val): (u64, u64) = (kani::any(), kani::any());
+        let _ = d.mmio_write(w_off, w_val);
+        let (r_off, r_bytes): (u64, u64) = (kani::any(), kani::any());
+        let _ = d.mmio_read(r_off, r_bytes);
+    }
+
+    /// **A byte reaches the real UART for exactly one offset.** `hv-metal` puts whatever this
+    /// returns onto the machine's PL011, so an extra `Some` is the emulated device writing to the
+    /// physical one behind the guest's back.
+    #[kani::proof]
+    fn pl011_reports_a_transmit_byte_only_for_dr() {
+        let mut d = VirtPl011::new();
+        let (off, value): (u64, u64) = (kani::any(), kani::any());
+        let out = d.mmio_write(off, value);
+        assert!(
+            out.is_some() == (off == 0x000),
+            "only a write to DR may put a byte on the real UART"
+        );
+        if let Some(b) = out {
+            assert!(
+                b == value as u8,
+                "the byte transmitted must be the byte written"
+            );
+        }
+    }
+
+    /// **Only EIGHT offsets in the whole 4 KiB window can change the register file.**
+    ///
+    /// The PL011 has no `Err` path — reserved space absorbs writes, as on the real device — so the
+    /// fail-closed property takes this shape instead. Stated as a complete enumeration rather than
+    /// as an ad-hoc disjunction of reserved offsets, so it says something about *every* address a
+    /// guest can name rather than about the ones the harness author happened to list.
+    ///
+    /// `DR` is deliberately NOT in the list: it reports a byte to the caller and mutates nothing.
+    /// That is only true because ⑯ moved the transmit counters out — before that, `DR` changed
+    /// state and this theorem could not have been stated in this form.
+    #[kani::proof]
+    fn only_the_writable_registers_can_change_the_pl011() {
+        /// `ILPR`, `IBRD`, `FBRD`, `LCR_H`, `CR`, `IFLS`, `IMSC`, `DMACR` — enumerated here from
+        /// the TRM, independently of the model's own `match`.
+        const WRITABLE: [u64; 8] = [0x020, 0x024, 0x028, 0x02c, 0x030, 0x034, 0x038, 0x048];
+
+        let mut d = VirtPl011::new();
+        let before = d.clone();
+        let (off, value): (u64, u64) = (kani::any(), kani::any());
+        kani::assume(!WRITABLE.contains(&off));
+        let _ = d.mmio_write(off, value);
+        assert!(
+            d == before,
+            "an offset outside the eight writable registers changed the register file"
+        );
+    }
+
+    /// **The needle matcher's cursor is an inductive invariant, and this is why it crossed the fence
+    /// with the model rather than staying with the other counters.**
+    ///
+    /// `needle[at]` is in bounds only because `at` reaches `needle.len()` on the same statement that
+    /// sets `saw`, which makes the next call return early. That is exactly the kind of reasoning an
+    /// eye skips. Four arbitrary bytes is enough to drive the cursor through the wrap.
+    #[kani::proof]
+    fn the_needle_matcher_never_runs_off_its_needle() {
+        let mut m = NeedleMatcher::new(b"AAB");
+        for _ in 0..4 {
+            m.feed(kani::any());
+        }
+    }
+
+    /// Non-vacuity for the matcher: the needle really does fire on its own bytes.
+    #[kani::proof]
+    fn the_needle_matcher_fires() {
+        let mut m = NeedleMatcher::new(b"AAB");
+        assert!(!m.saw());
+        m.feed(b'A');
+        m.feed(b'A');
+        m.feed(b'B');
+        assert!(m.saw(), "the matcher must fire on its own needle");
+    }
+}
