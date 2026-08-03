@@ -191,7 +191,7 @@ const WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 ///
 /// **A parameter, not a constant, and the crate docs say why.** The board's addresses live in
 /// `hv-metal`; this type is how they reach the model without being duplicated into it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GicLayout {
     gicd_base: u64,
     gicd_len: u64,
@@ -233,6 +233,30 @@ impl GicLayout {
             gicr_rd_base,
             gicr_end,
         }
+    }
+
+    /// Base of the distributor window.
+    #[must_use]
+    pub const fn gicd_base(&self) -> u64 {
+        self.gicd_base
+    }
+
+    /// Length of the distributor window.
+    #[must_use]
+    pub const fn gicd_len(&self) -> u64 {
+        self.gicd_len
+    }
+
+    /// Base of the redistributor window.
+    #[must_use]
+    pub const fn gicr_rd_base(&self) -> u64 {
+        self.gicr_rd_base
+    }
+
+    /// End of the redistributor window.
+    #[must_use]
+    pub const fn gicr_end(&self) -> u64 {
+        self.gicr_end
     }
 
     /// Whether this layout is one the decode can honour.
@@ -314,6 +338,12 @@ pub struct Unhandled {
 /// **Register state only.** The trap and enable tallies the boot witness reports live in the caller;
 /// the crate docs explain why a counter in here would make [`VirtGic::mmio_write`]'s fail-closed
 /// guarantee unstateable.
+///
+/// `Clone`/`PartialEq` exist **for the proofs**: "a failed write changes nothing" is a statement
+/// about two whole device states, so a harness has to be able to snapshot one and compare. They are
+/// not used by the metal, and deriving them is what keeps the theorem a comparison of the *entire*
+/// struct rather than of a hand-picked list of fields.
+#[derive(Clone, PartialEq, Eq)]
 pub struct VirtGic {
     /// Where this distributor sits in the guest's address space.
     layout: GicLayout,

@@ -40,7 +40,7 @@
 //!
 //! Neither entry point can fail. An unimplemented offset reads as 0 and absorbs writes, which is the
 //! TRM's behaviour for reserved space — so unlike the GIC there is no `Err` path and no fail-closed
-//! theorem to state. What is left to prove is that no offset the guest can name makes it **panic**,
+//! theorem to state. What is proven instead is that no offset the guest can name makes it **panic**,
 //! and that is not vacuous: the identification-register read converts an offset into an index into
 //! a fixed eight-element array, and its bounds hold *only* because two range checks are exactly one
 //! block wide.
@@ -113,6 +113,9 @@ const ID_BLOCK_BYTES: u64 = 4 * (ID.len() as u64) / 2;
 /// None of these fields steers the transmit path, which is why a guest cannot mis-program its way
 /// out of the emulation: `mmio_write` reports a `DR` byte to the caller regardless of `CR.UARTEN`,
 /// `LCR_H`, or the baud divisors.
+///
+/// `Clone`/`PartialEq` exist **for the proofs** — see [`crate::gicv3::VirtGic`] for the reasoning.
+#[derive(Clone, PartialEq, Eq)]
 pub struct VirtPl011 {
     cr: u32,
     lcr_h: u32,

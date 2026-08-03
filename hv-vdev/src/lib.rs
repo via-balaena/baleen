@@ -70,25 +70,27 @@
 //!
 //! ## Where this crate actually stands — read before believing the word "provable"
 //!
-//! **As of this commit there are NO harnesses over this crate.** ⑯'s first two steps move the
-//! models here — the PL011, then the GICv3 — and stop. The `hv-verify` harnesses are step 3. What
-//! has changed is *possibility*, not proof: code that was structurally unreachable by Kani is now
-//! reachable by it. Nothing here is verified yet, and a reader who takes "under the fence" to mean
-//! "proven" has read this crate as one rung further along than it is.
+//! ⑯ is complete: the models moved here (steps 1 and 2) and **`hv-verify::device_models` now carries
+//! fourteen harnesses over them** (step 3). Both entry points of both models are proven total over
+//! every offset, width and value a guest can name; the GIC's decode is proven a partition and its
+//! failed writes proven to change nothing; the enable state a caller mediates on is proven to move
+//! only where an enable register names it.
 //!
-//! Keep this paragraph honest as the steps land. It is the one place a reader is told what the
-//! fence does *not* buy, and a stale version of it would overstate the whole crate.
+//! **Keep this paragraph honest as things change.** It is the one place a reader is told what the
+//! fence does and does not buy, and it has gone stale twice already — once saying the GIC model was
+//! "a later step" in the very commit that moved it, once claiming no harnesses existed in the commit
+//! that added them.
 //!
-//! ## The honest ceiling — true now and after the harnesses land
+//! ## The honest ceiling — and it is the important half
 //!
-//! **This crate can make STRUCTURE provable, not CONFORMANCE.** A model that decodes every offset
+//! **This crate makes STRUCTURE provable, not CONFORMANCE.** A model that decodes every offset
 //! perfectly, never panics, never aliases two banks — and returns architecturally wrong *values* —
-//! will satisfy every property `hv-verify` can state about it. Conformance is not a theorem here and
+//! satisfies every property `hv-verify` states about it. Conformance is not a theorem here and
 //! should not be: the check that these registers mean what a GICv3 or a PL011 means is an unmodified
 //! Linux kernel booting on them, which is what the `real-linux boot (QEMU)` gate runs.
 //!
 //! The two are complementary and neither substitutes for the other. The boot proves the model is
-//! *right* on the paths a kernel walks; the proofs will cover every path it does not.
+//! *right* on the paths a kernel walks; the proofs cover every path it does not.
 //!
 //! ## Unsafe
 //!

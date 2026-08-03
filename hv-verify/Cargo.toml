@@ -22,6 +22,10 @@ hv-core = { path = "../hv-core" }
 # The Stage-2 encoding: its descriptor round-trip is pure bit manipulation, so Kani proves it
 # bit-precisely over ALL output addresses and permissions (see `stage2_encoding`).
 hv-s2 = { path = "../hv-s2" }
+# The emulated device models (⑯). Pure register files, so Kani proves panic-freedom and decode
+# locality over EVERY offset a guest can name — the surface a boot witness cannot reach, because a
+# booting kernel only ever offers the offsets it happens to use.
+hv-vdev = { path = "../hv-vdev" }
 
 [lints]
 workspace = true
