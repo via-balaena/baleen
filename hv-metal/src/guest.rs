@@ -2015,25 +2015,31 @@ fn vcpu_meta(slot: usize) -> VcpuMeta {
 // I1 invariant) is about a borrow being live across those. Atomics have no borrow to overlap, so the
 // hazard does not arise and no I1 argument is needed for this state.
 
-/// `u64` words in a per-vCPU pending set — 256 INTIDs, the whole range the `u8` HAL fence can express.
-const PENDING_WORDS: usize = 4;
-
-/// Per-vCPU **software pending set**: bit `i` of word `w` = vINTID `w * 64 + i` is pending for that vCPU
-/// but has no list register yet. Drained into free LRs by [`flush_pending_to_lrs`].
-static VCPU_PENDING: [[AtomicU64; PENDING_WORDS]; NUM_VCPUS_METAL] =
-    [const { [const { AtomicU64::new(0) }; PENDING_WORDS] }; NUM_VCPUS_METAL];
+/// Per-vCPU **software pending set** — now [`crate::pending::PendingSet`], the ONE type both switches
+/// share (the real-Linux path gained one too; two hand-rolled pending sets is the second-derivation
+/// defect `VgicCtx`, `FpCtx` and ⑰-b′ each spent a rung removing).
+///
+/// ⚠ **Its width changed and that is a fix, not a refactor.** This was four words — 256 bits, "the
+/// whole range the `u8` HAL fence can express" — which was correct *here* only because every
+/// injection on this path passes through `VcpuOps::inject_interrupt(vector: u8)`. The bound lived in
+/// a cast at each call site, not in the set. See [`crate::pending`] for why that made an
+/// out-of-bounds index possible the moment a path without the cast used the same code.
+static VCPU_PENDING: [crate::pending::PendingSet; NUM_VCPUS_METAL] =
+    [const { crate::pending::PendingSet::new() }; NUM_VCPUS_METAL];
 
 /// Record `intid` as pending for vCPU `slot` (idempotent — the whole point of a set).
-fn pending_mark(slot: usize, intid: u32) {
-    let (w, b) = ((intid as usize) / 64, (intid as usize) % 64);
-    VCPU_PENDING[slot][w].fetch_or(1 << b, Ordering::Relaxed);
+///
+/// The `bool` is "the emulated distributor can name this INTID"; on this path it is always true,
+/// because the HAL fence has already narrowed `intid` to a `u8`. `#[must_use]` anyway, so a future
+/// call site that is NOT so narrowed has to confront the case rather than inherit this one's luck.
+#[must_use]
+fn pending_mark(slot: usize, intid: u32) -> bool {
+    VCPU_PENDING[slot].mark(intid)
 }
 
 /// Whether vCPU `slot` has any software-pending vINT waiting for a list register.
 fn pending_is_empty(slot: usize) -> bool {
-    VCPU_PENDING[slot]
-        .iter()
-        .all(|w| w.load(Ordering::Relaxed) == 0)
+    VCPU_PENDING[slot].is_empty()
 }
 
 /// Remove and return the lowest-numbered software-pending vINTID of vCPU `slot`, if any.
@@ -2042,15 +2048,7 @@ fn pending_is_empty(slot: usize) -> bool {
 /// resolves simultaneous pending interrupts by priority and, at equal priority, by lowest INTID, so
 /// draining in this order makes the software half agree with the hardware half's tie-break.
 fn pending_take_next(slot: usize) -> Option<u32> {
-    for (w, word) in VCPU_PENDING[slot].iter().enumerate() {
-        let bits = word.load(Ordering::Relaxed);
-        if bits != 0 {
-            let b = bits.trailing_zeros() as usize;
-            word.fetch_and(!(1u64 << b), Ordering::Relaxed);
-            return Some((w * 64 + b) as u32);
-        }
-    }
-    None
+    VCPU_PENDING[slot].take_next()
 }
 
 /// Clear vCPU `slot`'s whole pending set. (`selftest`-only: the real paths only ever *drain* the set
@@ -2058,9 +2056,7 @@ fn pending_take_next(slot: usize) -> Option<u32> {
 /// clear would need its own re-arm, so the witness pairs every call with one.)
 #[cfg(feature = "selftest")]
 fn pending_clear(slot: usize) {
-    for w in &VCPU_PENDING[slot] {
-        w.store(0, Ordering::Relaxed);
-    }
+    VCPU_PENDING[slot].clear();
 }
 
 /// **Drain vCPU `slot`'s software pending set into free list registers, then re-arm the underflow
@@ -2095,7 +2091,9 @@ fn flush_pending_to_lrs(slot: usize) -> usize {
                 } else {
                     // The bank filled under us (it cannot, single-CPU, with a free LR just observed —
                     // but do not lose the vINT on a surprise): put it back.
-                    pending_mark(slot, intid);
+                    // In range by construction: `intid` came out of this very set via
+                    // `pending_take_next`, so it was nameable when it went in.
+                    let _ = pending_mark(slot, intid);
                     break;
                 }
             }
@@ -2321,7 +2319,10 @@ impl hv_hal::VcpuOps for ArmVcpu {
         // overflow vINT stays the property of the vCPU it was raised for.
         if !gic::inject(vector as u32) {
             let slot = CUR_VCPU.load(Ordering::Relaxed) as usize;
-            pending_mark(slot, u32::from(vector));
+            // In range by construction: `vector` is a `u8`, so at most 255, and the emulated
+            // distributor names 0..288. This is the HAL fence doing the narrowing that
+            // `crate::pending`'s capacity note describes.
+            let _ = pending_mark(slot, u32::from(vector));
             gic::set_underflow_interrupt(true);
         }
     }

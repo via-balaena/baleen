@@ -109,5 +109,6 @@
 //! `hv-metal`, where the rest of the `unsafe` already lives.
 
 pub mod gicv3;
+pub mod pending;
 pub mod pl011;
 pub mod vgic_cpuif;

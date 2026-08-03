@@ -3889,3 +3889,79 @@ mod vgic_cpu_interface {
         ));
     }
 }
+
+/// # The per-vCPU pending set's **index algebra**
+///
+/// **The gap this closes, and it is a live hazard rather than a tidy one.** `hv-metal`'s pending set
+/// indexed a **four**-word array with `intid / 64`. Four words is 256 bits, correct only because every
+/// caller first narrowed the INTID through a `u8` HAL fence — a fact that lived in a cast at each call
+/// site, not in the indexing. The emulated distributor advertises **288** INTIDs, so an INTID of 256 or
+/// more computes word index 4 into a four-element array: an **out-of-bounds index inside EL2's
+/// asynchronous interrupt path**. `the_word_index_of_any_nameable_intid_is_in_range` is that bound as a
+/// theorem instead of a convention.
+///
+/// **Structure, not conformance**, as everywhere in `hv_vdev`.
+#[cfg(kani)]
+mod pending_set_algebra {
+    use hv_vdev::gicv3::NUM_INTIDS;
+    use hv_vdev::pending::{bit_of, intid_of, is_empty, lowest_set, word_of, words_for};
+
+    /// Words a set must have to cover the whole distributor.
+    const WORDS: usize = words_for(NUM_INTIDS);
+
+    /// ★ **The safety theorem.** ∀ INTID the emulated distributor can name, the word index lands
+    /// inside a set sized by [`words_for`] — so `words[word_of(intid)]` cannot be out of bounds.
+    ///
+    /// This is the one that was previously a *convention* enforced by `as u8` casts in another file.
+    #[kani::proof]
+    fn the_word_index_of_any_nameable_intid_is_in_range() {
+        let intid: u32 = kani::any();
+        kani::assume((intid as usize) < NUM_INTIDS);
+        assert!(word_of(intid) < WORDS);
+    }
+
+    /// ∀ INTID: the bit the arithmetic sets is the bit it reads back, and it is exactly one bit.
+    ///
+    /// A mask with two bits set would make one interrupt's arrival mark another's as pending — a
+    /// delivered interrupt the guest never had, which is worse than a lost one.
+    #[kani::proof]
+    fn a_bit_round_trips_and_is_exactly_one_bit() {
+        let intid: u32 = kani::any();
+        kani::assume((intid as usize) < NUM_INTIDS);
+
+        let mask = bit_of(intid);
+        assert_eq!(mask.count_ones(), 1);
+        assert_eq!(intid_of(word_of(intid), mask.trailing_zeros()), intid);
+    }
+
+    /// ∀ set contents **and ∀ word count**: `lowest_set` returns the minimum member, and `None`
+    /// exactly when the set is empty — with the specification written as an **independent linear
+    /// search**, not by calling the model's own word/bit helpers (design-lesson #106).
+    ///
+    /// The length is enumerated rather than symbolic: design-lesson #142, learned when a symbolic
+    /// slice length ran past ten minutes in ⑰-b′.
+    #[kani::proof]
+    fn lowest_set_is_the_minimum_member_and_none_only_when_empty() {
+        let words: [u64; WORDS] = kani::any();
+
+        let mut n = 0;
+        while n <= WORDS {
+            let got = lowest_set(&words[..n]);
+
+            // Independent spec: scan every representable INTID in order, extracting the bit directly.
+            let mut expected: Option<u32> = None;
+            let mut i = 0usize;
+            while i < n * 64 {
+                if (words[i / 64] >> (i % 64)) & 1 == 1 {
+                    expected = Some(i as u32);
+                    break;
+                }
+                i += 1;
+            }
+
+            assert_eq!(got, expected);
+            assert_eq!(is_empty(&words[..n]), expected.is_none());
+            n += 1;
+        }
+    }
+}
