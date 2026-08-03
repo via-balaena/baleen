@@ -67,6 +67,8 @@ mod stage2;
 mod teardown;
 mod time;
 #[cfg(feature = "real-linux")]
+mod vcpu;
+#[cfg(feature = "real-linux")]
 mod vgic;
 mod virtio;
 #[cfg(feature = "real-linux")]

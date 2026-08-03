@@ -361,6 +361,12 @@ const LINUX_MARKERS: &[&str] = &[
     // it was still driving. Counted by the emulator, so a pass-through configuration cannot produce
     // it: the writes would never have been seen.
     "baleen: vgic OK: the guest's interrupt controller is EMULATED —",
+    // ③-b2b-i: the guest was switched OUT and BACK through hv-core's scheduler, with every context
+    // register poisoned in between. Unlike every marker above it, the evidence is not that a counter
+    // moved — it is that the kernel SURVIVED: a register missing from the saved set stays poisoned
+    // and the boot dies, so every marker after this line is a guest resumed from a context the metal
+    // rebuilt from scratch. Probe-verified per register (six of ten tested are load-bearing).
+    "baleen: vcpu OK: the guest was PREEMPTED and restored",
     // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
     // rather than recomputed from the layout constants the emitter used (design-lesson #36).
     // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
@@ -396,6 +402,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // ③-b2a: the two images overlap, one of them never got emitted, or an owned frame did not
     // resolve to its own identity mapping.
     "baleen: peer FAIL",
+    // ③-b2b-i: the timer tick never reached the vCPU switch, so the context save/restore — and the
+    // poison that makes it non-vacuous — was never exercised at all. A boot that is otherwise
+    // perfect but never preempts proves nothing about the switch.
+    "baleen: vcpu FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch

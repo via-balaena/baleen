@@ -214,7 +214,13 @@ impl<T> BootCell<T> {
 
     /// Claim exclusive access, or return `None` — the non-halting form, so the boot self-test can
     /// *witness* a refusal without ending the boot.
-    #[cfg(feature = "selftest")]
+    ///
+    /// ③-b2b-i is the second caller and wants it for a different reason: the real-Linux vCPU switch
+    /// runs from the timer IRQ, and a tick that lands while model setup holds the cell should DEFER,
+    /// not end an otherwise-healthy boot. Deferring is safe to do silently because the rung's witness
+    /// counts switches actually performed — a systematically-skipped switch reports zero and fails
+    /// the gate, rather than passing quietly.
+    #[cfg(any(feature = "selftest", feature = "real-linux"))]
     pub(crate) fn try_borrow_mut(&'static self) -> Option<BootRef<T>> {
         self.try_claim()
     }
