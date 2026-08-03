@@ -44,7 +44,7 @@ fn main() {
         // fetch-guest-image.sh` builds from checksum-pinned Alpine downloads.
         //   `qemu-linux`      the interactive demo (stdio inherited; you watch a kernel boot).
         //   `qemu-linux-test` the headless gate: same QEMU line, output captured, markers asserted.
-        // Both go through ONE `linux_qemu_args` (design-lesson #14c) — the gate must not be able to
+        // Both go through ONE `qemu_linux` (design-lesson #14c) — the gate must not be able to
         // pass against a QEMU invocation the demo does not use.
         "qemu-linux" => qemu_linux(false),
         "qemu-linux-test" => qemu_linux(true),
@@ -104,20 +104,90 @@ const METAL_BIN: &str = "hv-metal/target/aarch64-unknown-none-softfloat/release/
 // ─── M5 Arc 5e: the real-Linux capstone runner ──────────────────────────────────────────────────
 // The guest-RAM load layout — MUST match `hv-metal/src/stage2.rs`'s `LINUX_RAM_BASE`/`LINUX_RAM_END`
 // (what the emitter maps), `hv-metal/src/linux.rs`'s `DTB_ADDR`, and `hv-metal/linux/guest.dts`.
-// QEMU `-device loader` deposits the three blobs at these PAs before hv-metal boots.
+// QEMU `-device loader` deposits each guest's three blobs at these PAs before hv-metal boots —
+// SIX entries since ③-b2b-ii-b, because guest B's are guest A's plus `GUEST_B_OFFSET`.
 //
 // These three cannot be DERIVED from hv-metal: it is a workspace-excluded crate that does not link
 // for the host, so xtask cannot depend on it. ⑭ made the contract one declaration everywhere it
 // could reach and bound this last seam at RUN time instead — `LINUX_MARKERS` asserts hv-metal's
 // banner *with its addresses in it*, and the boot only reaches userspace if the initrd address
 // agrees too. That is a real check, not a comment: see the two entries in `LINUX_MARKERS`.
-const LINUX_KERNEL_ADDR: u64 = 0x4800_0000; // Image (also DTB /memory base)
+const LINUX_KERNEL_ADDR: u64 = LINUX_RAM_BASE; // Image (also guest A's DTB /memory base)
 const LINUX_DTB_ADDR: u64 = 0x4b00_0000; // DTB (hv-metal points guest x0 here)
 const LINUX_INITRD_ADDR: u64 = 0x4c00_0000; // initramfs (DTB /chosen linux,initrd-*)
 
+/// The guest-RAM window and the ③-b2a split, mirroring `hv-metal/src/stage2.rs`'s `LINUX_RAM_BASE`
+/// / `LINUX_RAM_SPLIT` / `LINUX_RAM_END`. Bound at RUN time by the banner marker, which prints all
+/// three — the same seam as the load addresses above, for the same reason.
+const LINUX_RAM_BASE: u64 = 0x4800_0000;
+const LINUX_RAM_SPLIT: u64 = 0x6400_0000;
+const LINUX_RAM_END: u64 = 0x8000_0000;
+
+/// **Guest B's blobs sit exactly this far above guest A's** (③-b2b-ii-b) — a derivation, not a
+/// fourth address to keep in step. It is also the size of each guest's half, which is why one
+/// constant serves both roles below.
+const GUEST_B_OFFSET: u64 = LINUX_RAM_SPLIT - LINUX_RAM_BASE;
+
+/// The number of real-Linux guests xtask loads blobs for. Mirrors `hv-metal`'s `NUM_GUESTS`; a
+/// disagreement shows up as a missing `linux model built for dom N` marker.
+const NUM_GUESTS: u64 = 2;
+
+// ─── the RAM QEMU actually creates (③-b2b-ii-b: the headroom guard) ──────────────────────────────
+
+/// Where the `virt` machine puts DRAM, and how much the `-m` flag below asks for. **These two are
+/// what QEMU really creates**, and until ③-b2b-ii-b nothing compared them against the window the
+/// emitter hands out: `LINUX_RAM_END` is *exactly* the top of a 1024 MiB `-m`, so the fit is correct
+/// and has zero headroom. Grow the window and QEMU simply never creates the memory, which presents
+/// as a guest faulting on RAM its own DTB promised it.
+const QEMU_RAM_BASE: u64 = 0x4000_0000;
+const QEMU_RAM_MIB: u64 = 1024;
+const QEMU_RAM_END: u64 = QEMU_RAM_BASE + QEMU_RAM_MIB * 1024 * 1024;
+
+/// The emitter's whole guest-RAM window must exist in the machine `-m` builds. True or the build
+/// fails — the half of the guard that needs no boot at all.
+const _: () = assert!(
+    LINUX_RAM_END <= QEMU_RAM_END,
+    "the guest-RAM window runs past the DRAM `-m` creates: hv-metal would map memory QEMU never made"
+);
+
+/// The window must split into [`NUM_GUESTS`] equal halves at [`LINUX_RAM_SPLIT`], or "B's blobs are
+/// A's plus the offset" stops being true and the loader addresses below drift out of their guest.
+const _: () = assert!(
+    LINUX_RAM_BASE + NUM_GUESTS * GUEST_B_OFFSET == LINUX_RAM_END,
+    "the guest-RAM window must divide exactly into NUM_GUESTS halves at LINUX_RAM_SPLIT"
+);
+
+/// `(Image, DTB, initramfs)` load addresses for guest `slot`, and the base+size of its RAM window.
+///
+/// **One derivation for both guests.** Guest A's three addresses are the constants above; every
+/// other guest's are those plus `slot * GUEST_B_OFFSET`, which is why the second kernel needed no
+/// new address to be agreed with anybody — see `hv-metal/src/linux.rs`, which derives the same
+/// three the same way and prints them for the marker below to assert.
+fn guest_load_addrs(slot: u64) -> GuestLoad {
+    let delta = slot * GUEST_B_OFFSET;
+    GuestLoad {
+        kernel: LINUX_KERNEL_ADDR + delta,
+        dtb: LINUX_DTB_ADDR + delta,
+        initrd: LINUX_INITRD_ADDR + delta,
+        ram_base: LINUX_RAM_BASE + delta,
+        ram_size: GUEST_B_OFFSET,
+    }
+}
+
+/// Where one guest's blobs go and what RAM window its DTB advertises.
+struct GuestLoad {
+    kernel: u64,
+    dtb: u64,
+    initrd: u64,
+    ram_base: u64,
+    ram_size: u64,
+}
+
 /// Boot a real aarch64 Linux kernel under hv-metal (M5 Arc 5e). Builds hv-metal `--features
-/// real-linux`, compiles the guest DTB (patching `initrd-end` to the initramfs size), and launches
-/// QEMU with the kernel `Image` + initramfs + DTB loaded into guest RAM via `-device loader`.
+/// real-linux`, renders and compiles ONE DTB PER GUEST from `guest.dts` (③-b2b-ii-b), and launches
+/// QEMU with each guest's `Image` + DTB + initramfs loaded into its own half of guest RAM via
+/// `-device loader`. The same `Image` and the same initramfs serve both guests — the kernel is
+/// relocatable and the two device trees are what differ.
 ///
 /// With `check` false this is the interactive demo: QEMU inherits stdio and you watch a kernel boot.
 /// With `check` true it is the gate `.github/workflows/ci.yml`'s `real-linux boot (QEMU)` job runs —
@@ -157,36 +227,177 @@ fn qemu_linux(check: bool) -> bool {
         }
     }
 
-    // Compile the DTB, patching linux,initrd-end = initrd-start + initramfs size.
-    let dts = match std::fs::read_to_string("hv-metal/linux/guest.dts") {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("xtask {task}: cannot read hv-metal/linux/guest.dts: {e}");
-            return false;
-        }
-    };
+    // ③-b2b-ii-b: compile ONE DTB PER GUEST, both from `guest.dts` through the same routine.
+    //
+    // **Why not a second hand-written `.dts`.** The two descriptions differ in exactly three values
+    // — the `/memory` node's name, its `reg`, and `/chosen`'s initrd range — and every other node,
+    // including the PL011 and the GIC, is IDENTICAL because each guest gets its own EL2-backed model
+    // at the same IPA. A second file would be a second declaration of the twenty lines that must not
+    // differ, which is the defect ⑭ spent a rung removing (#74/#92b).
+    //
+    // **And why both go through the same call.** Guest A's substitution is an identity — it replaces
+    // its own literals with themselves — so it looks like wasted work. It is not: a path only B
+    // takes is a path only B's failures exercise, and the whole point of deriving B from A is that
+    // they cannot drift. Running A through it too means the needle checks below guard A's DTB as
+    // well, on every single boot.
     let initrd_size = std::fs::metadata(&initrd).map(|m| m.len()).unwrap_or(0);
-    let initrd_end = LINUX_INITRD_ADDR + initrd_size;
-    let needle = format!("linux,initrd-end = <0x{LINUX_INITRD_ADDR:x}>;");
-    let patched = dts.replace(&needle, &format!("linux,initrd-end = <0x{initrd_end:x}>;"));
-    // `String::replace` that matches NOTHING returns the string unchanged — so if this constant and
-    // `guest.dts` ever drift, the DTB silently ships `initrd-end == initrd-start`, i.e. a zero-length
-    // initramfs, and the failure surfaces as a kernel that reaches no userspace. ⑬'s markers do catch
-    // that (`Run /init` and `BALEEN-STEP0-OK` go red), so it is not a hole — but it is caught a layer
-    // away from its cause. Refuse here instead, and name the two things that disagree (⑭b).
-    if patched == dts {
-        eprintln!(
-            "xtask {task}: guest.dts has no `{needle}` to patch — `LINUX_INITRD_ADDR` \
-             (0x{LINUX_INITRD_ADDR:x}) and hv-metal/linux/guest.dts's `linux,initrd-start` have \
-             drifted apart. The DTB would ship a zero-length initramfs."
-        );
+    let mut dtbs = Vec::new();
+    for slot in 0..NUM_GUESTS {
+        match render_guest_dtb(task, &dir, slot, initrd_size) {
+            Some(path) => dtbs.push(path),
+            None => return false,
+        }
+    }
+
+    if !metal_build_linux() {
         return false;
     }
-    let dts_out = dir.join("guest.patched.dts");
-    let dtb_out = dir.join("guest.dtb");
-    if let Err(e) = std::fs::write(&dts_out, patched) {
+
+    // `-device loader,file=…,addr=…,force-raw=on` deposits each blob at its guest PA before the
+    // `-kernel` (hv-metal) boots at EL2; hv-metal then erets into the kernel with x0 = the DTB.
+    let mut args: Vec<String> = vec![
+        "-M".into(),
+        "virt,virtualization=on,gic-version=3".into(),
+        // A stable ARMv8.0 baseline for the guest — NOT `-cpu max`. `max` advertises bleeding-edge
+        // features (S1PIE, SME, GCS, pointer-auth) whose EL1 use traps to EL2 for the hypervisor to
+        // enable (HCRX_EL2 …); our minimal EL2 doesn't, so the kernel traps on `PIRE0_EL1` early.
+        // `cortex-a72` exposes only what hv-metal actually virtualizes (GICv3, arch timer, PSCI,
+        // Stage-2), so an unmodified kernel boots without needing exotic-feature enablement at EL2.
+        "-cpu".into(),
+        "cortex-a72".into(),
+        "-smp".into(),
+        "1".into(),
+        "-m".into(),
+        QEMU_RAM_MIB.to_string(),
+        "-nographic".into(),
+        "-net".into(),
+        "none".into(),
+        // Semihosting: hv-metal's SYSTEM_OFF handler issues a semihosting SYS_EXIT so QEMU exits
+        // cleanly when the guest powers off (instead of parking until a timeout).
+        "-semihosting".into(),
+        "-kernel".into(),
+        METAL_BIN.into(),
+    ];
+
+    // ③-b2b-ii-b: every guest's three blobs, and the guard that they land in RAM that EXISTS.
+    //
+    // `-device loader` writes wherever it is told. An address past the top of the DRAM `-m` created
+    // is not refused by QEMU and not reported by it — the bytes simply are not there when hv-metal
+    // erets, and the guest dies reading its own kernel. The window fits exactly today (see the
+    // `const assert!` on `LINUX_RAM_END`), which is precisely the condition under which nobody
+    // notices the check is missing.
+    let mut blobs: Vec<(String, &std::path::Path, u64)> = Vec::new();
+    for (slot, dtb) in dtbs.iter().enumerate() {
+        let at = guest_load_addrs(slot as u64);
+        blobs.push((
+            format!("dom {} Image", slot + 1),
+            image.as_path(),
+            at.kernel,
+        ));
+        blobs.push((format!("dom {} DTB", slot + 1), dtb.as_path(), at.dtb));
+        blobs.push((
+            format!("dom {} initramfs", slot + 1),
+            initrd.as_path(),
+            at.initrd,
+        ));
+    }
+    for (what, file, addr) in &blobs {
+        let len = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+        if *addr < QEMU_RAM_BASE || addr.saturating_add(len) > QEMU_RAM_END {
+            eprintln!(
+                "xtask {task}: {what} would load at 0x{addr:x}..0x{:x}, outside the DRAM `-m \
+                 {QEMU_RAM_MIB}` creates (0x{QEMU_RAM_BASE:x}..0x{QEMU_RAM_END:x}). QEMU would \
+                 accept the -device loader silently and the guest would find nothing there.",
+                addr + len
+            );
+            return false;
+        }
+        args.push("-device".into());
+        args.push(format!(
+            "loader,file={},addr=0x{addr:x},force-raw=on",
+            file.display()
+        ));
+    }
+
+    let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    if !check {
+        return run("qemu-system-aarch64", &argv);
+    }
+    boot_and_check_linux(&argv)
+}
+
+/// Render and compile guest `slot`'s device tree from `hv-metal/linux/guest.dts`, returning the
+/// `.dtb` path (③-b2b-ii-b).
+///
+/// **Every substitution is CHECKED, and that is the whole design.** `String::replace` that matches
+/// nothing returns the string unchanged, so a constant here drifting from `guest.dts` would silently
+/// ship a device tree describing the wrong machine — ⑭b already hit exactly that with `initrd-end`,
+/// where the failure surfaced a layer away as "the kernel reached no userspace". Each needle below
+/// is therefore required to be present, and its absence names the two things that disagree.
+///
+/// The four values are the only ones that differ between guests. Everything else — the PL011, the
+/// GIC, the timer, `psci` — is identical, because each guest gets its own EL2-backed model at the
+/// same IPA rather than a share of one device.
+fn render_guest_dtb(
+    task: &str,
+    dir: &std::path::Path,
+    slot: u64,
+    initrd_size: u64,
+) -> Option<std::path::PathBuf> {
+    let src = "hv-metal/linux/guest.dts";
+    let dts = match std::fs::read_to_string(src) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("xtask {task}: cannot read {src}: {e}");
+            return None;
+        }
+    };
+
+    let at = guest_load_addrs(slot);
+    let dom = slot + 1;
+    // The needles are guest A's literals — the file IS guest A's description, and rendering A is an
+    // identity substitution that still has to find every one of them.
+    let a = guest_load_addrs(0);
+    let subs = [
+        (
+            format!("memory@{:x} {{", a.ram_base),
+            format!("memory@{:x} {{", at.ram_base),
+        ),
+        (
+            format!("reg = <0x00 0x{:x} 0x00 0x{:x}>;", a.ram_base, a.ram_size),
+            format!("reg = <0x00 0x{:x} 0x00 0x{:x}>;", at.ram_base, at.ram_size),
+        ),
+        (
+            format!("linux,initrd-start = <0x{:x}>;", a.initrd),
+            format!("linux,initrd-start = <0x{:x}>;", at.initrd),
+        ),
+        (
+            format!("linux,initrd-end = <0x{:x}>;", a.initrd),
+            format!("linux,initrd-end = <0x{:x}>;", at.initrd + initrd_size),
+        ),
+    ];
+
+    // Checked by PRESENCE, not by "did the string change" — because guest A's substitutions are
+    // identities, and a did-it-change test would silently skip every check on exactly the guest that
+    // boots today. Presence is the same test for both.
+    let mut rendered = dts;
+    for (needle, replacement) in &subs {
+        if !rendered.contains(needle.as_str()) {
+            eprintln!(
+                "xtask {task}: {src} has no `{needle}` to substitute — it and xtask's guest-RAM \
+                 constants have drifted apart, and dom {dom}'s device tree would describe a machine \
+                 this build does not create."
+            );
+            return None;
+        }
+        rendered = rendered.replace(needle, replacement);
+    }
+
+    let dts_out = dir.join(format!("guest-dom{dom}.dts"));
+    let dtb_out = dir.join(format!("guest-dom{dom}.dtb"));
+    if let Err(e) = std::fs::write(&dts_out, rendered) {
         eprintln!("xtask {task}: cannot write {}: {e}", dts_out.display());
-        return false;
+        return None;
     }
     if !run(
         "dtc",
@@ -200,56 +411,10 @@ fn qemu_linux(check: bool) -> bool {
             dtb_out.to_str().unwrap(),
         ],
     ) {
-        eprintln!("xtask {task}: dtc failed to compile the guest DTB");
-        return false;
+        eprintln!("xtask {task}: dtc failed to compile dom {dom}'s guest DTB");
+        return None;
     }
-
-    if !metal_build_linux() {
-        return false;
-    }
-
-    // `-device loader,file=…,addr=…,force-raw=on` deposits each blob at its guest PA before the
-    // `-kernel` (hv-metal) boots at EL2; hv-metal then erets into the kernel with x0 = the DTB.
-    let loader = |file: &std::path::Path, addr: u64| {
-        format!(
-            "loader,file={},addr=0x{addr:x},force-raw=on",
-            file.display()
-        )
-    };
-    let args: Vec<String> = vec![
-        "-M".into(),
-        "virt,virtualization=on,gic-version=3".into(),
-        // A stable ARMv8.0 baseline for the guest — NOT `-cpu max`. `max` advertises bleeding-edge
-        // features (S1PIE, SME, GCS, pointer-auth) whose EL1 use traps to EL2 for the hypervisor to
-        // enable (HCRX_EL2 …); our minimal EL2 doesn't, so the kernel traps on `PIRE0_EL1` early.
-        // `cortex-a72` exposes only what hv-metal actually virtualizes (GICv3, arch timer, PSCI,
-        // Stage-2), so an unmodified kernel boots without needing exotic-feature enablement at EL2.
-        "-cpu".into(),
-        "cortex-a72".into(),
-        "-smp".into(),
-        "1".into(),
-        "-m".into(),
-        "1024".into(),
-        "-nographic".into(),
-        "-net".into(),
-        "none".into(),
-        // Semihosting: hv-metal's SYSTEM_OFF handler issues a semihosting SYS_EXIT so QEMU exits
-        // cleanly when the guest powers off (instead of parking until a timeout).
-        "-semihosting".into(),
-        "-kernel".into(),
-        METAL_BIN.into(),
-        "-device".into(),
-        loader(&image, LINUX_KERNEL_ADDR),
-        "-device".into(),
-        loader(&dtb_out, LINUX_DTB_ADDR),
-        "-device".into(),
-        loader(&initrd, LINUX_INITRD_ADDR),
-    ];
-    let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    if !check {
-        return run("qemu-system-aarch64", &argv);
-    }
-    boot_and_check_linux(&argv)
+    Some(dtb_out)
 }
 
 // ─── the real-Linux boot's assertions (⑬: the capstone becomes a re-runnable gate) ───────────────
@@ -320,7 +485,7 @@ fn qemu_linux(check: bool) -> bool {
 ///   terminates rather than parking: busybox `poweroff -f` -> the kernel's PSCI -> `HVC` -> EL2.
 const LINUX_MARKERS: &[&str] = &[
     // hv-metal, before the guest runs. The ADDRESSES in this line are load-bearing, not decoration:
-    // they are hv-metal's view of the memory contract, and the three constants below are xtask's.
+    // they are hv-metal's view of the memory contract, and xtask's `guest_load_addrs` is its own.
     // `hv-metal` is workspace-EXCLUDED (it cannot link for the host), so no compile-time derivation
     // can bind the two — ⑭ folded the contract into one declaration everywhere it *could* reach, and
     // this marker is what binds the remaining cross-crate seam. Change `LINUX_KERNEL_ADDR` or
@@ -367,6 +532,24 @@ const LINUX_MARKERS: &[&str] = &[
     // and the boot dies, so every marker after this line is a guest resumed from a context the metal
     // rebuilt from scratch. Probe-verified per register (six of ten tested are load-bearing).
     "baleen: vcpu OK: the guest was PREEMPTED and restored",
+    // ③-b2b-ii-b: EL2 read the bytes at BOTH guests' load addresses before either ran, and found a
+    // real payload at each. Asserted with every value in place, because the values ARE the claim:
+    // the `ARM\x64` magic, `d00dfeed` and the addresses can only be there if the six `-device
+    // loader` entries above landed where this build and hv-metal independently computed they would.
+    //
+    // Nothing else in this gate can see dom 2's payload — dom 2 does not run, so a boot in which
+    // QEMU wrote its `Image` to the wrong address is byte-for-byte the boot in which it did, and the
+    // first symptom would arrive a rung later as guest B executing a window full of zeroes.
+    //
+    // BOTH lines are asserted, and that is what makes the pair self-instrumenting: dom 1's payload
+    // is known-good because it boots on every run, so dom 1 green with dom 2 red says the check is
+    // right and the load is wrong (design-lesson #118).
+    //
+    // `relocatable` is the load-bearing word. The second kernel needs no second build only because
+    // this exact file may boot at a 2 MiB-aligned base anywhere in memory (`flags` bit 3); an Alpine
+    // bump that lost that property would otherwise present as guest B hanging at instruction one.
+    "baleen: guestimage OK: dom 1 — Image 'ARM\\x64' 34 MiB, relocatable, at 0x48000000; DTB 0xd00dfeed at 0x4b000000; gzip initramfs at 0x4c000000",
+    "baleen: guestimage OK: dom 2 — Image 'ARM\\x64' 34 MiB, relocatable, at 0x64000000; DTB 0xd00dfeed at 0x67000000; gzip initramfs at 0x68000000",
     // ③-b2b-ii-a: the console is now MULTIPLEXED — EL2 buffers each guest's transmit stream to a
     // newline and emits whole lines tagged with the domain whose emulated PL011 received the bytes.
     //
@@ -427,6 +610,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // poison that makes it non-vacuous — was never exercised at all. A boot that is otherwise
     // perfect but never preempts proves nothing about the switch.
     "baleen: vcpu FAIL",
+    // ③-b2b-ii-b: a guest's window does not hold what the loader was told to put there — no kernel
+    // magic, a zero image_size, a non-relocatable Image, a kernel overrunning its DTB, or a missing
+    // device tree / initramfs. The message names which guest and which of the six checks failed.
+    "baleen: guestimage FAIL",
     // ③-b2b-ii-a: a guest that has never been dispatched has a non-zero counter, i.e. the per-guest
     // device models / contexts / witnesses are still shared, or a handler is indexing them with the
     // wrong slot. The message names which counter leaked.
