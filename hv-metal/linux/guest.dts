@@ -83,6 +83,32 @@
 		clock-names = "uartclk", "apb_pclk";
 	};
 
+	/*
+	 * ③-b2b-ii-d — THE PEER PROBE, and the one node here that is not a device this guest has.
+	 *
+	 * It names an AMBA peripheral at the base of the OTHER guest's half of the RAM window, so the
+	 * kernel's AMBA bus scan reads its identification registers during boot. Those reads are
+	 * Stage-2 aborts to EL2 (this guest's image does not map the peer's memory), which is exactly
+	 * the isolation property, asserted by a running guest attempting a real access rather than by
+	 * a walk over descriptors. EL2 recognises them, checks that the SAME address resolves in the
+	 * peer's live image and holds the peer's loaded kernel, skips the instruction, and the guest
+	 * carries on: the identification read returns nothing that matches, so no driver binds and the
+	 * device is dropped with -ENODEV.
+	 *
+	 * DECLARED COST, because ③ spent four rungs earning the opposite: this is an ADDITION to the
+	 * guest's device tree. ③'s property — that taking a device away from a guest never required
+	 * editing its description — is untouched; this node is not an accommodation of our emulation,
+	 * it is the negative test's instrument, and it is the only thing here that exists to fail.
+	 *
+	 * `xtask` rewrites the address per guest (dom 1 probes 0x64000000, dom 2 probes 0x48000000).
+	 */
+	peer-probe@64000000 {
+		compatible = "arm,pl011", "arm,primecell";
+		reg = <0x00 0x64000000 0x00 0x1000>;
+		clocks = <0x8000 0x8000>;
+		clock-names = "uartclk", "apb_pclk";
+	};
+
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <0x01 0x0d 0x04
