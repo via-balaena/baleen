@@ -2501,7 +2501,17 @@ mod tests {
     /// write-xor-pagetable, exclusivity) hold in every reachable state at **every** depth, over
     /// a full four-level tree. This is symmetry reduction's headline payoff: converting a
     /// depth-axis *argument* into a *measured* all-depths theorem (`docs/TIER-B-CUTOFF.md`
-    /// §2.5). Takes ~5 min in release — `#[ignore]`d like the other deep sweeps.
+    /// §2.5). `#[ignore]`d like the other deep sweeps.
+    ///
+    /// **COST — measured 2026-08-03, and the figure this replaced was 2.5x stale.** It said "~5 min
+    /// in release"; it is **739.8s (12m20s)**, which is **37.5% of the entire 32m52s deep-sweep
+    /// suite** — the top three tests are 64.5% of it and the other eighteen together are 20.5%. The
+    /// number drifted as the suite around it grew rather than because this test changed, which is
+    /// why it went unnoticed: nothing re-derives a cost written in prose.
+    ///
+    /// It matters beyond bookkeeping. This test is what sets the deep-sweep job's MAKESPAN, so it is
+    /// the first lever if that job's wall ever binds — `depth`, `max_states`, or splitting the
+    /// reduced and unreduced halves, which are two separate enumerations in one `#[test]`.
     fn sym_hierarchy_cfg(depth: u32) -> Config {
         Config {
             p2m: true,
