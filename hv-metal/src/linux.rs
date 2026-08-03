@@ -56,6 +56,25 @@
 //! The emulated UART is still transmit-only: its RX path needs a forwarded SPI, which ③-a2's
 //! machinery supports but nothing yet wires (see [`crate::vpl011`]'s module docs).
 //!
+//! ## ③-b2b-ii-a: everything per-guest becomes an INDEX
+//!
+//! Each device above is EL2 state, which is what makes a *second* copy of it possible. That
+//! possibility is now taken: the emulated PL011s, the emulated GICv3s, the vCPU contexts and the
+//! five witness counters are arrays indexed by [`CURRENT`], and a guest's domain id, Stage-2 set,
+//! frame range and table range are all functions of its slot. Only slot A runs — moving `CURRENT`
+//! is ③-b2b-ii-c, and what stands in its way is not this file but the **physical** timer's Active
+//! state, measured rather than assumed: at every preemption point PPI 27 is Active *and* Pending
+//! with the running guest holding the `HW=1` list register that owns its deactivation, so a second
+//! guest switched in there could never be signalled the tick — and the tick is the only thing that
+//! re-enters EL2.
+//!
+//! The **console** had to move with them ([`crate::console`]). ③-a1's relay is per-byte, and the
+//! preemption point can land between any two bytes of a line, so two kernels would interleave
+//! character by character — and `xtask::LINUX_MARKERS` is substring matching over that log. EL2
+//! therefore buffers each guest's stream to a newline and tags the line with the model instance that
+//! received it, which is also the only attribution a guest cannot forge: both guests run the *same*
+//! initramfs.
+//!
 //! ## The memory contract (shared with `cargo xtask qemu-linux`)
 //!
 //! QEMU `-device loader` deposits three blobs in guest DRAM before hv-metal runs; hv-metal never
@@ -1327,6 +1346,11 @@ fn read_hpfar() -> u64 {
 
 /// Report what the emulated PL011 witnessed, at the guest's `SYSTEM_OFF` — the last moment EL2 gets
 /// before the boot ends.
+///
+/// **Since ③-b2b-ii-a it reports the RUNNING guest's model**, i.e. the one that issued this
+/// `SYSTEM_OFF`. With one runner that is the whole story; ③-b2b-ii-c, where each guest powers off
+/// separately, is where this has to say *which* guest it is talking about — the same split
+/// [`report_per_guest_state`] already makes, and the reason that one exists.
 ///
 /// **Why this marker and not a simpler one.** Every other assertion in the real-Linux gate
 /// (`Linux version`, `Machine model`, `Run /init`, `BALEEN-STEP0-OK`) is satisfied identically
