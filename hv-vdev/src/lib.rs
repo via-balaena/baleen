@@ -70,11 +70,14 @@
 //!
 //! ## Where this crate actually stands — read before believing the word "provable"
 //!
-//! **As of this commit there are NO harnesses over this crate.** ⑯'s first step moves the PL011
-//! model here and stops; the GIC model and the `hv-verify` harnesses are later steps. What has
-//! changed is *possibility*, not proof: code that was structurally unreachable by Kani is now
+//! **As of this commit there are NO harnesses over this crate.** ⑯'s first two steps move the
+//! models here — the PL011, then the GICv3 — and stop. The `hv-verify` harnesses are step 3. What
+//! has changed is *possibility*, not proof: code that was structurally unreachable by Kani is now
 //! reachable by it. Nothing here is verified yet, and a reader who takes "under the fence" to mean
 //! "proven" has read this crate as one rung further along than it is.
+//!
+//! Keep this paragraph honest as the steps land. It is the one place a reader is told what the
+//! fence does *not* buy, and a stale version of it would overstate the whole crate.
 //!
 //! ## The honest ceiling — true now and after the harnesses land
 //!
@@ -93,4 +96,5 @@
 //! system registers, no hardware. Every place the emulation meets the machine is a call site in
 //! `hv-metal`, where the rest of the `unsafe` already lives.
 
+pub mod gicv3;
 pub mod pl011;
