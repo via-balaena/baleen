@@ -51,6 +51,8 @@
 mod abort;
 mod blk;
 mod cell;
+#[cfg(feature = "real-linux")]
+mod console;
 mod dmawitness;
 mod el2;
 mod exceptions;
@@ -136,6 +138,16 @@ pub(crate) fn uart() -> Pl011 {
 
 /// Park the core low-power. Nothing runs after the banner (or after a caught fault is reported).
 pub(crate) fn park() -> ! {
+    // ③-b2b-ii-a: the real-Linux guests' console is LINE-buffered in EL2 now, so a guest that dies
+    // mid-line leaves its last fragment held rather than on the wire — and that fragment is exactly
+    // the sort of thing a fatal path is being diagnosed from. Flushing here rather than at each of
+    // the ten `park()` sites in `linux.rs` keeps it one derivation and covers the ones a future rung
+    // adds. It appears *after* the trap message that named the fault, which is the one cost.
+    //
+    // `try_borrow_mut` inside: `park()` is also what `crate::cell`'s own conflict halt calls, and a
+    // halt caused by the console cell must not re-enter it.
+    #[cfg(feature = "real-linux")]
+    linux::flush_consoles();
     loop {
         // SAFETY: `wfe` is an unprivileged hint with no memory effect.
         unsafe { core::arch::asm!("wfe") };

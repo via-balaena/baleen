@@ -28,8 +28,11 @@
 //!   nothing" unstateable for the sibling GIC model and forced every property to carry an exception
 //!   clause for fields that are not device state at all.
 //! - **The hardware poke.** [`hv_vdev::pl011::VirtPl011::mmio_write`] *reports* a transmitted byte;
-//!   `linux.rs` is what puts it on the real UART. That is the one place the emulated device meets
-//!   the real one, and keeping it at the call site is what leaves the model free of `unsafe`.
+//!   `linux.rs` is what routes it onward, and keeping that at the call site is what leaves the model
+//!   free of `unsafe`. **Since ③-b2b-ii-a it does not go straight at the hardware**: the byte is
+//!   handed to [`crate::console`], which buffers it to a whole line and tags that line with the
+//!   guest whose model — this one — received it. One machine, one UART, two kernels about to print
+//!   at once; see that module for why a per-byte relay stops working at exactly two guests.
 //!
 //! ## Unsafe
 //!
@@ -105,7 +108,7 @@ pub(crate) struct DeployedPl011 {
     needle: NeedleMatcher,
     /// Register accesses trapped and serviced (reads and writes).
     traps: u64,
-    /// Bytes the guest transmitted through `DR`, i.e. forwarded to the real UART.
+    /// Bytes the guest transmitted through `DR`, i.e. handed on toward the real UART.
     dr_writes: u64,
 }
 
@@ -127,7 +130,7 @@ impl DeployedPl011 {
     }
 
     /// Service a guest **write** of `value` at `offset`. Returns `Some(byte)` iff the write was to
-    /// `DR` — the caller then puts that byte on the real UART.
+    /// `DR` — the caller then routes that byte on, via [`crate::console`]'s per-guest line buffer.
     #[must_use]
     pub(crate) fn mmio_write(&mut self, offset: u64, value: u64) -> Option<u8> {
         self.traps += 1;
