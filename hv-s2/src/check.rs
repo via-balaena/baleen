@@ -149,7 +149,7 @@ impl Verdict {
     /// reaching a state the refinement does not claim to cover — a **coverage fact**, decided and
     /// machine-checked by Phase I-4, and explicitly not an isolation failure.
     ///
-    /// ## Why this exists, which is a bug rather than a tidy-up
+    /// ## Why it exists — a bug, not a tidy-up
     ///
     /// It did not, and the two callers each answered the question for themselves. `hv-sim`'s
     /// enumerator got it right — it counts `OutOfDomain` states as coverage and treats only
