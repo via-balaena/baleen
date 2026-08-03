@@ -1309,6 +1309,31 @@ static HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GU
 // `SYSTEM_OFF` each guest issues, and a parameter that no longer selects anything reads as though it
 // does.
 
+/// How many switch-ins found the live FP register file holding **someone else's** data
+/// (③-b2b-ii-f) — i.e. how many times this guest would have read its peer's `v0..v31`.
+///
+/// **REPORTED, NEVER ASSERTED, and #127 is exactly why.** A boot whose guests never touch floating
+/// point leaves this at zero and is a perfectly good boot; the number counts what the WORKLOAD did,
+/// not what the mechanism guarantees. What it is worth reporting for is that it sizes the hole this
+/// rung closed, from the live boot rather than from an argument: the same quantity read ~31 per boot
+/// when it was measured with `CPTR_EL2.TFP` before the fix existed (see [`crate::fp`]).
+static FP_FOREIGN: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// How many switch-ins were followed by a **read-back** confirming the live FP register file now
+/// equals the incoming vCPU's saved one (③-b2b-ii-f).
+///
+/// **This is the assertable half, and it is structural: it must equal [`SWITCHES`] on every boot,
+/// whatever the guests do.** Every restore is obliged to make the hardware match the context it
+/// restored from — no guest behaviour can change that, so the equality is a property of the
+/// mechanism in the sense #127 asks for.
+///
+/// It is not merely checking that `ldp` works. The bug class it catches is a **partial** restore —
+/// a wrong offset dropping `v16..v31`, or `FPCR` written but not `FPSR` — which on any boot whose
+/// guests happen not to use the high registers is byte-for-byte indistinguishable from a correct
+/// one. The read-back is EL2 asking the register file what it actually holds, the same discipline
+/// `TIMER_DEACTIVATED` applies to the redistributor and `verify_encoding` to the emitted image.
+static FP_RESTORE_VERIFIED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
 /// How many times each guest has touched a PEER's memory and been refused by the hardware
 /// (③-b2b-ii-d).
 static PEER_FAULTS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
@@ -1635,6 +1660,16 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
         TIMER_DEACTIVATED[cur].fetch_add(1, Ordering::Relaxed);
     }
 
+    // 3b. ③-b2b-ii-f — **whose data is in the FP register file right now?** `ctx[cur].fp()` was read
+    //     off the hardware in step 1, so this compares the live file against what the INCOMING vCPU
+    //     last owned. Different means the incoming guest was about to read its peer's `v0..v31` —
+    //     which, before this rung, is exactly what it did. Taken here because step 4 is about to
+    //     destroy the evidence.
+    let incoming_fp = ctx[next].fp();
+    if ctx[cur].fp() != incoming_fp {
+        FP_FOREIGN[next].fetch_add(1, Ordering::Relaxed);
+    }
+
     // 4. Poison — see `crate::vcpu`. Still the instrument that stops a switch-to-self being vacuous.
     // SAFETY: at EL2 with the context saved, and the restore below is unconditional — the guest's
     // EL1 configuration is garbage only for the handful of instructions between the two.
@@ -1649,6 +1684,15 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     // B's boot and B's resume are the same instruction, not two paths that must agree.
     unsafe { ctx[next].restore(&mut frame.x) };
     drop(ctx);
+
+    // 5c. ③-b2b-ii-f — read the FP file back off the hardware and confirm it is the incoming vCPU's.
+    //     Structural: true on every switch regardless of what any guest does, which is what makes it
+    //     assertable where `FP_FOREIGN` is not.
+    let mut live = crate::fp::FpCtx::ZERO;
+    live.save();
+    if live == incoming_fp {
+        FP_RESTORE_VERIFIED[next].fetch_add(1, Ordering::Relaxed);
+    }
 
     // 5b. Install the incoming DOMAIN's VMID-tagged Stage-2, with **no TLB flush** — M5 Arc 2's
     //     headline property, reached here by two REAL kernels for the first time. Distinct VMIDs are
@@ -1764,6 +1808,7 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 report_timer_handoff(&mut uart);
                 report_el2_slice(&mut uart);
                 report_wfi_yield(&mut uart);
+                report_fp_isolation(&mut uart);
                 report_per_guest_state(&mut uart);
                 let _ = writeln!(
                     uart,
@@ -2709,6 +2754,54 @@ fn report_el2_slice(uart: &mut Pl011) {
             held * 1_000_000 / freq.max(1),
             ms(quantum)
         );
+    }
+}
+
+/// **The witness for FP/SIMD isolation** (③-b2b-ii-f) — residue 4's closure.
+///
+/// ## The assertion is the read-back, and the interesting number is the one NOT asserted
+///
+/// `verified == switches` is structural: every restore must leave the hardware equal to the context
+/// it restored from, on every switch, whatever the guests do. That is the quantity the mechanism
+/// determines (#127), and it catches the failure this rung can actually have — a **partial**
+/// restore, which on a boot that never touches the high registers is indistinguishable from a
+/// correct one.
+///
+/// `FP_FOREIGN` is reported beside it and deliberately never asserted. It counts switch-ins where
+/// the live register file belonged to the peer — i.e. the leak that would have happened — and it is
+/// a claim about the WORKLOAD: two guests that never use floating point leave it at zero on a
+/// perfectly good boot. Asserting it would be the fifth-plus repeat of this arc's standing mistake.
+///
+/// ## Honest ceiling
+///
+/// This says the register file the incoming guest resumes on is its own. It does **not** say a guest
+/// *observed* the peer's data before the fix — that claim is the `CPTR_EL2.TFP` measurement recorded
+/// in [`crate::fp`], which found ~31 first-FP-uses-after-a-switch per boot with the guest's own
+/// `CPACR_EL1` permitting each one — nor is it a theorem: `hv-metal` is not a Kani target.
+fn report_fp_isolation(uart: &mut Pl011) {
+    for slot in 0..NUM_GUESTS {
+        let dom = slot_dom(slot);
+        let verified = FP_RESTORE_VERIFIED[slot].load(Ordering::Relaxed);
+        let switches = SWITCHES[slot].load(Ordering::Relaxed);
+        let foreign = FP_FOREIGN[slot].load(Ordering::Relaxed);
+        if verified == switches {
+            let _ = writeln!(
+                uart,
+                "baleen: fp OK: dom {dom} resumed on its OWN FP register file every time — {verified} \
+                 of {switches} switch-ins read back v0..v31 + FPCR + FPSR equal to the context \
+                 restored, and on {foreign} of them the file had been left holding the PEER's data \
+                 (that count is the workload's, not the mechanism's)"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: fp FAIL: dom {dom} verified {verified} FP restores across {switches} \
+                 switch-ins — the register file EL2 restored is not the one the hardware holds, so \
+                 part of v0..v31/FPCR/FPSR is being dropped and a guest resumes on its peer's \
+                 floating-point state"
+            );
+            crate::park();
+        }
     }
 }
 

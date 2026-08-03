@@ -133,6 +133,11 @@ caught (the matrix FAILS / boot halts, `SCHEDULER TEST PASSED` never prints):
    desync the asm (the `const _` discipline, #14c).
 2. *(Auditor A)* Documented the scope boundary that FP/SIMD (`v0..v31`) is not saved — sound for the
    integer-register-only scheduler guests, flagged so a future FP guest doesn't inherit a silent leak.
+   **CLOSED by ③-b2b-ii-f**, and the flag is what made the closure cheap: `GuestContext` now carries
+   `crate::fp::FpCtx`, the same type the real-Linux switch uses. The "future FP guest" turned out to
+   be two real Linux kernels on a different path — measured using the register file across a switch
+   ~31 times per boot — which is the case for writing a scope boundary down rather than assuming the
+   next reader will rediscover it.
 3. *(Auditor B)* Made the affinity probe **occupancy-independent**: it now narrows B to exclude a
    *free* pCPU and probes there, so `NotAffine` is the only possible refusal — the witness no longer
    depends on hv-core's affinity-vs-occupancy check order (it failed *safe* before, but is now robust

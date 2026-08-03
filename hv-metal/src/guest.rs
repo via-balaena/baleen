@@ -1847,7 +1847,10 @@ const SPSR_EL2_GUEST: u64 = 0b0101 | (0b1111 << 6);
 
 /// The guest register frame the trampoline saves and restores around servicing: `x0..x30`. `x0` is
 /// where the guest's hypercall number arrives and the result is written back; the rest are preserved
-/// verbatim. FP/SIMD (`v0..v31`) is not framed — harmless for this register-only guest (Arc-4 review).
+/// verbatim. FP/SIMD (`v0..v31`) is **still not framed here**, and since ③-b2b-ii-f that sentence
+/// needs its other half: the trampoline frame does not carry the FP file, but [`GuestContext`] now
+/// does ([`crate::fp::FpCtx`]). The distinction is real — the frame is what a *trap* preserves, the
+/// context is what a *switch* moves, and only the second one can leak across vCPUs.
 #[repr(C)]
 pub struct GuestFrame {
     pub x: [u64; 31],
@@ -1872,9 +1875,15 @@ pub struct GuestFrame {
 ///   context and [`gic::VgicCtx`] became the one place that answers "what is a vGIC context"; two
 ///   domains had been cross-leaking their interrupt masking since Arc 2. Found by asking what else
 ///   was in this class, not by a failure.
-/// * **The FP/SIMD registers (`v0..v31`) — STILL UNSAVED, and the standing example.** Deliberate: the
-///   scheduler guests are integer-register-only. A future FP-using guest needs `v0..v31` added here
-///   (and to `__enter_guest_ctx`), or two such guests cross-leak FP state across a switch.
+/// * **The FP/SIMD registers (`v0..v31`, `FPCR`, `FPSR`) — CLOSED by ③-b2b-ii-f**, and worth reading
+///   as the vindication of the lesson below. This bullet used to end "a *future* FP-using guest
+///   needs `v0..v31` added here, or two such guests cross-leak FP state across a switch", and the
+///   deferral was reasonable: these guests are integer-only. It stopped being reasonable on the
+///   real-Linux path, where two kernels DID use floating point — measured at ~31 first-uses after a
+///   switch-in per boot, each with the guest's own `CPACR_EL1` permitting the access. Carried now by
+///   [`crate::fp::FpCtx`], the one type both switches share, for the same reason `VgicCtx` is one
+///   type. Behaviour-nil here, deliberately: the thesis path gets the guarantee before a guest needs
+///   it rather than after.
 ///
 /// The lesson the second bullet paid for: when one member of this class is found, the others are
 /// worth enumerating immediately — they are invisible until a guest is unlucky.
@@ -1900,6 +1909,10 @@ struct GuestContext {
     /// Saved/restored by Rust, NOT the asm — it sits *after* the asm-bound offsets (@280), so
     /// `__enter_guest_ctx` never touches it and its layout assumptions are unchanged.
     vgic: gic::VgicCtx,
+    /// The FP/SIMD register file (③-b2b-ii-f) — the other state the hardware keeps once and does not
+    /// swap. Rust-saved and past the asm-bound offsets for exactly the same reason as `vgic`, so
+    /// `__enter_guest_ctx` is again untouched.
+    fp: crate::fp::FpCtx,
 }
 
 impl GuestContext {
@@ -1910,6 +1923,7 @@ impl GuestContext {
         spsr_el2: 0,
         sctlr_el1: 0,
         vgic: gic::VgicCtx::ZERO,
+        fp: crate::fp::FpCtx::ZERO,
     };
 }
 
@@ -2691,6 +2705,7 @@ fn save_context(vcpu: usize, frame: &GuestFrame) {
     ctx.spsr_el2 = spsr;
     ctx.sctlr_el1 = sctlr;
     ctx.vgic = vgic;
+    ctx.fp.save();
 }
 
 /// Restore a vCPU's context — GPRs into the trampoline `frame` (so its `ldp`+`eret` resumes that
@@ -2708,6 +2723,9 @@ fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
     // pending vINTs writes 0 over the peer's higher LRs), nor its priority mask.
     // SAFETY: at EL2, restoring the context saved for the vCPU being switched in.
     unsafe { ctx.vgic.restore() };
+    // ③-b2b-ii-f: and its own FP register file, so two FP-using vCPUs cannot cross-leak `v0..v31`.
+    // SAFETY: at EL2, restoring the context saved for the vCPU being switched in.
+    unsafe { ctx.fp.restore() };
     // III-1: with this vCPU's own bank reinstated, top up any free list registers from ITS software
     // pending set — the deterministic half of the refill, needing no maintenance interrupt. It must run
     // *after* the restore (which overwrites the whole bank, so a pre-restore refill would be discarded)

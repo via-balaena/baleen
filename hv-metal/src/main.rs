@@ -56,6 +56,7 @@ mod console;
 mod dmawitness;
 mod el2;
 mod exceptions;
+mod fp;
 mod gic;
 mod guest;
 mod heap;
@@ -206,6 +207,15 @@ pub extern "C" fn rust_main() -> ! {
 
     // (3) Configure HCR_EL2 for AArch64 EL2 operation (RW=1, everything else 0 — no guest-trap
     //     bits, that is M4). Read it back and confirm the field took; a silent no-op write is a bug.
+    // ③-b2b-ii-f: EL2 must be able to touch the FP register file before it can carry one across a
+    // switch, and `CPTR_EL2`'s reset value is UNKNOWN. Same discipline as `el2::configure` below.
+    let cptr = fp::enable_at_el2();
+    let _ = writeln!(
+        uart,
+        "baleen: EL2 owns the FP register file: CPTR_EL2 read back as 0x{cptr:x} (TFP clear = {})",
+        fp::el2_fp_enabled(cptr)
+    );
+
     let hcr = el2::configure();
     if el2::rw_is_aarch64(hcr) {
         let _ = writeln!(

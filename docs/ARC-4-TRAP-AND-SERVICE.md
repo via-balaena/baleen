@@ -182,6 +182,9 @@ is orthogonal to Arc 5's guest Stage-2 work.
 
 - **FP/SIMD (`v0..v31`, `FPSR`/`FPCR`) not framed across the resume** — harmless for the register-only
   guest; the FP save/restore lands with the first non-trivial guest (`GuestFrame` doc).
+  **CLOSED by ③-b2b-ii-f.** It landed exactly where this predicted — with the first guests that use
+  floating point, the two real Linux kernels — though not where the frame is: a trap's frame and a
+  switch's context are different things, and only the latter can cross vCPUs. See `hv-metal/src/fp.rs`.
 - **`VTCR_EL2.PS` hardcoded to 40-bit** rather than clamped to `ID_AA64MMFR0_EL1.PARange` — fine on
   `virt`; a real-hardware-portability fix reads `PARange`.
 - **`SP_EL1` set to the exclusive window end** — a push lands in-window; correct-and-cosmetic.
