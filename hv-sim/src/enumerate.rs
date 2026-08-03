@@ -1258,11 +1258,17 @@ pub fn enumerate(cfg: &Config) -> EnumOutcome {
                 // measured number instead of a sentence in a doc.
                 let refinement = match hv_s2::check_all(&h) {
                     Ok(()) => None,
-                    Err(hv_s2::Verdict::Violated(v)) => Some(v),
-                    Err(hv_s2::Verdict::OutOfDomain(_)) => {
-                        out_of_domain_keys.insert(keyfn(&h));
-                        None
-                    }
+                    // `Verdict::finding` is the ONE place that decides which verdicts are defects
+                    // — this used to be re-derived here and, differently and wrongly, in
+                    // `hv-fuzz`'s `hypervisor` target. Counting the rest is still this caller's
+                    // own job: how the refinement's domain becomes a measured number.
+                    Err(v) => match v.finding() {
+                        Some(violation) => Some(violation),
+                        None => {
+                            out_of_domain_keys.insert(keyfn(&h));
+                            None
+                        }
+                    },
                 };
                 if !h.invariants_hold() || refinement.is_some() {
                     let key = keyfn(&h);

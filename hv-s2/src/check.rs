@@ -140,6 +140,36 @@ pub enum Verdict {
     OutOfDomain(OutOfDomain),
 }
 
+impl Verdict {
+    /// **Is this verdict a finding?** — the ONE place that question is answered.
+    ///
+    /// `check_all` returns `Err` for two very different things, and telling them apart is a
+    /// judgement about what this refinement *claims*, not a pattern match a caller should be
+    /// re-deriving. [`Verdict::Violated`] is a defect. [`Verdict::OutOfDomain`] is the model
+    /// reaching a state the refinement does not claim to cover — a **coverage fact**, decided and
+    /// machine-checked by Phase I-4, and explicitly not an isolation failure.
+    ///
+    /// ## Why it exists — a bug, not a tidy-up
+    ///
+    /// It did not, and the two callers each answered the question for themselves. `hv-sim`'s
+    /// enumerator got it right — it counts `OutOfDomain` states as coverage and treats only
+    /// `Violated` as a finding. `hv-fuzz`'s `hypervisor` target got it wrong: it panicked on **any**
+    /// `Err`, reporting `Stage-2 refinement violated: OutOfDomain(UnsupportedSpan { .. })` for a
+    /// state the emitter had correctly declined to represent.
+    ///
+    /// **That reddened the weekly `Deep verification` gate for two consecutive runs (2026-07-27 and
+    /// 2026-08-03) before anyone noticed**, because the job is schedule-only and not required. The
+    /// classification is now derived once, here, beside the enum it is about — so a third consumer
+    /// cannot invent a third answer.
+    #[must_use]
+    pub fn finding(self) -> Option<Violation> {
+        match self {
+            Verdict::Violated(v) => Some(v),
+            Verdict::OutOfDomain(_) => None,
+        }
+    }
+}
+
 /// **P-SOUND + P-PERM — no reachability without authorization.**
 ///
 /// For every mapped frame: either the domain **owns** it, or an **active grant** from its owner
@@ -367,6 +397,71 @@ mod tests {
             check_all(&h),
             Ok(()),
             "own frames are authorized by ownership"
+        );
+    }
+
+    /// **The regression test for the bug that reddened `Deep verification` for two weeks.**
+    ///
+    /// A page table pinned above `L2` has no span this refinement emits, so `leaf_map` declines it
+    /// and `check_all` reports `OutOfDomain(UnsupportedSpan { .. })`. That is the emitter refusing
+    /// to represent a state, which is CORRECT behaviour and explicitly not an isolation failure
+    /// (Phase I-4). The assertion that matters is the second one: run through [`Verdict::finding`]
+    /// — the predicate both the enumerator and the fuzz target now use — this state yields NO
+    /// finding. `hv-fuzz`'s `hypervisor` target used to panic on the bare `Err` and so reported it
+    /// as `Stage-2 refinement violated`.
+    ///
+    /// Deliberately a unit test rather than a fuzz seed: it now runs in the REQUIRED `cargo test`
+    /// gate, where the original failure only ever appeared in a schedule-only job nobody read.
+    #[test]
+    fn an_out_of_domain_state_is_not_a_finding() {
+        let mut h = hv();
+        ok(&mut h, DOM0, HvCall::P2mAllocate { mfn: 1 });
+        ok(
+            &mut h,
+            DOM0,
+            HvCall::P2mPin {
+                mfn: 1,
+                level: PtLevel::L3,
+            },
+        );
+        ok(&mut h, DOM0, HvCall::P2mAllocate { mfn: 2 });
+        ok(
+            &mut h,
+            DOM0,
+            HvCall::P2mLink {
+                parent: 1,
+                slot: 0,
+                child: 2,
+                writable: true,
+                leaf: true,
+                execute: false,
+            },
+        );
+
+        let verdict = check_all(&h).expect_err("an L3 leaf is outside the emitted spans");
+        assert_eq!(
+            verdict,
+            Verdict::OutOfDomain(OutOfDomain::UnsupportedSpan {
+                dom: DOM0,
+                parent: 1
+            }),
+            "the emitter must decline this state, naming the out-of-range parent"
+        );
+        assert_eq!(
+            verdict.finding(),
+            None,
+            "an out-of-domain state is a coverage fact, NOT a refinement violation"
+        );
+    }
+
+    /// The other half: a real violation IS a finding, so `finding` cannot be a constant `None`.
+    #[test]
+    fn a_violation_is_a_finding() {
+        let v = Verdict::Violated(Violation::Overflow { dom: DOM1, mfn: 3 });
+        assert_eq!(
+            v.finding(),
+            Some(Violation::Overflow { dom: DOM1, mfn: 3 }),
+            "a violation must survive the classification that filters out-of-domain states"
         );
     }
 

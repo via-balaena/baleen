@@ -68,8 +68,25 @@ fn pt_level(n: u8) -> PtLevel {
 /// configs cannot reach, so this is the refinement's coverage beyond the exhaustive-but-small sweeps.
 fn check(hv: &Hypervisor) {
     assert!(hv.invariants_hold(), "integrated invariant violated");
-    if let Err(v) = hv_s2::check_all(hv) {
-        panic!("Stage-2 refinement violated: {v:?}");
+    // `check_all` returns `Err` for two different things and only one of them is a defect. This
+    // asked `is_err()` and panicked on both, so a state the emitter had correctly DECLINED to
+    // represent — `OutOfDomain(UnsupportedSpan { .. })`, a decided and machine-checked boundary from
+    // Phase I-4 — was reported as `Stage-2 refinement violated`. It reddened the weekly
+    // `Deep verification` gate for two runs before anyone looked, the job being schedule-only.
+    //
+    // `Verdict::finding` is now the single answer to "is this a defect?", shared with `hv-sim`'s
+    // enumerator, which had the classification right all along. Reaching an out-of-domain state is
+    // not a pass to celebrate either — the enumerator MEASURES how often it happens — but a fuzz
+    // target's job is to fail on defects, and this is not one.
+    //
+    // ⚠ DECLARED RESIDUE, created by this fix rather than closed by it: the fuzzer now TOLERATES
+    // out-of-domain states without COUNTING them, so it cannot distinguish "explored the refinement
+    // deeply" from "spent its budget in states the refinement never claimed". The enumerator does
+    // keep that number; a libFuzzer target has nowhere natural to report one. Worth knowing before
+    // reading a clean run as coverage — and worth measuring if this target is ever tuned, because
+    // an out-of-domain state was reached within seconds of starting.
+    if let Some(violation) = hv_s2::check_all(hv).err().and_then(hv_s2::Verdict::finding) {
+        panic!("Stage-2 refinement violated: {violation:?}");
     }
 }
 
