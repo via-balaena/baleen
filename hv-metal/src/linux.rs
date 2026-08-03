@@ -2549,9 +2549,8 @@ fn report_timer_handoff(uart: &mut Pl011) {
 /// exactly that, and an earlier version of this function refused it.
 ///
 /// So the assertion is the STRUCTURAL half: `HCR_EL2` read back after the write, showing `TWI`
-/// really took effect. That is true on every boot, cannot be satisfied by luck, and is what actually
-/// determines whether an idle guest can freeze the machine. The counts are reported beside it as the
-/// behavioural half, and deliberately NOT asserted.
+/// really took effect. That is true on every boot and cannot be satisfied by luck. The counts are
+/// reported beside it as the behavioural half, and deliberately NOT asserted.
 ///
 /// **③-b2b-ii-e DEMOTED this mechanism, and saying so is the point of keeping the marker.** Until
 /// rung e, `TWI` was the *only* thing standing between an idle guest and a frozen machine — the
