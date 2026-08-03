@@ -6,9 +6,11 @@
 //! ## The defect this closes, stated as history because that is the argument
 //!
 //! A vCPU context is a handful of components — the GPR array, the EL1 system registers, the vGIC
-//! bank, the FP register file — and each must be **saved**, **restored** and (on the switch that
-//! poisons) **clobbered**. Until this module those were three lists maintained by hand in three
-//! places, with nothing tying them together.
+//! bank, the FP register file — and each must be **saved** and **restored**, and every one that
+//! lives in hardware must also be **clobbered** by the switch that poisons. (The GPR array is the
+//! exception on both counts: it moves between the context and the exception frame rather than the
+//! CPU, and is not poisoned. It is still named in every traversal — see below.) Until this module
+//! those were three lists maintained by hand in three places, with nothing tying them together.
 //!
 //! That is precisely how `v0..v31` stayed unsaved from M5 Arc 1 to ③-b2b-ii-f: not carelessness, a
 //! structurally unenforced list. And [`crate::vcpu`]'s own `ctx_regs!` macro exists to prevent
