@@ -461,6 +461,120 @@ pub(crate) fn write_lr(n: usize, v: u64) {
     }
 }
 
+/// Read `ICH_VMCR_EL2` — the guest's **virtual CPU interface** control.
+///
+/// Module-private: [`VgicCtx`] is the only thing that should be reading or writing this, because a
+/// caller that touched it outside a context save/restore would be editing one vCPU's interrupt
+/// masking from wherever it happened to be standing. Contrast [`read_lr`]/[`write_lr`], which
+/// `guest.rs` legitimately calls to *inject*.
+///
+/// Holds state the guest itself writes through `ICC_PMR_EL1` / `ICC_BPR<n>_EL1` / `ICC_IGRPEN<n>_EL1`:
+/// its priority mask, binary point, group enables and EOI mode. The hardware keeps it per-vCPU and
+/// does **not** swap it, exactly like the list registers.
+fn read_vmcr() -> u64 {
+    let v: u64;
+    // SAFETY: `ICH_VMCR_EL2` is an EL2 register of the virtual CPU interface, readable at EL2 without
+    // the `ICC_SRE_EL2` gate — the same class as `ICH_VTR_EL2` and the list registers. No effect.
+    unsafe {
+        asm!("mrs {v}, ICH_VMCR_EL2", v = out(reg) v, options(nomem, nostack, preserves_flags));
+    }
+    v
+}
+
+/// Write `ICH_VMCR_EL2` — the inverse of [`read_vmcr`].
+///
+/// # Safety
+/// This is the guest's own interrupt-masking state. Writing a value that does not belong to the vCPU
+/// about to run hands it another guest's priority mask and group enables.
+unsafe fn write_vmcr(v: u64) {
+    // SAFETY: forwarded from this function's contract; `ICH_VMCR_EL2` is writable at EL2 and affects
+    // only the VIRTUAL CPU interface, never EL2's own interrupt handling.
+    unsafe {
+        asm!("msr ICH_VMCR_EL2, {v}", "isb", v = in(reg) v, options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// **The vGIC state the hardware keeps per-vCPU and does not swap.**
+///
+/// One type, one owner, because there are two switches that need it — `guest.rs`'s synthetic
+/// time-slice and `linux.rs`'s real-guest preemption — and two hand-rolled copies of "what a vGIC
+/// context is" is the second-derivation defect ⑭ spent a rung removing (#74). Adding a register here
+/// is a single edit both paths inherit, which is how `vmcr` reached the synthetic path at all.
+///
+/// **What is here and what is deliberately not.** The list registers and `ICH_VMCR_EL2` are
+/// *hardware* per-vCPU state: leave them behind on a switch and the incoming vCPU inherits the
+/// outgoing one's pending interrupts and its priority mask. The III-1 software pending SET is not
+/// here — it is `guest.rs`'s own per-slot state, already carried by being indexed per vCPU rather
+/// than by living in a register.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct VgicCtx {
+    /// `ICH_LR<0..N>_EL2`. Sized to the architectural maximum; only [`num_list_registers`] are live.
+    lr: [u64; MAX_LIST_REGISTERS],
+    /// `ICH_VMCR_EL2` — the guest's priority mask, binary point, group enables and EOI mode.
+    vmcr: u64,
+}
+
+impl VgicCtx {
+    /// An empty context: every list register Invalid, `VMCR` zero.
+    pub(crate) const ZERO: Self = Self {
+        lr: [0; MAX_LIST_REGISTERS],
+        vmcr: 0,
+    };
+
+    /// Capture this vCPU's live vGIC state.
+    pub(crate) fn save(&mut self) {
+        let n = num_list_registers();
+        for (i, slot) in self.lr.iter_mut().enumerate().take(n) {
+            *slot = read_lr(i);
+        }
+        self.vmcr = read_vmcr();
+    }
+
+    /// Reinstate this vCPU's vGIC state.
+    ///
+    /// # Safety
+    /// The caller must be at EL2 and this context must belong to the vCPU about to be resumed.
+    pub(crate) unsafe fn restore(&self) {
+        let n = num_list_registers();
+        for (i, &lr) in self.lr.iter().enumerate().take(n) {
+            write_lr(i, lr);
+        }
+        // SAFETY: forwarded from this function's contract.
+        unsafe { write_vmcr(self.vmcr) };
+    }
+
+    /// Clobber the live vGIC state, so a restore that misses part of it cannot go unnoticed.
+    ///
+    /// **The poison is DESIGNED, not borrowed.** `vcpu.rs`'s blanket `0xDEAD_BEEF…` is wrong for this
+    /// state and using it would be a bug:
+    /// * A list register holds a State field, an `HW` bit and a `pINTID`. A garbage encoding is
+    ///   architecturally **UNPREDICTABLE**, so the poison is **all zeros** — every LR *Invalid*. That
+    ///   is both safe and exactly the failure being probed: a vCPU resuming to find its pending
+    ///   interrupts gone.
+    /// * `VMCR` is poisoned to a **valid but hostile** value: priority mask 0, both groups disabled.
+    ///   If it is not restored the guest can take no virtual interrupt at all, so its timer stops and
+    ///   the boot stalls — loud, and unambiguous about which half failed.
+    ///
+    /// Gated to `real-linux` because that is the only switch that poisons: the synthetic path's
+    /// cross-vCPU witness (Phase III-3) is guest-OBSERVED — a peer vCPU checking it took none of the
+    /// owner's vINTs — and needs no destructive step to discriminate.
+    ///
+    /// # Safety
+    /// The caller must be at EL2 with a saved context in hand, and must restore before returning to
+    /// EL1. Between this call and that restore the guest has no interrupt state.
+    #[cfg(feature = "real-linux")]
+    pub(crate) unsafe fn poison() {
+        let n = num_list_registers();
+        for i in 0..n {
+            write_lr(i, 0);
+        }
+        // SAFETY: forwarded from this function's contract. `VMCR` affects only the VIRTUAL interface,
+        // so EL2's own interrupt handling is untouched while the poison stands.
+        unsafe { write_vmcr(0) };
+    }
+}
+
 // ─── physical GICv3 (for receiving the virtual-timer PPI at EL2 — M5 Arc 5d) ─────────────────────────
 //
 // So far the vGIC only INJECTED. To deliver a real timer TICK, EL2 must RECEIVE the physical virtual-

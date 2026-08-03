@@ -71,6 +71,8 @@
 
 use core::arch::asm;
 
+use crate::gic;
+
 /// Declare the vCPU's system-register context **once**, generating the enum, the enumeration order,
 /// the names and both accessors from a single list.
 ///
@@ -181,22 +183,22 @@ const POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
 /// A vCPU's saved context: the GPRs live in the trap frame, everything else here.
 ///
-/// **The vGIC list-register bank is NOT here, and for ③-b2b-i that is correct rather than merely
-/// convenient — but it is a DECLARED RESIDUE, not a solved problem.** This switch resumes the *same*
-/// vCPU, and nothing between the save and the restore touches `ICH_LR<n>_EL2`, so the bank the guest
-/// left is the bank it returns to; carrying it would be a copy with no reader. `guest.rs` carries it
-/// (Arc 7c/8b, III-1) because its switch resumes a *different* vCPU, which is exactly the case
-/// ③-b2b-ii introduces here. **When a second guest lands, this context must carry the LR bank too,
-/// or the incoming guest inherits the outgoing one's pending virtual interrupts** — the cross-vCPU
-/// leak Arc 8b and Phase III-3 closed for the synthetic path, reopened on the real one.
+/// The vGIC per-vCPU state rides along in [`gic::VgicCtx`] — **one type, shared with `guest.rs`'s
+/// switch**, because two hand-rolled answers to "what is a vGIC context" is the second-derivation
+/// defect ⑭ spent a rung removing (#74).
 ///
-/// It should then be carried by *reusing* `gic.rs`'s existing save/restore rather than by adding a
-/// second copy of the bank here — the two-derivations defect ⑭ spent a rung removing.
+/// ③-b2b-i declared its absence as a residue: correct then (a switch-to-self resumes the same vCPU,
+/// so the bank it left is the bank it returns to) and a genuine cross-guest interrupt leak the moment
+/// a second guest runs. Closing it early also closed a **latent gap in the synthetic path**, which
+/// carried the list registers since Arc 7c/8b but never `ICH_VMCR_EL2` — the guest's own priority
+/// mask and group enables, which two domains would have cross-leaked.
 pub(crate) struct VcpuCtx {
     /// `x0..x30`, mirrored to and from the trap frame.
     pub(crate) x: [u64; 31],
     /// One entry per [`CtxReg::ALL`], in that order.
     regs: [u64; CtxReg::ALL.len()],
+    /// The vGIC state the hardware keeps per-vCPU and does not swap.
+    vgic: gic::VgicCtx,
 }
 
 impl VcpuCtx {
@@ -205,6 +207,7 @@ impl VcpuCtx {
         Self {
             x: [0; 31],
             regs: [0; CtxReg::ALL.len()],
+            vgic: gic::VgicCtx::ZERO,
         }
     }
 
@@ -214,6 +217,7 @@ impl VcpuCtx {
         for (slot, reg) in self.regs.iter_mut().zip(CtxReg::ALL) {
             *slot = reg.read();
         }
+        self.vgic.save();
     }
 
     /// Write this context back onto the CPU.
@@ -227,6 +231,8 @@ impl VcpuCtx {
             // SAFETY: forwarded from this function's contract.
             unsafe { reg.write(*slot) };
         }
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.vgic.restore() };
     }
 }
 
@@ -245,4 +251,9 @@ pub(crate) unsafe fn poison() {
         // execution, which runs MMU-off and identity-mapped with its own vectors already installed.
         unsafe { reg.write(POISON) };
     }
+    // The vGIC half poisons ITSELF, with values of its own choosing — [`POISON`] is wrong for a list
+    // register (a garbage encoding is architecturally UNPREDICTABLE) and wrong for `VMCR`. See
+    // [`gic::VgicCtx::poison`] for what it uses instead and why.
+    // SAFETY: forwarded from this function's contract.
+    unsafe { gic::VgicCtx::poison() };
 }
