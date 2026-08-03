@@ -3,7 +3,7 @@
 
 [package]
 name = "hv-vdev"
-description = "The emulated device models a guest drives — register files as pure no_std code with zero unsafe, so they can be proven rather than only boot-witnessed."
+description = "The guest's virtual device surface, both sides of it — the register files a guest drives and the vGIC CPU interface EL2 writes — as pure no_std code with zero unsafe, so they can be proven rather than only boot-witnessed."
 # Internal workspace crate — not for crates.io. Guards against an accidental publish.
 publish = false
 version.workspace = true

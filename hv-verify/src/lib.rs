@@ -3604,3 +3604,288 @@ mod device_models {
         assert!(m.saw(), "the matcher must fire on its own needle");
     }
 }
+
+/// # ⑰-b′ — the vGIC **CPU interface**: the list-register algebra
+///
+/// **The gap these close.** ⑯ proved the emulated distributor — *what the guest drives*. A virtual
+/// interrupt does not reach a guest through it: EL2 writes a **list register**, and that encoding,
+/// its decode, and the transform a context switch applies to a saved bank lived in `hv-metal`, which
+/// is workspace-EXCLUDED and so structurally unreachable by Kani. Every isolation claim on the
+/// real-Linux path rides through a switch that operates entirely on this algebra.
+///
+/// **It has a defect history, not merely a gap.** ③-b2b-ii-c1's witness expected 60 demotions per
+/// boot and measured **119**, because *an Invalid list register is not a zeroed one* — a completed
+/// injection leaves its `HW` bit and `pINTID` in a free slot until something overwrites them. The fix
+/// was to test `lr_is_free` first. That is one `!`, invisible to any boot that does not count, and
+/// `release_demotes_exactly_the_occupied_hardware_mappings` is that defect as a theorem.
+///
+/// **Structure, not conformance** — the same ceiling `hv_vdev` declares. Nothing here checks a field
+/// position against the Arm ARM; the boot is what does that.
+#[cfg(kani)]
+mod vgic_cpu_interface {
+    use hv_vdev::vgic_cpuif::{
+        encode_lr, lr_is_free, lr_is_group1, lr_is_hw, lr_pintid, lr_priority, lr_state, lr_vintid,
+        release_hardware_mappings, LrState, MAX_LIST_REGISTERS, MAX_PINTID,
+    };
+
+    // ─── the field layout, DERIVED INDEPENDENTLY of the model ────────────────────────────────────
+    //
+    // Written out here from the GICv3 list-register layout rather than by calling anything in
+    // `hv_vdev`. Design-lesson #106: a spec/checker pair wants two derivations, or the property
+    // holds by construction and proves nothing. If `occupied_and_hw_mapped` called the model's own
+    // `lr_is_free`/`lr_is_hw`, the count theorem below would be a tautology.
+
+    /// State field != Invalid **and** the `HW` bit set — the population
+    /// [`release_hardware_mappings`] claims to demote, spelled in raw bits.
+    fn occupied_and_hw_mapped(lr: u64) -> bool {
+        ((lr >> 62) & 0b11) != 0 && (lr & (1u64 << 61)) != 0
+    }
+
+    /// A fully symbolic bank at the architectural maximum.
+    fn symbolic_bank() -> [u64; MAX_LIST_REGISTERS] {
+        kani::any()
+    }
+
+    /// ∀ bank contents **and ∀ live length**: the properties hold for the prefix the metal actually
+    /// passes, not only for a full bank.
+    ///
+    /// **Why this harness exists, and it came out of a diff review rather than a failure.** Every
+    /// other harness here runs on all [`MAX_LIST_REGISTERS`] entries, but `hv-metal` passes
+    /// `&mut self.lr[..n]` with `n` from `ICH_VTR_EL2` — **4 on QEMU `virt`**. CBMC unwinds the loop
+    /// concretely, so a proof at length 16 is not a proof at length 4; the deployed length was the
+    /// one length nothing covered.
+    ///
+    /// ## Why the length is enumerated rather than symbolic — MEASURED, and it is the cost lesson
+    ///
+    /// The natural form is `let n: usize = kani::any(); assume(n <= MAX)`. That was written first and
+    /// **ran past ten minutes without terminating**, against 0.7 s for the fixed-length harnesses
+    /// beside it: a symbolic slice length makes CBMC reason about every unwinding of the loop at
+    /// once, which is the expensive shape this rung deliberately avoided everywhere else.
+    ///
+    /// Enumerating loses nothing here, and that is a property of *this* axis rather than a
+    /// concession. The length domain is **finite and small** — 0..=16, fixed by the architecture —
+    /// so a concrete sweep over it is exhaustive in exactly the sense a symbolic `n` would have been.
+    /// Each iteration is a cheap concrete-length proof, and the whole sweep costs a few seconds.
+    /// **Enumerate a finite axis; keep symbolic execution for the infinite ones** (the bank contents,
+    /// which stay fully symbolic here).
+    #[kani::proof]
+    fn the_properties_hold_for_any_live_bank_length() {
+        let before = symbolic_bank();
+
+        let mut n = 0;
+        while n <= MAX_LIST_REGISTERS {
+            let mut bank = before;
+            let released = release_hardware_mappings(&mut bank[..n]);
+
+            let mut expected: u64 = 0;
+            let mut i = 0;
+            while i < n {
+                if occupied_and_hw_mapped(before[i]) {
+                    expected += 1;
+                }
+                i += 1;
+            }
+            assert_eq!(released, expected);
+
+            let mut i = 0;
+            while i < MAX_LIST_REGISTERS {
+                if i >= n {
+                    // Beyond the live prefix nothing may be touched at all — the property that makes
+                    // the metal's slicing safe rather than merely conventional.
+                    assert_eq!(bank[i], before[i]);
+                } else {
+                    assert_eq!(lr_state(bank[i]), lr_state(before[i]));
+                    assert_eq!(lr_vintid(bank[i]), lr_vintid(before[i]));
+                    if lr_is_hw(bank[i]) {
+                        assert!(lr_is_free(bank[i]));
+                    }
+                }
+                i += 1;
+            }
+            n += 1;
+        }
+    }
+
+    /// **The 119/60 defect as a theorem.** ∀ bank contents: the count returned is exactly the number
+    /// of list registers that were *occupied* **and** hardware-mapped — not the number that merely
+    /// had the `HW` bit lying in them, which is what a free slot may carry.
+    #[kani::proof]
+    fn release_demotes_exactly_the_occupied_hardware_mappings() {
+        let before = symbolic_bank();
+        let mut bank = before;
+        let released = release_hardware_mappings(&mut bank);
+
+        let mut expected: u64 = 0;
+        for lr in before.iter() {
+            if occupied_and_hw_mapped(*lr) {
+                expected += 1;
+            }
+        }
+        assert_eq!(released, expected);
+    }
+
+    /// ∀ bank contents: after a release, **any list register still carrying a hardware mapping is
+    /// free** — equivalently, no *occupied* one does.
+    ///
+    /// This is the isolation content of the whole module, and the exact statement matters. `HW=1`
+    /// says "the guest's EOI of this virtual interrupt deactivates that physical one" — a promise
+    /// made to the vCPU being switched *out*. Leaving one on an interrupt the **incoming** guest can
+    /// take would have that guest's EOI deactivate a line the outgoing one was given: a cross-guest
+    /// effect on shared physical hardware.
+    ///
+    /// ## Why this is not the stronger "no `HW` bit survives anywhere" — Kani refuted that one
+    ///
+    /// The first version of this harness asserted `!lr_is_hw` for every entry and **failed**, with a
+    /// counterexample the design intends: a *free* slot holding a completed injection's residue keeps
+    /// its `HW` bit, because `release_hardware_mappings` tests `lr_is_free` first and leaves such
+    /// slots alone. That skip is deliberate — demoting them is what produced the 119/60 miscount.
+    ///
+    /// So the residue does survive, and the safety argument is not "the bit is gone" but **"the bit
+    /// is only ever where the guest cannot reach it"**: an Invalid list register is neither presented
+    /// to the guest nor matched by its EOI, and when the injector reuses the slot it writes the whole
+    /// 64-bit encoding at once, so no residue is ever partially inherited (see
+    /// [`an_encoded_list_register_is_never_free`], which is the other half of that argument).
+    ///
+    /// Worth recording as a refutation rather than quietly weakening the assertion: the true property
+    /// is narrower than the one that reads better, and only the narrower one is provable.
+    #[kani::proof]
+    fn a_surviving_hardware_mapping_can_only_be_in_a_free_slot() {
+        let mut bank = symbolic_bank();
+        let _ = release_hardware_mappings(&mut bank);
+        for lr in bank.iter() {
+            if lr_is_hw(*lr) {
+                assert!(lr_is_free(*lr));
+            } else {
+                assert_eq!(lr_pintid(*lr), None);
+            }
+        }
+    }
+
+    /// ∀ bank contents: a release demotes and **changes nothing else**.
+    ///
+    /// The outgoing guest must lose its ownership of a physical line and *nothing more* — its
+    /// interrupt stays pending, at its own priority, in its own group, with its own vINTID. A
+    /// transform that also cleared the state field would silently discard the guest's pending
+    /// interrupts, and every boot would still look identical.
+    #[kani::proof]
+    fn a_release_demotes_and_disturbs_nothing_else() {
+        let before = symbolic_bank();
+        let mut bank = before;
+        let _ = release_hardware_mappings(&mut bank);
+        for (old, new) in before.iter().zip(bank.iter()) {
+            assert_eq!(lr_state(*new), lr_state(*old));
+            assert_eq!(lr_vintid(*new), lr_vintid(*old));
+            assert_eq!(lr_priority(*new), lr_priority(*old));
+            assert_eq!(lr_is_group1(*new), lr_is_group1(*old));
+        }
+    }
+
+    /// ∀ bank contents: a **free** list register comes out byte-for-byte as it went in.
+    ///
+    /// The `lr_is_free`-first condition, stated exactly. A completed injection's residue is not
+    /// EL2's to tidy: touching it is inert for the guest and destroys the demotion count, which is
+    /// how the 119/60 discrepancy arose.
+    #[kani::proof]
+    fn a_free_list_register_is_left_exactly_as_it_was() {
+        let before = symbolic_bank();
+        let mut bank = before;
+        let _ = release_hardware_mappings(&mut bank);
+        for (old, new) in before.iter().zip(bank.iter()) {
+            if lr_is_free(*old) {
+                assert_eq!(*new, *old);
+            }
+        }
+    }
+
+    /// ∀ bank contents: releasing twice demotes nothing the second time and moves no bits.
+    ///
+    /// Every switch calls this on a bank the previous switch already released, so a transform that
+    /// were not idempotent would make the demotion count depend on the switch history rather than on
+    /// what the guest actually holds.
+    #[kani::proof]
+    fn a_release_is_idempotent() {
+        let mut bank = symbolic_bank();
+        let _ = release_hardware_mappings(&mut bank);
+        let settled = bank;
+        let again = release_hardware_mappings(&mut bank);
+        assert_eq!(again, 0);
+        assert_eq!(bank, settled);
+    }
+
+    /// ∀ vINTID, ∀ in-range pINTID, ∀ priority: what the encoder writes is exactly what the decoders
+    /// read back.
+    ///
+    /// The emit-seam / decode-seam coincidence, which is the shape that closed the whole-diamond
+    /// review's finding (A): the two seams stay independently derived, and this is what proves they
+    /// agree. A `pINTID` that came back changed would name a **different physical interrupt**, so the
+    /// guest's EOI would deactivate someone else's.
+    #[kani::proof]
+    fn an_encoded_hardware_mapping_decodes_to_exactly_what_was_asked() {
+        let vintid: u32 = kani::any();
+        let pintid: u32 = kani::any();
+        let priority: u8 = kani::any();
+        kani::assume(pintid <= MAX_PINTID);
+
+        let lr = encode_lr(vintid, Some(pintid), priority).expect("in-range pINTID must encode");
+        assert_eq!(lr_vintid(lr), vintid);
+        assert_eq!(lr_pintid(lr), Some(pintid));
+        assert_eq!(lr_priority(lr), priority);
+        assert!(lr_is_hw(lr));
+        assert!(lr_is_group1(lr));
+        assert_eq!(lr_state(lr), LrState::Pending);
+    }
+
+    /// ∀ vINTID, ∀ priority: a purely virtual injection carries **no** physical claim.
+    ///
+    /// A guest-generated SGI has no physical interrupt behind it, so a hardware mapping would be a
+    /// lie — and the guest's EOI would deactivate whatever the stale `pINTID` bits happened to name.
+    #[kani::proof]
+    fn a_purely_virtual_injection_carries_no_physical_claim() {
+        let vintid: u32 = kani::any();
+        let priority: u8 = kani::any();
+
+        let lr = encode_lr(vintid, None, priority).expect("a virtual injection always encodes");
+        assert!(!lr_is_hw(lr));
+        assert_eq!(lr_pintid(lr), None);
+        assert_eq!(lr_vintid(lr), vintid);
+        assert_eq!(lr_priority(lr), priority);
+        assert_eq!(lr_state(lr), LrState::Pending);
+    }
+
+    /// ∀ pINTID: the encoder refuses **exactly** the physical INTIDs it cannot name, and never
+    /// truncates one into a different interrupt.
+    ///
+    /// Both directions matter. Refusing too much would drop forwardable interrupts; refusing too
+    /// little is the silent case — a truncated `pINTID` names a real, *wrong* physical interrupt.
+    #[kani::proof]
+    fn a_physical_intid_is_refused_exactly_when_it_cannot_be_named() {
+        let vintid: u32 = kani::any();
+        let pintid: u32 = kani::any();
+        let priority: u8 = kani::any();
+
+        assert_eq!(
+            encode_lr(vintid, Some(pintid), priority).is_none(),
+            pintid > MAX_PINTID
+        );
+    }
+
+    /// ∀ arguments: a freshly encoded list register is **never free**.
+    ///
+    /// This is what makes the injector's first-free allocator correct. If an encoded value could
+    /// decode as Invalid, the very next injection would consider that slot free and overwrite an
+    /// interrupt the guest had not yet taken — a lost interrupt with no trace anywhere.
+    #[kani::proof]
+    fn an_encoded_list_register_is_never_free() {
+        let vintid: u32 = kani::any();
+        let pintid: u32 = kani::any();
+        let priority: u8 = kani::any();
+        kani::assume(pintid <= MAX_PINTID);
+
+        assert!(!lr_is_free(
+            encode_lr(vintid, None, priority).expect("a virtual injection always encodes")
+        ));
+        assert!(!lr_is_free(
+            encode_lr(vintid, Some(pintid), priority).expect("in-range pINTID must encode")
+        ));
+    }
+}

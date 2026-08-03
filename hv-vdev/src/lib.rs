@@ -38,6 +38,16 @@
 //! **Here: the model.** The register file, its decode, its reset values, and the state a driver can
 //! observe. Nothing else.
 //!
+//! **⑰-b′ widened that sentence, and the widening is worth naming rather than absorbing.**
+//! [`vgic_cpuif`] is not a register file a guest DRIVES — it is the GICv3 **CPU interface**, the
+//! `ICH_LR<n>_EL2` bank that **EL2 writes** to present a virtual interrupt, plus the transform a vCPU
+//! switch applies to a saved copy of it. A guest never addresses it. It belongs here anyway because
+//! the criterion that actually earns a module a place in this crate is not "the guest touches it" but
+//! **"it is a pure function of ordinary state, so a theorem about it is statable"** — and the
+//! distributor half was only ever the first thing to satisfy that. The two halves are one device seen
+//! from its two sides: [`gicv3`] is what the guest reads, [`vgic_cpuif`] is what EL2 writes, and an
+//! interrupt is not delivered until both agree.
+//!
 //! **Not here: the deployment.** Three kinds of thing stay in `hv-metal`, and the split is the part
 //! worth getting right:
 //!
@@ -100,3 +110,4 @@
 
 pub mod gicv3;
 pub mod pl011;
+pub mod vgic_cpuif;
