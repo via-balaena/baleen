@@ -609,6 +609,19 @@ const LINUX_MARKERS: &[&str] = &[
     // this rung exists to prevent, reproduced on the guest that exists today.
     "baleen: handoff OK: dom 1 gave the forwarded timer up every time it left the pCPU holding one —",
     "baleen: handoff OK: dom 2 gave the forwarded timer up every time it left the pCPU holding one —",
+    // ③-b2b-ii-c2 follow-up: an idle guest YIELDS. Without `HCR_EL2.TWI` a guest switched in while
+    // idle sits in `wfi`, EL2 never gets a tick (the deadline it waits on is not one EL2 armed), and
+    // the peer never runs again — both guests frozen. That reached `main` and timed out this very
+    // job; it reproduced locally at 2 runs in 15. This marker is the evidence the trap is in force,
+    // because a boot with the yield working and a boot that never switched to an idle guest look
+    // otherwise identical.
+    // ③-b2b-ii-c2 follow-up: an idle guest YIELDS instead of freezing the machine. Asserted as a
+    // READ-BACK of `HCR_EL2`, not as a count of trapped WFIs — with two kernels sharing one pCPU
+    // neither is ever short of work, so a boot in which nobody goes idle has a count of zero and is
+    // perfectly good. (Measured: a run of this gate did exactly that, and an earlier version of the
+    // witness refused it.) The read-back is true on every boot and is what actually determines
+    // whether an idle guest can hold the CPU with no way for EL2 to take it back.
+    "baleen: wfi OK: HCR_EL2.TWI is in force (HCR_EL2 read back as",
     // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
     // rather than recomputed from the layout constants the emitter used (design-lesson #36).
     // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
@@ -655,6 +668,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // PPI went Inactive. Both are the same consequence: the one physical timer stays Active across a
     // switch and the next guest can never be signalled it.
     "baleen: handoff FAIL",
+    // ③-b2b-ii-c2 follow-up: no guest WFI reached EL2, so `HCR_EL2.TWI` is not in force and an idle
+    // guest can hold the pCPU with no way for EL2 to take it back.
+    // ③-b2b-ii-c2 follow-up: `HCR_EL2.TWI` did not take effect, so an idle guest holds the pCPU.
+    "baleen: wfi FAIL",
     // ③-b2b-ii-b: a guest's window does not hold what the loader was told to put there — no kernel
     // magic, a zero image_size, a non-relocatable Image, a kernel overrunning its DTB, or a missing
     // device tree / initramfs. The message names which guest and which of the six checks failed.
