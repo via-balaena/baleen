@@ -799,6 +799,122 @@ const _: () = assert!(
 /// (`interrupts` on the `interrupt-controller` node) rather than from this constant.
 pub(crate) const MAINT_INTID: u32 = 25;
 
+/// **EL2's OWN timer interrupt** — the hypervisor physical timer (`CNTHP_*_EL2`), PPI 10 = INTID 26
+/// on QEMU `virt` (③-b2b-ii-e).
+///
+/// **MEASURED, not read off a table.** A scoping probe armed `CNTHP_CVAL_EL2` one millisecond ahead
+/// with the PPI left *disabled* at the redistributor — a GICv3 interrupt's pending state is
+/// independent of its enable state, so the line asserts and nothing is ever forwarded — and read
+/// `GICR_ISPENDR0` before and after: `0x00000000 -> 0x04000000`, i.e. **bit 26 and no other**. The
+/// same probe read `CNTHP_CTL_EL2` back as `0x5` (ENABLE, ¬IMASK, ISTATUS), which is also how we
+/// know this EL2 has the timer at all rather than assuming a `cortex-a72` with `virtualization=on`
+/// provides it. `guest.dts`'s `arm,armv8-timer` node agrees — its fourth entry is `<1 0x0a 0x04>`,
+/// PPI 10 — and the guest never claims it: Linux booted at EL1 reports `arch_timer: cp15 timer
+/// running at 62.50MHz (virt)` and uses [`VTIMER_INTID`] only.
+///
+/// **This INTID is a QEMU `virt` platform fact, not architectural**, exactly like [`MAINT_INTID`]:
+/// the hypervisor timer is wired to a PPI by the SoC integrator, so a real-hardware port must take
+/// it from the device tree's timer node rather than from this constant.
+#[cfg(feature = "real-linux")]
+pub(crate) const HYP_TIMER_INTID: u32 = 26;
+
+/// EL2's timer PPI is mirrored onto the redistributor through the same INTID 0..31 registers as
+/// [`VTIMER_INTID`], and for the same reason: a `u32` shift past 31 is masked rather than trapped in
+/// a release build, so a wider INTID would silently program a different interrupt.
+#[cfg(feature = "real-linux")]
+const _: () = assert!(
+    HYP_TIMER_INTID < 32,
+    "EL2's timer INTID must be an SGI/PPI: GICR_ISENABLER0 reaches INTIDs 0..31 only"
+);
+
+/// EL2's timer must not collide with either interrupt EL2 already fields. A collision would not be a
+/// wrong number: [`crate::linux`]'s IRQ handler dispatches on the acknowledged INTID, so EL2 would
+/// service its slice expiry as a guest tick (or the reverse) and the failure would present as a hang
+/// with no cause on the console.
+#[cfg(feature = "real-linux")]
+const _: () = assert!(
+    HYP_TIMER_INTID != VTIMER_INTID && HYP_TIMER_INTID != MAINT_INTID,
+    "EL2's timer PPI must be distinct from the guest's timer PPI and from the maintenance PPI"
+);
+
+/// **Enable EL2's own timer PPI at this CPU's redistributor** (③-b2b-ii-e).
+///
+/// Separate from [`init_physical_vtimer`] rather than folded into it, because that function is
+/// shared with the synthetic path (`guest.rs` calls it twice) and the synthetic path has no EL2
+/// timer: folding this in would change a build whose whole point is to be byte-for-byte unchanged.
+///
+/// Group 1 and priority `0x80`, the same as the two PPIs above — deliberately **equal** to the
+/// guest timer's rather than higher. EL2 runs `EOImode=1` ([`set_eoi_mode_split`]), so its
+/// priority-drop on a forwarded guest tick returns the running priority to idle while that
+/// interrupt is still Active; an equal-priority slice expiry can therefore be signalled with a
+/// forwarded tick in flight, which is the case the whole rung has to survive.
+#[cfg(feature = "real-linux")]
+pub(crate) fn enable_hyp_timer_ppi() {
+    // SAFETY: the redistributor SGI frame is device memory on the `virt` machine, addressed directly
+    // at EL2 (MMU off). `IGROUPR0`/`IPRIORITYR`/`ISENABLER0` are documented GICv3 registers;
+    // `ISENABLER0` is write-1-to-act, so writing one bit affects exactly that INTID.
+    unsafe {
+        let igroupr0 = (GICR_SGI_BASE + 0x0080) as *mut u32;
+        let g = core::ptr::read_volatile(igroupr0) | (1 << HYP_TIMER_INTID);
+        core::ptr::write_volatile(igroupr0, g);
+        core::ptr::write_volatile(
+            (GICR_SGI_BASE + 0x0400 + HYP_TIMER_INTID as u64) as *mut u8,
+            0x80,
+        );
+        core::ptr::write_volatile((GICR_SGI_BASE + 0x0100) as *mut u32, 1 << HYP_TIMER_INTID);
+    }
+}
+
+/// Whether `intid` is **enabled** at this CPU's redistributor (`GICR_ISENABLER0`), read back rather
+/// than assumed (③-b2b-ii-e).
+///
+/// The controller's own account of whether EL2's timer can reach EL2 at all. [`crate::linux`]'s
+/// witness pairs it with the `CNTHP_CTL_EL2` read-back: the timer counting and the PPI being
+/// deliverable are two different facts, and a rung whose point is that EL2 cannot be locked out
+/// should not take either on trust.
+#[cfg(feature = "real-linux")]
+pub(crate) fn ppi_is_enabled(intid: u32) -> bool {
+    if intid >= 32 {
+        return false;
+    }
+    // SAFETY: `GICR_ISENABLER0` is device memory at EL2 (MMU off); read-only here, aliases no Rust
+    // memory.
+    unsafe { core::ptr::read_volatile((GICR_SGI_BASE + 0x0100) as *const u32) & (1 << intid) != 0 }
+}
+
+/// **Complete EL2's own slice-expiry interrupt**, returning whether the controller agreed it went
+/// Active → Inactive (③-b2b-ii-e).
+///
+/// ## Why this is not [`release_forwarded_timer`]
+///
+/// That function disables the PPI before deactivating it, because the guest timer's level is still
+/// high at that point and deactivating under a high level makes the GIC re-assert immediately and
+/// storm EL2. **EL2's timer needs no disable, because its caller has already dropped the level**: a
+/// slice expiry is handled by re-arming `CNTHP_CVAL_EL2` to the next deadline, which clears
+/// `ISTATUS` and de-asserts the line before anything is completed. Arm, then EOI, then deactivate —
+/// and the order is not stylistic, it is the same hazard c1 measured on PPI 27.
+///
+/// ## Why the deactivate cannot be skipped
+///
+/// EL2 runs `EOImode=1`, so [`eoi_physical`] only drops the running priority. Leave EL2's own timer
+/// **Active** and the GIC will never signal it again: EL2 gets exactly one slice and then re-entry
+/// is behavioural once more, silently, with every other witness on the boot still green. That is
+/// the deadlock this read-back exists to catch, and it is the reason the caller asserts one
+/// controller-confirmed deactivation per expiry rather than merely counting expiries.
+#[cfg(feature = "real-linux")]
+#[must_use]
+pub(crate) fn release_hyp_timer() -> bool {
+    let was_active = ppi_is_active(HYP_TIMER_INTID);
+    deactivate_physical(HYP_TIMER_INTID);
+    // `ICC_DIR_EL1` is a system-register write and the read-back below is device MMIO; without a
+    // barrier the load may be observed before the deactivate takes effect.
+    // SAFETY: `dsb`/`isb` are unprivileged barriers with no memory or register effect.
+    unsafe {
+        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+    was_active && !ppi_is_active(HYP_TIMER_INTID)
+}
+
 /// Initialize the physical GICv3 enough to receive the EL2-bound PPIs: enable the distributor (affinity
 /// routing + Group 1), wake this CPU's redistributor, and enable PPI [`VTIMER_INTID`] (the guest's
 /// virtual timer) **and** PPI [`MAINT_INTID`] (the GIC maintenance interrupt — III-1's LR-refill signal)

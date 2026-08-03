@@ -624,6 +624,27 @@ const LINUX_MARKERS: &[&str] = &[
     // this rung exists to prevent, reproduced on the guest that exists today.
     "baleen: handoff OK: dom 1 gave the forwarded timer up every time it left the pCPU holding one —",
     "baleen: handoff OK: dom 2 gave the forwarded timer up every time it left the pCPU holding one —",
+    // ★ ③-b2b-ii-e — **EL2 OWNS A CLOCK.** Until this rung every re-entry to EL2 on this path was
+    // caused by the guest: a trap it took, or the arch-timer PPI it programmed for itself. That is a
+    // behavioural guarantee, and it already failed once — ③-b2b-ii-c2 put a machine-freezing hang on
+    // `main` whose own PR run was green. `HCR_EL2.TWI` patched the case that bit, and was itself
+    // behavioural. Now EL2 arms its own hypervisor timer (`CNTHP_*_EL2`, PPI 26) for one 10 ms slice
+    // on every switch-in, and THAT — not the guest's tick — is what preempts. The guest cannot
+    // program it (EL2-only registers), cannot mask it (③-b1 took the physical distributor away, and
+    // an IRQ routed to EL2 by `HCR_EL2.IMO` is not maskable by EL1's `PSTATE.I`), and cannot outlast
+    // it (the deadline is absolute).
+    //
+    // The assertion is a read-back plus a floor, and neither is a count of what the guests did. The
+    // read-back is `CNTHP_CTL_EL2` itself, in the shape `wfi OK` established. The floor is expiries
+    // against elapsed time — a quantity EL2's own deadline determines and no guest contributes to —
+    // which reads ZERO on the build this rung replaces. What is deliberately NOT asserted is a bound
+    // on how long a guest held the pCPU: a cooperative guest satisfies any such bound with EL2's
+    // clock switched off entirely, so it would pass unchanged on `main` (design-lesson #105). That
+    // claim belongs to the probes, recorded at `report_el2_slice`: with `HCR_EL2.TWI` off AND one
+    // guest's tick forwarding cut — no trap, no tick, no yield, nothing cooperative left — the peer
+    // must still boot and power off.
+    "baleen: slice OK: EL2 re-enters the machine on ITS OWN clock — CNTHP_CTL_EL2 read back as",
+    "baleen: EL2 arms a clock of its OWN — CNTHP_EL2 at 100 Hz on PPI 26",
     // ③-b2b-ii-c2 follow-up: an idle guest YIELDS. Without `HCR_EL2.TWI` a guest switched in while
     // idle sits in `wfi`, EL2 never gets a tick (the deadline it waits on is not one EL2 armed), and
     // the peer never runs again — both guests frozen. That reached `main` and timed out this very
@@ -699,10 +720,16 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // PPI went Inactive. Both are the same consequence: the one physical timer stays Active across a
     // switch and the next guest can never be signalled it.
     "baleen: handoff FAIL",
-    // ③-b2b-ii-c2 follow-up: no guest WFI reached EL2, so `HCR_EL2.TWI` is not in force and an idle
-    // guest can hold the pCPU with no way for EL2 to take it back.
-    // ③-b2b-ii-c2 follow-up: `HCR_EL2.TWI` did not take effect, so an idle guest holds the pCPU.
+    // ③-b2b-ii-c2 follow-up: `HCR_EL2.TWI` did not take effect. Since ③-b2b-ii-e that costs
+    // efficiency rather than the machine — an idle guest burns its whole slice instead of freezing
+    // the pCPU — but a mechanism that silently stopped working is still a red.
     "baleen: wfi FAIL",
+    // ③-b2b-ii-e: EL2's clock is not armed, not deliverable, not being completed, or not firing at
+    // the rate its own deadline implies. The last of those is the one with teeth: EL2 runs
+    // `EOImode=1`, so a missing `ICC_DIR_EL1` leaves EL2's OWN timer Active and the GIC never
+    // signals it again — EL2 gets exactly one slice for the whole boot, and re-entry silently goes
+    // back to depending on the guest.
+    "baleen: slice FAIL",
     // ③-b2b-ii-d: a guest reached the peer's memory and the refusal proved nothing — the address is
     // mapped in its own image too, or it does not resolve in the peer's, or the peer's kernel is not
     // there. Any of those makes the negative test an anecdote.
