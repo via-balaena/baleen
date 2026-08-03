@@ -89,6 +89,7 @@ use crate::cell::BootCell;
 use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
+use crate::vcpu;
 use crate::vgic::{self, DeployedGic};
 use crate::vpl011::{self, DeployedPl011};
 
@@ -99,10 +100,17 @@ const DOM0: DomId = 0;
 const GUEST_A: DomId = 1;
 const SET_A: usize = 0;
 /// The PEER domain (③-b2a). It owns the second half of the guest-RAM window and has a fully emitted
-/// Stage-2 image, but does not execute — running it is ③-b2b, which needs a scheduler this path does
-/// not have. What it exists for here is to make the negative test meaningful: see [`run`].
+/// Stage-2 image, but does not execute — running it is ③-b2b-ii. ③-b2b-i built the switch this path
+/// was missing and proved it carries a *real* kernel's state; what remains for B is a second image,
+/// per-guest device models and the live negative test. What B exists for here is to make the
+/// existing negative test meaningful: see [`run`].
 const GUEST_B: DomId = 2;
 const SET_B: usize = 1;
+
+/// The running guest's single vCPU, and the physical CPU it is dispatched onto (③-b2b-i). One of
+/// each: a second vCPU is ③-b2b-ii's business, and the machine is single-CPU throughout.
+const LINUX_VCPU: u32 = 0;
+const PCPU0: u32 = 0;
 
 /// The first model frame holding an `L2` page table — just above the super partition, in the base
 /// partition, and never mapped (a page table is model state, not a leaf). Each domain gets its own
@@ -589,6 +597,11 @@ __linux_sync_entry:
 // differs from the sync path in one way that matters: an IRQ's preferred return address is the
 // INTERRUPTED instruction, which `ELR_EL2` already holds, so there is no `advance_elr_past_fault`
 // here. Advancing it would silently skip one guest instruction per timer tick.
+//
+// ③-b2b-i added the `mov x0, sp`. Until then this trampoline saved the guest's GPRs and then called
+// the handler with NO argument, so the IRQ path could report a fault but could not *change* the
+// register state it returned to — which is precisely what a preemptive context switch has to do.
+// The sync path has passed its frame since ③-a1; this is that, one exception class over.
 global_asm!(
     r#"
     .section .text
@@ -612,6 +625,7 @@ __linux_irq_entry:
     stp     x26, x27, [sp, #(16 * 13)]
     stp     x28, x29, [sp, #(16 * 14)]
     str     x30,      [sp, #(16 * 15)]
+    mov     x0, sp
     bl      handle_linux_irq
     ldp     x0, x1,   [sp, #(16 * 0)]
     ldp     x2, x3,   [sp, #(16 * 1)]
@@ -715,10 +729,17 @@ static SGIS_DELIVERED: AtomicU64 = AtomicU64::new(0);
 /// silently completing an unexpected one would hide exactly the routing bug this path can have.
 ///
 /// # Safety
-/// Called from the IRQ trampoline with the guest's registers saved; it takes no frame because it needs
-/// no guest register (an interrupt, unlike a trapped instruction, carries no operands).
+/// Called from the IRQ trampoline with the guest's registers saved, **and now with the frame that
+/// holds them**. ③-a2 took no frame, on the reasoning that an interrupt — unlike a trapped
+/// instruction — carries no operands, which is true of *reading* the interrupt and false of what
+/// ③-b2b-i does with it: a preemptive context switch has to replace the register state the handler
+/// returns to. That is the whole difference between forwarding a tick and scheduling on it.
+///
+/// # Safety
+/// `frame` is the valid `*mut LinuxFrame` the trampoline saved on the exception stack, live until
+/// its epilogue reloads from it.
 #[no_mangle]
-extern "C" fn handle_linux_irq() {
+extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
     let intid = gic::ack_physical();
 
     if intid == gic::VTIMER_INTID {
@@ -755,6 +776,11 @@ extern "C" fn handle_linux_irq() {
         // cannot re-signal and storm EL2, while EL2's running priority returns to idle. The guest's
         // EOI of the virtual interrupt is what deactivates this one.
         gic::eoi_physical(intid);
+        // ③-b2b-i: the tick is also the PREEMPTION POINT. `IMO=1` (③-a2) is what put EL2 here on
+        // every tick; until now it only forwarded. See `preempt_through_the_scheduler`.
+        // SAFETY: `frame` is the valid `*mut LinuxFrame` the trampoline just saved on the exception
+        // stack, live until its epilogue reloads from it.
+        preempt_through_the_scheduler(unsafe { &mut *frame });
         return;
     }
 
@@ -770,6 +796,106 @@ extern "C" fn handle_linux_irq() {
          HCR_EL2.IMO — no forwarding rule; halting"
     );
     crate::park();
+}
+
+/// ③-b2b-i — how many timer ticks apart the vCPU is preempted.
+///
+/// Not every tick: the switch is ~30 system-register accesses plus a poison pass, and doing it on
+/// all ~400 ticks of a boot would change the guest's timing profile enough that a regression in the
+/// boot itself could be mistaken for one in the switch. Every eighth still exercises it ~50 times per
+/// boot, which is ~50 chances for a missing register to kill the kernel.
+const PREEMPT_EVERY: u64 = 8;
+
+/// The real guest's saved vCPU context (③-b2b-i).
+///
+/// **Borrowed from the IRQ handler only.** Exception entry to EL2 sets `PSTATE.I`, so no EL2 code can
+/// be interrupted while holding this — the class-3 re-entrancy hazard `crate::cell` documents needs
+/// a handler that runs with interrupts unmasked, and neither Linux-path handler does.
+static VCPU_CTX: BootCell<vcpu::VcpuCtx> = BootCell::new("LINUX_VCPU_CTX", vcpu::VcpuCtx::new());
+
+/// How many times the vCPU has been switched out and back through hv-core's scheduler.
+static SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// **③-b2b-i — preempt the guest at the timer tick, through `hv-core`'s REAL scheduler.**
+///
+/// The real-Linux path had no vCPU switch at all: `run` did one `eret` and never returned, and the
+/// only scheduler call this file ever made was `DomainCreate`. `guest.rs` has had a two-domain
+/// time-slice since M5 Arc 2 — but its saved context is four system registers, which is complete for
+/// register-only synthetic guests and would leave a real kernel running on the peer's page tables.
+///
+/// **The switch is to the SAME vCPU, and the poison is what stops that being vacuous.** A
+/// switch-to-self that saved nothing would look exactly like a correct one; between save and restore
+/// every register in [`vcpu::CtxReg::ALL`] is clobbered, so a missing entry kills the guest instead
+/// of going unnoticed (design-lesson #105, and the module docs of [`crate::vcpu`]).
+///
+/// **It goes through the model, not around it.** `SchedOffline` then `SchedRun` are the transitions
+/// Phase I-1 made exhaustive and Tier-D quantifies over; a switch that only moved registers would be
+/// a `memcpy` with a marker attached.
+fn preempt_through_the_scheduler(frame: &mut LinuxFrame) {
+    if !TIMER_FORWARDED
+        .load(Ordering::Relaxed)
+        .is_multiple_of(PREEMPT_EVERY)
+    {
+        return;
+    }
+
+    // `try_borrow_mut`, and a skip rather than a halt if it is held: the cell is claimed during model
+    // setup, and a tick that lands there should defer, not kill a boot that is otherwise fine. The
+    // witness counts switches actually performed, so a systematically-skipped switch shows up as a
+    // count of zero rather than as silence.
+    let Some(mut cell) = crate::guest::GUEST_HV.try_borrow_mut() else {
+        return;
+    };
+    let Some(hv) = cell.as_mut() else {
+        return;
+    };
+
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    let mut sched = |call: HvCall, what: &str| {
+        if let Err(e) = crate::teardown::dispatch(hv, GUEST_A, call) {
+            let mut uart = crate::uart();
+            let _ = writeln!(
+                uart,
+                "baleen: LINUX GUEST TRAP: scheduler '{what}' refused for dom {GUEST_A}: {e:?}; \
+                 halting"
+            );
+            crate::park();
+        }
+    };
+    // `SchedPreempt`, not `SchedOffline`. The model already had the right transition and its doc
+    // names this exact situation — *"the involuntary counterpart of a guest yield"*: `Running` →
+    // `Runnable`, freeing the pCPU without retiring the vCPU. `guest.rs` uses `SchedOffline` because
+    // its synthetic vCPUs genuinely finish; a kernel interrupted mid-instruction has not finished,
+    // and offlining it left the model in `Offline`, from which `SchedRun` is refused (`WrongState`).
+    // That refusal is the model declining to describe a lie, which is what it is for.
+    sched(
+        HvCall::SchedPreempt {
+            vcpu: LINUX_VCPU,
+            now,
+        },
+        "preempt the running vcpu",
+    );
+    sched(
+        HvCall::SchedRun {
+            vcpu: LINUX_VCPU,
+            pcpu: PCPU0,
+            now,
+        },
+        "run the vcpu again",
+    );
+    drop(cell);
+
+    let mut ctx = VCPU_CTX.borrow_mut();
+    ctx.save(&frame.x);
+    // SAFETY: at EL2 with the context saved, and the restore below is unconditional — the guest's
+    // EL1 configuration is garbage only for the handful of instructions between the two.
+    unsafe { vcpu::poison() };
+    // SAFETY: at EL2, restoring the context just saved for the vCPU about to be resumed.
+    unsafe { ctx.restore(&mut frame.x) };
+    SWITCHES.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The Linux-mode lower-EL synchronous handler. `HVC` → service PSCI (Linux's `method = "hvc"`); an
@@ -1159,6 +1285,27 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
         );
     }
 
+    // ③-b2b-i: the guest was SWITCHED OUT AND BACK, through hv-core's scheduler, with every context
+    // register poisoned in between. A FOURTH mechanism, and the only one whose evidence is that the
+    // guest survived rather than that a counter moved — every marker after this line is a kernel that
+    // resumed from a context this metal reconstructed from scratch.
+    let switches = SWITCHES.load(Ordering::Relaxed);
+    if switches > 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: vcpu OK: the guest was PREEMPTED and restored {switches} times through \
+             hv-core's scheduler — {} context registers saved, poisoned and reinstated each time, \
+             and the kernel never noticed",
+            vcpu::CtxReg::ALL.len()
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: vcpu FAIL: the guest was never preempted — the timer tick did not reach the \
+             switch, so nothing here was exercised"
+        );
+    }
+
     // The SGI half is a SEPARATE mechanism reached by a separate trap (`EC=0x18`, not the IRQ
     // vector), so it gets its own line rather than being folded into the timer count above.
     let sgis = SGIS_DELIVERED.load(Ordering::Relaxed);
@@ -1279,6 +1426,54 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
         SET_B,
     );
     report_disjointness(vttbr_a, vttbr_b, uart);
+
+    // ③-b2b-i — put the guest's vCPU under hv-core's REAL scheduler before it ever runs, so the
+    // preemption at each timer tick is a `SchedOffline`/`SchedRun` pair against a model that already
+    // has it Running, not a pair of calls the model would refuse. Admit moves it Offline → Runnable;
+    // the dispatch moves it Runnable → Running.
+    for (call, what) in [
+        (
+            HvCall::SchedAdmit { vcpu: LINUX_VCPU },
+            "admit the linux vcpu",
+        ),
+        (
+            HvCall::SchedRun {
+                vcpu: LINUX_VCPU,
+                pcpu: PCPU0,
+                now: {
+                    use hv_hal::TimeSource;
+                    crate::time::GenericTimer.now()
+                },
+            },
+            "dispatch the linux vcpu",
+        ),
+    ] {
+        if let Err(e) = crate::teardown::dispatch(hv, GUEST_A, call) {
+            let _ = writeln!(
+                uart,
+                "baleen: linux scheduler setup '{what}' failed for dom {GUEST_A}: {e:?}; halting"
+            );
+            crate::park();
+        }
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: linux vcpu {LINUX_VCPU} admitted and dispatched onto pCPU {PCPU0} through \
+         hv-core's scheduler — the guest is now PREEMPTIBLE at every {PREEMPT_EVERY}th timer tick"
+    );
+    // Name the saved set in the transcript. A context register that stops being saved is otherwise
+    // invisible until it corrupts a guest; here it changes this line, so the boot output itself
+    // records what this build believes a vCPU is made of.
+    let _ = write!(
+        uart,
+        "baleen: vcpu context = {} registers:",
+        vcpu::CtxReg::ALL.len()
+    );
+    for r in vcpu::CtxReg::ALL {
+        let _ = write!(uart, " {}", r.name());
+    }
+    let _ = writeln!(uart);
+
     drop(cell);
     enable_stage2(vttbr_a);
     enable_guest_hw_access();
