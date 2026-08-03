@@ -1685,15 +1685,6 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     unsafe { ctx[next].restore(&mut frame.x) };
     drop(ctx);
 
-    // 5c. ③-b2b-ii-f — read the FP file back off the hardware and confirm it is the incoming vCPU's.
-    //     Structural: true on every switch regardless of what any guest does, which is what makes it
-    //     assertable where `FP_FOREIGN` is not.
-    let mut live = crate::fp::FpCtx::ZERO;
-    live.save();
-    if live == incoming_fp {
-        FP_RESTORE_VERIFIED[next].fetch_add(1, Ordering::Relaxed);
-    }
-
     // 5b. Install the incoming DOMAIN's VMID-tagged Stage-2, with **no TLB flush** — M5 Arc 2's
     //     headline property, reached here by two REAL kernels for the first time. Distinct VMIDs are
     //     what make the two domains' TLB entries unable to alias, so the switch needs no `tlbi`; the
@@ -1705,6 +1696,16 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     //     fault at level 2. A's map does not reach B's memory even to fetch one instruction, and a
     //     running guest is what says so, rather than a walk over the descriptors.
     crate::guest::set_vttbr_no_flush(VTTBR[next].load(Ordering::Relaxed));
+
+    // 5c. ③-b2b-ii-f — read the FP file back off the hardware and confirm it is the incoming vCPU's.
+    //     Structural: true on every switch regardless of what any guest does, which is what makes it
+    //     assertable where `FP_FOREIGN` is not. Verifying here rather than immediately after step 5
+    //     costs nothing: `set_vttbr_no_flush` touches no floating-point state.
+    let mut live = crate::fp::FpCtx::ZERO;
+    live.save();
+    if live == incoming_fp {
+        FP_RESTORE_VERIFIED[next].fetch_add(1, Ordering::Relaxed);
+    }
 
     // 6. Re-arm the physical PPI for the INCOMING guest, according to its own emulated distributor —
     //    the same mediation seam `handle_vgic_access` mirrors, applied at the other moment the

@@ -254,8 +254,8 @@ impl VcpuCtx {
         Self {
             x: [0; 31],
             regs: [0; CtxReg::ALL.len()],
-            fp: crate::fp::FpCtx::ZERO,
             vgic: gic::VgicCtx::ZERO,
+            fp: crate::fp::FpCtx::ZERO,
         }
     }
 
