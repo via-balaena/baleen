@@ -238,6 +238,14 @@ pub(crate) struct VcpuCtx {
     regs: [u64; CtxReg::ALL.len()],
     /// The vGIC state the hardware keeps per-vCPU and does not swap.
     vgic: gic::VgicCtx,
+    /// The FP/SIMD register file, which the hardware does not swap either (③-b2b-ii-f).
+    ///
+    /// The **last** enumerated member of that class, and the one that stayed open longest: it was
+    /// declared a residue when the vGIC members were closed, on the reasoning that no guest here
+    /// used floating point. Two real kernels made that false — see [`crate::fp`] for the
+    /// measurement (~31 first-FP-uses-after-a-switch per boot, each with the guest's own
+    /// `CPACR_EL1` permitting the access).
+    fp: crate::fp::FpCtx,
 }
 
 impl VcpuCtx {
@@ -247,6 +255,7 @@ impl VcpuCtx {
             x: [0; 31],
             regs: [0; CtxReg::ALL.len()],
             vgic: gic::VgicCtx::ZERO,
+            fp: crate::fp::FpCtx::ZERO,
         }
     }
 
@@ -283,6 +292,12 @@ impl VcpuCtx {
             *slot = reg.read();
         }
         self.vgic.save();
+        self.fp.save();
+    }
+
+    /// This context's FP state, for the leak witness in [`crate::linux`].
+    pub(crate) fn fp(&self) -> crate::fp::FpCtx {
+        self.fp
     }
 
     /// **Demote this saved context's forwarded interrupts to purely virtual ones**, returning how
@@ -309,6 +324,8 @@ impl VcpuCtx {
         }
         // SAFETY: forwarded from this function's contract.
         unsafe { self.vgic.restore() };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.fp.restore() };
     }
 }
 
@@ -332,4 +349,9 @@ pub(crate) unsafe fn poison() {
     // [`gic::VgicCtx::poison`] for what it uses instead and why.
     // SAFETY: forwarded from this function's contract.
     unsafe { gic::VgicCtx::poison() };
+    // The FP half likewise brings its own, for the same reason and with a different answer: `v0..v31`
+    // carry no encoding constraints (so the blanket pattern IS right for them and is what makes the
+    // probe loud), while `FPCR`/`FPSR` need valid-but-hostile encodings. See `crate::fp::poison`.
+    // SAFETY: forwarded from this function's contract.
+    unsafe { crate::fp::poison() };
 }

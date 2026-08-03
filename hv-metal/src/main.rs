@@ -56,6 +56,7 @@ mod console;
 mod dmawitness;
 mod el2;
 mod exceptions;
+mod fp;
 mod gic;
 mod guest;
 mod heap;
@@ -203,6 +204,16 @@ pub extern "C" fn rust_main() -> ! {
         );
         park();
     }
+
+    // ③-b2b-ii-f: clear `CPTR_EL2.TFP` so EL2 may touch the FP register file at all — it cannot
+    //     carry a guest's `v0..v31` across a switch otherwise. Its reset value is UNKNOWN, exactly
+    //     like `HCR_EL2`'s below, so it is written explicitly and read back rather than inherited.
+    let cptr = fp::enable_at_el2();
+    let _ = writeln!(
+        uart,
+        "baleen: EL2 owns the FP register file: CPTR_EL2 read back as 0x{cptr:x} (TFP clear = {})",
+        fp::el2_fp_enabled(cptr)
+    );
 
     // (3) Configure HCR_EL2 for AArch64 EL2 operation (RW=1, everything else 0 — no guest-trap
     //     bits, that is M4). Read it back and confirm the field took; a silent no-op write is a bug.

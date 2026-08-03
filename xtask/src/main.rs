@@ -663,6 +663,30 @@ const LINUX_MARKERS: &[&str] = &[
     // `wfi`, so the yield simply never fires. The concurrency this gate has been asserting since
     // ③-b2b-ii-c2 came from the every-eighth-tick preemption, and now comes from `CNTHP_*_EL2`.
     "baleen: wfi OK: HCR_EL2.TWI is in force (HCR_EL2 read back as",
+    // ★ ③-b2b-ii-f — **THE FP/SIMD REGISTER FILE IS PER-GUEST.** The last enumerated member of the
+    // "state the hardware does not swap" class, and the one that stayed open longest: `v0..v31`,
+    // `FPCR` and `FPSR` are one physical file shared by every context on the CPU, and nothing saved
+    // them. `CPACR_EL1` IS saved, which is what made the leak reachable rather than latent — a guest
+    // resumes with its own trap state permitting FP while its kernel still believes the live
+    // registers hold its current task's data, and reads whatever the peer left.
+    //
+    // MEASURED both ways before the fix existed: with `CPTR_EL2.TFP` set, dom 1 took 15 FP traps and
+    // dom 2 took 16, EVERY one of them the guest's first FP use after a switch-in with its own
+    // `CPACR_EL1` allowing it; and the shipped witness reports the file holding the PEER's data at
+    // 12 switch-ins per guest.
+    //
+    // The assertion is the READ-BACK, not that count: `verified == switches` must hold on every boot
+    // whatever the guests do, and it catches the failure this rung can actually have — a PARTIAL
+    // restore, which on a boot that never touches the high registers is indistinguishable from a
+    // correct one. The foreign-data count is reported beside it and never asserted, because two
+    // guests that avoid floating point leave it at zero on a perfectly good boot (design-lesson #127).
+    //
+    // ⚠ THE KILL PROBE DOES NOT KILL, which is why this marker carries more weight than most.
+    // Deleting the FP restore leaves both kernels reaching userspace with no panic and no trap —
+    // Linux's own lazy-FP reload usually overwrites the clobbered file before anything reads it — so
+    // this read-back is the ONLY thing between a broken restore and a silent green boot.
+    "baleen: fp OK: dom 1 resumed on its OWN FP register file every time —",
+    "baleen: fp OK: dom 2 resumed on its OWN FP register file every time —",
     // ★ ③-b2b-ii-d — THE LIVE NEGATIVE TEST, in both directions. Each guest's device tree names an
     // AMBA peripheral at the base of the OTHER guest's half of the window, so the kernel's bus scan
     // reads its identification registers during boot and the hardware refuses every one.
@@ -735,6 +759,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // signals it again — EL2 gets exactly one slice for the whole boot, and re-entry silently goes
     // back to depending on the guest.
     "baleen: slice FAIL",
+    // ③-b2b-ii-f: a switch-in did not read back the FP register file it restored, so part of
+    // `v0..v31`/`FPCR`/`FPSR` is being dropped and a guest resumes on its peer's floating-point
+    // state. The only detector — the poison alone does not kill this boot.
+    "baleen: fp FAIL",
     // ③-b2b-ii-d: a guest reached the peer's memory and the refusal proved nothing — the address is
     // mapped in its own image too, or it does not resolve in the peer's, or the peer's kernel is not
     // there. Any of those makes the negative test an anecdote.
