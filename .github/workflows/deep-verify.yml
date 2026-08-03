@@ -40,7 +40,21 @@ jobs:
   exhaustive-sweeps:
     name: exhaustive enumerator sweeps
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45 was fine at 30m26s (2026-07-20, the last run that finished) and became a HARD FAILURE as the
+    # suite grew: 45m16s / 45m17s / 45m19s across the next three runs, each exactly this wall. Nothing
+    # broke — the budget stopped matching the work, which is the same diagnosis this repo already
+    # recorded for the Kani gate ("the wall was UNDER-SET, not flaky").
+    #
+    # 120 is DELIBERATELY GENEROUS rather than a tuned number, and the asymmetry is the argument: this
+    # job is weekly and nobody blocks on it, so an over-generous wall costs nothing while a too-tight
+    # one costs a SILENT RED — which went unnoticed for two weeks. It is set high enough that a run can
+    # finally COMPLETE and report the real CI duration, which no run has ever produced. Tighten it
+    # against that measured number (with the CI-vs-local ratio), never against the local number.
+    #
+    # MEASURED LOCALLY 2026-08-03, `--test-threads=1`, release: 23 tests, 32m52s total, and severely
+    # lopsided — `hierarchy_saturates_only_under_symmetry_reduction` alone is 739.8s (37.5%), the top
+    # three are 64.5%, and the remaining 18 tests together are 20.5%.
+    timeout-minutes: 120
     steps:
       - name: Harden the runner (audit egress)
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
@@ -56,6 +70,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      # `--test-threads=1` is for READABLE `--nocapture` output, not for correctness: the sweeps build
+      # their own `Hypervisor` per test and share nothing. So parallelising is a live option if this
+      # wall ever becomes the binding constraint — it would bound the job by the LONGEST test
+      # (12m20s) instead of the sum (32m52s). ⚠ Not done here, and the reason is recorded so nobody
+      # has to rediscover it: several sweeps carry `max_states: 3_000_000`, so running them
+      # concurrently risks exhausting the runner, and peak RSS has never been measured. Measure that
+      # before reaching for it — and note there is nothing to gain today, because this job is weekly
+      # and asynchronous.
       - name: cargo test --release --ignored (deep sweeps)
         run: cargo test --release -p hv-sim -- --ignored --nocapture --test-threads=1
 
