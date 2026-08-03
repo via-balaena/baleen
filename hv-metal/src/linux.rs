@@ -989,6 +989,241 @@ static TIMER_FORWARDED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; 
 /// atomic rather than a [`BootCell`], and per guest for the same reason.
 static SGIS_DELIVERED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
+/// Per-guest **software pending set** — the real-Linux path's answer to a full list-register bank.
+///
+/// ## ★ What this closes, and it is an ISOLATION defect rather than a robustness one
+///
+/// Before this, a guest SGI that found no free list register reached `crate::park()`. **A guest could
+/// therefore halt the entire machine, peer domain included, in about six instructions**: mask
+/// interrupts (`PSTATE.I=1`, so injected vINTs are never taken and never free their LR), then write
+/// `ICC_SGI1R_EL1` five times with distinct SGI ids. Nothing between the trapped instruction and the
+/// halt checked that the SGI was enabled, rate-limited it, or budgeted it per guest.
+///
+/// **Measured, not inferred** — a non-destructive probe on a real boot reported `bank=4 placed=4
+/// fifth_injection_refused=true`, and that refusal is exactly the branch that parked.
+///
+/// It went unnoticed because the shipped Alpine guest issues 59 SGIs a boot and **takes them all**,
+/// so the bank never holds more than one or two. The safety was a property of a cooperative workload
+/// — design-lesson #127, in its most consequential instance so far.
+///
+/// A **set**, not a queue, for III-1's reason: a queue's "full" is the old halt relocated, while a set
+/// over every INTID the distributor can name has no full state at all. See [`crate::pending`], which
+/// is the one type both switches now share.
+static LINUX_PENDING: [crate::pending::PendingSet; NUM_GUESTS] =
+    [const { crate::pending::PendingSet::new() }; NUM_GUESTS];
+
+/// vINTs that found no free list register and were recorded in the pending set instead.
+static SGIS_DEFERRED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// vINTs later drained from the pending set into a freed list register.
+static SGIS_DRAINED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// Maintenance interrupts ([`gic::MAINT_INTID`]) EL2 took on this path.
+static MAINT_TAKEN: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// **Deliver a guest-generated SGI, or record it as pending if the bank is full.**
+///
+/// Total by construction: there is no failure to report, which is what removes the `park()` this
+/// replaces. The two outcomes are "in a list register now" and "in the set until one frees".
+fn deliver_or_defer_sgi(slot: usize, intid: u32) {
+    if gic::inject(intid) {
+        SGIS_DELIVERED[slot].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if LINUX_PENDING[slot].mark(intid) {
+        SGIS_DEFERRED[slot].fetch_add(1, Ordering::Relaxed);
+        // Level-based, and armed only because something is now waiting — see
+        // `gic::set_underflow_interrupt` for why arming it over an empty set livelocks EL2.
+        gic::set_underflow_interrupt(true);
+    }
+    // `mark` refuses only an INTID the emulated distributor cannot name. A guest SGI comes from a
+    // FOUR-BIT field (`gic::sgi1r_intid`), so it is at most 15 and this cannot happen; it is written
+    // as a condition rather than an assert because a panic here would be the halt coming back.
+}
+
+/// **Drain `slot`'s pending set into free list registers, then re-arm `UIE` to match what is left.**
+///
+/// Runs from two places, for the two reasons III-1 identified:
+/// * [`switch_context`] — on every switch-in, so a vCPU resumes with its bank as full as it can be.
+///   Deterministic, needs no interrupt, and is the primary path.
+/// * [`handle_linux_irq`] on [`gic::MAINT_INTID`] — for the case a switch cannot reach: a guest that
+///   keeps running, taking and completing interrupts without exiting to EL2. There the bank runs down
+///   while EL2 is not executing, and only the hardware's underflow signal can say so.
+///
+/// The trailing arm is a function of what REMAINS, which is what keeps the level-based `UIE` from
+/// asserting over an empty set.
+fn flush_pending_to_lrs(slot: usize) -> usize {
+    let n = gic::num_list_registers();
+    let mut placed = 0;
+    for i in 0..n {
+        if !gic::lr_is_free(gic::read_lr(i)) {
+            continue;
+        }
+        match LINUX_PENDING[slot].take_next() {
+            Some(intid) => {
+                // Back through the raw allocator rather than writing the list register here, so the
+                // set and the synchronous path place interrupts through exactly one encoder (#55).
+                if gic::inject(intid) {
+                    placed += 1;
+                    SGIS_DRAINED[slot].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // Cannot happen single-CPU with a free LR just observed — but do not lose the
+                    // vINT on a surprise.
+                    let _ = LINUX_PENDING[slot].mark(intid);
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    gic::set_underflow_interrupt(!LINUX_PENDING[slot].is_empty());
+    placed
+}
+
+/// The four INTIDs the overflow probe fills the bank with, and the fifth it then injects.
+///
+/// Nameable by the emulated distributor and **not** enabled by either guest, so even if one were
+/// somehow observed it could not be presented. In practice none is: the probe runs between the
+/// outgoing vCPU's `save` and the incoming one's `poison`, so every list register it writes is zeroed
+/// before any guest runs again.
+#[cfg(feature = "selftest")]
+const PROBE_FILL_BASE: u32 = 200;
+#[cfg(feature = "selftest")]
+const PROBE_OVERFLOW_INTID: u32 = 204;
+
+/// One-shot latch, so the probe perturbs exactly one switch out of the hundreds a boot makes.
+#[cfg(feature = "selftest")]
+static LR_OVERFLOW_PROBED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// `0` = not run, `1` = ran and every check held, `2` = ran and something did not.
+#[cfg(feature = "selftest")]
+static LR_OVERFLOW_RESULT: AtomicU64 = AtomicU64::new(0);
+/// How many list registers the probe filled before the bank refused — the measured bank depth.
+#[cfg(feature = "selftest")]
+static LR_OVERFLOW_FILLED: AtomicU64 = AtomicU64::new(0);
+
+/// **The discriminating probe: fill the bank, then inject one more.**
+///
+/// Without this the rung is unwitnessable. The shipped Alpine guest issues 59 SGIs a boot and takes
+/// them all, so the bank never holds more than one or two: a "deferrals > 0" counter would read ZERO
+/// on a good boot and prove nothing — the "WFI traps > 0" mistake this project already made once
+/// (design-lesson #127). So the probe MANUFACTURES the condition instead of waiting for it.
+///
+/// **Safe by placement, not by care.** It runs between the outgoing vCPU's `save` and the incoming
+/// one's `poison`: the bank has already been captured into `VCPU_CTX[cur]`, and every list register
+/// is about to be zeroed and then overwritten by the incoming vCPU's restore. There is no window in
+/// which a guest can observe anything this writes.
+///
+/// What it asserts, and each is a read-back rather than a count:
+/// 1. the bank really does fill and refuse — the precondition of the old `park()`;
+/// 2. the overflowing vINT lands in the pending set instead of halting;
+/// 3. **`ICH_HCR_EL2.UIE` reads back ARMED** — the hardware agrees there is a refill pending;
+/// 4. freeing one list register drains exactly that vINT;
+/// 5. **`UIE` reads back CLEAR** — arming follows what remains, so an idle guest cannot be stormed.
+#[cfg(feature = "selftest")]
+fn probe_lr_overflow(slot: usize) {
+    let n = gic::num_list_registers();
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
+    let started_empty = LINUX_PENDING[slot].is_empty();
+
+    let mut filled = 0;
+    for k in 0..n {
+        if gic::inject(PROBE_FILL_BASE + k as u32) {
+            filled += 1;
+        }
+    }
+    let bank_refuses = !gic::inject(PROBE_FILL_BASE + n as u32);
+
+    deliver_or_defer_sgi(slot, PROBE_OVERFLOW_INTID);
+    let deferred = !LINUX_PENDING[slot].is_empty();
+    let armed = gic::underflow_interrupt_armed();
+
+    gic::write_lr(0, 0);
+    let placed = flush_pending_to_lrs(slot);
+    let drained = LINUX_PENDING[slot].is_empty();
+    let disarmed = !gic::underflow_interrupt_armed();
+
+    for i in 0..n {
+        gic::write_lr(i, 0);
+    }
+
+    let ok = started_empty
+        && filled == n
+        && bank_refuses
+        && deferred
+        && armed
+        && placed == 1
+        && drained
+        && disarmed;
+    LR_OVERFLOW_FILLED.store(filled as u64, Ordering::Relaxed);
+    LR_OVERFLOW_RESULT.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// Report what the pending set actually absorbed this boot.
+///
+/// ⚠ **Deliberately NOT a gate marker, and the reason is the whole lesson of design-lesson #127.**
+/// A marker asserting a positive count would be a claim about the WORKLOAD and would redden on a
+/// perfectly good boot; one asserting zero would redden on a boot that correctly survived a flood.
+/// Neither is a property of the mechanism, so this line is a **diagnostic**, and `lroverflow` —
+/// which manufactures the condition — is the assertion.
+///
+/// **What the numbers actually read, measured:** on a `real-linux` build every count is **zero**,
+/// because Alpine takes all 59 of its SGIs and the bank never fills. On a `real-linux,selftest`
+/// build — which is what the REQUIRED gate boots — the guest the probe ran on reads **1 deferred,
+/// 1 drained**, because `probe_lr_overflow` manufactures exactly one overflow and then drains it.
+/// That is the probe corroborating itself through a second, independent counter; it is not a guest
+/// having flooded anything.
+///
+/// What it is for: if a guest ever does flood its bank, that stops being invisible. Before this rung
+/// the machine simply stopped, and the last thing on the console was a halt message.
+fn report_pending_absorption(uart: &mut Pl011) {
+    for slot in 0..NUM_GUESTS {
+        let deferred = SGIS_DEFERRED[slot].load(Ordering::Relaxed);
+        let drained = SGIS_DRAINED[slot].load(Ordering::Relaxed);
+        let maint = MAINT_TAKEN[slot].load(Ordering::Relaxed);
+        let _ = writeln!(
+            uart,
+            "baleen: pending dom {}: {deferred} vINT(s) deferred when the list-register bank was \
+             full, {drained} drained back into it, {maint} maintenance interrupt(s) taken (all zero \
+             on a boot whose guest takes its own interrupts — this is a diagnostic, not a claim)",
+            slot_dom(slot)
+        );
+    }
+}
+
+/// Report the overflow probe (`selftest` builds only).
+#[cfg(feature = "selftest")]
+fn report_lr_overflow(uart: &mut Pl011) {
+    let filled = LR_OVERFLOW_FILLED.load(Ordering::Relaxed);
+    match LR_OVERFLOW_RESULT.load(Ordering::Relaxed) {
+        1 => {
+            let _ = writeln!(
+                uart,
+                "baleen: lroverflow OK: a FULL list-register bank now DEFERS instead of halting — \
+                 {filled} LRs filled and the next injection refused, the overflowing vINT went to \
+                 the software pending set with ICH_HCR_EL2.UIE READ BACK as armed, and freeing one \
+                 LR drained exactly it and read UIE back clear"
+            );
+        }
+        2 => {
+            let _ = writeln!(
+                uart,
+                "baleen: lroverflow FAIL: the overflow path did not behave as claimed ({filled} LRs \
+                 filled) — a full bank may still halt, or UIE is not tracking the pending set"
+            );
+        }
+        _ => {
+            let _ = writeln!(
+                uart,
+                "baleen: lroverflow FAIL: the probe never ran — no switch occurred, so the claim \
+                 that a full bank defers is UNWITNESSED on this boot"
+            );
+        }
+    }
+}
+
 /// The Linux-mode lower-EL **IRQ** handler (③-a2) — the guest's device interrupts, taken at EL2
 /// because `HCR_EL2.IMO` routes them there, and handed on as *virtual* interrupts.
 ///
@@ -1091,6 +1326,24 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         // quantum and a guest that stopped taking its tick stopped being preemptible — the
         // behavioural half of ledger item 9. EL2's slice expiry above is now the only thing that
         // preempts, so this path does exactly what ③-a2 built it for: forward the guest's tick.
+        return;
+    }
+
+    // The GIC **maintenance interrupt** — III-1's refill signal, and on this path it is NEW.
+    //
+    // ⚠ **It is not optional, and adding the pending set without it would have relocated the halt
+    // rather than removed it.** `gic::init_physical_vtimer` has always enabled this PPI here (its own
+    // doc says the enable is "inert" on a path that never arms `UIE`), and until now nothing on the
+    // Linux path ever armed `UIE` — so PPI 25 never fired, and if it had it would have fallen through
+    // to the "no forwarding rule; halting" branch below. Arming `UIE` without this branch would have
+    // turned a full-bank halt into a maintenance-interrupt halt.
+    if intid == gic::MAINT_INTID {
+        MAINT_TAKEN[slot].fetch_add(1, Ordering::Relaxed);
+        // Drain FIRST: the interrupt is level-based on `UIE` + bank occupancy, and the drain is what
+        // clears `UIE` when nothing is left. Deactivating before that could re-assert immediately.
+        let _ = flush_pending_to_lrs(slot);
+        gic::eoi_physical(intid);
+        gic::deactivate_physical(intid);
         return;
     }
 
@@ -1672,6 +1925,13 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
         FP_FOREIGN[next].fetch_add(1, Ordering::Relaxed);
     }
 
+    // 3c. The overflow probe, once per boot. Deliberately HERE: the outgoing bank is already saved
+    //     and step 4 is about to zero every list register, so nothing it writes can be observed.
+    #[cfg(feature = "selftest")]
+    if !LR_OVERFLOW_PROBED.swap(true, Ordering::Relaxed) {
+        probe_lr_overflow(cur);
+    }
+
     // 4. Poison — see `crate::vcpu`. Still the instrument that stops a switch-to-self being vacuous.
     // SAFETY: at EL2 with the context saved, and the restore below is unconditional — the guest's
     // EL1 configuration is garbage only for the handful of instructions between the two.
@@ -1708,6 +1968,12 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     if live == incoming_fp {
         FP_RESTORE_VERIFIED[next].fetch_add(1, Ordering::Relaxed);
     }
+
+    // 5d. Drain the incoming guest's pending set into its now-restored bank. It must run AFTER the
+    //     restore (which overwrites the whole bank, so a pre-restore refill would be discarded), and
+    //     it re-arms `UIE` for whatever is still pending — which is also what makes the arming follow
+    //     the switched-IN vCPU rather than the outgoing one.
+    let _ = flush_pending_to_lrs(next);
 
     // 6. Re-arm the physical PPI for the INCOMING guest, according to its own emulated distributor —
     //    the same mediation seam `handle_vgic_access` mirrors, applied at the other moment the
@@ -1812,6 +2078,9 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 report_el2_slice(&mut uart);
                 report_wfi_yield(&mut uart);
                 report_fp_isolation(&mut uart);
+                report_pending_absorption(&mut uart);
+                #[cfg(feature = "selftest")]
+                report_lr_overflow(&mut uart);
                 report_per_guest_state(&mut uart);
                 let _ = writeln!(
                     uart,
@@ -2182,15 +2451,11 @@ fn handle_linux_sysreg_trap(
         let rt = ((iss >> 5) & 0x1f) as usize;
         let value = if rt < 31 { frame.x[rt] } else { 0 };
         let intid = gic::sgi1r_intid(value);
-        if !gic::inject(intid) {
-            let _ = writeln!(
-                uart,
-                "baleen: LINUX GUEST TRAP: the list-register bank is full — cannot deliver the \
-                 guest's SGI {intid}; halting"
-            );
-            crate::park();
-        }
-        SGIS_DELIVERED[current_slot()].fetch_add(1, Ordering::Relaxed);
+        // ★ This used to `park()` when the bank was full — a halt a guest could REACH, taking the
+        //   peer domain with it. Delivery is now total: see `deliver_or_defer_sgi` and
+        //   `LINUX_PENDING`. There is no `false` left to branch on, which is what makes the halt
+        //   unwritable rather than merely unwritten.
+        deliver_or_defer_sgi(current_slot(), intid);
         // A trapped instruction's preferred return is the instruction ITSELF; resume past it or the
         // guest re-executes the `msr` forever.
         crate::guest::advance_elr_past_fault();
@@ -2309,10 +2574,15 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
         if gic_traps > 0 && gic_enables > 0 {
             let _ = writeln!(
                 uart,
+                // "enable TRANSITIONS", not "INTIDs enabled": `vgic.rs` counts every write that
+                // newly enables an INTID, so an INTID enabled, disabled and re-enabled counts twice.
+                // Measured on the shipped boot: 11 transitions against 10 INTIDs actually enabled.
+                // The number is a genuine mechanism witness; the sentence used to name a different
+                // quantity from the one it printed.
                 "baleen: vgic OK: dom {dom}'s interrupt controller is EMULATED — {gic_traps} \
-                 GICD/GICR register traps in EL2, {gic_enables} INTIDs enabled in a distributor \
-                 that is dom {dom}'s alone and that no guest can reach (Stage-2 device pass-through \
-                 window: 0 bytes)"
+                 GICD/GICR register traps in EL2, {gic_enables} INTID enable transitions through a \
+                 distributor that is dom {dom}'s alone and that no guest can reach (Stage-2 device \
+                 pass-through window: 0 bytes)"
             );
         } else {
             let _ = writeln!(

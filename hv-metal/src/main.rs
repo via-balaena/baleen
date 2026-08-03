@@ -64,6 +64,7 @@ mod heap;
 #[cfg(feature = "real-linux")]
 mod linux;
 mod pcie;
+mod pending;
 mod pl011;
 #[cfg(feature = "smmu")]
 mod smmu;
