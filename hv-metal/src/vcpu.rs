@@ -34,6 +34,14 @@
 //! let the failures name the list. A register omitted by an author reading the ARM ARM is silent
 //! for years; a register omitted here fails on the next boot.
 //!
+//! **③-b2b-ii-c2 changed what the poison is FOR, and it is worth being precise about.** With two
+//! kernels time-slicing, the switch is no longer a switch-to-self, so it is not vacuous on its own:
+//! a register left unsaved now carries one guest's value into the other, and the second kernel dies
+//! of it. The poison is no longer the only thing making the mechanism observable. It stays because
+//! it still catches the case the two-guest switch cannot — a register whose values happen to AGREE
+//! between the two guests at the moment of the switch, which is exactly the register a boot would
+//! otherwise keep getting away with. What was the instrument is now the backstop.
+//!
 //! ## One derivation
 //!
 //! The table is declared **once**, by [`ctx_regs!`], which generates the enum, the `ALL` slice, the
