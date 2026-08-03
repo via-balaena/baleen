@@ -18,8 +18,11 @@
 //! Scoped with `CPTR_EL2.TFP`, which traps EL1/EL0 FP access to EL2. An `EC=0x07` arriving there
 //! means `CPACR_EL1` *allowed* the access — i.e. the guest believed the registers were its own. On
 //! the shipped two-kernel boot: **dom 1 took 15 such traps and dom 2 took 16, and every one of them
-//! was the guest's first FP use after a switch-in.** So roughly thirty times per boot, a kernel read
-//! a register file its peer had last written.
+//! was the guest's first FP use after a switch-in.** So roughly thirty times per boot, a kernel
+//! reached for the register file immediately after being switched in, believing it held its own
+//! task's state. Stated that way on purpose: that this coincides with a switch on which the *peer*
+//! wrote the file is the second measurement below, and the two were never intersected — see the
+//! honest ceiling.
 //!
 //! That trap is a measurement instrument, not the fix. The fix is here, and it is unconditional.
 //!
@@ -237,15 +240,15 @@ impl FpCtx {
 /// kinds. Taken field by field:
 ///
 /// * **`v0..v31` carry no encoding constraints at all** — they are pure data, so an arbitrary
-///   recognizable pattern is both safe and maximally destructive. This is the half that makes the
-///   probe LOUD: a kernel resuming into a register file of `0xDEADBEEF…` and using it for a `memcpy`
-///   or a checksum produces wrong bytes immediately, not a subtle drift.
+///   recognizable pattern is both safe and maximally destructive. ⚠ **It is still not loud.** An
+///   earlier draft of this bullet claimed a kernel resuming into a file of `0xDEADBEEF…` would
+///   produce wrong bytes immediately; the kill probe below refuted that, and the claim is corrected
+///   here rather than left sitting three paragraphs above its own refutation.
 /// * **`FPCR` is a valid-but-hostile encoding**, in the shape `ICH_VMCR_EL2`'s poison established:
 ///   default-NaN, flush-to-zero and round-toward-zero, all architecturally legal with no RES0 bit
-///   set. **Its failure is quieter than the `v` half and that is stated rather than hidden** — an
-///   unrestored `FPCR` changes arithmetic semantics instead of destroying data, so it is the `v`
-///   registers that a kill probe actually catches. Setting the FP exception-trap enables would be
-///   louder but is unreliable: those bits are RES0 unless `FEAT_TRAPFP` is implemented.
+///   set. An unrestored `FPCR` changes arithmetic semantics rather than destroying data — quieter
+///   again. Setting the FP exception-trap enables would be louder but is unreliable: those bits are
+///   RES0 unless `FEAT_TRAPFP` is implemented.
 /// * **`FPSR` gets every cumulative exception flag set** — also a valid encoding, and one no correct
 ///   guest would be holding.
 #[cfg(feature = "real-linux")]
@@ -259,10 +262,13 @@ const POISON: FpCtx = FpCtx {
 
 /// Clobber the live FP register file, so a restore that misses part of it cannot go unnoticed.
 ///
-/// **The instrument, not a debugging aid** — the same standing as [`crate::vcpu::poison`]. Without
-/// it a switch-to-self proves nothing about this mechanism, and a partial restore (say, `v16..v31`
-/// dropped by a wrong offset) looks exactly like a correct one on any boot whose guests happen not
-/// to use the high registers.
+/// **The instrument, not a debugging aid** — the same standing as [`crate::vcpu::poison`], but be
+/// precise about what it buys, because the read-back witness overlaps it. A broken restore is caught
+/// *without* poison on any switch between two different guests: the live file still holds the
+/// outgoing guest's data, which differs from the incoming one's saved copy. What poison adds is the
+/// **switch-to-self** case — where live and incoming are the same context, so a restore that did
+/// nothing at all would read back as correct. Poison is what stops that being vacuous, exactly as it
+/// is for the system-register half.
 ///
 /// It is one call to [`FpCtx::restore`] rather than its own asm, so the poison path and the resume
 /// path are the same code (design-lesson #130): a restore bug cannot hide by being absent from the
