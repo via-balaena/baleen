@@ -645,18 +645,23 @@ const LINUX_MARKERS: &[&str] = &[
     // must still boot and power off.
     "baleen: slice OK: EL2 re-enters the machine on ITS OWN clock — CNTHP_CTL_EL2 read back as",
     "baleen: EL2 arms a clock of its OWN — CNTHP_EL2 at 100 Hz on PPI 26",
-    // ③-b2b-ii-c2 follow-up: an idle guest YIELDS. Without `HCR_EL2.TWI` a guest switched in while
-    // idle sits in `wfi`, EL2 never gets a tick (the deadline it waits on is not one EL2 armed), and
-    // the peer never runs again — both guests frozen. That reached `main` and timed out this very
-    // job; it reproduced locally at 2 runs in 15. This marker is the evidence the trap is in force,
-    // because a boot with the yield working and a boot that never switched to an idle guest look
-    // otherwise identical.
-    // ③-b2b-ii-c2 follow-up: an idle guest YIELDS instead of freezing the machine. Asserted as a
-    // READ-BACK of `HCR_EL2`, not as a count of trapped WFIs — with two kernels sharing one pCPU
-    // neither is ever short of work, so a boot in which nobody goes idle has a count of zero and is
-    // perfectly good. (Measured: a run of this gate did exactly that, and an earlier version of the
-    // witness refused it.) The read-back is true on every boot and is what actually determines
-    // whether an idle guest can hold the CPU with no way for EL2 to take it back.
+    // ③-b2b-ii-c2 follow-up: an idle guest YIELDS the pCPU. Asserted as a READ-BACK of `HCR_EL2`,
+    // not as a count of trapped WFIs — with two kernels sharing one pCPU neither is ever short of
+    // work, so a boot in which nobody goes idle has a count of zero and is perfectly good.
+    // (Measured: a run of this gate did exactly that, and an earlier version of the witness refused
+    // it.) The read-back is true on every boot and cannot be satisfied by luck.
+    //
+    // ⚠ **③-b2b-ii-e DEMOTED what this marker means, and the old wording is left behind on purpose.**
+    // It used to say that without `TWI` the peer never runs again and both guests freeze — true when
+    // this was the only way EL2 could get the pCPU back. EL2 now owns a clock, so a `TWI` that
+    // stopped working costs a wasted slice rather than the machine.
+    //
+    // The same rung's probes also corrected the converse, which is the more surprising half: `TWI`
+    // never covered for a missing EL2 clock either. MEASURED — with EL2's clock disarmed and `TWI`
+    // in force, the two kernels do not time-slice at all. They run strictly sequentially, one
+    // handover in the whole boot, at `SYSTEM_OFF`: a guest that always has work never executes
+    // `wfi`, so the yield simply never fires. The concurrency this gate has been asserting since
+    // ③-b2b-ii-c2 came from the every-eighth-tick preemption, and now comes from `CNTHP_*_EL2`.
     "baleen: wfi OK: HCR_EL2.TWI is in force (HCR_EL2 read back as",
     // ★ ③-b2b-ii-d — THE LIVE NEGATIVE TEST, in both directions. Each guest's device tree names an
     // AMBA peripheral at the base of the OTHER guest's half of the window, so the kernel's bus scan

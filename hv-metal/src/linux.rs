@@ -1615,7 +1615,9 @@ fn sched_on(hv: &mut Hypervisor, dom: DomId, call: HvCall, what: &str) {
 /// The ORDER of these steps is ③-b2b-ii-c1's rung and is documented at
 /// [`gic::release_forwarded_timer`]; what ③-b2b-ii-c2 adds is that `next` may now differ from `cur`,
 /// which turns two of them from identities into real work: the context restored is a different
-/// vCPU's, and `VTTBR_EL2` becomes a different domain's VMID-tagged Stage-2.
+/// vCPU's, and `VTTBR_EL2` becomes a different domain's VMID-tagged Stage-2. ③-b2b-ii-e adds an
+/// eighth step, and it is the only one about the guest that is *arriving* rather than the one
+/// leaving: its slice starts here.
 fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     let mut ctx = VCPU_CTX.borrow_mut();
     // 1. Capture the outgoing vCPU, list registers and `CNTV_CVAL_EL0` included.
@@ -2032,6 +2034,12 @@ static HCR_WITH_TWI: AtomicU64 = AtomicU64::new(0);
 /// EL2 waits instead of returning to a guest that would immediately trap again (which would be a
 /// livelock, not a wait). `wfi` wakes on a pending physical interrupt regardless of `PSTATE.I`, so
 /// the guest's own arch-timer PPI brings EL2 back, and the `eret` then delivers it.
+///
+/// **③-b2b-ii-e bounded this wait.** It used to end only when a GUEST's deadline arrived — the same
+/// dependence ledger item 9 is about, in the one place EL2 was already awake for it. EL2's slice is
+/// armed across the wait, so `CNTHP` wakes it after at most one quantum whether or not any guest's
+/// timer ever fires. Nothing else here changes: with no peer runnable there is still nothing to
+/// switch to, and the wake costs one switch-to-self.
 fn wait_at_el2() {
     // SAFETY: `wfi` is an unprivileged hint with no memory or register effect.
     unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
