@@ -105,6 +105,15 @@
 //! being picked, which is the *only* record of who is still alive. `hv-core`'s own docs draw that
 //! line — mechanism, not policy — so the rotation is `hv-metal`'s and the legality is the model's.
 //!
+//! **EL2 owns no clock, and with two guests that stopped being harmless.** Every re-entry to EL2
+//! here is caused by the guest — a trap it takes, or the arch-timer PPI it programmed for itself.
+//! With one guest that is sound; with two, a guest switched in while idle sits in `wfi` waiting for
+//! a deadline EL2 did not arm, and **the peer never runs again**. That reached `main` and made the
+//! required boot gate time out (2 runs in 15 locally). `HCR_EL2.TWI` ([`trap_guest_wfi`]) turns
+//! `wfi` into a voluntary yield, which closes it — and the residue is declared rather than left for
+//! the next hang to find: EL2 still has no timer of its own, so the guarantee is behavioural, and
+//! its structural closure is `CNTHP_*_EL2` armed on every switch-in.
+//!
 //! The headline is one string: **`[dom 2] baleen-guest-ram: 64000000-7fffffff:SystemRAM`**. It is
 //! guest B's userspace reading guest B's `/proc/iomem`, which needs B's kernel to have parsed B's
 //! DTB and reached that RAM through B's own Stage-2 — carrying EL2's tag and the guest's content in
