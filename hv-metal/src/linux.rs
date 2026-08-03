@@ -105,6 +105,15 @@
 //! being picked, which is the *only* record of who is still alive. `hv-core`'s own docs draw that
 //! line — mechanism, not policy — so the rotation is `hv-metal`'s and the legality is the model's.
 //!
+//! **EL2 owns no clock, and with two guests that stopped being harmless.** Every re-entry to EL2
+//! here is caused by the guest — a trap it takes, or the arch-timer PPI it programmed for itself.
+//! With one guest that is sound; with two, a guest switched in while idle sits in `wfi` waiting for
+//! a deadline EL2 did not arm, and **the peer never runs again**. That reached `main` and made the
+//! required boot gate time out (2 runs in 15 locally). `HCR_EL2.TWI` ([`trap_guest_wfi`]) turns
+//! `wfi` into a voluntary yield, which closes it — and the residue is declared rather than left for
+//! the next hang to find: EL2 still has no timer of its own, so the guarantee is behavioural, and
+//! its structural closure is `CNTHP_*_EL2` armed on every switch-in.
+//!
 //! The headline is one string: **`[dom 2] baleen-guest-ram: 64000000-7fffffff:SystemRAM`**. It is
 //! guest B's userspace reading guest B's `/proc/iomem`, which needs B's kernel to have parsed B's
 //! DTB and reached that RAM through B's own Stage-2 — carrying EL2's tag and the guest's content in
@@ -1083,6 +1092,8 @@ static TICK_HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; N
 enum Handover {
     /// A timer tick preempted the guest — a forwarded interrupt is in flight.
     Tick,
+    /// The guest executed `WFI` and yielded — it may or may not have one in flight.
+    Yield,
     /// The guest issued `SYSTEM_OFF` and is retiring — nothing is in flight.
     PowerOff,
 }
@@ -1365,6 +1376,14 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
         return;
     }
 
+    // EC 0x01 = a trapped `WFI`/`WFE`. `HCR_EL2.TWI` makes an idle guest yield the pCPU instead of
+    // freezing the machine — see `trap_guest_wfi`.
+    if ec == EC_WFX && esr & 1 == 0 {
+        // SAFETY: the trampoline gave us its on-stack frame; single-CPU, non-nested.
+        handle_linux_wfi(unsafe { &mut *frame });
+        return;
+    }
+
     // EC 0x18 = a trapped MSR/MRS. Under `IMO=1` the guest's `ICC_SGI1R_EL1` writes land here (③-a2).
     if ec == EC_SYSREG {
         // SAFETY: the trampoline gave us its on-stack frame; single-CPU, non-nested.
@@ -1412,6 +1431,7 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 report_vpl011(&mut uart);
                 report_interrupt_mediation(&mut uart);
                 report_timer_handoff(&mut uart);
+                report_wfi_yield(&mut uart);
                 report_per_guest_state(&mut uart);
                 let _ = writeln!(
                     uart,
@@ -1605,6 +1625,124 @@ fn handle_vgic_access(
 
 /// `ESR_EL2.EC` for a **trapped MSR/MRS or System instruction** in AArch64 state.
 const EC_SYSREG: u64 = 0x18;
+
+/// `ESR_EL2.EC` for a **trapped `WFI`/`WFE`**; ISS bit 0 (`TI`) is 0 for `WFI`, 1 for `WFE`.
+const EC_WFX: u64 = 0x01;
+/// `HCR_EL2.TWI` (bit 13) — trap the guest's `WFI` to EL2.
+const HCR_EL2_TWI: u64 = 1 << 13;
+
+/// **Trap the guest's `WFI` (③-b2b-ii-c2 follow-up), because EL2 owns no clock of its own.**
+///
+/// Every re-entry to EL2 on this configuration is caused by the guest: a trap it takes, or the
+/// arch-timer PPI it programmed for itself. With ONE guest that is sound — a kernel that goes idle
+/// has, by construction, armed the timer it intends to be woken by, so EL2 comes back. With TWO it
+/// is not, and the failure is total: a guest switched in while idle sits in `wfi` waiting for an
+/// interrupt, EL2 gets no tick because the deadline it is waiting on is far away or absent, and the
+/// **peer never runs again**. Both guests are frozen and the machine is dead.
+///
+/// That was not a theory. It reached `main` (③-b2b-ii-c2, #118) and made the post-merge
+/// `real-linux boot (QEMU)` job time out; reproduced locally at **2 runs in 15**, both stopping
+/// immediately after a guest printed `########## poweroff ##########` with no `SYSTEM_OFF` ever
+/// arriving at EL2 — because the guest that owned the pCPU was not the one that had work to do.
+///
+/// `TWI` makes `wfi` a **voluntary yield**: the guest saying "I have nothing to do" becomes an exit
+/// EL2 can act on. It is set here rather than in [`gic::enable_el2`] because that function is shared
+/// with the synthetic path, which has one guest per phase and does not want the trap.
+/// Returns `HCR_EL2` **read back after the write**, which is the witness: see [`report_wfi_yield`]
+/// for why the trap cannot be witnessed by counting the traps it produces.
+fn trap_guest_wfi() -> u64 {
+    let hcr: u64;
+    // SAFETY: `HCR_EL2` is an EL2 control register; the read-modify-write adds `TWI` and preserves
+    // every other bit (`RW`, `VM`, `IMO`). `isb` so the trap is in force before the `eret`, and the
+    // final read is the register's own account of what took effect.
+    unsafe {
+        asm!(
+            "mrs {t}, hcr_el2",
+            "orr {t}, {t}, {twi}",
+            "msr hcr_el2, {t}",
+            "isb",
+            "mrs {t}, hcr_el2",
+            t = out(reg) hcr,
+            twi = in(reg) HCR_EL2_TWI,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    hcr
+}
+
+/// `HCR_EL2` as read back after [`trap_guest_wfi`] wrote it.
+static HCR_WITH_TWI: AtomicU64 = AtomicU64::new(0);
+
+/// Wait at EL2 for the physical interrupt the guest was waiting for.
+///
+/// Reached when a guest goes idle and **no peer is runnable** — there is nothing to switch to, so
+/// EL2 waits instead of returning to a guest that would immediately trap again (which would be a
+/// livelock, not a wait). `wfi` wakes on a pending physical interrupt regardless of `PSTATE.I`, so
+/// the guest's own arch-timer PPI brings EL2 back, and the `eret` then delivers it.
+fn wait_at_el2() {
+    // SAFETY: `wfi` is an unprivileged hint with no memory or register effect.
+    unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
+}
+
+/// How many `WFI`s each guest has yielded to EL2 on (③-b2b-ii-c2 follow-up).
+static WFI_TRAPS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+/// How many of those handed the pCPU to a peer that had work to do.
+static WFI_YIELDS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// **A guest went idle — give the pCPU to someone who can use it.**
+///
+/// The whole point of trapping `wfi`: see [`trap_guest_wfi`] for what happens without this.
+///
+/// [`next_runnable`] is consulted **before** `SchedPreempt`, and that is deliberate — while this
+/// guest is still `Running` the model reports it as such, so the only slot that can come back is a
+/// genuine *peer*. (The preemption path calls it after, where falling back to self is what it
+/// wants.) `None` therefore means "nobody else can use the CPU", and the honest answer to that is to
+/// wait, not to hand it back to a guest that has just said it has nothing to do.
+fn handle_linux_wfi(frame: &mut LinuxFrame) {
+    let cur = current_slot();
+    WFI_TRAPS[cur].fetch_add(1, Ordering::Relaxed);
+
+    // A trapped `WFI`'s preferred return is the `WFI` ITSELF. Advance FIRST: this edits the live
+    // `ELR_EL2`, which still belongs to the OUTGOING guest — doing it after the switch would move
+    // the *incoming* guest's resume point by one instruction.
+    crate::guest::advance_elr_past_fault();
+
+    let Some(mut cell) = crate::guest::GUEST_HV.try_borrow_mut() else {
+        wait_at_el2();
+        return;
+    };
+    let Some(hv) = cell.as_mut() else {
+        wait_at_el2();
+        return;
+    };
+    let Some(peer) = next_runnable(hv, cur) else {
+        drop(cell);
+        wait_at_el2();
+        return;
+    };
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    sched_on(
+        hv,
+        slot_dom(cur),
+        HvCall::SchedPreempt {
+            vcpu: LINUX_VCPU,
+            now,
+        },
+        "preempt an idle vcpu",
+    );
+    sched_on(
+        hv,
+        slot_dom(peer),
+        scheduler_run(now),
+        "run the peer an idle vcpu yielded to",
+    );
+    drop(cell);
+    WFI_YIELDS[cur].fetch_add(1, Ordering::Relaxed);
+    switch_context(cur, peer, Handover::Yield, frame);
+}
 
 /// The `ICC_SGI1R_EL1` system-register encoding as it appears in an `EC=0x18` ISS: `Op0=3, Op1=0,
 /// CRn=12, CRm=11, Op2=5`, direction = write. Matched as one packed value rather than six field
@@ -2026,6 +2164,53 @@ fn report_timer_handoff(uart: &mut Pl011) {
     }
 }
 
+/// **The witness for the `WFI` yield**, and it is a READ-BACK rather than a count.
+///
+/// **The obvious witness is wrong, and it was wrong in the shape this arc keeps hitting.** Counting
+/// trapped `WFI`s asserts something about the GUESTS' timing, not about the mechanism: with two
+/// kernels sharing one pCPU each is permanently behind on work, so a boot in which neither ever goes
+/// idle is a perfectly good boot with a count of zero. Measured — a run of this gate produced
+/// exactly that, and an earlier version of this function refused it.
+///
+/// So the assertion is the STRUCTURAL half: `HCR_EL2` read back after the write, showing `TWI`
+/// really took effect. That is true on every boot, cannot be satisfied by luck, and is what actually
+/// determines whether an idle guest can freeze the machine. The counts are reported beside it as the
+/// behavioural half, and deliberately NOT asserted.
+///
+/// **Declared residue.** `TWI` closes the case that bit — a guest sitting in `wfi`. It does not make
+/// EL2's re-entry unconditional: EL2 still owns no clock, so a guest that neither idles nor takes
+/// the tick it programmed would hold the pCPU. A running Linux always has a tick, which is why that
+/// case is not observed, but the honest closure is an EL2 timer (`CNTHP_*_EL2`, PPI 26) armed on
+/// every switch-in, which would make the guarantee structural instead of behavioural.
+fn report_wfi_yield(uart: &mut Pl011) {
+    let hcr = HCR_WITH_TWI.load(Ordering::Relaxed);
+    if hcr & HCR_EL2_TWI != 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: wfi OK: HCR_EL2.TWI is in force (HCR_EL2 read back as 0x{hcr:x}) — a guest \
+             that goes idle YIELDS the pCPU instead of holding it with no way for EL2 to take it \
+             back"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: wfi FAIL: HCR_EL2 read back as 0x{hcr:x} with TWI clear — an idle guest holds \
+             the pCPU and the machine freezes the first time one is switched in while idle"
+        );
+        crate::park();
+    }
+    for slot in 0..NUM_GUESTS {
+        let _ = writeln!(
+            uart,
+            "baleen: wfi: dom {} — {} WFIs trapped, {} of them yielded the pCPU to a peer (a count \
+             of zero is a boot in which that guest never went idle, not a fault)",
+            slot_dom(slot),
+            WFI_TRAPS[slot].load(Ordering::Relaxed),
+            WFI_YIELDS[slot].load(Ordering::Relaxed)
+        );
+    }
+}
+
 /// The per-guest counters, named by the mechanism that writes each one. One array, so the count in
 /// the report below is derived and a counter cannot be added without appearing there.
 const PER_GUEST_COUNTERS: [&str; 10] = [
@@ -2373,6 +2558,8 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     gic::enable_physical_cpu_interface_el2();
     gic::set_eoi_mode_split();
     gic::enable_el2();
+    // An idle guest must yield rather than freeze the machine — EL2 owns no clock of its own.
+    HCR_WITH_TWI.store(trap_guest_wfi(), Ordering::Relaxed);
 
     let _ = writeln!(
         uart,
