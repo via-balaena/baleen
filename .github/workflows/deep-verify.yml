@@ -70,14 +70,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      # `--test-threads=1` is for READABLE `--nocapture` output, not for correctness: the sweeps build
-      # their own `Hypervisor` per test and share nothing. So parallelising is a live option if this
-      # wall ever becomes the binding constraint — it would bound the job by the LONGEST test
-      # (12m20s) instead of the sum (32m52s). ⚠ Not done here, and the reason is recorded so nobody
-      # has to rediscover it: several sweeps carry `max_states: 3_000_000`, so running them
-      # concurrently risks exhausting the runner, and peak RSS has never been measured. Measure that
-      # before reaching for it — and note there is nothing to gain today, because this job is weekly
-      # and asynchronous.
+      # ⚠ RETRACTION (#125 got this wrong): an earlier version of this comment claimed
+      # `--test-threads=1` was "for readable `--nocapture` output, not for correctness", and that
+      # parallelising was "a live option". Both are false, and the refutation was already thirty
+      # lines above at the `exhaustive-sweeps:` job comment, which has said all along that each sweep
+      # **peaks at several GB and running them in parallel would OOM a 16 GB runner**. A rationale was
+      # invented for a flag that already had a documented one — exactly the second-derivation defect
+      # this repo keeps paying for. Read the surrounding file before explaining a line in it.
+      #
+      # So: serialization is a MEMORY constraint, and parallelising is not a lever — it is the thing
+      # the job comment already rules out. The makespan figure is kept only because it bounds what
+      # parallelism could ever buy if the memory ceiling were lifted (longest test 12m20s vs the
+      # 32m52s sum), NOT as a suggestion. There is nothing to gain regardless: this job is weekly and
+      # asynchronous, and it now completes in 68m20s against a 120-minute wall.
       - name: cargo test --release --ignored (deep sweeps)
         run: cargo test --release -p hv-sim -- --ignored --nocapture --test-threads=1
 
@@ -248,3 +253,99 @@ jobs:
             cargo fuzz cmin --fuzz-dir hv-fuzz --target x86_64-unknown-linux-gnu "$target"
             echo "::endgroup::"
           done
+
+  # ─── the backstop's own backstop ─────────────────────────────────────────────────────────────────
+  #
+  # Deep verification is schedule-only and NOT required, so a failure blocks no merge and pages no
+  # one. It was RED FOR TWO WEEKS (2026-07-27 → 2026-08-03) before anyone noticed, and it turned out
+  # to be broken in TWO independent ways — a fuzz-harness false positive (#124) and this file's own
+  # sweeps wall (#125), the second only visible once the first was fixed.
+  #
+  # ⚠ THE OBVIOUS FIX WAS ALREADY IN PLACE AND HAD ALREADY FAILED. `README.md` carries this
+  # workflow's badge at the top of the repo front page — the page most looked at — and it showed red
+  # the entire time. "Put the signal where it will be seen" is not untried; it is refuted. An
+  # always-present indicator habituates: green and red occupy the same pixels in the same place, and
+  # the eye stops resolving it.
+  #
+  # So this job does not add another indicator. It changes the ISSUE COUNT, 0 → 1 — a new element
+  # appearing on a page already loaded, rather than an existing one changing colour. Different visual
+  # channel, and it PERSISTS: an issue has state that outlives a missed glance, and answers "is there
+  # an open one?" instead of "did I see it three weeks ago?".
+  #
+  # Uses the preinstalled `gh` rather than an action, deliberately: no new third-party dependency to
+  # pin, audit or trust for a job whose whole purpose is to be trustworthy when everything else is red.
+  report-red:
+    name: report a red backstop
+    needs: [exhaustive-sweeps, kani, verus, fuzz]
+    # `cancelled` is caught alongside `failure` because that is exactly how this went wrong: the Kani
+    # job died as a CANCEL (an external runner kill mid-harness, no proof failing), and a condition
+    # matching only `failure()` would have stayed silent for the case that motivated this job.
+    # Parens are load-bearing — `&&` binds tighter than `||` in GitHub expressions.
+    if: always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Scoped HERE, not at the workflow level: a job-level block replaces the default outright, so the
+    # write scope exists for this job alone and every other job keeps `contents: read`.
+    permissions:
+      issues: write
+    steps:
+      - name: Harden the runner (audit egress)
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - name: open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          red=$(printf '%s' "$NEEDS_JSON" \
+            | jq -r 'to_entries[] | select(.value.result != "success") | "- `\(.key)` → **\(.value.result)**"')
+
+          # Belt AND braces. The `if:` above already keeps this job from running on an all-green run,
+          # but that is ONE condition standing between a green run and an issue titled "Deep
+          # verification is red" listing nothing. A reporter that cries wolf is the failure mode that
+          # kills reporters — 52 spurious issues a year and you stop reading them, which is the
+          # problem this job exists to solve. Caught by dry-running the script rather than by reading
+          # it: with every job green it happily composed the issue.
+          if [ -z "$red" ]; then
+            echo "no red jobs — nothing to report (the workflow-level \`if:\` should have prevented this)"
+            exit 0
+          fi
+
+          body=$(cat <<EOF
+          \`Deep verification\` finished with a red job on \`${GITHUB_SHA}\`.
+
+          $red
+
+          Run: $RUN_URL
+
+          ---
+          **Red here means "go look", not "something is broken".** Two of the three reds seen so far
+          were NOT defects: a fuzz harness reporting an out-of-domain state as a violation (#124), and
+          a runner killing the Kani job mid-harness with every completed proof passing. Read the log
+          before concluding — and note the Kani proofs are separately gated as a REQUIRED PR check, so
+          a red here is a coverage gap rather than an unverified diamond.
+
+          Close this once the run is understood; it will reopen on the next red rather than nag.
+          EOF
+          )
+
+          # The label may not exist yet, and `gh issue create --label` fails on an unknown one.
+          gh label create deep-verify-red --color B60205 \
+            --description "Deep verification finished red — read the run before concluding" \
+            >/dev/null 2>&1 || true
+
+          existing=$(gh issue list --label deep-verify-red --state open --limit 1 --json number \
+            --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            # Comment rather than open a second one: a weekly job that opens an issue per failure
+            # produces 52 a year and teaches you to ignore them, which is the original problem again.
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Deep verification is red" --label deep-verify-red --body "$body"
+          fi
