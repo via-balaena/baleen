@@ -571,6 +571,21 @@ const LINUX_MARKERS: &[&str] = &[
     // shared field is dom 2 — never dispatched, so every one of its counters must read zero, against
     // a dom 1 that made hundreds of GIC traps and thousands of console bytes on the same boot.
     "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are INDEXED, not shared —",
+    // ③-b2b-ii-c1: the ONE physical timer changes hands at every switch. Two counts, because the
+    // handoff has two halves and one of them is invisible to the other:
+    //
+    //   * `demoted N … across N switches (exactly one each)` — the outgoing vCPU's `HW=1` list
+    //     register becomes a purely virtual pending interrupt, since the physical line it claimed is
+    //     about to belong to someone else. An equality, not a tally: exactly one hardware-mapped LR
+    //     exists at a preemption point, so "some switches" and "all switches" are distinguishable.
+    //   * `the redistributor confirmed PPI 27 went Active -> Inactive all N times` — read back from
+    //     `GICR_ISACTIVER0`, i.e. the interrupt controller's own view rather than EL2's bookkeeping.
+    //
+    // The second exists because deleting the physical deactivate leaves the first perfectly green.
+    // PROBED: with it deleted, guest A reaches userspace, prints `poweroff`, and HANGS — the tick
+    // never comes again, and the tick is the only thing that re-enters EL2. That is the deadlock
+    // this rung exists to prevent, reproduced on the guest that exists today.
+    "baleen: handoff OK: the forwarded timer changes hands at every switch —",
     // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
     // rather than recomputed from the layout constants the emitter used (design-lesson #36).
     // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
@@ -610,6 +625,11 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // poison that makes it non-vacuous — was never exercised at all. A boot that is otherwise
     // perfect but never preempts proves nothing about the switch.
     "baleen: vcpu FAIL",
+    // ③-b2b-ii-c1: the timer handoff did not fire on every switch — either the outgoing vCPU's
+    // hardware-mapped list register was not demoted, or the redistributor did not agree the physical
+    // PPI went Inactive. Both are the same consequence: the one physical timer stays Active across a
+    // switch and the next guest can never be signalled it.
+    "baleen: handoff FAIL",
     // ③-b2b-ii-b: a guest's window does not hold what the loader was told to put there — no kernel
     // magic, a zero image_size, a non-relocatable Image, a kernel overrunning its DTB, or a missing
     // device tree / initramfs. The message names which guest and which of the six checks failed.

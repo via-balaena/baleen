@@ -75,6 +75,13 @@ const LR_STATE_PENDING: u64 = 0b01 << 62;
 /// the level, and EL2 gets no signal when that happens. `HW=1` is the hardware's answer: the guest's
 /// own EOI of the *virtual* interrupt deactivates the *physical* interrupt named by `pINTID`, with no
 /// EL2 involvement at all. This is how KVM forwards the arch timer, for the same reason.
+///
+/// **What the delegation costs, and where it is taken back (③-b2b-ii-c1).** "No EL2 involvement" is
+/// the point and also the limit: the mapping names *a* guest as the one who will end this physical
+/// interrupt, and there is one physical timer PPI on this machine. At a vCPU switch that guest stops
+/// running, so the promise stops being keepable — [`VgicCtx::release_hardware_mappings`] clears this
+/// bit on the outgoing context and EL2 does the deactivation itself
+/// ([`release_forwarded_timer`]).
 const LR_HW: u64 = 1 << 61;
 /// `ICH_LR<n>_EL2.pINTID`, bits [41:32] — the **physical** INTID a `HW=1` list register is mapped to.
 /// Ten bits, so it names INTIDs 0..=1023 (the SPI/PPI/SGI range); LPIs are out of its reach and out of
@@ -282,9 +289,15 @@ pub(crate) fn sgi1r_intid(value: u64) -> u32 {
 /// **Deactivate** a physical interrupt EL2 handled itself (`ICC_DIR_EL1`).
 ///
 /// Only meaningful with [`set_eoi_mode_split`] in effect: there, [`eoi_physical`] drops the running
-/// priority and this ends the interrupt's Active state. A *forwarded* interrupt never comes here —
-/// the guest's EOI deactivates it through [`LR_HW`] — so this is for the interrupts EL2 consumes or
-/// declines, where nobody else will ever do it and the entry would otherwise stay Active forever.
+/// priority and this ends the interrupt's Active state. So this is for the interrupts EL2 consumes
+/// or declines, where nobody else will ever do it and the entry would otherwise stay Active forever.
+///
+/// **This doc used to say "a *forwarded* interrupt never comes here — the guest's EOI deactivates it
+/// through [`LR_HW`]", and ③-b2b-ii-c1 made that false.** It was true of a machine with one guest,
+/// and it is exactly the assumption a second guest breaks: `HW=1` delegates deactivation to *a*
+/// guest, and at a switch the line stops belonging to the guest it was delegated to. So a forwarded
+/// interrupt does come here now, from [`release_forwarded_timer`], once per switch — recorded rather
+/// than quietly edited, because the sentence was not wrong when it was written.
 #[cfg(feature = "real-linux")]
 pub(crate) fn deactivate_physical(intid: u32) {
     // SAFETY: `ICC_DIR_EL1` at EL2 is the physical CPU interface's deactivate register; writing an
@@ -292,6 +305,91 @@ pub(crate) fn deactivate_physical(intid: u32) {
     unsafe {
         asm!("msr ICC_DIR_EL1, {i}", i = in(reg) intid as u64, options(nomem, nostack, preserves_flags));
     }
+}
+
+/// **Hand the forwarded physical timer back, so it can be given to a different vCPU**
+/// (③-b2b-ii-c1).
+///
+/// ## What this is fixing, MEASURED rather than argued
+///
+/// Instrumenting the redistributor at the preemption point on the shipped boot found, identically
+/// at every switch: **PPI 27 `active=1 pending=1 enabled=1`**, with the running guest holding
+/// `LR0 = 0x7080001b0000001b` — State `Pending`, `HW=1`, `pINTID=27`, and *not yet taken by the
+/// guest*. So at the instant a switch would install a peer's context:
+///
+/// * the physical timer is **Active**, and the GIC will not signal an Active interrupt to anyone;
+/// * it is also **Pending** — the level is high and already re-latched;
+/// * and the interrupt that would eventually deactivate it belongs to the vCPU going away.
+///
+/// A second guest switched in there could therefore **never be signalled the tick** — and the tick
+/// is the only thing that re-enters EL2 on this configuration, so it is a hard hang of the machine,
+/// not a degraded case. [`deactivate_physical`]'s own doc records the assumption that dies here: *"a
+/// forwarded interrupt never comes here — the guest's EOI deactivates it through `LR_HW`"*. True
+/// with one guest; false the moment the line changes hands.
+///
+/// ## The order is load-bearing, and the `pending=1` half is why
+///
+/// **Disable, then deactivate.** The arch timer's PPI is level-triggered and its level is still
+/// high; deactivating while enabled would have the GIC re-assert immediately and storm EL2 — which
+/// is the same reason [`crate::linux`]'s masked-guest path already disables before completing.
+///
+/// And this must run **after** the outgoing context is saved but the re-enable must run **after the
+/// incoming one is restored**, because `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` are per-vCPU context: only
+/// once they are the incoming guest's does the level mean anything about the incoming guest. That is
+/// why the re-arm is not folded in here — see [`crate::linux`]'s switch.
+/// ## What it returns, and why it is a READ-BACK rather than a claim
+///
+/// `true` iff the redistributor agreed: the PPI was **Active** on entry and is **Inactive** on
+/// return. That is the difference between "EL2 wrote `ICC_DIR_EL1`" and "the interrupt controller
+/// ended the interrupt", and only the second one is what a second guest needs — the same distinction
+/// III-1 drew when it read `GICR_ISPENDR0` instead of trusting that setting `UIE` had produced a
+/// maintenance interrupt.
+///
+/// It matters here because the caller's other witness cannot see this half at all: demoting the list
+/// register is EL2 editing its own saved bytes, and it would go on succeeding with the physical
+/// deactivate deleted entirely.
+///
+/// ## The kill probe, and what it demonstrated
+///
+/// Deleting the `deactivate_physical` below — keeping the list-register demotion, so the counter
+/// that watches *that* half stayed perfectly green — **hangs guest A**. The boot reaches userspace,
+/// prints its markers, prints `########## poweroff ##########`, and then stops: `poweroff -f` needs
+/// the kernel to make progress, the kernel needs its tick, and the tick never comes again because
+/// the physical PPI is Active and the demoted list register no longer deactivates it.
+///
+/// That is the deadlock this rung exists to prevent, reproduced on the guest that exists **today**,
+/// a rung before the second one could be hurt by it. It is also why the pair of witnesses is a pair:
+/// with the list-register half alone, this deletion is invisible.
+#[cfg(feature = "real-linux")]
+#[must_use]
+pub(crate) fn release_forwarded_timer() -> bool {
+    let was_active = ppi_is_active(VTIMER_INTID);
+    set_ppi_enabled(VTIMER_INTID, false);
+    deactivate_physical(VTIMER_INTID);
+    // `ICC_DIR_EL1` is a system-register write and the read-back below is device MMIO; without a
+    // barrier the load may be observed before the deactivate takes effect, which would report a
+    // failure that did not happen.
+    // SAFETY: `dsb`/`isb` are unprivileged barriers with no memory or register effect.
+    unsafe {
+        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+    was_active && !ppi_is_active(VTIMER_INTID)
+}
+
+/// Whether `intid` is **Active** at this CPU's redistributor (`GICR_ISACTIVER0`), read without
+/// disturbing it.
+///
+/// Reading the *controller's* view rather than EL2's bookkeeping is the whole point: what stops a
+/// second guest being signalled the timer is the GIC's Active state, so that is the thing to ask.
+#[cfg(feature = "real-linux")]
+fn ppi_is_active(intid: u32) -> bool {
+    if intid >= 32 {
+        return false;
+    }
+    // SAFETY: `GICR_ISACTIVER0` is a documented redistributor register in the SGI/PPI frame — device
+    // memory on the `virt` machine, addressed directly at EL2 (MMU off). Read-only here; aliases no
+    // Rust memory.
+    unsafe { core::ptr::read_volatile((GICR_SGI_BASE + 0x0300) as *const u32) & (1 << intid) != 0 }
 }
 
 /// Enable or disable a **physical** SGI/PPI at this CPU's redistributor (`GICR_ISENABLER0` /
@@ -542,6 +640,49 @@ impl VgicCtx {
         }
         // SAFETY: forwarded from this function's contract.
         unsafe { write_vmcr(self.vmcr) };
+    }
+
+    /// **Strip the hardware mapping from every saved list register**, returning how many were
+    /// converted (③-b2b-ii-c1).
+    ///
+    /// **Why a forwarded interrupt cannot cross a switch as a forwarded interrupt.** `HW=1` is a
+    /// promise about a *physical* interrupt: the guest's EOI of this virtual one will deactivate
+    /// `pINTID`. There is one physical timer PPI on this machine and it is about to belong to a
+    /// different vCPU, so the promise stops being true the moment the switch happens — and honouring
+    /// it later would have the *incoming* guest's EOI deactivate an interrupt the *outgoing* one was
+    /// given. EL2 therefore deactivates the physical interrupt itself
+    /// ([`release_forwarded_timer`]) and demotes what it saved to a purely virtual pending
+    /// interrupt, which is exactly what it now is: something the guest still has to take and end,
+    /// with nothing physical hanging off it.
+    ///
+    /// The outgoing guest loses nothing. Its interrupt is still pending in its own bank at its own
+    /// priority; when it is resumed, its still-expired `CNTV_CVAL_EL0` re-asserts the level and EL2
+    /// forwards a fresh one. What it gives up is ownership of a line it is not running on.
+    ///
+    /// **The `pINTID` field is cleared, not left behind.** With `HW=0` those bits are not a spare
+    /// copy of the physical INTID: bit 41 becomes `EOI` (request a maintenance interrupt when the
+    /// guest ends this interrupt) and bits 40:32 are RES0. Leaving `27` there would write a nonzero
+    /// RES0 field, and for a wider INTID would arm a maintenance interrupt nobody handles — the same
+    /// class of error as poisoning a list register with `0xDEAD_BEEF` (see [`Self::poison`]).
+    #[cfg(feature = "real-linux")]
+    pub(crate) fn release_hardware_mappings(&mut self) -> u64 {
+        const PINTID_FIELD: u64 = ((1 << LR_PINTID_BITS) - 1) << LR_PINTID_SHIFT;
+        let n = num_list_registers();
+        let mut released = 0;
+        for lr in self.lr.iter_mut().take(n) {
+            // **`lr_is_free` first, and it is not an optimization.** An Invalid list register is not
+            // a zeroed one: `place` overwrites a free slot wholesale when it reuses it, so a
+            // COMPLETED injection leaves its `HW` bit and `pINTID` behind until then. Measured — at
+            // every switch after the first, the bank reads `LR0=0x7080001b…` (Pending, HW=1) and
+            // `LR1=0x3080001b…`, whose State field is `0b00`. Demoting the second is inert, because
+            // an Invalid LR is neither presented to the guest nor matched by its EOI; what it
+            // destroys is the WITNESS, which claims exactly one demotion per switch and got two.
+            if !lr_is_free(*lr) && *lr & LR_HW != 0 {
+                *lr &= !(LR_HW | PINTID_FIELD);
+                released += 1;
+            }
+        }
+        released
     }
 
     /// Clobber the live vGIC state, so a restore that misses part of it cannot go unnoticed.
