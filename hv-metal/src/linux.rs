@@ -213,30 +213,82 @@ fn current_slot() -> usize {
 
 use crate::stage2::{LINUX_RAM_BASE as GUEST_RAM_BASE, LINUX_RAM_END as GUEST_RAM_END};
 
-/// Kernel `Image` load address — the base of guest RAM, per the arm64 boot protocol. `ELR_EL2` entry.
+/// Guest A's kernel `Image` load address — the base of guest RAM, per the arm64 boot protocol, and
+/// what `ELR_EL2` is set to. Every other guest's is [`kernel_entry`].
 const KERNEL_ENTRY: u64 = GUEST_RAM_BASE;
-/// Flattened device tree (DTB) load address — handed to the kernel in `x0`. The one address here
-/// with no authoritative source under the fence: it names a spot inside guest RAM that xtask's
-/// `-device loader` writes to, so it is asserted at run time (see the note above) rather than
-/// derived.
+/// Guest A's flattened device tree (DTB) load address — handed to the kernel in `x0`.
 const DTB_ADDR: u64 = 0x4b00_0000;
-
-/// The kernel and the DTB must land inside the RUNNING guest's half of the window (③-b2a).
+/// Guest A's initramfs load address — named in its DTB's `/chosen` `linux,initrd-*`.
 ///
-/// `KERNEL_ENTRY` is `LINUX_RAM_BASE` by derivation so it is safe by construction, but `DTB_ADDR` is
-/// a bare literal — the one address here with no authoritative source under the fence. Before the
-/// split it only had to be inside a 896 MiB window and could not plausibly fall out; now it has to
-/// be inside a 448 MiB one, and a further split would put it in the PEER's half, where the kernel
-/// would be handed a pointer its own Stage-2 cannot translate. That failure looks like a kernel that
-/// dies before its first console byte, with nothing naming the cause. True or the build fails (#97).
+/// **The kernel never learns this from us**, so before ③-b2b-ii-b hv-metal had no reason to know it
+/// and did not. It is here because [`report_loaded_images`] reads the bytes at this address to
+/// witness that the loader actually deposited a second guest's payload, and a witness that took the
+/// address on faith would be checking a place instead of a thing.
+const INITRD_ADDR: u64 = 0x4c00_0000;
+
+/// The base of guest `slot`'s RAM window — the address its `Image` loads at and the base its DTB's
+/// `/memory` node advertises. Derived from which model frames the guest owns, so it cannot disagree
+/// with what the emitter maps for it.
+const fn guest_ram_base(slot: usize) -> u64 {
+    stage2::LINUX_RAM_BASE + first_frame(slot) as u64 * stage2::SUP_FRAME_BYTES
+}
+
+/// How far guest `slot`'s window sits above guest A's. **This is the whole of ③-b2b-ii-b's address
+/// arithmetic**: the second kernel needed no new address agreed with anyone, because all three of
+/// its blobs are guest A's plus this one delta — which is itself a consequence of the ③-b2a split,
+/// not a new constant.
+const fn window_delta(slot: usize) -> u64 {
+    guest_ram_base(slot) - guest_ram_base(SLOT_A)
+}
+
+/// Guest `slot`'s kernel `Image` load address, i.e. where its `eret` enters.
+const fn kernel_entry(slot: usize) -> u64 {
+    KERNEL_ENTRY + window_delta(slot)
+}
+/// Guest `slot`'s DTB address, i.e. what its `x0` points at.
+const fn dtb_addr(slot: usize) -> u64 {
+    DTB_ADDR + window_delta(slot)
+}
+/// Guest `slot`'s initramfs address, i.e. what its DTB's `/chosen` names.
+const fn initrd_addr(slot: usize) -> u64 {
+    INITRD_ADDR + window_delta(slot)
+}
+
+/// **Every guest's three blobs must land inside that guest's own half of the window**, and the
+/// kernel must not overrun the DTB sitting above it.
+///
+/// ③-b2a made the first half of this a `const assert!` for the RUNNING guest only, on the reasoning
+/// that `KERNEL_ENTRY` is derived and safe while `DTB_ADDR` is a bare literal that a further split
+/// could push into the peer's half — where the kernel would be handed a pointer its own Stage-2
+/// cannot translate, and would die before its first console byte with nothing naming the cause.
+/// ③-b2b-ii-b generalizes it to every guest, because there is now more than one to get wrong.
+///
+/// The `image_size` clause is new and was never checked anywhere: the DTB sits 48 MiB above the
+/// kernel base and the shipped `Image` is 34.4 MiB, so a kernel that grew past that margin would
+/// have the DTB written into the middle of itself. That is a runtime check ([`report_loaded_images`])
+/// rather than a `const assert!`, because only the loaded image knows its own size.
+const fn every_blob_is_inside_its_guest() -> bool {
+    let mut slot = 0;
+    while slot < NUM_GUESTS {
+        let base = guest_ram_base(slot);
+        let end = base + stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES;
+        if kernel_entry(slot) < base || kernel_entry(slot) >= end {
+            return false;
+        }
+        if dtb_addr(slot) < base || dtb_addr(slot) >= end {
+            return false;
+        }
+        if initrd_addr(slot) < base || initrd_addr(slot) >= end {
+            return false;
+        }
+        slot += 1;
+    }
+    true
+}
 const _: () = assert!(
-    KERNEL_ENTRY >= stage2::LINUX_RAM_BASE && KERNEL_ENTRY < stage2::LINUX_RAM_SPLIT,
-    "the kernel image must load inside the running guest's half of the window"
-);
-const _: () = assert!(
-    DTB_ADDR >= stage2::LINUX_RAM_BASE && DTB_ADDR < stage2::LINUX_RAM_SPLIT,
-    "the DTB must load inside the running guest's half of the window — a DTB in the peer's half is \
-     a pointer the guest's Stage-2 cannot translate"
+    every_blob_is_inside_its_guest(),
+    "every guest's Image, DTB and initramfs must load inside that guest's own half of the window — \
+     a blob in the peer's half is a pointer the guest's Stage-2 cannot translate"
 );
 
 // The Stage-2 descriptor encodings, the device window and the translation regime used to be declared
@@ -1481,6 +1533,132 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
     }
 }
 
+// ─── ③-b2b-ii-b: what the loader actually deposited ──────────────────────────────────────────────
+
+/// arm64 `Image` header, from `Documentation/arch/arm64/booting.rst`: `image_size` at +16, `flags`
+/// at +24, and the `ARM\x64` magic at +56.
+const IMAGE_SIZE_OFF: u64 = 16;
+const IMAGE_FLAGS_OFF: u64 = 24;
+const IMAGE_MAGIC_OFF: u64 = 56;
+/// `"ARM\x64"` as the little-endian `u32` the header stores.
+const IMAGE_MAGIC: u32 = 0x644d_5241;
+/// `flags` bit 3: **1 = the 2 MiB-aligned base may be ANYWHERE in physical memory.**
+///
+/// **This is the single fact the whole arc rests on.** The second kernel needs no second build only
+/// because the shipped `Image` is fully relocatable, so the same file boots at `0x6400_0000`. That
+/// was measured off the header rather than assumed — and asserting it here means an Alpine bump that
+/// silently lost the property fails at this line, naming it, instead of hanging guest B at its first
+/// instruction with nothing to go on.
+const IMAGE_FLAG_RELOCATABLE: u64 = 1 << 3;
+/// The flattened-device-tree magic, stored big-endian at offset 0.
+const DTB_MAGIC: u32 = 0xd00d_feed;
+/// gzip's `1f 8b`, as the little-endian `u16` a read at the initramfs base returns.
+const GZIP_MAGIC: u16 = 0x8b1f;
+
+/// Read a `u16`/`u32`/`u64` of **physical** memory from EL2.
+///
+/// Safe functions, not `unsafe` ones, and the reason is the same argument `crate::pl011` makes for
+/// its MMIO: the precondition is a property of *this* configuration, not of the caller. EL2 runs
+/// MMU-off and identity-mapped throughout, and every caller here reads inside the guest-RAM window —
+/// bounded above by [`every_blob_is_inside_its_guest`] at compile time and by xtask's loader guard
+/// against the `-m` size. A `pa` outside DRAM would be the bug, and no caller can name one.
+mod peek {
+    pub(super) fn u16_at(pa: u64) -> u16 {
+        // SAFETY: an identity-mapped DRAM address inside the guest-RAM window (see the module
+        // docs). Read-only, volatile, and aliasing no Rust memory — the window is loader-owned
+        // bytes, never a Rust allocation.
+        unsafe { core::ptr::read_volatile(pa as *const u16) }
+    }
+    pub(super) fn u32_at(pa: u64) -> u32 {
+        // SAFETY: as [`u16_at`]; the address is 4-byte aligned at every call site (header offsets
+        // 0 and 56 off a 2 MiB-aligned base).
+        unsafe { core::ptr::read_volatile(pa as *const u32) }
+    }
+    pub(super) fn u64_at(pa: u64) -> u64 {
+        // SAFETY: as [`u16_at`]; the address is 8-byte aligned at every call site (header offsets
+        // 16 and 24 off a 2 MiB-aligned base).
+        unsafe { core::ptr::read_volatile(pa as *const u64) }
+    }
+}
+
+/// **③-b2b-ii-b's witness: every guest's window really holds a loaded, bootable payload.**
+///
+/// **Why this is not decoration.** Guest B's blobs are deposited by three `-device loader` entries
+/// in a crate that cannot depend on `hv-metal`, at addresses agreed only by arithmetic on both
+/// sides. Nothing in the existing gate can see them: B does not run, so a boot in which QEMU wrote
+/// B's `Image` to the wrong address, or did not write it at all, is byte-for-byte the boot in which
+/// it did. The first symptom would arrive a whole rung later, as guest B executing whatever happens
+/// to be at `0x6400_0000` — which is zeroes, i.e. a hang with no cause on the console.
+///
+/// So EL2 reads the bytes. The `ARM\x64` magic, the DTB's `d00dfeed` and gzip's `1f 8b` are there
+/// only because the loader put them there; they cannot be produced by hv-metal, by the emitter, or
+/// by guest A.
+///
+/// **It checks BOTH guests, and that is what makes it self-instrumenting.** Guest A's payload is
+/// known-good — it boots on every run of this gate — so A's line passing while B's fails says the
+/// check is right and the load is wrong, which is the one thing a peer-only check could not tell
+/// you (design-lesson #118).
+///
+/// It also lands three assertions nothing made before: that the image is **relocatable**
+/// ([`IMAGE_FLAG_RELOCATABLE`]), that `image_size` is non-zero, and that the kernel does not overrun
+/// the **DTB** sitting 48 MiB above it — a margin the shipped 34.4 MiB `Image` fits with room to
+/// spare, and which nothing would have noticed it outgrowing.
+fn report_loaded_images(uart: &mut Pl011) {
+    for slot in 0..NUM_GUESTS {
+        let (dom, kernel, dtb, initrd) = (
+            slot_dom(slot),
+            kernel_entry(slot),
+            dtb_addr(slot),
+            initrd_addr(slot),
+        );
+        let magic = peek::u32_at(kernel + IMAGE_MAGIC_OFF);
+        let size = peek::u64_at(kernel + IMAGE_SIZE_OFF);
+        let flags = peek::u64_at(kernel + IMAGE_FLAGS_OFF);
+        let dtb_magic = u32::from_be(peek::u32_at(dtb));
+        let gzip = peek::u16_at(initrd);
+
+        let bad = if magic != IMAGE_MAGIC {
+            Some("the Image magic 'ARM\\x64' is absent — no kernel was loaded at this address")
+        } else if size == 0 {
+            Some("the Image header reports a zero image_size")
+        } else if flags & IMAGE_FLAG_RELOCATABLE == 0 {
+            Some(
+                "the Image is NOT relocatable (flags bit 3 clear) — this build boots the same file \
+                 at two different bases, which only a relocatable kernel permits",
+            )
+        } else if kernel + size > dtb {
+            Some("the Image overruns the DTB loaded above it")
+        } else if dtb_magic != DTB_MAGIC {
+            Some("the DTB magic 0xd00dfeed is absent — no device tree was loaded at this address")
+        } else if gzip != GZIP_MAGIC {
+            Some("the initramfs gzip magic 0x1f8b is absent — no initramfs was loaded here")
+        } else {
+            None
+        };
+
+        match bad {
+            None => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: guestimage OK: dom {dom} — Image 'ARM\\x64' {} MiB, relocatable, at \
+                     0x{kernel:08x}; DTB 0xd00dfeed at 0x{dtb:08x}; gzip initramfs at \
+                     0x{initrd:08x} (read from EL2 before any guest ran)",
+                    size / (1024 * 1024)
+                );
+            }
+            Some(why) => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: guestimage FAIL: dom {dom} at 0x{kernel:08x}: {why} (Image magic \
+                     0x{magic:08x}, size 0x{size:x}, flags 0x{flags:x}, DTB magic \
+                     0x{dtb_magic:08x}, initramfs magic 0x{gzip:04x})"
+                );
+                crate::park();
+            }
+        }
+    }
+}
+
 /// Put every guest's unterminated console line on the wire.
 ///
 /// Called from [`crate::park`] — a guest that dies mid-line would otherwise take its last fragment
@@ -1671,6 +1849,11 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
          peer dom {GUEST_B} owns 0x{split:08x}..0x{GUEST_RAM_END:08x})",
         split = stage2::LINUX_RAM_SPLIT
     );
+
+    // ③-b2b-ii-b — BEFORE anything else, read what the loader actually deposited. Every guest's
+    // payload, not only the peer's: guest A's is known-good, so A passing while B fails says the
+    // check is right and the load is wrong.
+    report_loaded_images(uart);
 
     // Build the guest's model and emit its Stage-2 through the PROVEN emitter (M5 Arc 6b).
     *crate::guest::GUEST_HV.borrow_mut() = Some(crate::build_hypervisor());
