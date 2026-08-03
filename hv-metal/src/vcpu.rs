@@ -233,7 +233,7 @@ const POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 ///
 /// ⚠ It is a NAME list, not the obligation. Nothing here forces it to agree with the struct — that
 /// job belongs to the destructurings, which the compiler checks. Kept short and adjacent for that
-/// reason: a reviewer comparing three lines against three fields is a check this file can afford,
+/// reason: a reviewer comparing four names against four fields is a check this file can afford,
 /// where three *traversals* against four fields was not.
 pub(crate) const CTX_COMPONENTS: [&str; 4] = ["gprs", "sysregs", "vgic", "fp"];
 
@@ -354,7 +354,6 @@ impl VcpuCtx {
     }
 
     /// Capture the live vCPU state into this context.
-    /// Capture the live vCPU state into this context.
     ///
     /// **⑰-a: the destructuring is the mechanism, not style.** No `..`, so adding a field to
     /// [`VcpuCtx`] fails to compile here with E0027 — and binding one without acting on it is
@@ -417,33 +416,33 @@ impl VcpuCtx {
     }
 }
 
-/// Clobber every component of the live vCPU state, so a restore that misses one cannot go unnoticed.
-///
-/// **This is the rung's instrument, not a debugging aid.** Without it a switch-to-self proves
-/// nothing: see the module docs. It runs between [`VcpuCtx::save`] and [`VcpuCtx::restore`], while
-/// the machine is at EL2 and no EL1 state is live.
-///
-/// ## ⑰-a — why this became a method on a context it does not read
-///
-/// It was a free function, and that is exactly why the FP register file could be absent from it for
-/// six arcs without anyone noticing. `&self` is a **type witness**: it lets the body destructure
-/// `Self` exhaustively, which puts poisoning under the same E0027 obligation as `save` and
-/// `restore`. A free function cannot be driven from a destructuring, so a forgotten component there
-/// degrades from a hard error to nothing at all.
-///
-/// `x: _` is the other half of the statement. The GPR array is deliberately NOT poisoned — the trap
-/// frame is overwritten wholesale by the restore, so there is no partial-restore failure for a
-/// poison to expose — and binding it to `_` says that on purpose, in a place a reviewer must look.
-///
-/// Each component brings its own poison VALUE rather than inheriting [`POISON`], because a poison
-/// belongs to the state kind it clobbers (design-lesson #126): a garbage list-register encoding is
-/// architecturally UNPREDICTABLE, and `FPCR`/`FPSR` need valid-but-hostile encodings, while
-/// `v0..v31` and the EL1 system registers take the blanket pattern.
-///
-/// # Safety
-/// The caller must be at EL2 with a saved context in hand, and must restore before returning to EL1.
-/// Between this call and that restore the guest's entire EL1 configuration is garbage.
 impl VcpuCtx {
+    /// Clobber every component of the live vCPU state, so a restore that misses one cannot go unnoticed.
+    ///
+    /// **This is the rung's instrument, not a debugging aid.** Without it a switch-to-self proves
+    /// nothing: see the module docs. It runs between [`VcpuCtx::save`] and [`VcpuCtx::restore`], while
+    /// the machine is at EL2 and no EL1 state is live.
+    ///
+    /// ## ⑰-a — why this became a method on a context it does not read
+    ///
+    /// It was a free function, and that is exactly why the FP register file could be absent from it for
+    /// six arcs without anyone noticing. `&self` is a **type witness**: it lets the body destructure
+    /// `Self` exhaustively, which puts poisoning under the same E0027 obligation as `save` and
+    /// `restore`. A free function cannot be driven from a destructuring, so a forgotten component there
+    /// degrades from a hard error to nothing at all.
+    ///
+    /// `x: _` is the other half of the statement. The GPR array is deliberately NOT poisoned — the trap
+    /// frame is overwritten wholesale by the restore, so there is no partial-restore failure for a
+    /// poison to expose — and binding it to `_` says that on purpose, in a place a reviewer must look.
+    ///
+    /// Each component brings its own poison VALUE rather than inheriting [`POISON`], because a poison
+    /// belongs to the state kind it clobbers (design-lesson #126): a garbage list-register encoding is
+    /// architecturally UNPREDICTABLE, and `FPCR`/`FPSR` need valid-but-hostile encodings, while
+    /// `v0..v31` and the EL1 system registers take the blanket pattern.
+    ///
+    /// # Safety
+    /// The caller must be at EL2 with a saved context in hand, and must restore before returning to EL1.
+    /// Between this call and that restore the guest's entire EL1 configuration is garbage.
     pub(crate) unsafe fn poison(&self) {
         let Self {
             x: _,

@@ -69,6 +69,11 @@
 
 use core::arch::asm;
 
+// Only `poison` calls a trait method by name, and it is `real-linux`-gated; the `impl` below names
+// the trait by path and needs no import.
+#[cfg(feature = "real-linux")]
+use crate::ctx::CtxComponent;
+
 /// `CPTR_EL2.TFP` — bit 10. `1` traps FP/SIMD access **at EL2 as well as below it**.
 const CPTR_EL2_TFP: u64 = 1 << 10;
 
@@ -151,88 +156,6 @@ impl FpCtx {
         fpcr: 0,
         fpsr: 0,
     };
-
-    /// Capture the live FP register file into this context. See the [`crate::ctx::CtxComponent`]
-    /// impl below, which is what obliges a switch to call it.
-    pub(crate) fn save_live(&mut self) {
-        let p = core::ptr::addr_of_mut!(self.v) as *mut u64;
-        // SAFETY: `p` points at 512 aligned, owned bytes (`v`, pinned at offset 0 by the `const _`
-        // above). The `stp` pairs write exactly that range. `fpcr`/`fpsr` are readable at EL2 —
-        // `CPTR_EL2.TFP` is left clear, which is what lets EL2 touch the register file at all.
-        unsafe {
-            asm!(
-                // `hv-metal` builds for `aarch64-unknown-none-softfloat`, which disables `fp-armv8`
-                // and makes the integrated assembler REJECT `q`-register instructions. That is the
-                // right default for EL2 — it must not compute in floating point — but saving a
-                // guest's register file is not computing in it: these are 128-bit MOVES, exactly as
-                // KVM does them. So the extension is re-enabled for this block only. ⚠ `cargo xtask
-                // metal-lint` does NOT catch a mistake here: clippy never runs the assembler on
-                // inline asm, so this file passed all five lint configs while failing to build.
-                ".arch_extension fp",
-                "stp q0,  q1,  [{p}, #0]",
-                "stp q2,  q3,  [{p}, #32]",
-                "stp q4,  q5,  [{p}, #64]",
-                "stp q6,  q7,  [{p}, #96]",
-                "stp q8,  q9,  [{p}, #128]",
-                "stp q10, q11, [{p}, #160]",
-                "stp q12, q13, [{p}, #192]",
-                "stp q14, q15, [{p}, #224]",
-                "stp q16, q17, [{p}, #256]",
-                "stp q18, q19, [{p}, #288]",
-                "stp q20, q21, [{p}, #320]",
-                "stp q22, q23, [{p}, #352]",
-                "stp q24, q25, [{p}, #384]",
-                "stp q26, q27, [{p}, #416]",
-                "stp q28, q29, [{p}, #448]",
-                "stp q30, q31, [{p}, #480]",
-                p = in(reg) p,
-                options(nostack, preserves_flags),
-            );
-            // `.arch_extension fp` again: `FPCR`/`FPSR` are gated by the same feature as the `q`
-            // registers, so a softfloat build rejects even reading them.
-            asm!(".arch_extension fp", "mrs {c}, fpcr", "mrs {s}, fpsr",
-                 c = out(reg) self.fpcr, s = out(reg) self.fpsr,
-                 options(nomem, nostack, preserves_flags));
-        }
-    }
-
-    /// Write this context back onto the live CPU.
-    ///
-    /// # Safety
-    /// The caller must be at EL2 with the outgoing context already saved; between a [`poison`] and
-    /// this call the register file belongs to nobody.
-    pub(crate) unsafe fn restore_live(&self) {
-        let p = core::ptr::addr_of!(self.v) as *const u64;
-        // SAFETY: forwarded from this function's contract; `p` covers the same 512 aligned bytes
-        // `save` wrote, and the `ldp` pairs read exactly that range.
-        unsafe {
-            asm!(
-                // See `save` for why the extension is re-enabled here.
-                ".arch_extension fp",
-                "ldp q0,  q1,  [{p}, #0]",
-                "ldp q2,  q3,  [{p}, #32]",
-                "ldp q4,  q5,  [{p}, #64]",
-                "ldp q6,  q7,  [{p}, #96]",
-                "ldp q8,  q9,  [{p}, #128]",
-                "ldp q10, q11, [{p}, #160]",
-                "ldp q12, q13, [{p}, #192]",
-                "ldp q14, q15, [{p}, #224]",
-                "ldp q16, q17, [{p}, #256]",
-                "ldp q18, q19, [{p}, #288]",
-                "ldp q20, q21, [{p}, #320]",
-                "ldp q22, q23, [{p}, #352]",
-                "ldp q24, q25, [{p}, #384]",
-                "ldp q26, q27, [{p}, #416]",
-                "ldp q28, q29, [{p}, #448]",
-                "ldp q30, q31, [{p}, #480]",
-                p = in(reg) p,
-                options(readonly, nostack, preserves_flags),
-            );
-            asm!(".arch_extension fp", "msr fpcr, {c}", "msr fpsr, {s}", "isb",
-                 c = in(reg) self.fpcr, s = in(reg) self.fpsr,
-                 options(nomem, nostack, preserves_flags));
-        }
-    }
 }
 
 /// The poison context — a **designed** value, not `vcpu.rs`'s blanket `0xDEAD_BEEF_DEAD_BEEF`.
@@ -308,20 +231,94 @@ pub(crate) unsafe fn poison() {
     // SAFETY: forwarded from this function's contract. EL2 is built for
     // `aarch64-unknown-none-softfloat` and executes no FP instructions of its own, so a garbage
     // register file cannot affect EL2's own execution between here and the restore.
-    unsafe { POISON.restore_live() };
+    unsafe { POISON.restore() };
 }
 
 /// ⑰-a: the FP register file as a declared context component.
+///
+/// The bodies live HERE rather than in an inherent impl that the trait forwards to, matching
+/// [`crate::gic::VgicCtx`]. One `save` and one `restore` per component, reached one way — a
+/// forwarding pair would be a second name for the same operation, which is the shape this rung
+/// exists to reduce rather than add to.
 impl crate::ctx::CtxComponent for FpCtx {
     fn save(&mut self) {
-        self.save_live();
+        let p = core::ptr::addr_of_mut!(self.v) as *mut u64;
+        // SAFETY: `p` points at 512 aligned, owned bytes (`v`, pinned at offset 0 by the `const _`
+        // above). The `stp` pairs write exactly that range. `fpcr`/`fpsr` are readable at EL2 —
+        // `CPTR_EL2.TFP` is left clear, which is what lets EL2 touch the register file at all.
+        unsafe {
+            asm!(
+                // `hv-metal` builds for `aarch64-unknown-none-softfloat`, which disables `fp-armv8`
+                // and makes the integrated assembler REJECT `q`-register instructions. That is the
+                // right default for EL2 — it must not compute in floating point — but saving a
+                // guest's register file is not computing in it: these are 128-bit MOVES, exactly as
+                // KVM does them. So the extension is re-enabled for this block only. ⚠ `cargo xtask
+                // metal-lint` does NOT catch a mistake here: clippy never runs the assembler on
+                // inline asm, so this file passed all five lint configs while failing to build.
+                ".arch_extension fp",
+                "stp q0,  q1,  [{p}, #0]",
+                "stp q2,  q3,  [{p}, #32]",
+                "stp q4,  q5,  [{p}, #64]",
+                "stp q6,  q7,  [{p}, #96]",
+                "stp q8,  q9,  [{p}, #128]",
+                "stp q10, q11, [{p}, #160]",
+                "stp q12, q13, [{p}, #192]",
+                "stp q14, q15, [{p}, #224]",
+                "stp q16, q17, [{p}, #256]",
+                "stp q18, q19, [{p}, #288]",
+                "stp q20, q21, [{p}, #320]",
+                "stp q22, q23, [{p}, #352]",
+                "stp q24, q25, [{p}, #384]",
+                "stp q26, q27, [{p}, #416]",
+                "stp q28, q29, [{p}, #448]",
+                "stp q30, q31, [{p}, #480]",
+                p = in(reg) p,
+                options(nostack, preserves_flags),
+            );
+            // `.arch_extension fp` again: `FPCR`/`FPSR` are gated by the same feature as the `q`
+            // registers, so a softfloat build rejects even reading them.
+            asm!(".arch_extension fp", "mrs {c}, fpcr", "mrs {s}, fpsr",
+                 c = out(reg) self.fpcr, s = out(reg) self.fpsr,
+                 options(nomem, nostack, preserves_flags));
+        }
     }
 
+    /// Write this context back onto the live CPU.
+    ///
     /// # Safety
-    /// Forwarded to [`FpCtx::restore_live`], whose contract this is.
+    /// The caller must be at EL2 with the outgoing context already saved; between a [`poison`] and
+    /// this call the register file belongs to nobody.
     unsafe fn restore(&self) {
-        // SAFETY: forwarded from this function's contract.
-        unsafe { self.restore_live() };
+        let p = core::ptr::addr_of!(self.v) as *const u64;
+        // SAFETY: forwarded from this function's contract; `p` covers the same 512 aligned bytes
+        // `save` wrote, and the `ldp` pairs read exactly that range.
+        unsafe {
+            asm!(
+                // See `save` for why the extension is re-enabled here.
+                ".arch_extension fp",
+                "ldp q0,  q1,  [{p}, #0]",
+                "ldp q2,  q3,  [{p}, #32]",
+                "ldp q4,  q5,  [{p}, #64]",
+                "ldp q6,  q7,  [{p}, #96]",
+                "ldp q8,  q9,  [{p}, #128]",
+                "ldp q10, q11, [{p}, #160]",
+                "ldp q12, q13, [{p}, #192]",
+                "ldp q14, q15, [{p}, #224]",
+                "ldp q16, q17, [{p}, #256]",
+                "ldp q18, q19, [{p}, #288]",
+                "ldp q20, q21, [{p}, #320]",
+                "ldp q22, q23, [{p}, #352]",
+                "ldp q24, q25, [{p}, #384]",
+                "ldp q26, q27, [{p}, #416]",
+                "ldp q28, q29, [{p}, #448]",
+                "ldp q30, q31, [{p}, #480]",
+                p = in(reg) p,
+                options(readonly, nostack, preserves_flags),
+            );
+            asm!(".arch_extension fp", "msr fpcr, {c}", "msr fpsr, {s}", "isb",
+                 c = in(reg) self.fpcr, s = in(reg) self.fpsr,
+                 options(nomem, nostack, preserves_flags));
+        }
     }
 }
 

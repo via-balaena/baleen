@@ -685,6 +685,8 @@ const LINUX_MARKERS: &[&str] = &[
     // Deleting the FP restore leaves both kernels reaching userspace with no panic and no trap —
     // Linux's own lazy-FP reload usually overwrites the clobbered file before anything reads it — so
     // this read-back is the ONLY thing between a broken restore and a silent green boot.
+    "baleen: fp OK: dom 1 resumed on its OWN FP register file every time —",
+    "baleen: fp OK: dom 2 resumed on its OWN FP register file every time —",
     // ⑰-a — the boot transcript records what THIS BUILD believes a vCPU context is made of, so a
     // component silently added or removed changes a line the gate asserts. The real obligation is
     // the compiler's: `save`, `restore` and `poison` each destructure the context with no `..`, so
@@ -697,8 +699,6 @@ const LINUX_MARKERS: &[&str] = &[
     // a component is meant to redden here and be updated knowingly, which is the `perguest OK`
     // discipline applied to the context.
     "baleen: vcpu context = 4 components (gprs sysregs vgic fp) / 25 registers:",
-    "baleen: fp OK: dom 1 resumed on its OWN FP register file every time —",
-    "baleen: fp OK: dom 2 resumed on its OWN FP register file every time —",
     // ★ ③-b2b-ii-d — THE LIVE NEGATIVE TEST, in both directions. Each guest's device tree names an
     // AMBA peripheral at the base of the OTHER guest's half of the window, so the kernel's bus scan
     // reads its identification registers during boot and the hardware refuses every one.
