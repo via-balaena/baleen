@@ -1294,8 +1294,8 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
         let _ = writeln!(
             uart,
             "baleen: vcpu OK: the guest was PREEMPTED and restored {switches} times through \
-             hv-core's scheduler — {} context registers saved, poisoned and reinstated each time, \
-             and the kernel never noticed",
+             hv-core's scheduler — {} context registers plus the vGIC bank (list registers + \
+             ICH_VMCR_EL2) saved, poisoned and reinstated each time, and the kernel never noticed",
             vcpu::CtxReg::ALL.len()
         );
     } else {

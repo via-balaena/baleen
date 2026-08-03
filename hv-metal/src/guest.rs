@@ -419,7 +419,7 @@ const NR_GIC_ASYNC_FINAL: u64 = 0xd4;
 // peer's pending list-register interrupts. This phase upgrades that to a GUEST-observed witness of the
 // isolation property: two vCPUs of one domain time-slice under hv-core's REAL scheduler — reusing
 // `NR_YIELD`/[`handle_yield`], so the switch rides the SAME proven save/restore that carries
-// [`GuestContext::ich_lr`] — WITH the vGIC actually presenting interrupts to guest EL1
+// [`GuestContext::vgic`] — WITH the vGIC actually presenting interrupts to guest EL1
 // (`gic::enable_el2` → `ICH_HCR_EL2.En` + `HCR_EL2.IMO`).
 //
 // vCPU A injects a pending vINT into its own live list registers (IRQs still masked — it stays pending),
@@ -1859,15 +1859,25 @@ pub struct GuestFrame {
 /// context can be loaded before `eret`. `hv-core`'s `RunState` stays abstract — this concrete
 /// register/sysreg state is the metal's own, keeping the `hv-hal` fence architecture-neutral.
 ///
-/// **Scope:** the FP/SIMD registers (`v0..v31`) are deliberately NOT part of the saved context — the
-/// scheduler guests are integer-register-only. A future FP-using guest would need `v0..v31` added here
-/// (and to `__enter_guest_ctx`), or two such guests would silently cross-leak FP state across a switch.
-/// The **vGIC list registers** were the same latent omission until M5 Arc 7c/8b added the `ich_lr`
-/// bank below: pending virtual interrupts live in `ICH_LR<0..N>_EL2`, per-vCPU state the hardware does
-/// not swap, so interrupt-carrying vCPUs would have cross-leaked them across a switch. The whole
-/// implemented bank (`gic::num_list_registers()`) is saved/restored, so up to N interrupts can be
-/// simultaneously pending per vCPU without loss — the multi-LR case 7c's single `ich_lr0` could not
-/// represent. (The FP registers remain the standing example of the same, still-unsaved, class.)
+/// **Scope — and this paragraph names a RECURRING class, so keep it current.** The hazard is state
+/// the hardware keeps per-vCPU and does *not* swap: leave it out of the context and two vCPUs
+/// silently cross-leak it. Three instances so far, and only the first was found by design rather than
+/// by something later going wrong:
+///
+/// * **`ICH_LR<0..N>_EL2`, the vGIC list registers** — pending virtual interrupts. Closed by M5 Arc
+///   7c → 8b, which carries the whole implemented bank (`gic::num_list_registers()`), so up to N can
+///   be pending per vCPU without loss — the multi-LR case 7c's single `ich_lr0` could not represent.
+/// * **`ICH_VMCR_EL2`** — the guest's own priority mask, binary point, group enables and EOI mode.
+///   **It was carried by NO switch in this codebase** until the real-Linux path needed the same
+///   context and [`gic::VgicCtx`] became the one place that answers "what is a vGIC context"; two
+///   domains had been cross-leaking their interrupt masking since Arc 2. Found by asking what else
+///   was in this class, not by a failure.
+/// * **The FP/SIMD registers (`v0..v31`) — STILL UNSAVED, and the standing example.** Deliberate: the
+///   scheduler guests are integer-register-only. A future FP-using guest needs `v0..v31` added here
+///   (and to `__enter_guest_ctx`), or two such guests cross-leak FP state across a switch.
+///
+/// The lesson the second bullet paid for: when one member of this class is found, the others are
+/// worth enumerating immediately — they are invisible until a guest is unlucky.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct GuestContext {
@@ -1883,12 +1893,13 @@ struct GuestContext {
     spsr_el2: u64,
     /// `SCTLR_EL1` — the guest's EL1 system control (MMU/cache enables etc.).
     sctlr_el1: u64,
-    /// `ICH_LR<0..N>_EL2` — this vCPU's pending-interrupt **bank** (M5 Arc 7c → 8b). The whole set of
-    /// list registers is per-vCPU state the hardware does not swap; [`save_context`]/[`restore_context`]
-    /// carry the `gic::num_list_registers()` implemented entries `[0..N)`. Sized to the architectural
-    /// max (16) and saved/restored by Rust, NOT the asm — it sits *after* the asm-bound offsets (@280),
-    /// so `__enter_guest_ctx` never touches it and its layout assumptions are unchanged.
-    ich_lr: [u64; gic::MAX_LIST_REGISTERS],
+    /// The vGIC state the hardware keeps per-vCPU and does not swap (M5 Arc 7c → 8b for the list
+    /// registers; `ICH_VMCR_EL2` joined them when the real-Linux switch needed the same thing and
+    /// [`gic::VgicCtx`] became the one place that answers "what is a vGIC context").
+    ///
+    /// Saved/restored by Rust, NOT the asm — it sits *after* the asm-bound offsets (@280), so
+    /// `__enter_guest_ctx` never touches it and its layout assumptions are unchanged.
+    vgic: gic::VgicCtx,
 }
 
 impl GuestContext {
@@ -1898,7 +1909,7 @@ impl GuestContext {
         elr_el2: 0,
         spsr_el2: 0,
         sctlr_el1: 0,
-        ich_lr: [0; gic::MAX_LIST_REGISTERS],
+        vgic: gic::VgicCtx::ZERO,
     };
 }
 
@@ -1911,9 +1922,11 @@ const _: () = {
     assert!(core::mem::offset_of!(GuestContext, elr_el2) == 256);
     assert!(core::mem::offset_of!(GuestContext, spsr_el2) == 264);
     assert!(core::mem::offset_of!(GuestContext, sctlr_el1) == 272);
-    // Arc 7c/8b: the `ich_lr` bank sits *past* the last asm-referenced field (@272), so
-    // `__enter_guest_ctx` (which reads through offset 272) is untouched — the LRs are Rust-only state.
-    assert!(core::mem::offset_of!(GuestContext, ich_lr) == 280);
+    // Arc 7c/8b: the vGIC context sits *past* the last asm-referenced field (@272), so
+    // `__enter_guest_ctx` (which reads through offset 272) is untouched — it is Rust-only state.
+    // Growing `VgicCtx` (as `ICH_VMCR_EL2` did) therefore cannot desync the asm; this pins the
+    // *start*, which is the only part the asm's bound could ever collide with.
+    assert!(core::mem::offset_of!(GuestContext, vgic) == 280);
 };
 
 static VCPU_CTX: BootCell<[GuestContext; NUM_VCPUS_METAL]> =
@@ -1977,7 +1990,7 @@ fn vcpu_meta(slot: usize) -> VcpuMeta {
 //
 // **Why PER-vCPU.** A single global set would deliver one vCPU's overflow vINTs into whichever vCPU
 // happened to be running — reopening exactly the cross-vCPU leak Arc 8b/III-3 closed for the hardware
-// half of the same state. The LR bank rides the context switch per vCPU ([`GuestContext::ich_lr`]); its
+// half of the same state. The LR bank rides the context switch per vCPU ([`GuestContext::vgic`]); its
 // software overflow must too, or the isolation property holds for the first 4 pending interrupts and
 // silently stops holding for the fifth. So this is indexed by [`CUR_VCPU`], and the witness asserts the
 // isolation half explicitly rather than only the correctness half.
@@ -2661,13 +2674,11 @@ fn write_sysctx(sp_el1: u64, elr: u64, spsr: u64, sctlr: u64) {
 /// into `VCPU_CTX[vcpu]` (M5 Arc 1).
 fn save_context(vcpu: usize, frame: &GuestFrame) {
     let (sp_el1, elr, spsr, sctlr) = read_sysctx();
-    // Arc 7c/8b: capture the outgoing vCPU's whole pending-interrupt bank *before* the incoming vCPU's
-    // restore overwrites the live list registers, so every pending vINT rides the switch with it.
-    let n = gic::num_list_registers();
-    let mut ich_lr = [0u64; gic::MAX_LIST_REGISTERS];
-    for (i, slot) in ich_lr.iter_mut().enumerate().take(n) {
-        *slot = gic::read_lr(i);
-    }
+    // Arc 7c/8b: capture the outgoing vCPU's whole vGIC context *before* the incoming vCPU's restore
+    // overwrites the live registers, so every pending vINT — and the guest's own priority mask — rides
+    // the switch with it.
+    let mut vgic = gic::VgicCtx::ZERO;
+    vgic.save();
     let mut ctxs = VCPU_CTX.borrow_mut();
     let ctx = &mut ctxs[vcpu];
     ctx.x = frame.x;
@@ -2675,7 +2686,7 @@ fn save_context(vcpu: usize, frame: &GuestFrame) {
     ctx.elr_el2 = elr;
     ctx.spsr_el2 = spsr;
     ctx.sctlr_el1 = sctlr;
-    ctx.ich_lr = ich_lr;
+    ctx.vgic = vgic;
 }
 
 /// Restore a vCPU's context — GPRs into the trampoline `frame` (so its `ldp`+`eret` resumes that
@@ -2688,13 +2699,11 @@ fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
     let ctx = VCPU_CTX.borrow_mut()[vcpu];
     frame.x = ctx.x;
     write_sysctx(ctx.sp_el1, ctx.elr_el2, ctx.spsr_el2, ctx.sctlr_el1);
-    // Arc 7c/8b: restore this vCPU's own pending-interrupt bank (its saved list registers), so it
-    // resumes with exactly the vINTs it left — and the incoming vCPU does NOT inherit the outgoing
-    // one's (a switch to a vCPU with fewer pending vINTs writes 0 over the peer's higher LRs).
-    let n = gic::num_list_registers();
-    for (i, &lr) in ctx.ich_lr.iter().enumerate().take(n) {
-        gic::write_lr(i, lr);
-    }
+    // Arc 7c/8b: restore this vCPU's own vGIC context, so it resumes with exactly the vINTs it left
+    // — and the incoming vCPU does NOT inherit the outgoing one's (a switch to a vCPU with fewer
+    // pending vINTs writes 0 over the peer's higher LRs), nor its priority mask.
+    // SAFETY: at EL2, restoring the context saved for the vCPU being switched in.
+    unsafe { ctx.vgic.restore() };
     // III-1: with this vCPU's own bank reinstated, top up any free list registers from ITS software
     // pending set — the deterministic half of the refill, needing no maintenance interrupt. It must run
     // *after* the restore (which overwrites the whole bank, so a pre-restore refill would be discarded)
@@ -5455,7 +5464,7 @@ const SELFTEST_LR_BASE_INTID: u32 = 96;
 /// **The Arc-7c/8b per-vCPU vGIC LR-**bank** ownership witness (`selftest` builds).** The pending
 /// virtual interrupts live in the `ICH_LR<0..N>_EL2` bank — per-vCPU state the hardware does not swap
 /// on a world switch — so [`save_context`]/[`restore_context`] carry the whole implemented bank in
-/// [`GuestContext::ich_lr`]. Assert that carry gives each vCPU its OWN bank across a switch:
+/// [`GuestContext::vgic`]. Assert that carry gives each vCPU its OWN bank across a switch:
 ///
 /// 1. slot 0 **fills every LR** (N distinct pending vINTs) via the allocating [`gic::inject`] — each
 ///    finds a free LR, none overwrites another (the multi-LR capacity 7c's single-LR0 lacked);
