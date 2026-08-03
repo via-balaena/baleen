@@ -53,43 +53,28 @@ const ICH_HCR_EL2_UIE: u64 = 1 << 1;
 /// mechanism by which a pending list-register interrupt is presented to the guest).
 const HCR_EL2_IMO: u64 = 1 << 4;
 
-// ─── ICH_LR<n>_EL2 field layout (GICv3 list register) ────────────────────────────────────────────
-/// vINTID — the virtual interrupt id the guest sees, bits [31:0].
-const LR_VINTID_SHIFT: u64 = 0;
-/// Priority, bits [55:48] (only the top `ICH_VTR_EL2.PRIbits` are significant).
-const LR_PRIORITY_SHIFT: u64 = 48;
-/// Group, bit [60] — 1 = Group 1 (acknowledged via `ICC_IAR1_EL1`).
-const LR_GROUP1: u64 = 1 << 60;
-/// State = Pending, bits [63:62] = 0b01.
-const LR_STATE_PENDING: u64 = 0b01 << 62;
-
-/// `ICH_LR<n>_EL2.HW` (bit 61) — this virtual interrupt is **mapped to a physical one**, named by
-/// [`LR_PINTID_SHIFT`]. Left 0 by [`inject`] (a pure virtual interrupt, deactivated entirely in the
-/// virtual interface); set by [`inject_hw`], which is what a *forwarded* physical interrupt needs.
-///
-/// **Why the bit exists, and why ③-a2 cannot work without it.** A forwarded device interrupt has a
-/// physical lifecycle (Pending → Active → Inactive) that only a *deactivate* ends, and for a
-/// **level-triggered** source — the arch timer's PPI, asserted while `CNTV_CTL_EL0.ISTATUS` is set —
-/// deactivating it while the level is still high makes the GIC re-assert immediately. So EL2 cannot
-/// deactivate on the guest's behalf: it must wait until the guest has serviced the device and dropped
-/// the level, and EL2 gets no signal when that happens. `HW=1` is the hardware's answer: the guest's
-/// own EOI of the *virtual* interrupt deactivates the *physical* interrupt named by `pINTID`, with no
-/// EL2 involvement at all. This is how KVM forwards the arch timer, for the same reason.
-///
-/// **What the delegation costs, and where it is taken back (③-b2b-ii-c1).** "No EL2 involvement" is
-/// the point and also the limit: the mapping names *a* guest as the one who will end this physical
-/// interrupt, and there is one physical timer PPI on this machine. At a vCPU switch that guest stops
-/// running, so the promise stops being keepable — [`VgicCtx::release_hardware_mappings`] clears this
-/// bit on the outgoing context and EL2 does the deactivation itself
-/// ([`release_forwarded_timer`]).
-const LR_HW: u64 = 1 << 61;
-/// `ICH_LR<n>_EL2.pINTID`, bits [41:32] — the **physical** INTID a `HW=1` list register is mapped to.
-/// Ten bits, so it names INTIDs 0..=1023 (the SPI/PPI/SGI range); LPIs are out of its reach and out of
-/// this port's scope.
-const LR_PINTID_SHIFT: u64 = 32;
-/// Width of the `pINTID` field — an INTID that does not fit cannot be named by a `HW=1` LR, so
-/// [`inject_hw`] refuses rather than silently truncating into a *different* physical interrupt.
-const LR_PINTID_BITS: u32 = 10;
+// ─── ICH_LR<n>_EL2: the FIELD LAYOUT moved under the fence (⑰-b′) ────────────────────────────────
+//
+// The list register's field positions, its encoder and its decoders are now
+// `hv_vdev::vgic_cpuif` — a pure module Kani can reach, which `hv-metal` (workspace-EXCLUDED)
+// never can. What stays here is the hardware: `mrs`/`msr` against `ICH_LR<n>_EL2`, the live
+// register count from `ICH_VTR_EL2`, and the priority policy below.
+//
+// **`HW` (bit 61) is the field worth keeping prose about**, because ③-a2 cannot work without it and
+// ③-b2b-ii-c1 is about taking it back. A forwarded device interrupt has a physical lifecycle
+// (Pending → Active → Inactive) that only a *deactivate* ends, and for a **level-triggered** source —
+// the arch timer's PPI, asserted while `CNTV_CTL_EL0.ISTATUS` is set — deactivating it while the
+// level is still high makes the GIC re-assert immediately. So EL2 cannot deactivate on the guest's
+// behalf: it must wait until the guest has serviced the device and dropped the level, and EL2 gets no
+// signal when that happens. `HW=1` is the hardware's answer — the guest's own EOI of the *virtual*
+// interrupt deactivates the *physical* one named by `pINTID`, with no EL2 involvement. This is how
+// KVM forwards the arch timer, for the same reason.
+//
+// "No EL2 involvement" is the point and also the limit: the mapping names *a* guest as the one who
+// will end this physical interrupt, and there is one physical timer PPI on this machine. At a vCPU
+// switch that guest stops running, so the promise stops being keepable — `VgicCtx::
+// release_hardware_mappings` demotes the outgoing context and EL2 deactivates the line itself
+// (`release_forwarded_timer`).
 
 /// `ICC_CTLR_EL1.EOImode` (bit 1) — **split priority-drop from deactivate.** With `EOImode=0` (the
 /// reset value, and what the synthetic path uses) a write to `ICC_EOIR1_EL1` does both. With it set,
@@ -98,34 +83,25 @@ const LR_PINTID_BITS: u32 = 10;
 /// **The real-Linux forwarding path requires it set at EL2**, and the requirement is not a style
 /// choice: EL2 must return to a low running priority so *other* interrupts can be taken, while leaving
 /// the forwarded interrupt **Active** so its still-asserted level cannot re-signal. Deactivation then
-/// arrives from the guest through [`LR_HW`]. With `EOImode=0` those two needs are in direct conflict —
-/// drop the priority and you deactivate; keep it Active and EL2 stays at the interrupt's priority.
+/// arrives from the guest through the list register's `HW` bit. With `EOImode=0` those two needs are
+/// in direct conflict — drop the priority and you deactivate; keep it Active and EL2 stays at the
+/// interrupt's priority.
 #[cfg(feature = "real-linux")]
 const ICC_CTLR_EL1_EOIMODE: u64 = 1 << 1;
 
 /// A moderate priority for injected interrupts — below `ICC_PMR_EL1 = 0xff`, so it passes the mask.
-const INJECT_PRIORITY: u64 = 0x80;
+///
+/// **Policy, which is why it stays here and is passed to the encoder rather than baked into it**
+/// (⑯'s split, applied again): the value is justified by the mask the guest is expected to run with,
+/// which is a claim about this deployment, not about the GICv3 register layout.
+const INJECT_PRIORITY: u8 = 0x80;
 
-/// The LR **State** field, bits [63:62]: `0b00` Invalid (free), `0b01` Pending, `0b10` Active, `0b11`
-/// Pending+Active. A free list register the allocator may reuse has State = Invalid (the whole field 0).
-const LR_STATE_MASK: u64 = 0b11 << 62;
-
-/// The architectural maximum number of list registers (GICv3 implements at most 16, `ICH_LR0..15`); the
-/// per-vCPU LR store ([`crate::guest`]'s `GuestContext`) is sized to this, though only
-/// [`num_list_registers`] are live on a given machine (4 on QEMU `virt`).
-pub(crate) const MAX_LIST_REGISTERS: usize = 16;
-
-/// A list register with State = Invalid holds no interrupt — a free slot [`inject`] may allocate.
-pub(crate) fn lr_is_free(lr: u64) -> bool {
-    lr & LR_STATE_MASK == 0
-}
-
-/// The vINTID a list register carries (bits [31:0]). (`selftest`-only: the LR-bank ownership witness
-/// checks it; the switch and injector treat the LR as an opaque 64-bit value.)
+// **Re-exported, not re-derived.** `guest.rs` reaches these through `gic::`, and the whole point of
+// the move is that there is ONE answer to "what do these bits mean". A second copy here — even a
+// trivially correct one — is the second-derivation defect this project keeps spending rungs to remove.
 #[cfg(feature = "selftest")]
-pub(crate) fn lr_vintid(lr: u64) -> u32 {
-    (lr & 0xffff_ffff) as u32
-}
+pub(crate) use hv_vdev::vgic_cpuif::lr_vintid;
+pub(crate) use hv_vdev::vgic_cpuif::{lr_is_free, MAX_LIST_REGISTERS};
 
 /// Enable the hardware virtual CPU interface at EL2: `ICC_SRE_EL2` (SRE + Enable, so the guest may use
 /// `ICC_SRE_EL1`), `ICH_HCR_EL2.En`, and `HCR_EL2.IMO` (so a list-register interrupt reaches the guest).
@@ -218,20 +194,24 @@ pub(crate) fn underflow_interrupt_armed() -> bool {
 /// this function claims.
 #[must_use]
 pub(crate) fn inject(intid: u32) -> bool {
-    place(encode_lr(intid, None))
+    match encode_lr(intid, None) {
+        Some(lr) => place(lr),
+        // Unreachable: a purely virtual injection names no `pINTID`, so the encoder's only refusal
+        // cannot fire. Matched rather than unwrapped so the impossible case is a delivery failure the
+        // caller already handles, not a panic in the interrupt path.
+        None => false,
+    }
 }
 
-/// **The ONE list-register encoder** (#55). `hw` is `Some(pintid)` for a *forwarded* physical
-/// interrupt — see [`LR_HW`] for why that case exists — and `None` for a purely virtual one.
-fn encode_lr(vintid: u32, hw: Option<u32>) -> u64 {
-    let base = LR_STATE_PENDING
-        | LR_GROUP1
-        | (INJECT_PRIORITY << LR_PRIORITY_SHIFT)
-        | ((vintid as u64) << LR_VINTID_SHIFT);
-    match hw {
-        Some(pintid) => base | LR_HW | ((pintid as u64) << LR_PINTID_SHIFT),
-        None => base,
-    }
+/// **The ONE list-register encoder** (#55), now `hv_vdev::vgic_cpuif::encode_lr` — this is the
+/// deployment of it, which supplies the one thing that is policy rather than architecture: the
+/// priority an injection gets.
+///
+/// Returns `None` exactly when `pintid` cannot be named by the `pINTID` field. That refusal used to
+/// live in [`inject_hw`] as a range test; it is now the encoder's, and proven total there
+/// (`a_physical_intid_is_refused_exactly_when_it_cannot_be_named`).
+fn encode_lr(vintid: u32, hw: Option<u32>) -> Option<u64> {
+    hv_vdev::vgic_cpuif::encode_lr(vintid, hw, INJECT_PRIORITY)
 }
 
 /// Place an encoded list-register value in the first free LR. `false` = the bank is full.
@@ -247,21 +227,27 @@ fn place(lr: u64) -> bool {
 }
 
 /// Inject `vintid` as a **hardware-mapped** virtual interrupt: the guest's EOI of it will deactivate
-/// the physical interrupt `pintid` (see [`LR_HW`]). This is the ③-a2 forwarding primitive — EL2 takes
+/// the physical interrupt `pintid` (see the `HW` note at the top of this module). This is the ③-a2
+/// forwarding primitive — EL2 takes
 /// the guest's device interrupt because `HCR_EL2.IMO` routes it there, and hands it on without ever
 /// having to decide *when* the device stopped asserting.
 ///
-/// Returns `false` if the bank is full **or** if `pintid` does not fit [`LR_PINTID_BITS`]. The second
+/// Returns `false` if the bank is full **or** if `pintid` does not fit
+/// [`hv_vdev::vgic_cpuif::MAX_PINTID`]. The second
 /// case is refused rather than truncated: a truncated `pINTID` would name a *different* physical
 /// interrupt, so the guest's EOI would deactivate someone else's — silent, and far worse than a
 /// refusal the caller reports.
 #[must_use]
 #[cfg(feature = "real-linux")]
 pub(crate) fn inject_hw(vintid: u32, pintid: u32) -> bool {
-    if pintid >= (1 << LR_PINTID_BITS) {
-        return false;
+    // ⑰-b′: the range refusal used to be an `if` here. It is now the encoder's, so an out-of-range
+    // `pINTID` is *unrepresentable* rather than rejected by whoever remembered to check — and it is
+    // proven exact (`a_physical_intid_is_refused_exactly_when_it_cannot_be_named`), in both
+    // directions, which an `if` at one call site never was.
+    match encode_lr(vintid, Some(pintid)) {
+        Some(lr) => place(lr),
+        None => false,
     }
-    place(encode_lr(vintid, Some(pintid)))
 }
 
 /// The SGI id a write to `ICC_SGI1R_EL1` requests — bits [27:24], so 0..=15 (the whole SGI range).
@@ -293,7 +279,7 @@ pub(crate) fn sgi1r_intid(value: u64) -> u32 {
 /// or declines, where nobody else will ever do it and the entry would otherwise stay Active forever.
 ///
 /// **This doc used to say "a *forwarded* interrupt never comes here — the guest's EOI deactivates it
-/// through [`LR_HW`]", and ③-b2b-ii-c1 made that false.** It was true of a machine with one guest,
+/// through the list register's `HW` bit", and ③-b2b-ii-c1 made that false.** It was true of a machine with one guest,
 /// and it is exactly the assumption a second guest breaks: `HW=1` delegates deactivation to *a*
 /// guest, and at a switch the line stops belonging to the guest it was delegated to. So a forwarded
 /// interrupt does come here now, from [`release_forwarded_timer`], once per switch — recorded rather
@@ -626,41 +612,37 @@ impl VgicCtx {
     /// **Why a forwarded interrupt cannot cross a switch as a forwarded interrupt.** `HW=1` is a
     /// promise about a *physical* interrupt: the guest's EOI of this virtual one will deactivate
     /// `pINTID`. There is one physical timer PPI on this machine and it is about to belong to a
-    /// different vCPU, so the promise stops being true the moment the switch happens — and honouring
-    /// it later would have the *incoming* guest's EOI deactivate an interrupt the *outgoing* one was
-    /// given. EL2 therefore deactivates the physical interrupt itself
-    /// ([`release_forwarded_timer`]) and demotes what it saved to a purely virtual pending
-    /// interrupt, which is exactly what it now is: something the guest still has to take and end,
-    /// with nothing physical hanging off it.
+    /// different vCPU, so the promise stops being true the moment the switch happens. EL2 therefore
+    /// deactivates the physical interrupt itself ([`release_forwarded_timer`]) and demotes what it
+    /// saved to a purely virtual pending interrupt.
     ///
-    /// The outgoing guest loses nothing. Its interrupt is still pending in its own bank at its own
-    /// priority; when it is resumed, its still-expired `CNTV_CVAL_EL0` re-asserts the level and EL2
-    /// forwards a fresh one. What it gives up is ownership of a line it is not running on.
+    /// ## ⑰-b′ — this is now a DEPLOYMENT of a proven transform
     ///
-    /// **The `pINTID` field is cleared, not left behind.** With `HW=0` those bits are not a spare
-    /// copy of the physical INTID: bit 41 becomes `EOI` (request a maintenance interrupt when the
-    /// guest ends this interrupt) and bits 40:32 are RES0. Leaving `27` there would write a nonzero
-    /// RES0 field, and for a wider INTID would arm a maintenance interrupt nobody handles — the same
-    /// class of error as poisoning a list register with `0xDEAD_BEEF` (see [`Self::poison`]).
+    /// The transform moved to [`hv_vdev::vgic_cpuif::release_hardware_mappings`], where it is proven
+    /// over ∀ bank contents: the `lr_is_free`-first rule that produced the 119/60 miscount, the
+    /// `pINTID` clearing, the exact demotion count, idempotence, and the confinement property (a
+    /// surviving mapping can only sit in a free slot) are theorems rather than comments. **The
+    /// reasoning that used to live here in prose lives there beside the proofs** — deliberately not
+    /// restated, because two copies of an argument drift exactly the way two copies of a register
+    /// list did.
+    ///
+    /// What is left here is the one thing the model cannot know: **how much of the bank is live on
+    /// this machine.** That comes from `ICH_VTR_EL2` and is the length of the slice passed below.
+    ///
+    /// ⚠ **What is and is not a theorem about that slicing** — the distinction is narrow and worth
+    /// stating exactly. `the_properties_hold_for_any_live_bank_length` proves the transform correct
+    /// for *every* prefix length 0..=16 **and** that it touches nothing beyond the prefix it is
+    /// given. What no theorem can see is `num_list_registers()` itself: that this reads `ICH_VTR_EL2`
+    /// and that its answer is the machine's true live count is a construction argument, because
+    /// `hv-metal` is not a Kani target.
+    ///
+    /// So the residual is one value from one register — not "the prefix is unchecked". Slicing to
+    /// too *many* entries would demote stale ones beyond the live count and inflate the demotion
+    /// count: the 119/60 defect in a new place, which is why this line is load-bearing.
     #[cfg(feature = "real-linux")]
     pub(crate) fn release_hardware_mappings(&mut self) -> u64 {
-        const PINTID_FIELD: u64 = ((1 << LR_PINTID_BITS) - 1) << LR_PINTID_SHIFT;
         let n = num_list_registers();
-        let mut released = 0;
-        for lr in self.lr.iter_mut().take(n) {
-            // **`lr_is_free` first, and it is not an optimization.** An Invalid list register is not
-            // a zeroed one: `place` overwrites a free slot wholesale when it reuses it, so a
-            // COMPLETED injection leaves its `HW` bit and `pINTID` behind until then. Measured — at
-            // every switch after the first, the bank reads `LR0=0x7080001b…` (Pending, HW=1) and
-            // `LR1=0x3080001b…`, whose State field is `0b00`. Demoting the second is inert, because
-            // an Invalid LR is neither presented to the guest nor matched by its EOI; what it
-            // destroys is the WITNESS, which claims exactly one demotion per switch and got two.
-            if !lr_is_free(*lr) && *lr & LR_HW != 0 {
-                *lr &= !(LR_HW | PINTID_FIELD);
-                released += 1;
-            }
-        }
-        released
+        hv_vdev::vgic_cpuif::release_hardware_mappings(&mut self.lr[..n])
     }
 
     /// Clobber the live vGIC state, so a restore that misses part of it cannot go unnoticed.
@@ -787,8 +769,12 @@ pub(crate) const VTIMER_INTID: u32 = 27;
 /// (design-lesson #97): the timer PPI must be nameable in a `HW=1` list register's `pINTID` field, or
 /// [`inject_hw`] would refuse it at run time and the forwarding path would be dead on arrival. A boot
 /// marker can only witness what a boot exercises; this is true or the build fails.
+///
+/// ⑰-b′: the bound is now `hv_vdev::vgic_cpuif`'s, so this is a `const assert!` **binding a model to
+/// a board** — exactly what ⑯ said stays in `hv-metal`. The field width is the model's fact; that
+/// *this machine's* timer PPI fits inside it is the metal's claim, and only the metal can make it.
 const _: () = assert!(
-    VTIMER_INTID < (1 << LR_PINTID_BITS),
+    VTIMER_INTID <= hv_vdev::vgic_cpuif::MAX_PINTID,
     "the forwarded timer PPI must fit ICH_LR<n>_EL2.pINTID — a wider INTID cannot be hardware-mapped"
 );
 

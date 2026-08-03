@@ -999,7 +999,8 @@ static SGIS_DELIVERED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; N
 /// tick it re-arms itself, is destroyed by it. So the level has to be dropped by the GUEST reprogramming
 /// `CNTV_CVAL_EL0`, which means the physical interrupt must stay **Active** until it does — and EL2
 /// gets no signal when that happens. [`gic::inject_hw`] is the answer: the guest's own EOI of the
-/// virtual interrupt deactivates the physical one, with no EL2 involvement. See [`gic::LR_HW`].
+/// virtual interrupt deactivates the physical one, with no EL2 involvement. See the `HW`
+/// note in [`crate::gic`].
 ///
 /// Anything that is not the timer is a bring-up fault, reported with its INTID and parked, on the same
 /// reasoning as [`handle_linux_data_abort`]: with `IMO=1` EVERY physical interrupt now arrives here, so
