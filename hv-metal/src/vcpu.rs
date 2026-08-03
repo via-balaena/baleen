@@ -220,6 +220,17 @@ impl VcpuCtx {
         self.vgic.save();
     }
 
+    /// **Demote this saved context's forwarded interrupts to purely virtual ones**, returning how
+    /// many were converted (③-b2b-ii-c1).
+    ///
+    /// Called between [`Self::save`] and the physical release, because a `HW=1` list register is a
+    /// claim on a *physical* interrupt that this vCPU is about to stop owning. See
+    /// [`gic::VgicCtx::release_hardware_mappings`] for why the claim cannot travel and what the
+    /// outgoing guest does and does not lose.
+    pub(crate) fn release_hardware_mappings(&mut self) -> u64 {
+        self.vgic.release_hardware_mappings()
+    }
+
     /// Write this context back onto the CPU.
     ///
     /// # Safety

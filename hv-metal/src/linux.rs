@@ -60,13 +60,25 @@
 //!
 //! Each device above is EL2 state, which is what makes a *second* copy of it possible. That
 //! possibility is now taken: the emulated PL011s, the emulated GICv3s, the vCPU contexts and the
-//! five witness counters are arrays indexed by [`CURRENT`], and a guest's domain id, Stage-2 set,
-//! frame range and table range are all functions of its slot. Only slot A runs — moving `CURRENT`
-//! is ③-b2b-ii-c, and what stands in its way is not this file but the **physical** timer's Active
-//! state, measured rather than assumed: at every preemption point PPI 27 is Active *and* Pending
-//! with the running guest holding the `HW=1` list register that owns its deactivation, so a second
-//! guest switched in there could never be signalled the tick — and the tick is the only thing that
-//! re-enters EL2.
+//! witness counters are arrays indexed by [`CURRENT`], and a guest's domain id, Stage-2 set, frame
+//! range and table range are all functions of its slot. Only slot A runs — moving `CURRENT` is
+//! ③-b2b-ii-c2.
+//!
+//! ## ③-b2b-ii-c1: the one physical timer learns to change hands
+//!
+//! What stood in the way of a second runner was not this file's indexing but the **physical** timer,
+//! measured rather than assumed: at every preemption point PPI 27 is Active *and* Pending, with the
+//! running guest holding the `HW=1` list register that owns its deactivation. A second guest
+//! switched in there could never be signalled the tick — and the tick is the only thing that
+//! re-enters EL2, so that is a hang of the machine, not a slow boot.
+//!
+//! [`preempt_through_the_scheduler`] is therefore a seven-step sequence whose *order* is the rung.
+//! The outgoing guest's forwarded interrupt is demoted to a purely virtual one (it no longer owns
+//! the line), EL2 deactivates the physical interrupt itself, and the PPI is re-armed from the
+//! **incoming** guest's own emulated distributor — after the restore, because only then does
+//! `CNTV_CVAL_EL0` describe the guest about to run. See [`gic::release_forwarded_timer`], which also
+//! records the kill probe: delete that deactivate and guest A itself hangs after printing
+//! `poweroff`.
 //!
 //! The **console** had to move with them ([`crate::console`]). ③-a1's relay is per-byte, and the
 //! preemption point can land between any two bytes of a line, so two kernels would interleave
@@ -994,6 +1006,26 @@ const VCPU_CTX_EMPTY: vcpu::VcpuCtx = vcpu::VcpuCtx::new();
 /// How many times each guest's vCPU has been switched out and back through hv-core's scheduler.
 static SWITCHES: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
+/// How many hardware-mapped list registers each guest has handed back at a switch (③-b2b-ii-c1).
+///
+/// **The witness is not that this is non-zero but that it EQUALS [`SWITCHES`].** Exactly one `HW=1`
+/// list register exists at a preemption point — the timer EL2 forwarded moments earlier on the very
+/// path that led here, and nothing else on this configuration is forwarded with a hardware mapping
+/// (a guest's SGIs are injected `HW=0`, because the guest invented them). So one per switch is not a
+/// tendency, it is an invariant, and a count that merely *moves* would not distinguish a handoff
+/// that fires on some switches from one that fires on all of them.
+static HW_RELEASED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// How many times the **interrupt controller agreed** that the forwarded timer went Active →
+/// Inactive at a switch (③-b2b-ii-c1).
+///
+/// **The other half of the handoff, and the half [`HW_RELEASED`] structurally cannot see.** Demoting
+/// a list register is EL2 editing bytes it saved itself: delete the physical deactivate entirely and
+/// that count is unchanged, the boot stays green, and guest B hangs a rung later. This one is read
+/// back from `GICR_ISACTIVER0` — the GIC's own view, and the Active state is precisely what would
+/// stop a second guest being signalled the tick.
+static TIMER_DEACTIVATED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
 /// **③-b2b-i — preempt the guest at the timer tick, through `hv-core`'s REAL scheduler.**
 ///
 /// The real-Linux path had no vCPU switch at all: `run` did one `eret` and never returned, and the
@@ -1066,16 +1098,51 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     );
     drop(cell);
 
+    // ── the switch proper. The ORDER of these seven steps is the rung (③-b2b-ii-c1) ──────────────
+    //
+    // `next` is still `slot`: ③-b2b-ii-c2 is what makes the restored vCPU a different one. Naming it
+    // separately here is not anticipation for its own sake — every step below already has to say
+    // which vCPU it means, and writing `slot` in all of them would hide that three of them mean the
+    // OUTGOING one and two mean the INCOMING one.
+    let next = slot;
+
     let mut ctx = VCPU_CTX.borrow_mut();
+    // 1. Capture the outgoing vCPU, list registers and `CNTV_CVAL_EL0` included.
     ctx[slot].save(&frame.x);
+
+    // 2. Demote its forwarded interrupts, and 3. hand the physical timer back. Between them these
+    //    are the whole of Probe 0's fix: the outgoing guest keeps its pending tick as a purely
+    //    VIRTUAL interrupt, and the one physical PPI on this machine stops being Active so it can be
+    //    signalled to whoever runs next. See `gic::release_forwarded_timer` for the measurement that
+    //    forced this and for why disable must precede deactivate.
+    let released = ctx[slot].release_hardware_mappings();
+    HW_RELEASED[slot].fetch_add(released, Ordering::Relaxed);
+    if gic::release_forwarded_timer() {
+        TIMER_DEACTIVATED[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    // 4. Poison — see `crate::vcpu`. Still the instrument that stops a switch-to-self being vacuous.
     // SAFETY: at EL2 with the context saved, and the restore below is unconditional — the guest's
     // EL1 configuration is garbage only for the handful of instructions between the two.
     unsafe { vcpu::poison() };
-    // SAFETY: at EL2, restoring the context just saved for the vCPU about to be resumed. Still the
-    // SAME slot: ③-b2b-ii-c is the rung that makes the restored slot differ from the saved one, and
-    // it is the physical timer's Active state — not this line — that stands in its way (Probe 0).
-    unsafe { ctx[slot].restore(&mut frame.x) };
-    SWITCHES[slot].fetch_add(1, Ordering::Relaxed);
+
+    // 5. Install the incoming vCPU. **Only now** does `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` describe the
+    //    guest about to run, which is why step 6 cannot be folded into step 3: re-arming the PPI
+    //    while the outgoing guest's deadline was still loaded would fire the outgoing guest's timer
+    //    into the incoming one.
+    // SAFETY: at EL2, restoring the context of the vCPU about to be resumed.
+    unsafe { ctx[next].restore(&mut frame.x) };
+    drop(ctx);
+
+    // 6. Re-arm the physical PPI for the INCOMING guest, according to its own emulated distributor —
+    //    the same mediation seam `handle_vgic_access` mirrors, applied at the other moment the
+    //    answer can change. A guest running with its timer masked stays masked; one that wants it
+    //    gets it, and gets it immediately, because its restored deadline has long since passed.
+    let wants_timer = VGIC.borrow_mut()[next].is_enabled(gic::VTIMER_INTID);
+    gic::set_ppi_enabled(gic::VTIMER_INTID, wants_timer);
+
+    // 7. Count the switch. `eret` is the caller's.
+    SWITCHES[next].fetch_add(1, Ordering::Relaxed);
 }
 
 /// The Linux-mode lower-EL synchronous handler. `HVC` → service PSCI (Linux's `method = "hvc"`); an
@@ -1134,6 +1201,7 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 drop(console);
                 report_vpl011(&mut uart);
                 report_interrupt_mediation(&mut uart);
+                report_timer_handoff(&mut uart);
                 report_per_guest_state(&mut uart);
                 let _ = writeln!(
                     uart,
@@ -1676,9 +1744,58 @@ pub(crate) fn flush_consoles() {
     }
 }
 
+/// **③-b2b-ii-c1's witness: the one physical timer changes hands at every switch.**
+///
+/// **What the boot could not tell you without this.** ③-b2b-ii-c1 is a rung whose entire content is
+/// that a physical interrupt stops being Active at a moment nothing observes — the guest that
+/// resumes is the guest that left, so it boots identically whether the handoff happened or not.
+/// Every other marker in the gate is satisfied either way. That is the same trap ③-b2b-i's
+/// switch-to-self fell into, arriving one rung later at a different mechanism.
+///
+/// **The claim is an equality, not a tally.** Exactly one hardware-mapped list register exists at a
+/// preemption point: EL2 reached here from [`handle_linux_irq`] having just forwarded the timer with
+/// `HW=1`, and nothing else on this configuration is forwarded that way. So `released == switches`
+/// is an invariant of the mechanism, and a counter that merely moved would not distinguish a handoff
+/// that fires on some switches from one that fires on all of them — which is the difference between
+/// guest B getting a tick and guest B hanging the machine.
+///
+/// **Honest limit.** This says the *outgoing* half happened: the mapping was demoted and the
+/// physical interrupt released, every time. It cannot witness the *incoming* half — that a
+/// different guest is then signalled the timer — because with one runner there is no different
+/// guest. ③-b2b-ii-c2 is where that becomes observable, and where a failure of this mechanism stops
+/// being invisible and becomes a hang.
+fn report_timer_handoff(uart: &mut Pl011) {
+    let slot = current_slot();
+    let dom = slot_dom(slot);
+    let released = HW_RELEASED[slot].load(Ordering::Relaxed);
+    let deactivated = TIMER_DEACTIVATED[slot].load(Ordering::Relaxed);
+    let switches = SWITCHES[slot].load(Ordering::Relaxed);
+    if switches > 0 && released == switches && deactivated == switches {
+        let _ = writeln!(
+            uart,
+            "baleen: handoff OK: the forwarded timer changes hands at every switch — dom {dom} \
+             demoted {released} hardware-mapped list registers across {switches} switches (exactly \
+             one each), and the redistributor confirmed PPI {} went Active -> Inactive all \
+             {deactivated} times before it was re-armed from the incoming guest's own emulated \
+             distributor",
+            gic::VTIMER_INTID
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: handoff FAIL: dom {dom} demoted {released} hardware-mapped list registers and \
+             got {deactivated} controller-confirmed deactivations across {switches} switches — \
+             expected exactly one of each per switch. The physical timer stays Active across a \
+             switch, so a second guest could never be signalled it, and the tick is the only thing \
+             that re-enters EL2"
+        );
+        crate::park();
+    }
+}
+
 /// The per-guest counters, named by the mechanism that writes each one. One array, so the count in
 /// the report below is derived and a counter cannot be added without appearing there.
-const PER_GUEST_COUNTERS: [&str; 8] = [
+const PER_GUEST_COUNTERS: [&str; 10] = [
     "GIC register traps",
     "INTID enables",
     "PL011 register traps",
@@ -1687,6 +1804,8 @@ const PER_GUEST_COUNTERS: [&str; 8] = [
     "forwarded timer ticks",
     "mediated SGIs",
     "scheduler switches",
+    "released hardware mappings",
+    "controller-confirmed deactivations",
 ];
 
 /// **③-b2b-ii-a's own witness: the per-guest state is INDEXED, not SHARED.**
@@ -1725,6 +1844,8 @@ fn report_per_guest_state(uart: &mut Pl011) {
             TIMER_FORWARDED[slot].load(Ordering::Relaxed),
             SGIS_DELIVERED[slot].load(Ordering::Relaxed),
             SWITCHES[slot].load(Ordering::Relaxed),
+            HW_RELEASED[slot].load(Ordering::Relaxed),
+            TIMER_DEACTIVATED[slot].load(Ordering::Relaxed),
         ]
     };
 
