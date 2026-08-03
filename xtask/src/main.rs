@@ -685,6 +685,18 @@ const LINUX_MARKERS: &[&str] = &[
     // Deleting the FP restore leaves both kernels reaching userspace with no panic and no trap —
     // Linux's own lazy-FP reload usually overwrites the clobbered file before anything reads it — so
     // this read-back is the ONLY thing between a broken restore and a silent green boot.
+    // ⑰-a — the boot transcript records what THIS BUILD believes a vCPU context is made of, so a
+    // component silently added or removed changes a line the gate asserts. The real obligation is
+    // the compiler's: `save`, `restore` and `poison` each destructure the context with no `..`, so
+    // a forgotten component is E0027 and a component named-but-not-acted-on is `unused_variables`
+    // under `metal-lint`'s `-D warnings`. That is what makes the class of bug which kept `v0..v31`
+    // unsaved from M5 Arc 1 to ③-b2b-ii-f unexpressible rather than merely unlikely.
+    //
+    // This marker is the transcript half, in the same spirit as the register list it extends: it
+    // cannot enforce anything, it records. Asserting the COUNTS is deliberate — adding a register or
+    // a component is meant to redden here and be updated knowingly, which is the `perguest OK`
+    // discipline applied to the context.
+    "baleen: vcpu context = 4 components (gprs sysregs vgic fp) / 25 registers:",
     "baleen: fp OK: dom 1 resumed on its OWN FP register file every time —",
     "baleen: fp OK: dom 2 resumed on its OWN FP register file every time —",
     // ★ ③-b2b-ii-d — THE LIVE NEGATIVE TEST, in both directions. Each guest's device tree names an

@@ -53,6 +53,7 @@ mod blk;
 mod cell;
 #[cfg(feature = "real-linux")]
 mod console;
+mod ctx;
 mod dmawitness;
 mod el2;
 mod exceptions;

@@ -104,6 +104,7 @@ use hv_core::{HvCall, HvError, HvOutcome, Hypercall, Hypervisor, RawHypercall};
 use hv_hal::GuestMemory;
 
 use crate::cell::{BootCell, BootRef};
+use crate::ctx::CtxComponent;
 use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, GuestMem};
@@ -2699,13 +2700,27 @@ fn save_context(vcpu: usize, frame: &GuestFrame) {
     vgic.save();
     let mut ctxs = VCPU_CTX.borrow_mut();
     let ctx = &mut ctxs[vcpu];
-    ctx.x = frame.x;
-    ctx.sp_el1 = sp_el1;
-    ctx.elr_el2 = elr;
-    ctx.spsr_el2 = spsr;
-    ctx.sctlr_el1 = sctlr;
-    ctx.vgic = vgic;
-    ctx.fp.save();
+    // ⑰-a: exhaustive, no `..`. Adding a field to `GuestContext` fails to compile here with E0027
+    // rather than being silently left out of the switch — the defect that kept `v0..v31` unsaved
+    // from M5 Arc 1 to ③-b2b-ii-f. The synthetic path gets the destructuring but NOT a component
+    // newtype for its four scalars: their offsets are hard-coded by `__enter_guest_ctx` and pinned
+    // by the `const _` block above, so wrapping them would desync the asm for no gain.
+    let GuestContext {
+        x,
+        sp_el1: saved_sp,
+        elr_el2: saved_elr,
+        spsr_el2: saved_spsr,
+        sctlr_el1: saved_sctlr,
+        vgic: saved_vgic,
+        fp,
+    } = ctx;
+    *x = frame.x;
+    *saved_sp = sp_el1;
+    *saved_elr = elr;
+    *saved_spsr = spsr;
+    *saved_sctlr = sctlr;
+    *saved_vgic = vgic;
+    fp.save();
 }
 
 /// Restore a vCPU's context — GPRs into the trampoline `frame` (so its `ldp`+`eret` resumes that
@@ -2716,16 +2731,27 @@ fn save_context(vcpu: usize, frame: &GuestFrame) {
 fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
     // Copied out, so the claim is released before `vcpu_meta` (below) takes its own.
     let ctx = VCPU_CTX.borrow_mut()[vcpu];
-    frame.x = ctx.x;
-    write_sysctx(ctx.sp_el1, ctx.elr_el2, ctx.spsr_el2, ctx.sctlr_el1);
+    // ⑰-a: exhaustive, for the reason given on `save_context`. `ctx` is a copy, so this destructures
+    // by value.
+    let GuestContext {
+        x,
+        sp_el1,
+        elr_el2,
+        spsr_el2,
+        sctlr_el1,
+        vgic,
+        fp,
+    } = ctx;
+    frame.x = x;
+    write_sysctx(sp_el1, elr_el2, spsr_el2, sctlr_el1);
     // Arc 7c/8b: restore this vCPU's own vGIC context, so it resumes with exactly the vINTs it left
     // — and the incoming vCPU does NOT inherit the outgoing one's (a switch to a vCPU with fewer
     // pending vINTs writes 0 over the peer's higher LRs), nor its priority mask.
     // SAFETY: at EL2, restoring the context saved for the vCPU being switched in.
-    unsafe { ctx.vgic.restore() };
+    unsafe { vgic.restore() };
     // ③-b2b-ii-f: and its own FP register file, so two FP-using vCPUs cannot cross-leak `v0..v31`.
     // SAFETY: at EL2, restoring the context saved for the vCPU being switched in.
-    unsafe { ctx.fp.restore() };
+    unsafe { fp.restore() };
     // III-1: with this vCPU's own bank reinstated, top up any free list registers from ITS software
     // pending set — the deterministic half of the refill, needing no maintenance interrupt. It must run
     // *after* the restore (which overwrites the whole bank, so a pre-restore refill would be discarded)

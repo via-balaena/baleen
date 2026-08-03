@@ -152,8 +152,9 @@ impl FpCtx {
         fpsr: 0,
     };
 
-    /// Capture the live FP register file into this context.
-    pub(crate) fn save(&mut self) {
+    /// Capture the live FP register file into this context. See the [`crate::ctx::CtxComponent`]
+    /// impl below, which is what obliges a switch to call it.
+    pub(crate) fn save_live(&mut self) {
         let p = core::ptr::addr_of_mut!(self.v) as *mut u64;
         // SAFETY: `p` points at 512 aligned, owned bytes (`v`, pinned at offset 0 by the `const _`
         // above). The `stp` pairs write exactly that range. `fpcr`/`fpsr` are readable at EL2 —
@@ -200,7 +201,7 @@ impl FpCtx {
     /// # Safety
     /// The caller must be at EL2 with the outgoing context already saved; between a [`poison`] and
     /// this call the register file belongs to nobody.
-    pub(crate) unsafe fn restore(&self) {
+    pub(crate) unsafe fn restore_live(&self) {
         let p = core::ptr::addr_of!(self.v) as *const u64;
         // SAFETY: forwarded from this function's contract; `p` covers the same 512 aligned bytes
         // `save` wrote, and the `ldp` pairs read exactly that range.
@@ -307,5 +308,29 @@ pub(crate) unsafe fn poison() {
     // SAFETY: forwarded from this function's contract. EL2 is built for
     // `aarch64-unknown-none-softfloat` and executes no FP instructions of its own, so a garbage
     // register file cannot affect EL2's own execution between here and the restore.
-    unsafe { POISON.restore() };
+    unsafe { POISON.restore_live() };
+}
+
+/// ⑰-a: the FP register file as a declared context component.
+impl crate::ctx::CtxComponent for FpCtx {
+    fn save(&mut self) {
+        self.save_live();
+    }
+
+    /// # Safety
+    /// Forwarded to [`FpCtx::restore_live`], whose contract this is.
+    unsafe fn restore(&self) {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.restore_live() };
+    }
+}
+
+#[cfg(feature = "real-linux")]
+impl crate::ctx::CtxPoison for FpCtx {
+    /// # Safety
+    /// Forwarded to [`poison`], whose contract this is.
+    unsafe fn poison(&self) {
+        // SAFETY: forwarded from this function's contract. `&self` is the type witness only.
+        unsafe { poison() };
+    }
 }

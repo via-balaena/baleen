@@ -79,6 +79,9 @@
 
 use core::arch::asm;
 
+use crate::ctx::CtxComponent;
+#[cfg(feature = "real-linux")]
+use crate::ctx::CtxPoison;
 use crate::gic;
 
 /// Declare the vCPU's system-register context **once**, generating the enum, the enumeration order,
@@ -220,6 +223,71 @@ const _: () = assert!(
 /// the guest's next use of it is a fault rather than a subtly wrong result.
 const POISON: u64 = 0xDEAD_BEEF_DEAD_BEEF;
 
+/// The components a vCPU context is made of, **named for the boot transcript** (⑰-a).
+///
+/// The compiler is what enforces that every one of these is saved, restored and poisoned — see
+/// [`crate::ctx`]. This array exists so the *boot* records which components this build believes a
+/// context has, in the same spirit as the register list beside it: a component silently added or
+/// removed changes a line the gate asserts. It is a build-time constant, not a count of anything a
+/// guest did, so it is structural rather than a claim about the workload (design-lesson #127).
+///
+/// ⚠ It is a NAME list, not the obligation. Nothing here forces it to agree with the struct — that
+/// job belongs to the destructurings, which the compiler checks. Kept short and adjacent for that
+/// reason: a reviewer comparing three lines against three fields is a check this file can afford,
+/// where three *traversals* against four fields was not.
+pub(crate) const CTX_COMPONENTS: [&str; 4] = ["gprs", "sysregs", "vgic", "fp"];
+
+/// The EL1 system-register half of a context, as one **component** (⑰-a).
+///
+/// A newtype over the array rather than the bare `[u64; N]` for one reason: a component is a thing
+/// that implements [`crate::ctx::CtxComponent`], and `VcpuCtx`'s traversals drive every field
+/// through that trait. Without it this half would be the one piece of the context whose save and
+/// restore were open-coded — which is exactly the shape the rung exists to remove.
+#[derive(Clone, Copy)]
+pub(crate) struct SysRegs([u64; CtxReg::ALL.len()]);
+
+impl SysRegs {
+    /// An empty set.
+    const ZERO: Self = Self([0; CtxReg::ALL.len()]);
+
+    /// Overwrite one register's saved value — the boot seed's only reason to reach inside.
+    fn set(&mut self, reg: CtxReg, value: u64) {
+        self.0[reg.index()] = value;
+    }
+}
+
+impl crate::ctx::CtxComponent for SysRegs {
+    fn save(&mut self) {
+        for (slot, reg) in self.0.iter_mut().zip(CtxReg::ALL) {
+            *slot = reg.read();
+        }
+    }
+
+    /// # Safety
+    /// Restores EL1 translation and exception state; the caller must be at EL2 and this context must
+    /// belong to the vCPU about to be resumed.
+    unsafe fn restore(&self) {
+        for (slot, reg) in self.0.iter().zip(CtxReg::ALL) {
+            // SAFETY: forwarded from this function's contract.
+            unsafe { reg.write(*slot) };
+        }
+    }
+}
+
+#[cfg(feature = "real-linux")]
+impl crate::ctx::CtxPoison for SysRegs {
+    /// # Safety
+    /// The caller must be at EL2 with a saved context in hand and must restore before returning to
+    /// EL1.
+    unsafe fn poison(&self) {
+        for reg in CtxReg::ALL {
+            // SAFETY: forwarded from this function's contract. None of these registers affects EL2's
+            // own execution, which runs MMU-off and identity-mapped with its own vectors installed.
+            unsafe { reg.write(POISON) };
+        }
+    }
+}
+
 /// A vCPU's saved context: the GPRs live in the trap frame, everything else here.
 ///
 /// The vGIC per-vCPU state rides along in [`gic::VgicCtx`] — **one type, shared with `guest.rs`'s
@@ -235,7 +303,7 @@ pub(crate) struct VcpuCtx {
     /// `x0..x30`, mirrored to and from the trap frame.
     pub(crate) x: [u64; 31],
     /// One entry per [`CtxReg::ALL`], in that order.
-    regs: [u64; CtxReg::ALL.len()],
+    regs: SysRegs,
     /// The vGIC state the hardware keeps per-vCPU and does not swap.
     vgic: gic::VgicCtx,
     /// The FP/SIMD register file, which the hardware does not swap either (③-b2b-ii-f).
@@ -253,7 +321,7 @@ impl VcpuCtx {
     pub(crate) const fn new() -> Self {
         Self {
             x: [0; 31],
-            regs: [0; CtxReg::ALL.len()],
+            regs: SysRegs::ZERO,
             vgic: gic::VgicCtx::ZERO,
             fp: crate::fp::FpCtx::ZERO,
         }
@@ -280,19 +348,31 @@ impl VcpuCtx {
         *self = Self::new();
         // The arm64 boot protocol: `x0` is the DTB, `x1..x3` are zero.
         self.x[0] = dtb;
-        self.regs[CtxReg::ElrEl2.index()] = entry;
-        self.regs[CtxReg::SpsrEl2.index()] = spsr;
-        self.regs[CtxReg::SctlrEl1.index()] = sctlr;
+        self.regs.set(CtxReg::ElrEl2, entry);
+        self.regs.set(CtxReg::SpsrEl2, spsr);
+        self.regs.set(CtxReg::SctlrEl1, sctlr);
     }
 
     /// Capture the live vCPU state into this context.
+    /// Capture the live vCPU state into this context.
+    ///
+    /// **⑰-a: the destructuring is the mechanism, not style.** No `..`, so adding a field to
+    /// [`VcpuCtx`] fails to compile here with E0027 — and binding one without acting on it is
+    /// `unused_variables`, which `metal-lint` runs as `-D warnings`. `gprs` is the one component
+    /// that is not a [`CtxComponent`]: it moves between the context and the exception frame rather
+    /// than the hardware, and a whole-array assignment has no partial-failure mode for a trait to
+    /// protect against. It is still named here, because being named is what makes it reviewed.
     pub(crate) fn save(&mut self, x: &[u64; 31]) {
-        self.x = *x;
-        for (slot, reg) in self.regs.iter_mut().zip(CtxReg::ALL) {
-            *slot = reg.read();
-        }
-        self.vgic.save();
-        self.fp.save();
+        let Self {
+            x: gprs,
+            regs,
+            vgic,
+            fp,
+        } = self;
+        *gprs = *x;
+        regs.save();
+        vgic.save();
+        fp.save();
     }
 
     /// This context's FP state, for the leak witness in [`crate::linux`].
@@ -317,41 +397,65 @@ impl VcpuCtx {
     /// Restores EL1 translation and exception state; the caller must be at EL2 and this context must
     /// belong to the vCPU about to be resumed.
     pub(crate) unsafe fn restore(&self, x: &mut [u64; 31]) {
-        *x = self.x;
-        for (slot, reg) in self.regs.iter().zip(CtxReg::ALL) {
-            // SAFETY: forwarded from this function's contract.
-            unsafe { reg.write(*slot) };
-        }
+        // ⑰-a: exhaustive, for the reason given on `save`. The ORDER is ③-b2b-ii-f's and unchanged:
+        // the three components are independent (`CPACR_EL1` gates EL0/EL1 FP access, not EL2's,
+        // which is `CPTR_EL2`), so this is preserved to keep the rung behaviour-nil rather than
+        // because it is forced.
+        let Self {
+            x: gprs,
+            regs,
+            vgic,
+            fp,
+        } = self;
+        *x = *gprs;
         // SAFETY: forwarded from this function's contract.
-        unsafe { self.vgic.restore() };
+        unsafe { regs.restore() };
         // SAFETY: forwarded from this function's contract.
-        unsafe { self.fp.restore() };
+        unsafe { vgic.restore() };
+        // SAFETY: forwarded from this function's contract.
+        unsafe { fp.restore() };
     }
 }
 
-/// Clobber every context register, so a restore that misses one cannot go unnoticed.
+/// Clobber every component of the live vCPU state, so a restore that misses one cannot go unnoticed.
 ///
 /// **This is the rung's instrument, not a debugging aid.** Without it a switch-to-self proves
 /// nothing: see the module docs. It runs between [`VcpuCtx::save`] and [`VcpuCtx::restore`], while
 /// the machine is at EL2 and no EL1 state is live.
 ///
+/// ## ⑰-a — why this became a method on a context it does not read
+///
+/// It was a free function, and that is exactly why the FP register file could be absent from it for
+/// six arcs without anyone noticing. `&self` is a **type witness**: it lets the body destructure
+/// `Self` exhaustively, which puts poisoning under the same E0027 obligation as `save` and
+/// `restore`. A free function cannot be driven from a destructuring, so a forgotten component there
+/// degrades from a hard error to nothing at all.
+///
+/// `x: _` is the other half of the statement. The GPR array is deliberately NOT poisoned — the trap
+/// frame is overwritten wholesale by the restore, so there is no partial-restore failure for a
+/// poison to expose — and binding it to `_` says that on purpose, in a place a reviewer must look.
+///
+/// Each component brings its own poison VALUE rather than inheriting [`POISON`], because a poison
+/// belongs to the state kind it clobbers (design-lesson #126): a garbage list-register encoding is
+/// architecturally UNPREDICTABLE, and `FPCR`/`FPSR` need valid-but-hostile encodings, while
+/// `v0..v31` and the EL1 system registers take the blanket pattern.
+///
 /// # Safety
 /// The caller must be at EL2 with a saved context in hand, and must restore before returning to EL1.
 /// Between this call and that restore the guest's entire EL1 configuration is garbage.
-pub(crate) unsafe fn poison() {
-    for reg in CtxReg::ALL {
-        // SAFETY: forwarded from this function's contract. None of these registers affects EL2's own
-        // execution, which runs MMU-off and identity-mapped with its own vectors already installed.
-        unsafe { reg.write(POISON) };
+impl VcpuCtx {
+    pub(crate) unsafe fn poison(&self) {
+        let Self {
+            x: _,
+            regs,
+            vgic,
+            fp,
+        } = self;
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            regs.poison();
+            vgic.poison();
+            fp.poison();
+        }
     }
-    // The vGIC half poisons ITSELF, with values of its own choosing — [`POISON`] is wrong for a list
-    // register (a garbage encoding is architecturally UNPREDICTABLE) and wrong for `VMCR`. See
-    // [`gic::VgicCtx::poison`] for what it uses instead and why.
-    // SAFETY: forwarded from this function's contract.
-    unsafe { gic::VgicCtx::poison() };
-    // The FP half likewise brings its own, for the same reason and with a different answer: `v0..v31`
-    // carry no encoding constraints (so the blanket pattern IS right for them and is what makes the
-    // probe loud), while `FPCR`/`FPSR` need valid-but-hostile encodings. See `crate::fp::poison`.
-    // SAFETY: forwarded from this function's contract.
-    unsafe { crate::fp::poison() };
 }
