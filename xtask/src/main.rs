@@ -490,9 +490,8 @@ const LINUX_MARKERS: &[&str] = &[
     // can bind the two — ⑭ folded the contract into one declaration everywhere it *could* reach, and
     // this marker is what binds the remaining cross-crate seam. Change `LINUX_KERNEL_ADDR` or
     // `LINUX_DTB_ADDR` without changing hv-metal and this goes red here rather than hanging a guest.
-    "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as EL1 guest dom 1 \
-     (Image@0x48000000, DTB@0x4b000000, RAM 0x48000000..0x64000000; peer dom 2 owns \
-     0x64000000..0x80000000)",
+    "baleen: M5 Arc 5e — booting 2 REAL aarch64 Linux kernels as EL1 guests time-slicing ONE pCPU \
+     (dom 1 owns 0x48000000..0x64000000, dom 2 owns 0x64000000..0x80000000)",
     // ③-b2a: 224 leaves each, not 448 — the window is split. BOTH domains are asserted, so a
     // build that quietly stopped emitting the peer would redden here and not only at `peer OK`.
     "baleen: linux model built for dom 1 — 224 super-span leaves (448 MiB at 0x48000000) across 28 L2-pinned tables, into stage-2 set 0",
@@ -513,25 +512,31 @@ const LINUX_MARKERS: &[&str] = &[
     "########## BALEEN-STEP0-OK ##########",
     "baleen-guest-ram: 48000000-63ffffff:SystemRAM",
     // ③-a1: the console every marker above travelled over is EMULATED.
-    "baleen: vpl011 OK: the guest's console is EMULATED — userspace's 'BALEEN-STEP0-OK' was \
-     written to the emulated PL011's DR register in EL2",
+    "baleen: vpl011 OK: dom 1's console is EMULATED — its own userspace's 'BALEEN-STEP0-OK' was \
+     written to dom 1's emulated PL011 DR register in EL2",
+    "baleen: vpl011 OK: dom 2's console is EMULATED — its own userspace's 'BALEEN-STEP0-OK' was \
+     written to dom 2's emulated PL011 DR register in EL2",
     // ③-a2: the interrupts that DROVE the boot above are EL2's now. Same discipline as the vpl011
     // marker and for the same reason — a guest whose scheduler tick arrives by list-register
     // injection prints exactly what one taking the PPI directly prints, so every marker above this
     // point survives `IMO=0` unchanged. These two are printed by hv-metal's own counters, which
     // only the forwarding path increments.
-    "baleen: vtimer OK: the guest's scheduler tick is FORWARDED —",
-    "baleen: vsgi OK:",
+    "baleen: vtimer OK: dom 1's scheduler tick is FORWARDED —",
+    "baleen: vtimer OK: dom 2's scheduler tick is FORWARDED —",
+    "of dom 1's SGIs MEDIATED at EL2 —",
+    "of dom 2's SGIs MEDIATED at EL2 —",
     // ③-b1: the interrupt CONTROLLER the guest programmed was EL2 state too — the last real device
     // it was still driving. Counted by the emulator, so a pass-through configuration cannot produce
     // it: the writes would never have been seen.
-    "baleen: vgic OK: the guest's interrupt controller is EMULATED —",
+    "baleen: vgic OK: dom 1's interrupt controller is EMULATED —",
+    "baleen: vgic OK: dom 2's interrupt controller is EMULATED —",
     // ③-b2b-i: the guest was switched OUT and BACK through hv-core's scheduler, with every context
     // register poisoned in between. Unlike every marker above it, the evidence is not that a counter
     // moved — it is that the kernel SURVIVED: a register missing from the saved set stays poisoned
     // and the boot dies, so every marker after this line is a guest resumed from a context the metal
     // rebuilt from scratch. Probe-verified per register (six of ten tested are load-bearing).
-    "baleen: vcpu OK: the guest was PREEMPTED and restored",
+    "baleen: vcpu OK: dom 1 was dispatched onto the pCPU",
+    "baleen: vcpu OK: dom 2 was dispatched onto the pCPU",
     // ③-b2b-ii-b: EL2 read the bytes at BOTH guests' load addresses before either ran, and found a
     // real payload at each. Asserted with every value in place, because the values ARE the claim:
     // the `ARM\x64` magic, `d00dfeed` and the addresses can only be there if the six `-device
@@ -565,12 +570,29 @@ const LINUX_MARKERS: &[&str] = &[
     // which kernel printed it, and the tag is EL2's own answer (which model instance took the byte)
     // rather than anything the guest could write.
     "[dom 1] ########## BALEEN-STEP0-OK ##########",
+    // ★ ③-b2b-ii-c2's HEADLINE — the four lines only a SECOND running kernel can produce, each
+    // carrying EL2's tag (which model instance received the byte) and guest B's own content in one
+    // string. Both guests run the SAME initramfs and the same `Image`, so no guest-supplied content
+    // alone can say which kernel printed it, and no EL2 tag alone says a kernel ran at all.
+    //
+    // `[dom 2] baleen-guest-ram: 64000000-7fffffff` is the strongest single assertion in this file:
+    // it is dom 2's userspace reading dom 2's `/proc/iomem`, which requires dom 2's kernel to have
+    // parsed dom 2's DTB and reached that RAM through dom 2's OWN Stage-2 image. Guest A cannot
+    // produce that string — its window ends at 0x63ffffff, and the peer's half is unmapped in its
+    // image (`peer OK`, walked from the descriptors before either guest ran).
+    // Dom 2's KERNEL lines cannot be asserted tag-plus-content: `printk` puts its own timestamp
+    // between the two (`[dom 2] [    0.000000] Linux version …`), and the timestamp varies. So the
+    // kernel-side claim is made by CONTENT that only dom 2 can print — its `/memory` window — and
+    // the tag-plus-content claims are the two userspace lines, which carry no timestamp.
+    "  node   0: [mem 0x0000000064000000-0x000000007fffffff]",
+    "[dom 2] ########## BALEEN-STEP0-OK ##########",
+    "[dom 2] baleen-guest-ram: 64000000-7fffffff:SystemRAM",
     // ③-b2b-ii-a's own witness, and the only assertion here that can tell an INDEXED per-guest state
     // from a shared one. Everything else this rung changed is structural: with one guest running,
     // eight arrays-of-one behave exactly like the eight globals they replaced. What cannot survive a
     // shared field is dom 2 — never dispatched, so every one of its counters must read zero, against
     // a dom 1 that made hundreds of GIC traps and thousands of console bytes on the same boot.
-    "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are INDEXED, not shared —",
+    "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are INDEXED, not shared — all 10 of them are non-zero for EVERY one of the 2 guests",
     // ③-b2b-ii-c1: the ONE physical timer changes hands at every switch. Two counts, because the
     // handoff has two halves and one of them is invisible to the other:
     //
@@ -585,14 +607,17 @@ const LINUX_MARKERS: &[&str] = &[
     // PROBED: with it deleted, guest A reaches userspace, prints `poweroff`, and HANGS — the tick
     // never comes again, and the tick is the only thing that re-enters EL2. That is the deadlock
     // this rung exists to prevent, reproduced on the guest that exists today.
-    "baleen: handoff OK: the forwarded timer changes hands at every switch —",
+    "baleen: handoff OK: dom 1 gave the forwarded timer up every time it left the pCPU holding one —",
+    "baleen: handoff OK: dom 2 gave the forwarded timer up every time it left the pCPU holding one —",
     // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
     // rather than recomputed from the layout constants the emitter used (design-lesson #36).
     // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
     // frames plus three out-of-window probes, not ∀-address. The ∀ statement is `hv-verify`'s.
     "baleen: peer OK: two domains, two Stage-2 images, DISJOINT over the guest-RAM window —",
     // The round trip home.
-    "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
+    "baleen: dom 1 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
+    "baleen: dom 2 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
+    "baleen: every real Linux guest has powered off — 2 unmodified kernels ran isolated on hv-metal's EL2 and shut down",
 ];
 
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
@@ -746,7 +771,10 @@ fn boot_and_check_linux(argv: &[&str]) -> bool {
         println!("----------------------------------------");
         println!("qemu-linux-test: FAILED");
     } else {
-        println!("qemu-linux-test: OK — a real Linux kernel booted behind the proven emitter and powered off");
+        println!(
+            "qemu-linux-test: OK — {NUM_GUESTS} real Linux kernels booted behind the proven \
+             emitter, ran isolated on one pCPU, and powered off"
+        );
     }
     let _ = std::fs::remove_file(&out);
     !failed

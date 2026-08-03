@@ -93,6 +93,16 @@ macro_rules! ctx_regs {
             /// Every register in the context, in save/restore order.
             pub(crate) const ALL: &'static [CtxReg] = &[$(CtxReg::$variant),*];
 
+            /// This register's slot in a saved context.
+            ///
+            /// The enum's discriminants and [`Self::ALL`]'s order are both generated from the one
+            /// list below, so the discriminant *is* the index — checked by
+            /// [`discriminants_are_indices`] rather than left as a assumption a future edit could
+            /// quietly break.
+            pub(crate) const fn index(self) -> usize {
+                self as usize
+            }
+
             /// The architectural name, for a diagnostic.
             pub(crate) const fn name(self) -> &'static str {
                 match self { $(CtxReg::$variant => $reg),* }
@@ -173,6 +183,27 @@ ctx_regs! {
     MdscrEl1 => "mdscr_el1",
 }
 
+/// [`CtxReg::index`] returns the register's position in [`CtxReg::ALL`].
+///
+/// True by construction — one macro generates the enum and the slice from one list — and checked
+/// anyway, because "by construction" is what stops being true when someone adds a variant by hand or
+/// gives one an explicit discriminant. A wrong index here would silently restore one register's
+/// value into another, which is a corrupted guest rather than a build error.
+const fn discriminants_are_indices() -> bool {
+    let mut i = 0;
+    while i < CtxReg::ALL.len() {
+        if CtxReg::ALL[i] as usize != i {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(
+    discriminants_are_indices(),
+    "a CtxReg's discriminant must be its index in CtxReg::ALL"
+);
+
 /// The value written over every context register between save and restore.
 ///
 /// Deliberately not `0`: zero is a plausible reset value for several of these, and a register that
@@ -209,6 +240,32 @@ impl VcpuCtx {
             regs: [0; CtxReg::ALL.len()],
             vgic: gic::VgicCtx::ZERO,
         }
+    }
+
+    /// **Seed the context of a vCPU that has never run** (③-b2b-ii-c2).
+    ///
+    /// **This is what makes a second kernel's BOOT and its RESUME the same code path.** hv-metal
+    /// enters guest A by writing `ELR_EL2`/`SPSR_EL2` and `eret`-ing; guest B is never entered that
+    /// way at all. Its first instruction is executed by [`Self::restore`] on a switch, exactly like
+    /// its ten-thousandth — so there is no second entry sequence to keep in step with the first, and
+    /// no path that runs once at boot and is never exercised again.
+    ///
+    /// The state is the arm64 boot protocol's, and everything not named here is deliberately zero:
+    /// `x1..x3` (the protocol requires it), and every EL1 register the kernel sets up for itself.
+    /// `TTBR*`/`TCR_EL1` being zero is not a hazard because `sctlr` is entered with the MMU off,
+    /// which is the same condition guest A is entered under.
+    ///
+    /// `sctlr` is passed in rather than computed: it is read back from the live CPU after
+    /// [`crate::linux`]'s `init_guest_el1` has cleared the enables, so guest B starts from the
+    /// identical value guest A did — RES1 bits and all. Deriving it here would be a second answer to
+    /// "what `SCTLR_EL1` does a guest boot with", and the two would agree until a board changed.
+    pub(crate) fn seed_boot(&mut self, entry: u64, dtb: u64, spsr: u64, sctlr: u64) {
+        *self = Self::new();
+        // The arm64 boot protocol: `x0` is the DTB, `x1..x3` are zero.
+        self.x[0] = dtb;
+        self.regs[CtxReg::ElrEl2.index()] = entry;
+        self.regs[CtxReg::SpsrEl2.index()] = spsr;
+        self.regs[CtxReg::SctlrEl1.index()] = sctlr;
     }
 
     /// Capture the live vCPU state into this context.

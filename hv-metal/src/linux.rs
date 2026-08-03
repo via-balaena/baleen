@@ -61,8 +61,7 @@
 //! Each device above is EL2 state, which is what makes a *second* copy of it possible. That
 //! possibility is now taken: the emulated PL011s, the emulated GICv3s, the vCPU contexts and the
 //! witness counters are arrays indexed by [`CURRENT`], and a guest's domain id, Stage-2 set, frame
-//! range and table range are all functions of its slot. Only slot A runs — moving `CURRENT` is
-//! ③-b2b-ii-c2.
+//! range and table range are all functions of its slot.
 //!
 //! ## ③-b2b-ii-c1: the one physical timer learns to change hands
 //!
@@ -86,6 +85,32 @@
 //! therefore buffers each guest's stream to a newline and tags the line with the model instance that
 //! received it, which is also the only attribution a guest cannot forge: both guests run the *same*
 //! initramfs.
+//!
+//! ## ③-b2b-ii-c2: `CURRENT` moves, and a second unmodified kernel runs
+//!
+//! Two real Linux kernels now time-slice one physical CPU. Each holds half the RAM window behind its
+//! own emitted Stage-2 image, drives its own emulated PL011 and GICv3, and is switched by `hv-core`'s
+//! real scheduler — `SchedPreempt` the outgoing vCPU, `SchedRun` the incoming one, and `VTTBR_EL2`
+//! swapped with **no `tlbi`** because the two domains' VMIDs cannot alias (M5 Arc 2's property,
+//! reached by real kernels for the first time).
+//!
+//! **Guest B is never `eret`-ed into.** Its context is *seeded* with the arm64 boot protocol's entry
+//! state ([`vcpu::VcpuCtx::seed_boot`]) and its first instruction is executed by the same context
+//! restore that resumes it ten thousand switches later — so its boot is not a second entry path that
+//! must be kept in step with guest A's, and there is no code that runs once and is never exercised
+//! again.
+//!
+//! **Selection is asked of the model but decided here.** [`next_runnable`] rotates over the slots
+//! `hv_core::sched` reports `Runnable`; a guest that has issued `SYSTEM_OFF` is `Offline` and stops
+//! being picked, which is the *only* record of who is still alive. `hv-core`'s own docs draw that
+//! line — mechanism, not policy — so the rotation is `hv-metal`'s and the legality is the model's.
+//!
+//! The headline is one string: **`[dom 2] baleen-guest-ram: 64000000-7fffffff:SystemRAM`**. It is
+//! guest B's userspace reading guest B's `/proc/iomem`, which needs B's kernel to have parsed B's
+//! DTB and reached that RAM through B's own Stage-2 — carrying EL2's tag and the guest's content in
+//! one line, neither of which means much alone. Guest A cannot produce it: its window ends at
+//! `0x63ffffff`, and the probe in [`switch_context`] shows what happens to a guest handed the wrong
+//! image — an instruction abort on its first fetch.
 //!
 //! ## The memory contract (shared with `cargo xtask qemu-linux`)
 //!
@@ -113,6 +138,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use hv_core::hypervisor::DomId;
 use hv_core::p2m::{Mfn, PtLevel};
+use hv_core::sched::RunState;
 use hv_core::{HvCall, Hypervisor};
 
 use crate::abort::{self, DataAbort, EC_DATA_ABORT};
@@ -153,11 +179,15 @@ pub(crate) const fn slot_dom(slot: usize) -> DomId {
 
 /// The domain the first real Linux kernel boots as.
 const GUEST_A: DomId = slot_dom(SLOT_A);
-/// The PEER domain (③-b2a). It owns the second half of the guest-RAM window and has a fully emitted
-/// Stage-2 image, but does not execute — running it is ③-b2b-ii-c. ③-b2b-i built the switch this
-/// path was missing and proved it carries a *real* kernel's state; ③-b2b-ii-a gave B its own device
-/// models, vCPU context and console; what remains is B's own blobs and the live negative test. What
-/// B exists for here is to make the existing negative test meaningful: see [`run`].
+/// The second domain. **It runs a second unmodified Linux kernel since ③-b2b-ii-c2** — it owns the
+/// upper half of the guest-RAM window behind its own emitted Stage-2 image, drives its own emulated
+/// PL011 and GICv3, and time-slices the one physical CPU with dom A through `hv-core`'s scheduler.
+///
+/// It got there a rung at a time: ③-b2a gave it an emitted image (and made the disjointness walk a
+/// statement about a peer's *live* mapping rather than about unmapped space), ③-b2b-i built the
+/// context switch and proved it carries a real kernel's state, ③-b2b-ii-a made every piece of
+/// per-guest state an index, ③-b2b-ii-b put its blobs in its window, and ③-b2b-ii-c1 taught the one
+/// physical timer to change hands.
 const GUEST_B: DomId = slot_dom(SLOT_B);
 
 /// A guest's Stage-2 table set **is** its slot.
@@ -1026,6 +1056,45 @@ static HW_RELEASED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_
 /// stop a second guest being signalled the tick.
 static TIMER_DEACTIVATED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
+/// How many times each guest has been switched **out** (③-b2b-ii-c2).
+///
+/// Distinct from [`SWITCHES`], which counts switch-*ins*, and the distinction only exists once there
+/// are two runners: with A↔B alternating, a guest is switched out and back in almost but not exactly
+/// the same number of times, and the timer handoff is an outgoing-side event. Comparing the two
+/// would have been comparing different quantities — which is what the first version of
+/// [`report_timer_handoff`] did, and it read `63 across 64 switches`.
+static HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// How many of a guest's handovers were driven by a **timer tick** (③-b2b-ii-c2).
+///
+/// **The distinction is what makes the handoff invariant statable.** A tick-driven handover always
+/// has a forwarded timer in flight — EL2 got here from [`handle_linux_irq`] having just injected one
+/// with `HW=1` — so exactly one mapping is demoted and the controller confirms exactly one
+/// deactivation. A `SYSTEM_OFF` handover has neither: it arrives on the *synchronous* path, with no
+/// interrupt in hand, so both counts correctly stay put. Comparing against total handovers read
+/// `66 across 67`, which was the witness noticing a real difference and calling it a fault.
+static TICK_HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// Why a guest is giving up the physical CPU.
+///
+/// Named rather than passed as a bool because it is what the handoff invariant is conditioned on,
+/// and a reader of [`switch_context`] has to know which kind they are looking at.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handover {
+    /// A timer tick preempted the guest — a forwarded interrupt is in flight.
+    Tick,
+    /// The guest issued `SYSTEM_OFF` and is retiring — nothing is in flight.
+    PowerOff,
+}
+
+/// Each guest's VMID-tagged `VTTBR_EL2`, as the proven emitter produced it (③-b2b-ii-c2).
+///
+/// Recorded at setup because a switch has to *install* the incoming domain's Stage-2, and the value
+/// is the emitter's output rather than anything this file computes — `build_stage2_from_p2m` returns
+/// it, and `report_disjointness` has already walked both images to the descriptors before either
+/// guest runs. Plain atomics: written once before any guest exists, read from the IRQ handler.
+static VTTBR: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
 /// **③-b2b-i — preempt the guest at the timer tick, through `hv-core`'s REAL scheduler.**
 ///
 /// The real-Linux path had no vCPU switch at all: `run` did one `eret` and never returned, and the
@@ -1065,60 +1134,171 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
         use hv_hal::TimeSource;
         crate::time::GenericTimer.now()
     };
-    let mut sched = |call: HvCall, what: &str| {
-        if let Err(e) = crate::teardown::dispatch(hv, dom, call) {
-            let mut uart = crate::uart();
-            let _ = writeln!(
-                uart,
-                "baleen: LINUX GUEST TRAP: scheduler '{what}' refused for dom {dom}: {e:?}; halting"
-            );
-            crate::park();
-        }
-    };
     // `SchedPreempt`, not `SchedOffline`. The model already had the right transition and its doc
     // names this exact situation — *"the involuntary counterpart of a guest yield"*: `Running` →
     // `Runnable`, freeing the pCPU without retiring the vCPU. `guest.rs` uses `SchedOffline` because
     // its synthetic vCPUs genuinely finish; a kernel interrupted mid-instruction has not finished,
     // and offlining it left the model in `Offline`, from which `SchedRun` is refused (`WrongState`).
     // That refusal is the model declining to describe a lie, which is what it is for.
-    sched(
+    sched_on(
+        hv,
+        dom,
         HvCall::SchedPreempt {
             vcpu: LINUX_VCPU,
             now,
         },
         "preempt the running vcpu",
     );
-    sched(
-        HvCall::SchedRun {
-            vcpu: LINUX_VCPU,
-            pcpu: PCPU0,
-            now,
-        },
-        "run the vcpu again",
-    );
+
+    let next = match next_runnable(hv, slot) {
+        Some(n) => n,
+        None => {
+            let mut uart = crate::uart();
+            let _ = writeln!(
+                uart,
+                "baleen: LINUX GUEST TRAP: no vcpu is Runnable after preempting dom {dom} — the \
+                 model just made it Runnable, so this cannot happen; halting"
+            );
+            crate::park();
+        }
+    };
+    sched_on(hv, slot_dom(next), scheduler_run(now), "run the next vcpu");
     drop(cell);
 
-    // ── the switch proper. The ORDER of these seven steps is the rung (③-b2b-ii-c1) ──────────────
-    //
-    // `next` is still `slot`: ③-b2b-ii-c2 is what makes the restored vCPU a different one. Naming it
-    // separately here is not anticipation for its own sake — every step below already has to say
-    // which vCPU it means, and writing `slot` in all of them would hide that three of them mean the
-    // OUTGOING one and two mean the INCOMING one.
-    let next = slot;
+    switch_context(slot, next, Handover::Tick, frame);
+}
 
+/// **Retire the guest that issued `SYSTEM_OFF` and hand the CPU to a peer** (③-b2b-ii-c2).
+///
+/// Returns `true` if a peer took it, `false` if that was the last guest standing and the machine has
+/// nothing left to run.
+///
+/// **`SchedOffline`, and here it is the truthful transition** — the opposite of ③-b2b-i's finding
+/// about preemption. A preempted kernel has not finished and offlining it would be the model
+/// describing a lie; a kernel that has issued `SYSTEM_OFF` genuinely has, and `Offline` is exactly
+/// what [`next_runnable`] then reads to stop dispatching it. One state change, and the selection
+/// policy needs no separate record of who is dead.
+///
+/// The handover uses the **same** [`switch_context`] as a timer preemption, from the *synchronous*
+/// trampoline's frame rather than the IRQ one. The two frames are the same layout and the two
+/// trampolines the same save/restore discipline, so a switch out of an `HVC` is a switch — this path
+/// does not get its own.
+fn power_off_and_hand_over(cur: usize, frame: &mut LinuxFrame, uart: &mut Pl011) -> bool {
+    let Some(mut cell) = crate::guest::GUEST_HV.try_borrow_mut() else {
+        let _ = writeln!(
+            uart,
+            "baleen: LINUX GUEST TRAP: dom {} issued SYSTEM_OFF while the model was borrowed; \
+             halting",
+            slot_dom(cur)
+        );
+        crate::park();
+    };
+    let Some(hv) = cell.as_mut() else {
+        crate::park();
+    };
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    sched_on(
+        hv,
+        slot_dom(cur),
+        HvCall::SchedOffline {
+            vcpu: LINUX_VCPU,
+            now,
+        },
+        "retire the powered-off vcpu",
+    );
+    let Some(next) = next_runnable(hv, cur) else {
+        return false;
+    };
+    sched_on(
+        hv,
+        slot_dom(next),
+        scheduler_run(now),
+        "run the surviving vcpu",
+    );
+    drop(cell);
+    switch_context(cur, next, Handover::PowerOff, frame);
+    true
+}
+
+/// **Which guest gets the pCPU next** — round-robin from `cur` over the slots the MODEL says are
+/// `Runnable` (③-b2b-ii-c2).
+///
+/// **Selection is asked of `hv-core` but decided here, and that split is the core's own.**
+/// `hv_core::sched`'s module doc draws it explicitly: *"Mechanism, not policy … it does not decide
+/// which runnable vCPU should get a CPU next. Fairness is policy, not a safety property."* So the
+/// rotation is `hv-metal`'s, while *whether a vCPU may run at all* is read back from
+/// [`hv_core::sched::System::state_of`] rather than from bookkeeping this file would otherwise have
+/// to keep in step. A guest that has issued `SYSTEM_OFF` is `Offline` in the model, and that is the
+/// one and only reason it stops being picked.
+///
+/// Stepping `1..=NUM_GUESTS` rather than `0..NUM_GUESTS` is what makes the peer preferred and the
+/// caller the fallback: with one guest left alive the last candidate is `cur` itself, so the switch
+/// degrades to ③-b2b-ii-c1's switch-to-self instead of having nowhere to go.
+fn next_runnable(hv: &Hypervisor, cur: usize) -> Option<usize> {
+    (1..=NUM_GUESTS)
+        .map(|step| (cur + step) % NUM_GUESTS)
+        .find(|&slot| hv.sched().state_of(slot_dom(slot), LINUX_VCPU) == Some(RunState::Runnable))
+}
+
+/// The `SchedRun` that dispatches a guest's vCPU onto the one physical CPU.
+///
+/// **It takes no slot, and that is the interesting part.** A vCPU id is scoped to its *domain* in
+/// `hv_core::sched`, so every guest's single vCPU is [`LINUX_VCPU`] and every dispatch names
+/// [`PCPU0`]; which guest is being run is carried entirely by the domain the call is dispatched on
+/// behalf of ([`sched_on`]'s `dom`). A `slot` parameter here would look like it selected something.
+fn scheduler_run(now: hv_hal::Ticks) -> HvCall {
+    HvCall::SchedRun {
+        vcpu: LINUX_VCPU,
+        pcpu: PCPU0,
+        now,
+    }
+}
+
+/// Dispatch `call` on behalf of `dom`, halting loudly if the model refuses.
+///
+/// A refusal here is never a guest's fault and never recoverable: it means hv-metal asked for a
+/// transition the model says is not legal from the state it is in, i.e. this file's idea of who is
+/// running has come apart from the model's. Continuing would run a vCPU the scheduler does not
+/// believe is on a CPU.
+fn sched_on(hv: &mut Hypervisor, dom: DomId, call: HvCall, what: &str) {
+    if let Err(e) = crate::teardown::dispatch(hv, dom, call) {
+        let mut uart = crate::uart();
+        let _ = writeln!(
+            uart,
+            "baleen: LINUX GUEST TRAP: scheduler '{what}' refused for dom {dom}: {e:?}; halting"
+        );
+        crate::park();
+    }
+}
+
+/// **Move the physical CPU from guest `cur` to guest `next`** — the register half of a switch, with
+/// the scheduler transitions already made by the caller (③-b2b-ii-c1 / c2).
+///
+/// The ORDER of these steps is ③-b2b-ii-c1's rung and is documented at
+/// [`gic::release_forwarded_timer`]; what ③-b2b-ii-c2 adds is that `next` may now differ from `cur`,
+/// which turns two of them from identities into real work: the context restored is a different
+/// vCPU's, and `VTTBR_EL2` becomes a different domain's VMID-tagged Stage-2.
+fn switch_context(cur: usize, next: usize, why: Handover, frame: &mut LinuxFrame) {
     let mut ctx = VCPU_CTX.borrow_mut();
     // 1. Capture the outgoing vCPU, list registers and `CNTV_CVAL_EL0` included.
-    ctx[slot].save(&frame.x);
+    ctx[cur].save(&frame.x);
 
     // 2. Demote its forwarded interrupts, and 3. hand the physical timer back. Between them these
     //    are the whole of Probe 0's fix: the outgoing guest keeps its pending tick as a purely
     //    VIRTUAL interrupt, and the one physical PPI on this machine stops being Active so it can be
     //    signalled to whoever runs next. See `gic::release_forwarded_timer` for the measurement that
     //    forced this and for why disable must precede deactivate.
-    let released = ctx[slot].release_hardware_mappings();
-    HW_RELEASED[slot].fetch_add(released, Ordering::Relaxed);
+    HANDOVERS[cur].fetch_add(1, Ordering::Relaxed);
+    if why == Handover::Tick {
+        TICK_HANDOVERS[cur].fetch_add(1, Ordering::Relaxed);
+    }
+    let released = ctx[cur].release_hardware_mappings();
+    HW_RELEASED[cur].fetch_add(released, Ordering::Relaxed);
     if gic::release_forwarded_timer() {
-        TIMER_DEACTIVATED[slot].fetch_add(1, Ordering::Relaxed);
+        TIMER_DEACTIVATED[cur].fetch_add(1, Ordering::Relaxed);
     }
 
     // 4. Poison — see `crate::vcpu`. Still the instrument that stops a switch-to-self being vacuous.
@@ -1130,9 +1310,23 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     //    guest about to run, which is why step 6 cannot be folded into step 3: re-arming the PPI
     //    while the outgoing guest's deadline was still loaded would fire the outgoing guest's timer
     //    into the incoming one.
-    // SAFETY: at EL2, restoring the context of the vCPU about to be resumed.
+    // SAFETY: at EL2, restoring the context of the vCPU about to be resumed. For guest B's FIRST
+    // switch-in this is the arm64 boot protocol's entry state, seeded by `VcpuCtx::seed_boot` — so
+    // B's boot and B's resume are the same instruction, not two paths that must agree.
     unsafe { ctx[next].restore(&mut frame.x) };
     drop(ctx);
+
+    // 5b. Install the incoming DOMAIN's VMID-tagged Stage-2, with **no TLB flush** — M5 Arc 2's
+    //     headline property, reached here by two REAL kernels for the first time. Distinct VMIDs are
+    //     what make the two domains' TLB entries unable to alias, so the switch needs no `tlbi`; the
+    //     images themselves were walked disjoint before either guest ran (`report_disjointness`).
+    //
+    //     **PROBED, and the probe is the isolation claim from the live side.** Installing guest A's
+    //     image here instead of the incoming guest's makes guest B's very first instruction fetch
+    //     fault: `EC=0x20 ELR=FAR=0x64000000 ESR=0x82000006` — an instruction abort, translation
+    //     fault at level 2. A's map does not reach B's memory even to fetch one instruction, and a
+    //     running guest is what says so, rather than a walk over the descriptors.
+    crate::guest::set_vttbr_no_flush(VTTBR[next].load(Ordering::Relaxed));
 
     // 6. Re-arm the physical PPI for the INCOMING guest, according to its own emulated distributor —
     //    the same mediation seam `handle_vgic_access` mirrors, applied at the other moment the
@@ -1141,7 +1335,9 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     let wants_timer = VGIC.borrow_mut()[next].is_enabled(gic::VTIMER_INTID);
     gic::set_ppi_enabled(gic::VTIMER_INTID, wants_timer);
 
-    // 7. Count the switch. `eret` is the caller's.
+    // 7. The pCPU now belongs to `next`, so every handler that asks "which guest?" must get the new
+    //    answer from here on. Stored LAST: everything above still had to speak about `cur`.
+    CURRENT.store(next, Ordering::Relaxed);
     SWITCHES[next].fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1191,9 +1387,23 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 };
             }
             PSCI_SYSTEM_OFF_FID => {
-                // The guest's last line is often the one announcing the poweroff, and it arrives
+                let cur = current_slot();
+                // This guest's last line is usually the one announcing the poweroff, and it arrives
                 // without a terminating newline in front of this `HVC`. Flush before reporting, or
-                // the witness swallows the last thing the boot said.
+                // the witness swallows the last thing it said.
+                CONSOLE.borrow_mut().flush(cur, &mut uart);
+                let _ = writeln!(
+                    uart,
+                    "baleen: dom {} issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut \
+                     down on hv-metal's EL2",
+                    slot_dom(cur)
+                );
+                // ③-b2b-ii-c2: one guest powering off is no longer the end of the machine. Retire
+                // it in the MODEL and hand the physical CPU to whoever is still Runnable; only when
+                // nothing is does the boot end.
+                if power_off_and_hand_over(cur, frame, &mut uart) {
+                    return;
+                }
                 let mut console = CONSOLE.borrow_mut();
                 for slot in 0..NUM_GUESTS {
                     console.flush(slot, &mut uart);
@@ -1205,8 +1415,8 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 report_per_guest_state(&mut uart);
                 let _ = writeln!(
                     uart,
-                    "baleen: linux guest issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut \
-                     down on hv-metal's EL2 (M5 Arc 5e)"
+                    "baleen: every real Linux guest has powered off — {NUM_GUESTS} unmodified \
+                     kernels ran isolated on hv-metal's EL2 and shut down (M5 Arc 5e)"
                 );
                 semihosting_exit(); // clean QEMU exit (falls through to a fault→park if -semihosting off)
             }
@@ -1488,21 +1698,24 @@ fn read_hpfar() -> u64 {
 /// covered both. A witness that overstates by one word is the same defect as one that cannot
 /// discriminate, only harder to notice.
 fn report_vpl011(uart: &mut Pl011) {
-    let (ok, traps, dr_writes) = VPL011.borrow_mut()[current_slot()].witness();
-    if ok {
-        let _ = writeln!(
-            uart,
-            "baleen: vpl011 OK: the guest's console is EMULATED — userspace's 'BALEEN-STEP0-OK' was \
-             written to the emulated PL011's DR register in EL2 ({traps} register traps, \
-             {dr_writes} bytes relayed to the real PL011)"
-        );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: vpl011 FAIL: the guest's console did not go through the emulator \
-             ({traps} register traps, {dr_writes} bytes forwarded) — the PL011 is being passed \
-             through, or the transmit path is broken"
-        );
+    for slot in 0..NUM_GUESTS {
+        let dom = slot_dom(slot);
+        let (ok, traps, dr_writes) = VPL011.borrow_mut()[slot].witness();
+        if ok {
+            let _ = writeln!(
+                uart,
+                "baleen: vpl011 OK: dom {dom}'s console is EMULATED — its own userspace's \
+                 'BALEEN-STEP0-OK' was written to dom {dom}'s emulated PL011 DR register in EL2 \
+                 ({traps} register traps, {dr_writes} bytes relayed to the real PL011)"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: vpl011 FAIL: dom {dom}'s console did not go through its emulator \
+                 ({traps} register traps, {dr_writes} bytes forwarded) — the PL011 is being passed \
+                 through, the transmit path is broken, or this guest never reached userspace"
+            );
+        }
     }
 }
 
@@ -1525,79 +1738,75 @@ fn report_vpl011(uart: &mut Pl011) {
 /// `Run /init`, so `BALEEN-STEP0-OK` and every marker after it go red. Neither half claims the other's
 /// ground.
 fn report_interrupt_mediation(uart: &mut Pl011) {
-    let slot = current_slot();
-    let n = TIMER_FORWARDED[slot].load(Ordering::Relaxed);
-    if n > 0 {
-        let _ = writeln!(
-            uart,
-            "baleen: vtimer OK: the guest's scheduler tick is FORWARDED — {n} physical timer \
-             interrupts (INTID {}) taken at EL2 under HCR_EL2.IMO=1 and injected as hardware-mapped \
-             virtual interrupts",
-            gic::VTIMER_INTID
-        );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: vtimer FAIL: EL2 forwarded no timer interrupt — the guest is taking the PPI \
-             directly (IMO=0), or the physical CPU interface never delivered one"
-        );
-    }
+    for slot in 0..NUM_GUESTS {
+        let dom = slot_dom(slot);
+        let n = TIMER_FORWARDED[slot].load(Ordering::Relaxed);
+        if n > 0 {
+            let _ = writeln!(
+                uart,
+                "baleen: vtimer OK: dom {dom}'s scheduler tick is FORWARDED — {n} physical timer \
+                 interrupts (INTID {}) taken at EL2 under HCR_EL2.IMO=1 while dom {dom} held the \
+                 pCPU, and injected as hardware-mapped virtual interrupts",
+                gic::VTIMER_INTID
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: vtimer FAIL: EL2 forwarded no timer interrupt to dom {dom} — it is taking \
+                 the PPI directly (IMO=0), the physical CPU interface never delivered one, or this \
+                 guest never ran"
+            );
+        }
 
-    // ③-b1: the interrupt CONTROLLER the guest programmed was ours too — a THIRD mechanism, reached
-    // by a third path (a Stage-2 data abort on the GIC window). Each of the three gets its own line
-    // for the same reason: a witness that merged them could stay green with any one path dead.
-    let (gic_traps, gic_enables) = VGIC.borrow_mut()[slot].witness();
-    if gic_traps > 0 && gic_enables > 0 {
-        let _ = writeln!(
-            uart,
-            "baleen: vgic OK: the guest's interrupt controller is EMULATED — {gic_traps} GICD/GICR \
-             register traps in EL2, {gic_enables} INTIDs enabled in a distributor the guest cannot \
-             reach (Stage-2 device pass-through window: 0 bytes)"
-        );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: vgic FAIL: the guest's GIC accesses did not go through the emulator \
-             ({gic_traps} traps, {gic_enables} enables) — the distributor is being passed through"
-        );
-    }
+        let (gic_traps, gic_enables) = VGIC.borrow_mut()[slot].witness();
+        if gic_traps > 0 && gic_enables > 0 {
+            let _ = writeln!(
+                uart,
+                "baleen: vgic OK: dom {dom}'s interrupt controller is EMULATED — {gic_traps} \
+                 GICD/GICR register traps in EL2, {gic_enables} INTIDs enabled in a distributor \
+                 that is dom {dom}'s alone and that no guest can reach (Stage-2 device pass-through \
+                 window: 0 bytes)"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: vgic FAIL: dom {dom}'s GIC accesses did not go through its emulator \
+                 ({gic_traps} traps, {gic_enables} enables) — the distributor is being passed \
+                 through, or this guest never ran"
+            );
+        }
 
-    // ③-b2b-i: the guest was SWITCHED OUT AND BACK, through hv-core's scheduler, with every context
-    // register poisoned in between. A FOURTH mechanism, and the only one whose evidence is that the
-    // guest survived rather than that a counter moved — every marker after this line is a kernel that
-    // resumed from a context this metal reconstructed from scratch.
-    let switches = SWITCHES[slot].load(Ordering::Relaxed);
-    if switches > 0 {
-        let _ = writeln!(
-            uart,
-            "baleen: vcpu OK: the guest was PREEMPTED and restored {switches} times through \
-             hv-core's scheduler — {} context registers plus the vGIC bank (list registers + \
-             ICH_VMCR_EL2) saved, poisoned and reinstated each time, and the kernel never noticed",
-            vcpu::CtxReg::ALL.len()
-        );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: vcpu FAIL: the guest was never preempted — the timer tick did not reach the \
-             switch, so nothing here was exercised"
-        );
-    }
+        let switches = SWITCHES[slot].load(Ordering::Relaxed);
+        if switches > 0 {
+            let _ = writeln!(
+                uart,
+                "baleen: vcpu OK: dom {dom} was dispatched onto the pCPU {switches} times through \
+                 hv-core's scheduler — {} context registers plus the vGIC bank (list registers + \
+                 ICH_VMCR_EL2) reinstated each time, with every one of them poisoned in between",
+                vcpu::CtxReg::ALL.len()
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: vcpu FAIL: dom {dom} was never dispatched — the timer tick did not reach \
+                 the switch, so nothing here was exercised for this guest"
+            );
+        }
 
-    // The SGI half is a SEPARATE mechanism reached by a separate trap (`EC=0x18`, not the IRQ
-    // vector), so it gets its own line rather than being folded into the timer count above.
-    let sgis = SGIS_DELIVERED[slot].load(Ordering::Relaxed);
-    if sgis > 0 {
-        let _ = writeln!(
-            uart,
-            "baleen: vsgi OK: {sgis} guest SGIs MEDIATED at EL2 — ICC_SGI1R_EL1 writes trap under \
-             HCR_EL2.IMO=1 and are delivered as virtual interrupts"
-        );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: vsgi FAIL: EL2 mediated no SGI — the guest reached its own SGI generation \
-             register, which HCR_EL2.IMO=1 is supposed to make impossible"
-        );
+        let sgis = SGIS_DELIVERED[slot].load(Ordering::Relaxed);
+        if sgis > 0 {
+            let _ = writeln!(
+                uart,
+                "baleen: vsgi OK: {sgis} of dom {dom}'s SGIs MEDIATED at EL2 — ICC_SGI1R_EL1 \
+                 writes trap under HCR_EL2.IMO=1 and are delivered as virtual interrupts"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: vsgi FAIL: EL2 mediated no SGI for dom {dom} — it reached its own SGI \
+                 generation register, which HCR_EL2.IMO=1 is supposed to make impossible"
+            );
+        }
     }
 }
 
@@ -1765,31 +1974,55 @@ pub(crate) fn flush_consoles() {
 /// guest. ③-b2b-ii-c2 is where that becomes observable, and where a failure of this mechanism stops
 /// being invisible and becomes a hang.
 fn report_timer_handoff(uart: &mut Pl011) {
-    let slot = current_slot();
-    let dom = slot_dom(slot);
-    let released = HW_RELEASED[slot].load(Ordering::Relaxed);
-    let deactivated = TIMER_DEACTIVATED[slot].load(Ordering::Relaxed);
-    let switches = SWITCHES[slot].load(Ordering::Relaxed);
-    if switches > 0 && released == switches && deactivated == switches {
-        let _ = writeln!(
-            uart,
-            "baleen: handoff OK: the forwarded timer changes hands at every switch — dom {dom} \
-             demoted {released} hardware-mapped list registers across {switches} switches (exactly \
-             one each), and the redistributor confirmed PPI {} went Active -> Inactive all \
-             {deactivated} times before it was re-armed from the incoming guest's own emulated \
-             distributor",
-            gic::VTIMER_INTID
-        );
-    } else {
-        let _ = writeln!(
-            uart,
-            "baleen: handoff FAIL: dom {dom} demoted {released} hardware-mapped list registers and \
-             got {deactivated} controller-confirmed deactivations across {switches} switches — \
-             expected exactly one of each per switch. The physical timer stays Active across a \
-             switch, so a second guest could never be signalled it, and the tick is the only thing \
-             that re-enters EL2"
-        );
-        crate::park();
+    for slot in 0..NUM_GUESTS {
+        let dom = slot_dom(slot);
+        let released = HW_RELEASED[slot].load(Ordering::Relaxed);
+        let deactivated = TIMER_DEACTIVATED[slot].load(Ordering::Relaxed);
+        let handovers = HANDOVERS[slot].load(Ordering::Relaxed);
+        let on_tick = TICK_HANDOVERS[slot].load(Ordering::Relaxed);
+
+        // The three conjuncts, and each is here because a weaker one let something through:
+        //
+        // * `released == deactivated` — **the load-bearing one.** It cross-checks the SOFTWARE half
+        //   (EL2 demoted the mapping in the context it saved) against the HARDWARE half (the
+        //   redistributor agreed the physical interrupt went Inactive). Either alone is satisfiable
+        //   with the other deleted; together they are not.
+        // * `released >= on_tick` — no tick-driven handover was missed. A handover reached from
+        //   `handle_linux_irq` always has a forwarded interrupt in flight, because EL2 got there by
+        //   injecting one.
+        // * `released <= handovers` — nothing was demoted outside a handover.
+        //
+        // What is deliberately NOT asserted is `released == on_tick`, and the reason is a measured
+        // correction rather than caution. A guest can issue `SYSTEM_OFF` while a forwarded tick is
+        // still sitting un-taken in its bank, and that handover then demotes one too — so the count
+        // depends on the guest's timing, not on the mechanism. Two earlier forms of this witness
+        // (`== switches`, then `== on_tick`) each refused a perfectly correct boot before the
+        // numbers said which quantity was actually invariant.
+        let ok =
+            on_tick > 0 && released == deactivated && released >= on_tick && released <= handovers;
+        if ok {
+            let _ = writeln!(
+                uart,
+                "baleen: handoff OK: dom {dom} gave the forwarded timer up every time it left the \
+                 pCPU holding one — {released} hardware-mapped list registers demoted and {} \
+                 controller-confirmed Active -> Inactive transitions of PPI {}, across {handovers} \
+                 handovers of which {on_tick} were tick-driven; then re-armed from the incoming \
+                 guest's own emulated distributor",
+                deactivated,
+                gic::VTIMER_INTID
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: handoff FAIL: dom {dom} demoted {released} hardware-mapped list registers \
+                 but the redistributor confirmed {deactivated} deactivations, across {handovers} \
+                 handovers ({on_tick} tick-driven) — the two halves of the handoff disagree, or a \
+                 tick-driven handover kept its mapping. The physical timer then stays Active across \
+                 a switch, the next guest can never be signalled it, and the tick is the only thing \
+                 that re-enters EL2"
+            );
+            crate::park();
+        }
     }
 }
 
@@ -1808,25 +2041,24 @@ const PER_GUEST_COUNTERS: [&str; 10] = [
     "controller-confirmed deactivations",
 ];
 
-/// **③-b2b-ii-a's own witness: the per-guest state is INDEXED, not SHARED.**
+/// **③-b2b-ii-a's witness, inverted by ③-b2b-ii-c2: the per-guest state is INDEXED, not SHARED.**
 ///
-/// **Why this rung needs a witness at all, and why the obvious one is empty.** Everything ③-b2b-ii-a
-/// changed is structural — eight globals became eight arrays — and with one guest running, the boot
-/// it produces is byte-for-byte the boot it produced before. That is design-lesson #105's shape
-/// exactly: a change whose "it still works" test cannot tell the change from its absence. An array
-/// indexed by a constant is a global wearing brackets.
+/// **The claim had to change when the second guest started running, and the change is the rung.**
+/// While only dom 1 ran, the falsifiable statement was about the PEER: dom 2 had never been
+/// dispatched, so every one of its counters had to read zero, and a shared model or a stale index
+/// would contaminate them with the runner's traffic. That statement is now meaningless — dom 2 makes
+/// its own traffic.
 ///
-/// **So the witness is aimed at the peer, not the runner.** Dom 2 has never been dispatched, so
-/// every one of its counters must be exactly zero — and that is a *falsifiable* statement about the
-/// refactor rather than about the boot. A model still shared between the guests, or a handler
-/// indexing with the wrong slot, contaminates the peer's counters with the runner's traffic: dom 1
-/// makes hundreds of GIC traps and thousands of console bytes on this boot, so a single shared field
-/// is the difference between `0` and a four-digit number. Nothing else in the gate can see that.
+/// What replaces it is stronger. With both guests running, **every guest's counters must be
+/// non-zero**, and a shared model gives itself away the other way round: one guest's tallies would
+/// carry both guests' work while the other's stayed at zero. There is no arrangement of shared state
+/// that produces two independently non-zero sets. So the same check, read in the opposite direction,
+/// witnesses the same property against a machine that can now actually violate it.
 ///
-/// **Honest limit.** Zero peer counters prove no handler *on the paths this boot took* wrote through
-/// a stale index. They do not prove the arrays are indexed correctly — with one runner, "always slot
-/// 0" and "always the running slot" agree. What distinguishes those is a second runner, which is
-/// ③-b2b-ii-c; this rung's job is to make sure the runner's state stops leaking sideways first.
+/// **Honest limit.** Non-zero on both sides proves the state is *two-valued*, not that each value
+/// belongs to the right guest. What binds a counter to its owner is elsewhere and stronger: dom 2's
+/// console lines carry `baleen-guest-ram: 64000000-7fffffff`, which is dom 2's kernel reading dom
+/// 2's DTB through dom 2's Stage-2, and which dom 1 cannot produce.
 fn report_per_guest_state(uart: &mut Pl011) {
     let pl011 = VPL011.borrow_mut();
     let vgic = VGIC.borrow_mut();
@@ -1849,47 +2081,55 @@ fn report_per_guest_state(uart: &mut Pl011) {
         ]
     };
 
-    let run = current_slot();
-    let mine = sample(run);
-    // The first peer counter that is not zero, if any — named, because "the peer is contaminated"
-    // and "the peer's GIC model is the runner's" are different bugs and the counter says which.
-    let mut leak = None;
-    for slot in (0..NUM_GUESTS).filter(|&s| s != run) {
+    // The first counter any guest failed to move, if any — named, because "this guest never ran" and
+    // "this guest's GIC model is the other one's" are different bugs and the counter says which.
+    let mut dead = None;
+    for slot in 0..NUM_GUESTS {
         for (name, value) in PER_GUEST_COUNTERS.iter().zip(sample(slot)) {
-            if value != 0 && leak.is_none() {
-                leak = Some((slot_dom(slot), *name, value));
+            if value == 0 && dead.is_none() {
+                dead = Some((slot_dom(slot), *name));
             }
         }
     }
 
-    match leak {
+    match dead {
         None => {
             let _ = writeln!(
                 uart,
                 "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are \
-                 INDEXED, not shared — dom {} ran and made {} GIC traps, {} INTID enables, {} PL011 \
-                 traps, {} console bytes on {} lines, {} forwarded ticks, {} SGIs and {} switches, \
-                 while all {} of dom {}'s counters are ZERO",
-                slot_dom(run),
-                mine[0],
-                mine[1],
-                mine[2],
-                mine[3],
-                mine[4],
-                mine[5],
-                mine[6],
-                mine[7],
-                PER_GUEST_COUNTERS.len(),
-                slot_dom(if run == SLOT_A { SLOT_B } else { SLOT_A }),
+                 INDEXED, not shared — all {} of them are non-zero for EVERY one of the \
+                 {NUM_GUESTS} guests, which no arrangement of shared state produces (a shared \
+                 model carries both guests' work in one tally and leaves the other at zero)",
+                PER_GUEST_COUNTERS.len()
             );
+            for slot in 0..NUM_GUESTS {
+                let c = sample(slot);
+                let _ = writeln!(
+                    uart,
+                    "baleen: perguest: dom {} — {} GIC traps, {} INTID enables, {} PL011 traps, {} \
+                     console bytes on {} lines, {} forwarded ticks, {} SGIs, {} dispatches, {} \
+                     released mappings, {} confirmed deactivations",
+                    slot_dom(slot),
+                    c[0],
+                    c[1],
+                    c[2],
+                    c[3],
+                    c[4],
+                    c[5],
+                    c[6],
+                    c[7],
+                    c[8],
+                    c[9]
+                );
+            }
         }
-        Some((dom, name, value)) => {
+        Some((dom, name)) => {
             let _ = writeln!(
                 uart,
-                "baleen: perguest FAIL: dom {dom} has never been dispatched, yet its '{name}' \
-                 counter reads {value} — the per-guest state is shared, or a handler indexed it \
-                 with the wrong slot"
+                "baleen: perguest FAIL: dom {dom}'s '{name}' counter is ZERO — that guest never \
+                 exercised the mechanism, or its state is shared with a peer that did"
             );
+            crate::park();
         }
     }
 }
@@ -1965,9 +2205,9 @@ extern "C" {
 pub(crate) fn run(uart: &mut Pl011) -> ! {
     let _ = writeln!(
         uart,
-        "baleen: M5 Arc 5e — booting a REAL aarch64 Linux kernel as EL1 guest dom {GUEST_A} \
-         (Image@0x{KERNEL_ENTRY:08x}, DTB@0x{DTB_ADDR:08x}, RAM 0x{GUEST_RAM_BASE:08x}..0x{split:08x}; \
-         peer dom {GUEST_B} owns 0x{split:08x}..0x{GUEST_RAM_END:08x})",
+        "baleen: M5 Arc 5e — booting {NUM_GUESTS} REAL aarch64 Linux kernels as EL1 guests \
+         time-slicing ONE pCPU (dom {GUEST_A} owns 0x{GUEST_RAM_BASE:08x}..0x{split:08x}, dom \
+         {GUEST_B} owns 0x{split:08x}..0x{GUEST_RAM_END:08x})",
         split = stage2::LINUX_RAM_SPLIT
     );
 
@@ -1983,7 +2223,7 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
         Some(hv) => hv,
         None => crate::park(),
     };
-    // ③-b2a — TWO domains, TWO Stage-2 images, one running kernel.
+    // ③-b2a — TWO domains, TWO Stage-2 images; since ③-b2b-ii-c2, TWO running kernels.
     //
     // Domain A is the guest that boots; domain B owns the other half of the window and has a real
     // emitted image it could run from. Building B is not decoration: it is what makes the negative
@@ -2003,44 +2243,49 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
         );
     }
     report_disjointness(&vttbr, uart);
-
-    // ③-b2b-i — put the guest's vCPU under hv-core's REAL scheduler before it ever runs, so the
-    // preemption at each timer tick is a `SchedOffline`/`SchedRun` pair against a model that already
-    // has it Running, not a pair of calls the model would refuse. Admit moves it Offline → Runnable;
-    // the dispatch moves it Runnable → Running.
-    for (call, what) in [
-        (
-            HvCall::SchedAdmit { vcpu: LINUX_VCPU },
-            "admit the linux vcpu",
-        ),
-        (
-            HvCall::SchedRun {
-                vcpu: LINUX_VCPU,
-                pcpu: PCPU0,
-                now: {
-                    use hv_hal::TimeSource;
-                    crate::time::GenericTimer.now()
-                },
-            },
-            "dispatch the linux vcpu",
-        ),
-    ] {
-        if let Err(e) = crate::teardown::dispatch(hv, GUEST_A, call) {
-            let _ = writeln!(
-                uart,
-                "baleen: linux scheduler setup '{what}' failed for dom {GUEST_A}: {e:?}; halting"
-            );
-            crate::park();
-        }
+    // Keep each domain's VMID-tagged image where a switch can install it (③-b2b-ii-c2). Stored only
+    // after `report_disjointness` has walked both to their descriptors — an image nothing has read
+    // back is not one to start dispatching guests onto.
+    for (slot, v) in vttbr.iter().enumerate() {
+        VTTBR[slot].store(*v, Ordering::Relaxed);
     }
+
+    // ③-b2b-i put guest A's vCPU under hv-core's REAL scheduler before it ever ran, so the
+    // preemption at each timer tick is a pair of transitions against a model that already has it
+    // Running rather than a pair of calls the model would refuse. **③-b2b-ii-c2 admits EVERY
+    // guest's**, and that is what makes a switch to the peer legal: `next_runnable` picks only
+    // vCPUs the model reports `Runnable`, so a vCPU nobody ever admitted is one the scheduler would
+    // never hand the CPU to.
+    //
+    // Admit moves each Offline → Runnable; the single dispatch moves guest A's Runnable → Running.
+    // Guest B stays Runnable until the first timer tick preempts A — its first instruction is
+    // executed by a context RESTORE, not by an `eret` of its own (see `VcpuCtx::seed_boot`).
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    for slot in 0..NUM_GUESTS {
+        sched_on(
+            hv,
+            slot_dom(slot),
+            HvCall::SchedAdmit { vcpu: LINUX_VCPU },
+            "admit a linux vcpu",
+        );
+    }
+    sched_on(
+        hv,
+        GUEST_A,
+        scheduler_run(now),
+        "dispatch the first linux vcpu",
+    );
     let _ = writeln!(
         uart,
-        "baleen: linux vcpu {LINUX_VCPU} admitted and dispatched onto pCPU {PCPU0} through \
-         hv-core's scheduler — the guest is now PREEMPTIBLE at every {PREEMPT_EVERY}th timer tick"
-    );
-    // Name the saved set in the transcript. A context register that stops being saved is otherwise
-    // invisible until it corrupts a guest; here it changes this line, so the boot output itself
-    // records what this build believes a vCPU is made of.
+        "baleen: {NUM_GUESTS} linux vcpus admitted through hv-core's scheduler, dom {GUEST_A} \
+         dispatched onto pCPU {PCPU0} — each guest is PREEMPTIBLE at every {PREEMPT_EVERY}th timer \
+         tick, and the pCPU passes to whichever peer the model still reports Runnable"
+    ); // Name the saved set in the transcript. A context register that stops being saved is otherwise
+       // invisible until it corrupts a guest; here it changes this line, so the boot output itself
+       // records what this build believes a vCPU is made of.
     let _ = write!(
         uart,
         "baleen: vcpu context = {} registers:",
@@ -2055,6 +2300,44 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     enable_stage2(vttbr[SLOT_A]);
     enable_guest_hw_access();
     init_guest_el1();
+
+    // ③-b2b-ii-c2 — **seed every guest that is not the one this `eret` enters.**
+    //
+    // Guest A is entered the way it always was: `ELR_EL2`/`SPSR_EL2` written below, then `eret`.
+    // Guest B is never entered that way at all — its first instruction is executed by the context
+    // RESTORE inside `switch_context`, exactly like its ten-thousandth. So there is no second entry
+    // sequence to keep in step with the first, and no boot path that runs once and is then never
+    // exercised again.
+    //
+    // `SCTLR_EL1` is read back from the live CPU rather than recomputed: `init_guest_el1` just
+    // cleared the enables on it, so this is the identical value guest A is about to be entered with,
+    // RES1 bits included. Two answers to "what `SCTLR_EL1` does a guest boot with" would agree
+    // until a board changed.
+    let sctlr_at_boot: u64;
+    // SAFETY: `SCTLR_EL1` is readable at EL2; no memory effect.
+    unsafe {
+        asm!("mrs {v}, sctlr_el1", v = out(reg) sctlr_at_boot, options(nomem, nostack, preserves_flags));
+    }
+    {
+        let mut ctx = VCPU_CTX.borrow_mut();
+        for slot in (0..NUM_GUESTS).filter(|&s| s != SLOT_A) {
+            ctx[slot].seed_boot(
+                kernel_entry(slot),
+                dtb_addr(slot),
+                SPSR_EL2_LINUX,
+                sctlr_at_boot,
+            );
+            let _ = writeln!(
+                uart,
+                "baleen: dom {} seeded for its first switch-in — entry 0x{:08x}, x0 = DTB \
+                 0x{:08x}, SPSR 0x{SPSR_EL2_LINUX:x}, SCTLR_EL1 0x{sctlr_at_boot:x} (MMU off, as \
+                 the arm64 boot protocol requires); it is entered by a context restore, not an eret",
+                slot_dom(slot),
+                kernel_entry(slot),
+                dtb_addr(slot)
+            );
+        }
+    }
 
     // Boot registers: SPSR = EL1h/DAIF-masked, ELR = kernel entry.
     // SAFETY: `SPSR_EL2`/`ELR_EL2` are RW at EL2; they seed the state `eret` restores.
