@@ -49,7 +49,9 @@
 
 /// How many `u64` words are needed to hold `intids` bits.
 ///
-/// Ceiling division, written out rather than `div_ceil` so it is `const` on the pinned MSRV.
+/// Ceiling division. `usize::div_ceil` is `const` on the pinned MSRV — the `MSRV (1.96)` job is what
+/// keeps that true, and it is a required check, so a toolchain floor that lost it fails there rather
+/// than here.
 pub const fn words_for(intids: usize) -> usize {
     intids.div_ceil(64)
 }
