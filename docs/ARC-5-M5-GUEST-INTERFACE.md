@@ -214,4 +214,9 @@ guest, and each faulting on the peer's memory — is where the thesis content is
   is per-CPU EL2 context. Scheduling *multiple* interrupt-capable guests concurrently would make the
   `ICH_*` state part of the per-vCPU context to save/restore on a switch (like `GuestContext` for GPRs) —
   a named forward obligation, not needed for Arc 5's model. See Audit #7.
+  **That obligation is DISCHARGED** — `gic::VgicCtx` (Arc 8b for the list registers, PR #114 for
+  `ICH_VMCR_EL2`) is one type carrying exactly that state, shared by the synthetic switch and the
+  real-Linux one. Recorded here because the sentence above outlived it: closing #114 found that
+  `ICH_VMCR_EL2` had been carried by *neither* switch since Arc 2, which is the failure mode a
+  paragraph naming a class without enumerating its members produces.
 - `hv-core`/`hv-hal` untouched. Every `unsafe` is EL2-legal GIC/timer register or GIC MMIO access.

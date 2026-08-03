@@ -367,6 +367,27 @@ const LINUX_MARKERS: &[&str] = &[
     // and the boot dies, so every marker after this line is a guest resumed from a context the metal
     // rebuilt from scratch. Probe-verified per register (six of ten tested are load-bearing).
     "baleen: vcpu OK: the guest was PREEMPTED and restored",
+    // ③-b2b-ii-a: the console is now MULTIPLEXED — EL2 buffers each guest's transmit stream to a
+    // newline and emits whole lines tagged with the domain whose emulated PL011 received the bytes.
+    //
+    // **What this asserts TODAY is narrower than it looks, and saying so is the point.** With one
+    // guest running, a hard-coded `[dom 1]` would pass this identically: the tag cannot be
+    // falsified until there is a second guest to mis-tag. What it *does* witness is that the
+    // multiplexer is in the byte path at all — delete `hv-metal/src/console.rs` and relay straight
+    // to the hardware as before, and this goes red while `vpl011 OK` and every kernel marker stay
+    // green, because the needle is matched inside the device model and the bytes still arrive.
+    //
+    // The tag becomes discriminating at ③-b2b-ii-c, where the `[dom 2]` twin of this line is the
+    // arc's headline: both guests run the SAME initramfs, so `BALEEN-STEP0-OK` alone can never say
+    // which kernel printed it, and the tag is EL2's own answer (which model instance took the byte)
+    // rather than anything the guest could write.
+    "[dom 1] ########## BALEEN-STEP0-OK ##########",
+    // ③-b2b-ii-a's own witness, and the only assertion here that can tell an INDEXED per-guest state
+    // from a shared one. Everything else this rung changed is structural: with one guest running,
+    // eight arrays-of-one behave exactly like the eight globals they replaced. What cannot survive a
+    // shared field is dom 2 — never dispatched, so every one of its counters must read zero, against
+    // a dom 1 that made hundreds of GIC traps and thousands of console bytes on the same boot.
+    "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are INDEXED, not shared —",
     // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
     // rather than recomputed from the layout constants the emitter used (design-lesson #36).
     // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
@@ -406,6 +427,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // poison that makes it non-vacuous — was never exercised at all. A boot that is otherwise
     // perfect but never preempts proves nothing about the switch.
     "baleen: vcpu FAIL",
+    // ③-b2b-ii-a: a guest that has never been dispatched has a non-zero counter, i.e. the per-guest
+    // device models / contexts / witnesses are still shared, or a handler is indexing them with the
+    // wrong slot. The message names which counter leaked.
+    "baleen: perguest FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
