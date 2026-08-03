@@ -116,9 +116,46 @@
 //! With one guest that is sound; with two, a guest switched in while idle sits in `wfi` waiting for
 //! a deadline EL2 did not arm, and **the peer never runs again**. That reached `main` and made the
 //! required boot gate time out (2 runs in 15 locally). `HCR_EL2.TWI` ([`trap_guest_wfi`]) turns
-//! `wfi` into a voluntary yield, which closes it — and the residue is declared rather than left for
-//! the next hang to find: EL2 still has no timer of its own, so the guarantee is behavioural, and
-//! its structural closure is `CNTHP_*_EL2` armed on every switch-in.
+//! `wfi` into a voluntary yield, which closed the case that bit — but only behaviourally: it depends
+//! on the guest choosing to execute `wfi`.
+//!
+//! ## ③-b2b-ii-e: EL2 gets a clock, and stops asking the guest for the CPU back
+//!
+//! **The guarantee above is now structural.** EL2 arms its own hypervisor timer (`CNTHP_*_EL2`,
+//! [`gic::HYP_TIMER_INTID`]) for one slice on every switch-in and on every expiry, through the one
+//! [`arm_slice`], and that expiry — not the guest's tick — is what preempts. Three things make it
+//! unconditional, and each is a property some earlier rung bought:
+//!
+//! * the guest cannot **program** it — `CNTHP_*_EL2` is EL2-only, `UNDEFINED` at EL1;
+//! * the guest cannot **mask** it — ③-b1 took the physical distributor away, so the kernel's
+//!   `GICR_ISENABLER0` writes land in [`crate::vgic`] and touch no hardware, and a physical IRQ
+//!   routed to EL2 by `HCR_EL2.IMO` (③-a2) is not maskable by EL1's `PSTATE.I`;
+//! * the guest cannot **outlast** it — the deadline is absolute, so traps taken in between do not
+//!   extend it and a guest that never traps reaches it at exactly the same instant as one that
+//!   traps constantly.
+//!
+//! **What this removed is as much the rung as what it added.** `PREEMPT_EVERY` — preempt on every
+//! eighth guest tick — is gone, and with it the arrangement where the GUEST's tick rate set the
+//! scheduling quantum and a guest that stopped taking its tick stopped being preemptible. The
+//! spinning-guest denial of service that reasoning left open (neither idle, so no `wfi`; no tick, so
+//! no PPI 27) is closed by construction rather than by a workload that happens not to exhibit it.
+//!
+//! **What the boot itself cannot show, and the 2×2 that does.** Both guests here cooperate, so no
+//! counter on a green boot distinguishes this rung from the one it replaces. The claim is made by
+//! probe instead — `HCR_EL2.TWI` off *and* dom 1's tick forwarding cut a fifth of the way into its
+//! boot, so nothing cooperative is left — against a control with EL2's clock disarmed and nothing
+//! else changed. With the clock: dom 2 boots to userspace and powers off. Without it: **dom 2 never
+//! executes an instruction.** The table, and what it corrected about `TWI`, is at
+//! [`report_el2_slice`].
+//!
+//! Two consequences worth carrying, both of which had to be worked out before the code and not
+//! after. A slice expiry arrives with a **different interrupt in hand** than a tick-driven
+//! preemption did, so ③-b2b-ii-c1's "exactly one hardware-mapped list register in flight" does not
+//! carry over and the invariant that rested on it is retired — see [`HW_RELEASED`]. And EL2 must now
+//! complete an interrupt of **its own**: `CNTHP` is level-triggered, so the next deadline is armed
+//! *before* the deactivate (or the GIC re-asserts immediately and storms EL2), and the deactivate
+//! cannot be skipped (or EL2 gets exactly one slice for the whole boot, silently). See
+//! [`gic::release_hyp_timer`] and [`report_el2_slice`].
 //!
 //! ## ③-b2b-ii-d: a guest reaches for its peer's memory and the hardware says no
 //!
@@ -979,10 +1016,39 @@ static SGIS_DELIVERED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; N
 /// its epilogue reloads from it.
 #[no_mangle]
 extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
+    note_el2_entry();
     let intid = gic::ack_physical();
     // The interrupt belongs to whichever guest is executing: the physical timer's `CNTV_CVAL_EL0` is
     // part of the vCPU context, so the deadline that just expired is the running guest's own.
     let slot = current_slot();
+
+    // ③-b2b-ii-e — **EL2's OWN clock, and the only interrupt here that no guest can influence.**
+    // Checked before the guest's timer and before the mediation seam, because this one is not
+    // mediated: `HYP_TIMER_INTID` is never offered to a vGIC, never forwarded, and never enabled or
+    // disabled on a guest's behalf. A guest cannot mask it either — ③-b1 took the physical
+    // distributor away, so the guest's `GICR_ISENABLER0` writes land in `crate::vgic` and touch no
+    // hardware, and a physical IRQ routed to EL2 by `HCR_EL2.IMO` is not maskable by EL1's
+    // `PSTATE.I`. That is what makes this rung structural rather than behavioural.
+    if intid == gic::HYP_TIMER_INTID {
+        // 1. **Arm the next deadline FIRST.** `CNTHP` is level-triggered; this is what clears
+        //    `ISTATUS` and de-asserts the line, so the deactivate below cannot make the GIC
+        //    re-assert immediately and storm EL2. See `arm_slice`.
+        let _ = arm_slice();
+        // 2. Priority drop (`EOImode=1`), so EL2's running priority returns to idle.
+        gic::eoi_physical(intid);
+        // 3. **EL2 completes its own interrupt**, and reads back that the controller agreed. With
+        //    `EOImode=1` a missing `ICC_DIR_EL1` leaves this Active forever: EL2 would get exactly
+        //    one slice for the whole boot and re-entry would be behavioural again, silently, with
+        //    every other witness on this boot still green.
+        SLICE_EXPIRIES.fetch_add(1, Ordering::Relaxed);
+        if gic::release_hyp_timer() {
+            SLICE_DEACTIVATED.fetch_add(1, Ordering::Relaxed);
+        }
+        // SAFETY: `frame` is the valid `*mut LinuxFrame` the trampoline just saved on the exception
+        // stack, live until its epilogue reloads from it.
+        preempt_through_the_scheduler(slot, unsafe { &mut *frame });
+        return;
+    }
 
     if intid == gic::VTIMER_INTID {
         // ③-b1 — THE MEDIATION SEAM. Before this rung EL2 forwarded the timer unconditionally, which
@@ -1018,11 +1084,11 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         // cannot re-signal and storm EL2, while EL2's running priority returns to idle. The guest's
         // EOI of the virtual interrupt is what deactivates this one.
         gic::eoi_physical(intid);
-        // ③-b2b-i: the tick is also the PREEMPTION POINT. `IMO=1` (③-a2) is what put EL2 here on
-        // every tick; until now it only forwarded. See `preempt_through_the_scheduler`.
-        // SAFETY: `frame` is the valid `*mut LinuxFrame` the trampoline just saved on the exception
-        // stack, live until its epilogue reloads from it.
-        preempt_through_the_scheduler(slot, unsafe { &mut *frame });
+        // ③-b2b-i made the tick the PREEMPTION POINT as well; **③-b2b-ii-e took that back**, and
+        // taking it back is the rung. Preempting here meant the guest's own tick rate set the
+        // quantum and a guest that stopped taking its tick stopped being preemptible — the
+        // behavioural half of ledger item 9. EL2's slice expiry above is now the only thing that
+        // preempts, so this path does exactly what ③-a2 built it for: forward the guest's tick.
         return;
     }
 
@@ -1040,13 +1106,145 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
     crate::park();
 }
 
-/// ③-b2b-i — how many timer ticks apart the vCPU is preempted.
+/// **How often EL2's own clock takes the machine back** — the scheduling quantum, in hertz
+/// (③-b2b-ii-e).
 ///
-/// Not every tick: the switch is ~30 system-register accesses plus a poison pass, and doing it on
-/// all ~400 ticks of a boot would change the guest's timing profile enough that a regression in the
-/// boot itself could be mistaken for one in the switch. Every eighth still exercises it ~50 times per
-/// boot, which is ~50 chances for a missing register to kill the kernel.
-const PREEMPT_EVERY: u64 = 8;
+/// 100 Hz = a 10 ms slice. **Sized from measurement, not taste.** The shipped two-kernel boot spans
+/// ~1.31 s of guest-visible time and made ~130 switches under ③-b2b-ii-c1's every-eighth-guest-tick
+/// rule, so a 10 ms quantum lands the switch count in the same place: the timing profile the
+/// `PREEMPT_EVERY` this replaces was protecting is preserved, while what *sets* the quantum stops
+/// being the guest's tick rate and becomes a deadline EL2 owns.
+///
+/// The tick count is derived from `CNTFRQ_EL0` at run time rather than written here, because the
+/// counter frequency is a platform property (62.5 MHz on this QEMU) and a hard-coded tick count
+/// would silently become a different quantum on any other machine.
+const EL2_SLICE_HZ: u64 = 100;
+
+/// The slice length in counter ticks, computed once from `CNTFRQ_EL0`. Zero until [`arm_slice`] is
+/// first called, which is also how [`report_el2_slice`] knows the clock was never started.
+static SLICE_QUANTUM: AtomicU64 = AtomicU64::new(0);
+
+/// `CNTPCT_EL0` at the FIRST arm — the origin the slice witness measures elapsed time from.
+///
+/// Not boot entry: everything before the first arm is EL2 setting the machine up with no guest
+/// running, and counting it would charge the mechanism for time it did not own.
+static SLICE_FIRST_ARM: AtomicU64 = AtomicU64::new(0);
+
+/// How many times EL2's own timer expired and EL2 took the interrupt (③-b2b-ii-e).
+static SLICE_EXPIRIES: AtomicU64 = AtomicU64::new(0);
+
+/// How many of those the **redistributor confirmed** EL2 completed, Active → Inactive.
+///
+/// The other half, and the half a count of expiries structurally cannot see: EL2 runs `EOImode=1`,
+/// so forgetting `ICC_DIR_EL1` leaves its own timer Active, the GIC never signals it again, and EL2
+/// gets exactly one slice for the whole boot. See [`gic::release_hyp_timer`].
+static SLICE_DEACTIVATED: AtomicU64 = AtomicU64::new(0);
+
+/// `CNTHP_CTL_EL2` as read back after the most recent [`arm_slice`].
+///
+/// A register's own account of whether EL2's clock is armed, in the shape [`HCR_WITH_TWI`]
+/// established: structural, true on every boot, and unsatisfiable by a lucky workload. Stored on
+/// *every* arm rather than only the first, so it describes the steady state and not just the
+/// cold start.
+static CNTHP_CTL_READBACK: AtomicU64 = AtomicU64::new(0);
+
+/// `CNTPCT_EL0` at the most recent entry to EL2 from a guest, of any cause.
+static LAST_EL2_ENTRY: AtomicU64 = AtomicU64::new(0);
+
+/// The longest interval, per guest, between two consecutive entries to EL2 — i.e. **the longest any
+/// guest held the physical CPU** (③-b2b-ii-e).
+///
+/// **Reported, never asserted, and the distinction is the point.** This is the number the rung is
+/// about, but a bound on it is not a valid gate: a cooperative guest keeps the interval far below
+/// any quantum with EL2's clock switched off entirely, so the assertion would pass unchanged on
+/// `main` (design-lesson #105). What discriminates is [`SLICE_EXPIRIES`] against elapsed time — a
+/// quantity EL2's clock determines and no guest contributes to — and, properly, the probes.
+///
+/// Measured entry-to-entry, so it includes EL2's own service time for the previous trap; that is
+/// microseconds against a 10 ms quantum and is stated rather than corrected for.
+static MAX_HOLD: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// **Arm EL2's timer for one slice**, returning `CNTHP_CTL_EL2` read back after the write.
+///
+/// ## The one function, called from the cold start and from the steady state
+///
+/// Three callers — the last thing before the first `eret`, the first thing in the slice-expiry
+/// handler, and the end of [`switch_context`] — and deliberately not three pieces of code
+/// (design-lesson #130). The boot path is the resume path here in the same sense that guest B's
+/// first instruction is executed by the same restore that resumes it: there is no arming code that
+/// runs once and is never exercised again.
+///
+/// ## Arming is also how the level is dropped, and that ordering is load-bearing
+///
+/// `CNTHP` is level-triggered like any generic timer: its output is asserted while
+/// `CNTPCT >= CNTHP_CVAL`. Writing the next deadline clears `ISTATUS` and de-asserts the line, which
+/// is why the expiry handler arms **before** it completes the interrupt — deactivating under a high
+/// level makes the GIC re-assert immediately and storm EL2. Same hazard ③-b2b-ii-c1 measured on the
+/// guest's PPI 27; a different resolution only because EL2 can move its own deadline and cannot
+/// move the guest's.
+///
+/// The deadline is absolute, so traps taken between arms do not extend it: a guest that traps a
+/// thousand times still reaches its deadline at the same instant as one that traps never.
+fn arm_slice() -> u64 {
+    let quantum = {
+        let q = SLICE_QUANTUM.load(Ordering::Relaxed);
+        if q != 0 {
+            q
+        } else {
+            let q = crate::time::frequency() / EL2_SLICE_HZ;
+            SLICE_QUANTUM.store(q, Ordering::Relaxed);
+            q
+        }
+    };
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    let _ = SLICE_FIRST_ARM.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+    let ctl: u64;
+    // SAFETY: `CNTHP_CVAL_EL2`/`CNTHP_CTL_EL2` are the EL2 physical timer's own registers, RW at EL2
+    // in a non-VHE hypervisor (probe-verified on this platform: see `gic::HYP_TIMER_INTID`). The
+    // `isb` makes the write architecturally visible before the read-back, which is the witness.
+    unsafe {
+        asm!(
+            "msr CNTHP_CVAL_EL2, {d}",
+            "msr CNTHP_CTL_EL2, {e}",
+            "isb",
+            "mrs {c}, CNTHP_CTL_EL2",
+            d = in(reg) now + quantum,
+            e = in(reg) CNTHP_CTL_EL2_ENABLE,
+            c = out(reg) ctl,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    CNTHP_CTL_READBACK.store(ctl, Ordering::Relaxed);
+    ctl
+}
+
+/// `CNTHP_CTL_EL2.ENABLE` (bit 0), with `IMASK` (bit 1) left clear so the timer actually signals.
+const CNTHP_CTL_EL2_ENABLE: u64 = 1 << 0;
+/// `CNTHP_CTL_EL2.IMASK` (bit 1) — set would mean armed but muted, which is the failure the
+/// read-back witness is looking for.
+const CNTHP_CTL_EL2_IMASK: u64 = 1 << 1;
+
+/// Record that EL2 has just been entered from a guest, and charge the interval to whoever held the
+/// pCPU (③-b2b-ii-e). Called first thing in both Linux-mode handlers, which between them are every
+/// entry to EL2 on this path.
+fn note_el2_entry() {
+    let now = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer.now()
+    };
+    let prev = LAST_EL2_ENTRY.swap(now, Ordering::Relaxed);
+    if prev == 0 {
+        return;
+    }
+    let slot = current_slot();
+    let held = now.saturating_sub(prev);
+    if held > MAX_HOLD[slot].load(Ordering::Relaxed) {
+        MAX_HOLD[slot].store(held, Ordering::Relaxed);
+    }
+}
 
 /// The real guest's saved vCPU context (③-b2b-i).
 ///
@@ -1067,12 +1265,21 @@ static SWITCHES: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUE
 
 /// How many hardware-mapped list registers each guest has handed back at a switch (③-b2b-ii-c1).
 ///
-/// **The witness is not that this is non-zero but that it EQUALS [`SWITCHES`].** Exactly one `HW=1`
-/// list register exists at a preemption point — the timer EL2 forwarded moments earlier on the very
-/// path that led here, and nothing else on this configuration is forwarded with a hardware mapping
-/// (a guest's SGIs are injected `HW=0`, because the guest invented them). So one per switch is not a
-/// tendency, it is an invariant, and a count that merely *moves* would not distinguish a handoff
-/// that fires on some switches from one that fires on all of them.
+/// **The witness is that this EQUALS [`TIMER_DEACTIVATED`]** — the software half of the handoff
+/// against the controller's own account of the hardware half. Either is satisfiable with the other
+/// deleted; together they are not.
+///
+/// ⚠ **③-b2b-ii-e retired the conjunct that used to sit beside it, and the reason is worth keeping.**
+/// Under c1 a preemption was reached from [`handle_linux_irq`] having *just* forwarded a tick, so
+/// exactly one `HW=1` list register existed at every preemption point and `released >= tick
+/// handovers` was an invariant. A slice expiry arrives with a **different interrupt in hand**: the
+/// guest may or may not still be holding an untaken forwarded tick, so `released` is 0 or 1
+/// depending on the guest's timing. Both branches were traced before the mechanism changed —
+/// untaken tick ⇒ non-free `HW=1` LR demoted *and* PPI 27 Active (EL2 having only priority-dropped);
+/// already EOI'd ⇒ `lr_is_free` rejects the stale mapping *and* the guest's own EOI has already
+/// deactivated the physical interrupt — and the equality holds on both. The lower bound does not,
+/// and carrying it over would have refused a correct boot, which in this arc is the shape of every
+/// witness that mentioned a count.
 static HW_RELEASED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
 /// How many times the **interrupt controller agreed** that the forwarded timer went Active →
@@ -1094,29 +1301,13 @@ static TIMER_DEACTIVATED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }
 /// [`report_timer_handoff`] did, and it read `63 across 64 switches`.
 static HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
-/// How many of a guest's handovers were driven by a **timer tick** (③-b2b-ii-c2).
-///
-/// **The distinction is what makes the handoff invariant statable.** A tick-driven handover always
-/// has a forwarded timer in flight — EL2 got here from [`handle_linux_irq`] having just injected one
-/// with `HW=1` — so exactly one mapping is demoted and the controller confirms exactly one
-/// deactivation. A `SYSTEM_OFF` handover has neither: it arrives on the *synchronous* path, with no
-/// interrupt in hand, so both counts correctly stay put. Comparing against total handovers read
-/// `66 across 67`, which was the witness noticing a real difference and calling it a fault.
-static TICK_HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
-
-/// Why a guest is giving up the physical CPU.
-///
-/// Named rather than passed as a bool because it is what the handoff invariant is conditioned on,
-/// and a reader of [`switch_context`] has to know which kind they are looking at.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Handover {
-    /// A timer tick preempted the guest — a forwarded interrupt is in flight.
-    Tick,
-    /// The guest executed `WFI` and yielded — it may or may not have one in flight.
-    Yield,
-    /// The guest issued `SYSTEM_OFF` and is retiring — nothing is in flight.
-    PowerOff,
-}
+// ③-b2b-ii-e retired the `Handover` enum that used to sit here. It existed to condition the handoff
+// invariant — a `Tick` handover was guaranteed to have a forwarded interrupt in flight, so
+// `TICK_HANDOVERS` was a lower bound on demoted mappings. No handover class carries that guarantee
+// any more (see `HW_RELEASED`), so both the counter and the discriminant are gone rather than kept
+// as decoration: the three causes are already recoverable from `HANDOVERS`, `WFI_YIELDS` and the one
+// `SYSTEM_OFF` each guest issues, and a parameter that no longer selects anything reads as though it
+// does.
 
 /// How many times each guest has touched a PEER's memory and been refused by the hardware
 /// (③-b2b-ii-d).
@@ -1145,7 +1336,13 @@ const MAX_PEER_FAULTS: u64 = 4096;
 /// guest runs. Plain atomics: written once before any guest exists, read from the IRQ handler.
 static VTTBR: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
-/// **③-b2b-i — preempt the guest at the timer tick, through `hv-core`'s REAL scheduler.**
+/// **③-b2b-i — preempt the running guest through `hv-core`'s REAL scheduler.**
+///
+/// **③-b2b-ii-e changed who calls this and why.** It used to be reached from the guest's own timer
+/// tick, every eighth one (`PREEMPT_EVERY`) — so the guest's tick rate set the quantum, and a guest that
+/// stopped taking its tick stopped being preemptible. It is now reached from EL2's own slice expiry
+/// ([`gic::HYP_TIMER_INTID`]) and from nowhere else: the deadline belongs to EL2, so preemption no
+/// longer depends on the guest doing anything at all.
 ///
 /// The real-Linux path had no vCPU switch at all: `run` did one `eret` and never returned, and the
 /// only scheduler call this file ever made was `DomainCreate`. `guest.rs` has had a two-domain
@@ -1161,18 +1358,13 @@ static VTTBR: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS
 /// Phase I-1 made exhaustive and Tier-D quantifies over; a switch that only moved registers would be
 /// a `memcpy` with a marker attached.
 fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
-    if !TIMER_FORWARDED[slot]
-        .load(Ordering::Relaxed)
-        .is_multiple_of(PREEMPT_EVERY)
-    {
-        return;
-    }
     let dom = slot_dom(slot);
 
     // `try_borrow_mut`, and a skip rather than a halt if it is held: the cell is claimed during model
-    // setup, and a tick that lands there should defer, not kill a boot that is otherwise fine. The
-    // witness counts switches actually performed, so a systematically-skipped switch shows up as a
-    // count of zero rather than as silence.
+    // setup, and a slice expiry that lands there should defer, not kill a boot that is otherwise
+    // fine. The witness counts switches actually performed, so a systematically-skipped switch shows
+    // up as a count of zero rather than as silence. The expiry itself has already been completed and
+    // the next deadline armed by the caller, so deferring costs one slice and nothing else.
     let Some(mut cell) = crate::guest::GUEST_HV.try_borrow_mut() else {
         return;
     };
@@ -1215,7 +1407,7 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     sched_on(hv, slot_dom(next), scheduler_run(now), "run the next vcpu");
     drop(cell);
 
-    switch_context(slot, next, Handover::Tick, frame);
+    switch_context(slot, next, frame);
 }
 
 /// Which guest's half of the RAM window contains `ipa`, if any (③-b2b-ii-d).
@@ -1362,7 +1554,7 @@ fn power_off_and_hand_over(cur: usize, frame: &mut LinuxFrame, uart: &mut Pl011)
         "run the surviving vcpu",
     );
     drop(cell);
-    switch_context(cur, next, Handover::PowerOff, frame);
+    switch_context(cur, next, frame);
     true
 }
 
@@ -1423,8 +1615,10 @@ fn sched_on(hv: &mut Hypervisor, dom: DomId, call: HvCall, what: &str) {
 /// The ORDER of these steps is ③-b2b-ii-c1's rung and is documented at
 /// [`gic::release_forwarded_timer`]; what ③-b2b-ii-c2 adds is that `next` may now differ from `cur`,
 /// which turns two of them from identities into real work: the context restored is a different
-/// vCPU's, and `VTTBR_EL2` becomes a different domain's VMID-tagged Stage-2.
-fn switch_context(cur: usize, next: usize, why: Handover, frame: &mut LinuxFrame) {
+/// vCPU's, and `VTTBR_EL2` becomes a different domain's VMID-tagged Stage-2. ③-b2b-ii-e adds an
+/// eighth step, and it is the only one about the guest that is *arriving* rather than the one
+/// leaving: its slice starts here.
+fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     let mut ctx = VCPU_CTX.borrow_mut();
     // 1. Capture the outgoing vCPU, list registers and `CNTV_CVAL_EL0` included.
     ctx[cur].save(&frame.x);
@@ -1435,9 +1629,6 @@ fn switch_context(cur: usize, next: usize, why: Handover, frame: &mut LinuxFrame
     //    signalled to whoever runs next. See `gic::release_forwarded_timer` for the measurement that
     //    forced this and for why disable must precede deactivate.
     HANDOVERS[cur].fetch_add(1, Ordering::Relaxed);
-    if why == Handover::Tick {
-        TICK_HANDOVERS[cur].fetch_add(1, Ordering::Relaxed);
-    }
     let released = ctx[cur].release_hardware_mappings();
     HW_RELEASED[cur].fetch_add(released, Ordering::Relaxed);
     if gic::release_forwarded_timer() {
@@ -1482,6 +1673,13 @@ fn switch_context(cur: usize, next: usize, why: Handover, frame: &mut LinuxFrame
     //    answer from here on. Stored LAST: everything above still had to speak about `cur`.
     CURRENT.store(next, Ordering::Relaxed);
     SWITCHES[next].fetch_add(1, Ordering::Relaxed);
+
+    // 8. ③-b2b-ii-e — the incoming guest gets a FULL slice, whichever of the three handovers got us
+    //    here. On the slice-expiry path this re-arms a deadline the handler already set moments ago,
+    //    which is deliberate: without it a guest entered by a `WFI` yield or a `SYSTEM_OFF` would
+    //    inherit whatever was left of the yielding guest's slice, and the quantum would depend on
+    //    who ran before you.
+    let _ = arm_slice();
 }
 
 /// The Linux-mode lower-EL synchronous handler. `HVC` → service PSCI (Linux's `method = "hvc"`); an
@@ -1494,6 +1692,7 @@ fn switch_context(cur: usize, next: usize, why: Handover, frame: &mut LinuxFrame
 /// `frame` is the valid `&mut LinuxFrame` the trampoline saved on the exception stack.
 #[no_mangle]
 extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
+    note_el2_entry();
     let (esr, elr, far) = read_syndrome();
     let ec = (esr >> 26) & 0x3f;
     let mut uart = crate::uart();
@@ -1563,6 +1762,7 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 report_vpl011(&mut uart);
                 report_interrupt_mediation(&mut uart);
                 report_timer_handoff(&mut uart);
+                report_el2_slice(&mut uart);
                 report_wfi_yield(&mut uart);
                 report_per_guest_state(&mut uart);
                 let _ = writeln!(
@@ -1834,6 +2034,12 @@ static HCR_WITH_TWI: AtomicU64 = AtomicU64::new(0);
 /// EL2 waits instead of returning to a guest that would immediately trap again (which would be a
 /// livelock, not a wait). `wfi` wakes on a pending physical interrupt regardless of `PSTATE.I`, so
 /// the guest's own arch-timer PPI brings EL2 back, and the `eret` then delivers it.
+///
+/// **③-b2b-ii-e bounded this wait.** It used to end only when a GUEST's deadline arrived — the same
+/// dependence ledger item 9 is about, in the one place EL2 was already awake for it. EL2's slice is
+/// armed across the wait, so `CNTHP` wakes it after at most one quantum whether or not any guest's
+/// timer ever fires. Nothing else here changes: with no peer runnable there is still nothing to
+/// switch to, and the wake costs one switch-to-self.
 fn wait_at_el2() {
     // SAFETY: `wfi` is an unprivileged hint with no memory or register effect.
     unsafe { asm!("wfi", options(nomem, nostack, preserves_flags)) };
@@ -1896,7 +2102,7 @@ fn handle_linux_wfi(frame: &mut LinuxFrame) {
     );
     drop(cell);
     WFI_YIELDS[cur].fetch_add(1, Ordering::Relaxed);
-    switch_context(cur, peer, Handover::Yield, frame);
+    switch_context(cur, peer, frame);
 }
 
 /// The `ICC_SGI1R_EL1` system-register encoding as it appears in an `EC=0x18` ISS: `Op0=3, Op1=0,
@@ -2254,53 +2460,69 @@ pub(crate) fn flush_consoles() {
 /// Every other marker in the gate is satisfied either way. That is the same trap ③-b2b-i's
 /// switch-to-self fell into, arriving one rung later at a different mechanism.
 ///
-/// **The claim is an equality, not a tally.** Exactly one hardware-mapped list register exists at a
-/// preemption point: EL2 reached here from [`handle_linux_irq`] having just forwarded the timer with
-/// `HW=1`, and nothing else on this configuration is forwarded that way. So `released == switches`
-/// is an invariant of the mechanism, and a counter that merely moved would not distinguish a handoff
-/// that fires on some switches from one that fires on all of them — which is the difference between
-/// guest B getting a tick and guest B hanging the machine.
+/// **The claim is an equality, not a tally** — but ③-b2b-ii-e changed WHICH equality, and that
+/// change is the one thing to read carefully here. Under c1 the preemption point was reached from
+/// [`handle_linux_irq`] having *just* forwarded the timer, so exactly one hardware-mapped list
+/// register existed at every switch and the count of demotions was pinned to the count of switches.
+/// A slice expiry arrives with a **different interrupt in hand** and no such guarantee: 0 or 1
+/// depending on whether the guest has already EOI'd its tick. What survives — and what was always
+/// the load-bearing half — is that the SOFTWARE demotion and the CONTROLLER-confirmed deactivation
+/// agree with each other, on both branches. See [`HW_RELEASED`] for the branch-by-branch trace.
 ///
-/// **Honest limit.** This says the *outgoing* half happened: the mapping was demoted and the
-/// physical interrupt released, every time. It cannot witness the *incoming* half — that a
-/// different guest is then signalled the timer — because with one runner there is no different
-/// guest. ③-b2b-ii-c2 is where that becomes observable, and where a failure of this mechanism stops
-/// being invisible and becomes a hang.
+/// **The antecedent got RARE at ③-b2b-ii-e, and the kill probe was re-run rather than assumed.**
+/// A guest now leaves the pCPU at an arbitrary instruction rather than moments after EL2 forwarded
+/// it a tick, so "still holding an untaken forwarded tick" fell from *every* switch to **1 per guest
+/// per boot** (measured; a ~1.5% window — Linux's GIC handler against a ~1.25 ms tick period). The
+/// tempting conclusion is that the mechanism stopped mattering. **It has not: deleting the physical
+/// deactivate still kills the boot.** Re-run on this rung, both guests reach userspace, print
+/// `########## poweroff ##########`, and then neither completes `SYSTEM_OFF` — one missed
+/// deactivation leaves PPI 27 Active for good, and no guest gets another tick.
+///
+/// What DID change is the shape of the failure, and it is worth one line: under c1 that was a frozen
+/// machine, because the guest's tick was the only thing that re-entered EL2. Now EL2 keeps its own
+/// clock, keeps taking slices and keeps switching — the hypervisor survives its own bug, and the
+/// guests are what stop. Still fatal to the gate, and diagnosable instead of silent.
+///
+/// **Honest limit.** This says the *outgoing* half happened: whenever a mapping was in flight it was
+/// demoted and the physical interrupt released. It cannot witness the *incoming* half — that a
+/// different guest is then signalled the timer — which is what the kill probe above is for.
 fn report_timer_handoff(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
         let dom = slot_dom(slot);
         let released = HW_RELEASED[slot].load(Ordering::Relaxed);
         let deactivated = TIMER_DEACTIVATED[slot].load(Ordering::Relaxed);
         let handovers = HANDOVERS[slot].load(Ordering::Relaxed);
-        let on_tick = TICK_HANDOVERS[slot].load(Ordering::Relaxed);
 
-        // The three conjuncts, and each is here because a weaker one let something through:
+        // The two conjuncts that survive ③-b2b-ii-e, and what was removed:
         //
-        // * `released == deactivated` — **the load-bearing one.** It cross-checks the SOFTWARE half
-        //   (EL2 demoted the mapping in the context it saved) against the HARDWARE half (the
-        //   redistributor agreed the physical interrupt went Inactive). Either alone is satisfiable
-        //   with the other deleted; together they are not.
-        // * `released >= on_tick` — no tick-driven handover was missed. A handover reached from
-        //   `handle_linux_irq` always has a forwarded interrupt in flight, because EL2 got there by
-        //   injecting one.
+        // * `released == deactivated` — **the load-bearing one, unchanged.** It cross-checks the
+        //   SOFTWARE half (EL2 demoted the mapping in the context it saved) against the HARDWARE
+        //   half (the redistributor agreed the physical interrupt went Inactive). Either alone is
+        //   satisfiable with the other deleted; together they are not, and both branches of a slice
+        //   expiry satisfy it — see `HW_RELEASED`.
         // * `released <= handovers` — nothing was demoted outside a handover.
         //
-        // What is deliberately NOT asserted is `released == on_tick`, and the reason is a measured
-        // correction rather than caution. A guest can issue `SYSTEM_OFF` while a forwarded tick is
-        // still sitting un-taken in its bank, and that handover then demotes one too — so the count
-        // depends on the guest's timing, not on the mechanism. Two earlier forms of this witness
-        // (`== switches`, then `== on_tick`) each refused a perfectly correct boot before the
-        // numbers said which quantity was actually invariant.
-        let ok =
-            on_tick > 0 && released == deactivated && released >= on_tick && released <= handovers;
+        // RETIRED: `released >= tick-driven handovers`. It rested on every preemption being reached
+        // from `handle_linux_irq` with a freshly forwarded interrupt in flight, which is exactly the
+        // property ③-b2b-ii-e removed. Carrying it over would have refused a correct boot — the
+        // fifth time in this arc that an invariant mentioning a count turned out to be a claim about
+        // the workload. Nothing replaces it as a FLOOR here: that job moved to `report_el2_slice`,
+        // where the quantity is elapsed time against a deadline EL2 owns and no guest contributes to.
+        //
+        // Also deliberately NOT asserted, and it was already true before this rung: `released ==
+        // handovers`. A guest can leave the pCPU with nothing in flight — after `SYSTEM_OFF`, after
+        // a `WFI`, or at a slice boundary that lands between its EOI and its next tick — so the
+        // count depends on the guest's timing, not on the mechanism. Three earlier forms of this
+        // witness (`== switches`, `== tick handovers`, `>= tick handovers`) each refused, or would
+        // have refused, a perfectly correct boot.
+        let ok = released == deactivated && released <= handovers;
         if ok {
             let _ = writeln!(
                 uart,
                 "baleen: handoff OK: dom {dom} gave the forwarded timer up every time it left the \
                  pCPU holding one — {released} hardware-mapped list registers demoted and {} \
                  controller-confirmed Active -> Inactive transitions of PPI {}, across {handovers} \
-                 handovers of which {on_tick} were tick-driven; then re-armed from the incoming \
-                 guest's own emulated distributor",
+                 handovers; then re-armed from the incoming guest's own emulated distributor",
                 deactivated,
                 gic::VTIMER_INTID
             );
@@ -2309,10 +2531,9 @@ fn report_timer_handoff(uart: &mut Pl011) {
                 uart,
                 "baleen: handoff FAIL: dom {dom} demoted {released} hardware-mapped list registers \
                  but the redistributor confirmed {deactivated} deactivations, across {handovers} \
-                 handovers ({on_tick} tick-driven) — the two halves of the handoff disagree, or a \
-                 tick-driven handover kept its mapping. The physical timer then stays Active across \
-                 a switch, the next guest can never be signalled it, and the tick is the only thing \
-                 that re-enters EL2"
+                 handovers — the two halves of the handoff disagree, or a mapping was demoted \
+                 outside a handover. The physical timer then stays Active across a switch and the \
+                 next guest can never be signalled it"
             );
             crate::park();
         }
@@ -2328,15 +2549,16 @@ fn report_timer_handoff(uart: &mut Pl011) {
 /// exactly that, and an earlier version of this function refused it.
 ///
 /// So the assertion is the STRUCTURAL half: `HCR_EL2` read back after the write, showing `TWI`
-/// really took effect. That is true on every boot, cannot be satisfied by luck, and is what actually
-/// determines whether an idle guest can freeze the machine. The counts are reported beside it as the
-/// behavioural half, and deliberately NOT asserted.
+/// really took effect. That is true on every boot and cannot be satisfied by luck. The counts are
+/// reported beside it as the behavioural half, and deliberately NOT asserted.
 ///
-/// **Declared residue.** `TWI` closes the case that bit — a guest sitting in `wfi`. It does not make
-/// EL2's re-entry unconditional: EL2 still owns no clock, so a guest that neither idles nor takes
-/// the tick it programmed would hold the pCPU. A running Linux always has a tick, which is why that
-/// case is not observed, but the honest closure is an EL2 timer (`CNTHP_*_EL2`, PPI 26) armed on
-/// every switch-in, which would make the guarantee structural instead of behavioural.
+/// **③-b2b-ii-e DEMOTED this mechanism, and saying so is the point of keeping the marker.** Until
+/// rung e, `TWI` was the *only* thing standing between an idle guest and a frozen machine — the
+/// residue this doc used to declare. EL2 now owns a clock ([`report_el2_slice`]), so re-entry no
+/// longer depends on a guest choosing to execute `wfi` at all, and `TWI` becomes an **efficiency**
+/// mechanism: without it an idle guest burns its whole 10 ms slice doing nothing while its peer
+/// waits. That is a real cost and the trap stays, but it is no longer load-bearing for liveness, and
+/// this marker should not be read as though it were.
 fn report_wfi_yield(uart: &mut Pl011) {
     let hcr = HCR_WITH_TWI.load(Ordering::Relaxed);
     if hcr & HCR_EL2_TWI != 0 {
@@ -2366,6 +2588,130 @@ fn report_wfi_yield(uart: &mut Pl011) {
     }
 }
 
+/// **The witness for EL2's own clock** (③-b2b-ii-e) — ledger item 9's structural closure.
+///
+/// ## What each conjunct is for, and why none of them is a count of what the guests did
+///
+/// * **`CNTHP_CTL_EL2` read back** with `ENABLE` set and `IMASK` clear. The register's own account
+///   of whether EL2's timer is armed and audible, in the shape [`report_wfi_yield`] established. It
+///   is stored on every arm, not only the cold start, so it describes the steady state.
+/// * **PPI 26 enabled at the redistributor**, read back from `GICR_ISENABLER0`. Armed and
+///   deliverable are two different facts: a timer counting into a masked PPI is a timer EL2 never
+///   hears, and the whole rung is about EL2 not being lockable-out.
+/// * **`expiries == deactivated`.** EL2 runs `EOImode=1`, so failing to issue `ICC_DIR_EL1` leaves
+///   EL2's own interrupt Active and the GIC never signals it again — EL2 would get exactly one slice
+///   for the entire boot, with every other marker still green. Read back from `GICR_ISACTIVER0`, the
+///   controller's view rather than EL2's bookkeeping, which is the distinction ③-b2b-ii-c1 drew.
+/// * **`expiries >= elapsed / (2 * quantum)`.** The floor, and the only conjunct that is a count —
+///   deliberately, because it is a count of a quantity **the mechanism determines**: the deadline is
+///   EL2's own, so how many times it expires follows from elapsed time divided by the quantum and
+///   from nothing any guest contributes. It reads zero on a build without this rung. The factor of
+///   two is the declared allowance for EL2's own service time between expiry and re-arm — real
+///   handler latency is microseconds against a 10 ms slice, so the margin is ~1000×, and it is a
+///   slack on EL2's behaviour rather than on a guest's.
+///
+/// ## What is reported and NOT asserted, and why that restraint matters here
+///
+/// The longest interval any guest held the pCPU is the number this rung is *about*, and it is still
+/// only reported. A bound on it is not a valid gate: a cooperative guest keeps that interval far
+/// below any quantum with EL2's clock switched off entirely, so the assertion would pass unchanged
+/// on the build this rung replaces (design-lesson #105). Under the non-cooperation probe it is the
+/// number to read; as a gate it would be theatre.
+///
+/// ## Honest ceiling, and the probes that stand where this witness cannot
+///
+/// This says EL2's clock is armed, audible, completed, and firing at the rate its own deadline
+/// implies. It does **not** say EL2 regains control from a guest that refuses to cooperate — no
+/// counter can, on a boot where both guests do cooperate. That claim is the probes', run as a 2×2
+/// with a deterministic control rather than argued:
+///
+/// | | EL2 clock armed | disarmed |
+/// |---|---|---|
+/// | guests cooperate | interleaved: dom 2's first line arrives while dom 1 still has 350 to go | **no time-slicing at all** — dom 1 runs to completion, *then* dom 2 starts; this witness reads `slice FAIL` |
+/// | **dom 1 cannot cooperate** | **dom 2 boots to userspace, reads its own `/proc/iomem`, powers off** — 159 of its lines interleaved before dom 1's last | **dom 2 never executes an instruction. Zero lines. The machine is dead.** |
+///
+/// "Cannot cooperate" is forced, not waited for: `HCR_EL2.TWI` off *and* dom 1's tick forwarding cut
+/// at its 60th tick with PPI 27 disabled at the redistributor, so from a fifth of the way into its
+/// boot dom 1 has no tick to take, no `wfi` that traps, and no other route by which the pCPU can
+/// leave it. That is the ③-b2b-ii-c2 hang condition **forced** rather than reproduced at 2 runs in
+/// 15 — which is what makes the bottom-right cell a control worth having.
+///
+/// Read the bottom row together. The same non-cooperating guest kills the machine outright without
+/// EL2's clock and cannot even slow its peer down with it, and nothing differs between those two
+/// runs except whether `CNTHP_CTL_EL2` was written with `ENABLE`.
+///
+/// The top-right cell is worth one more line, because it corrects something. `HCR_EL2.TWI` does not
+/// cover for a missing EL2 clock the way it might appear to: with the clock disarmed the two kernels
+/// ran strictly **sequentially** — one handover in the whole boot, at `SYSTEM_OFF`. A guest that
+/// always has work never executes `wfi`, so the yield never fires, and before this rung the
+/// every-eighth-guest-tick preemption was the *only* thing producing concurrency at all.
+fn report_el2_slice(uart: &mut Pl011) {
+    let ctl = CNTHP_CTL_READBACK.load(Ordering::Relaxed);
+    let quantum = SLICE_QUANTUM.load(Ordering::Relaxed);
+    let expiries = SLICE_EXPIRIES.load(Ordering::Relaxed);
+    let deactivated = SLICE_DEACTIVATED.load(Ordering::Relaxed);
+    let enabled = gic::ppi_is_enabled(gic::HYP_TIMER_INTID);
+    let freq = crate::time::frequency();
+    let elapsed = {
+        use hv_hal::TimeSource;
+        crate::time::GenericTimer
+            .now()
+            .saturating_sub(SLICE_FIRST_ARM.load(Ordering::Relaxed))
+    };
+    // The floor. `quantum == 0` means `arm_slice` was never called at all, which must fail rather
+    // than divide by zero into a vacuous pass.
+    let floor = if quantum == 0 {
+        u64::MAX
+    } else {
+        elapsed / (2 * quantum)
+    };
+    let armed = ctl & CNTHP_CTL_EL2_ENABLE != 0 && ctl & CNTHP_CTL_EL2_IMASK == 0;
+    let ok = armed && enabled && expiries == deactivated && expiries >= floor;
+
+    let ms = |ticks: u64| ticks * 1000 / freq.max(1);
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: slice OK: EL2 re-enters the machine on ITS OWN clock — CNTHP_CTL_EL2 read back \
+             as 0x{ctl:x} (ENABLE, IMASK clear), PPI {} enabled at the redistributor, {expiries} \
+             slice expiries taken and {deactivated} controller-confirmed Active -> Inactive, over \
+             {} ms at a {} ms quantum (floor {floor}). A guest that never idles and never takes its \
+             tick can no longer hold the pCPU",
+            gic::HYP_TIMER_INTID,
+            ms(elapsed),
+            ms(quantum)
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: slice FAIL: CNTHP_CTL_EL2 read back as 0x{ctl:x}, PPI {} enabled={enabled}, \
+             {expiries} expiries against {deactivated} controller-confirmed deactivations and a \
+             floor of {floor} over {} ms — EL2's clock is not armed, not audible, not being \
+             completed, or not firing. Re-entry to EL2 is behavioural again and a guest can hold \
+             the pCPU with no way to take it back",
+            gic::HYP_TIMER_INTID,
+            ms(elapsed)
+        );
+        crate::park();
+    }
+    for (slot, hold) in MAX_HOLD.iter().enumerate() {
+        let held = hold.load(Ordering::Relaxed);
+        let _ = writeln!(
+            uart,
+            "baleen: slice: dom {} — the longest it held the pCPU between two entries to EL2 was {} \
+             ticks ({} us), against a quantum of {quantum} ticks ({} ms). Reported, not asserted, \
+             and it exceeds the quantum for two reasons that are not this mechanism: the interval \
+             is measured entry-to-entry so it carries EL2's own service time for the previous trap, \
+             and QEMU runs the generic timer off the host clock, so host scheduling of the QEMU \
+             thread appears here directly",
+            slot_dom(slot),
+            held,
+            held * 1_000_000 / freq.max(1),
+            ms(quantum)
+        );
+    }
+}
+
 /// The per-guest counters, named by the mechanism that writes each one. One array, so the count in
 /// the report below is derived and a counter cannot be added without appearing there.
 const PER_GUEST_COUNTERS: [&str; 11] = [
@@ -2377,8 +2723,26 @@ const PER_GUEST_COUNTERS: [&str; 11] = [
     "forwarded timer ticks",
     "mediated SGIs",
     "scheduler switches",
-    "released hardware mappings",
-    "controller-confirmed deactivations",
+    // ⚠ ③-b2b-ii-e REPLACED two entries here, and the replacement is the point rather than a tidy-up.
+    // They were "released hardware mappings" and "controller-confirmed deactivations", and both were
+    // legitimate per-guest discriminators while a preemption was reached from the guest's own tick:
+    // exactly one hardware-mapped list register was in flight at every switch, so each read ~65 per
+    // guest and a zero meant a broken handoff. A slice expiry lands at an arbitrary instruction, so
+    // the antecedent — the guest still holding an UNTAKEN forwarded tick — became a coincidence:
+    // **MEASURED at 1 per guest on the first boot of this rung, down from 65.** That is a ~1.5%
+    // window (Linux's GIC handler against a ~1.25 ms tick period), which means the next boot could
+    // as easily produce zero and redden a gate with nothing wrong.
+    //
+    // Precisely the shape this arc keeps hitting: a counter that was pinned to the mechanism became
+    // pinned to the workload the moment the mechanism changed underneath it. The equality that
+    // matters (`released == deactivated`) is CONDITIONAL and is still asserted in
+    // `report_timer_handoff`; what belongs *here* is a quantity every running guest produces.
+    //
+    // Both replacements are determined by EL2's clock and by nothing a guest chooses: a guest that
+    // runs for longer than one quantum is handed over, and a guest that enters EL2 twice has a
+    // measurable hold.
+    "handovers",
+    "longest pCPU hold",
     "refused peer accesses",
 ];
 
@@ -2417,8 +2781,8 @@ fn report_per_guest_state(uart: &mut Pl011) {
             TIMER_FORWARDED[slot].load(Ordering::Relaxed),
             SGIS_DELIVERED[slot].load(Ordering::Relaxed),
             SWITCHES[slot].load(Ordering::Relaxed),
-            HW_RELEASED[slot].load(Ordering::Relaxed),
-            TIMER_DEACTIVATED[slot].load(Ordering::Relaxed),
+            HANDOVERS[slot].load(Ordering::Relaxed),
+            MAX_HOLD[slot].load(Ordering::Relaxed),
             PEER_FAULTS[slot].load(Ordering::Relaxed),
         ]
     };
@@ -2450,7 +2814,7 @@ fn report_per_guest_state(uart: &mut Pl011) {
                     uart,
                     "baleen: perguest: dom {} — {} GIC traps, {} INTID enables, {} PL011 traps, {} \
                      console bytes on {} lines, {} forwarded ticks, {} SGIs, {} dispatches, {} \
-                     released mappings, {} confirmed deactivations, {} refused peer accesses",
+                     handovers, longest hold {} ticks, {} refused peer accesses",
                     slot_dom(slot),
                     c[0],
                     c[1],
@@ -2624,8 +2988,8 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     let _ = writeln!(
         uart,
         "baleen: {NUM_GUESTS} linux vcpus admitted through hv-core's scheduler, dom {GUEST_A} \
-         dispatched onto pCPU {PCPU0} — each guest is PREEMPTIBLE at every {PREEMPT_EVERY}th timer \
-         tick, and the pCPU passes to whichever peer the model still reports Runnable"
+         dispatched onto pCPU {PCPU0} — each guest runs for at most one {EL2_SLICE_HZ} Hz EL2 \
+         slice, and the pCPU passes to whichever peer the model still reports Runnable"
     ); // Name the saved set in the transcript. A context register that stops being saved is otherwise
        // invisible until it corrupts a guest; here it changes this line, so the boot output itself
        // records what this build believes a vCPU is made of.
@@ -2713,10 +3077,14 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // `crate::vgic` and touch no hardware, so **EL2 owns the physical distributor** and must
     // initialize it itself. Taking a device away from a guest means inheriting its job.
     gic::init_physical_vtimer();
+    // ③-b2b-ii-e — EL2's OWN timer PPI, separate from the call above because that one is shared with
+    // the synthetic path and the synthetic path has no EL2 clock.
+    gic::enable_hyp_timer_ppi();
     gic::enable_physical_cpu_interface_el2();
     gic::set_eoi_mode_split();
     gic::enable_el2();
-    // An idle guest must yield rather than freeze the machine — EL2 owns no clock of its own.
+    // An idle guest should yield rather than burn its slice. Since ③-b2b-ii-e this is efficiency,
+    // not liveness — see `report_wfi_yield`.
     HCR_WITH_TWI.store(trap_guest_wfi(), Ordering::Relaxed);
 
     let _ = writeln!(
@@ -2724,6 +3092,19 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
         "baleen: EL2 takes the guest's interrupts — HCR_EL2.IMO=1, timer PPI {} forwarded by \
          hardware-mapped list-register injection",
         gic::VTIMER_INTID
+    );
+
+    // ③-b2b-ii-e — **start EL2's clock, with the same call every switch makes.** The last thing
+    // before the `eret`, so no guest ever runs un-deadlined; and `arm_slice` rather than a bespoke
+    // cold-start sequence, so there is no arming code that runs once and is never exercised again
+    // (design-lesson #130, the same reasoning that seeds guest B rather than `eret`-ing into it).
+    let ctl = arm_slice();
+    let _ = writeln!(
+        uart,
+        "baleen: EL2 arms a clock of its OWN — CNTHP_EL2 at {} Hz on PPI {} (CNTHP_CTL_EL2 read \
+         back as 0x{ctl:x}), so the pCPU comes back to EL2 whether or not the guest cooperates",
+        EL2_SLICE_HZ,
+        gic::HYP_TIMER_INTID
     );
 
     let _ = writeln!(uart, "baleen: entering EL1 — the kernel takes the machine");

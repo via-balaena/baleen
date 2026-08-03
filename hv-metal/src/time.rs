@@ -92,7 +92,15 @@ impl TimeSource for GenericTimer {
 }
 
 /// The counter frequency in Hz, from `CNTFRQ_EL0`. Advisory (a firmware/QEMU-programmed label — see
-/// the module note); used for the banner, never for the monotonic `Ticks` themselves.
+/// the module note): it never enters the monotonic `Ticks` themselves, which are raw `CNTPCT_EL0`.
+///
+/// **③-b2b-ii-e gave it a second consumer, and it is no longer only cosmetic.** `crate::linux`'s EL2
+/// scheduling slice derives its length from this, so a firmware that mislabels the counter gives a
+/// slice of the wrong DURATION. That is a fidelity fault and not a correctness one, and the reason
+/// is worth stating rather than assumed: the deadline is still a real point on the real counter, so
+/// EL2 still regains control unconditionally — just at the wrong period — and the witness that
+/// checks the rate divides by the same value it multiplied by, so it stays self-consistent under a
+/// wrong label instead of reporting a failure that did not happen.
 pub(crate) fn frequency() -> u64 {
     let freq: u64;
     // SAFETY: `CNTFRQ_EL0` is readable at EL2; read-only, no memory effect.
