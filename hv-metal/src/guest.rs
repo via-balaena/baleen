@@ -2091,6 +2091,10 @@ fn flush_pending_to_lrs(slot: usize) -> usize {
     placed
 }
 
+/// **`pub(crate)` since ③-b2b-ii-c2**, which is the first time two *real* kernels time-slice: the
+/// real-Linux switch needs exactly this operation, and a second `msr vttbr_el2` there would be a
+/// second derivation of the no-flush argument below rather than a use of it.
+///
 /// Install a VMID-tagged `VTTBR_EL2` with **no TLB flush** (M5 Arc 2 — the headline property). Switching
 /// the active Stage-2 between two domains needs no `tlbi` *because* the two domains' translations are
 /// tagged with distinct VMIDs (`set_vmid(set) = set + 1`): a walk for one domain's VMID can never hit
@@ -2101,7 +2105,7 @@ fn flush_pending_to_lrs(slot: usize) -> usize {
 /// TCG-invisible (QEMU models no TLB retention), so on QEMU isolation is witnessed through the *tables*
 /// (VTTBR → distinct `L1` → distinct leaves → distinct host PA); the VMID-tag soundness is reasoned
 /// (design-lesson #23; `docs/AUDIT-4-CONCURRENT-STAGE2.md`).
-fn set_vttbr_no_flush(vttbr: u64) {
+pub(crate) fn set_vttbr_no_flush(vttbr: u64) {
     // SAFETY: `VTTBR_EL2` is RW at EL2; it only redirects Stage-2 walks for EL1&0 (EL2 runs
     // MMU-off/identity, so this handler's own accesses are unaffected). No memory effect; no `tlbi`.
     unsafe {
