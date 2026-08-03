@@ -1124,11 +1124,18 @@ static PEER_FAULTS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_
 
 /// How many peer faults EL2 will service for one guest before treating the guest as looping.
 ///
-/// The probe below produces a fixed, small number of them (one AMBA identification read per
-/// register), so a count far past that is not the negative test — it is a guest that never makes
-/// progress, and skipping its faulting instruction forever would turn a fault into a hang. Bounded
-/// rather than trusted, on the same reasoning as every other refusal on this path.
-const MAX_PEER_FAULTS: u64 = 64;
+/// **This is a runaway backstop, not a bound on the probe, and the difference cost a near-miss.**
+/// The first value here was 64, chosen from "the AMBA identification read is eight registers". The
+/// boot actually produces **48 per guest** — the driver core re-probes, so the real number is eight
+/// times however many times it retries, which is a function of probe ordering rather than anything
+/// this file controls. 64 left a third of a margin against a quantity nobody was measuring; a
+/// kernel that deferred once more would have turned the negative test into a `LINUX GUEST TRAP`.
+///
+/// So the cap is set where it can only catch what it is for: a guest looping on the access makes no
+/// progress at all and blows past any figure of this size immediately, while a probe cannot
+/// plausibly approach it. Same shape as the invariants earlier in this arc — do not pin a number to
+/// a workload's behaviour when the mechanism does not depend on it.
+const MAX_PEER_FAULTS: u64 = 4096;
 
 /// Each guest's VMID-tagged `VTTBR_EL2`, as the proven emitter produced it (③-b2b-ii-c2).
 ///
@@ -1584,10 +1591,17 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
     crate::park();
 }
 
-/// Route a guest **Stage-2 data abort** (`EC=0x24`). An access inside the emulated PL011's window is
-/// trap-and-emulated; anything else is a real fault in a guest that is supposed to have everything
-/// it touches either mapped or emulated, so it is reported with full syndrome and parked (the
-/// `LINUX GUEST TRAP` string the gate forbids).
+/// Route a guest **Stage-2 data abort** (`EC=0x24`) to one of four outcomes:
+///
+/// * the emulated **GIC**'s window (③-b1) — trap-and-emulated;
+/// * the emulated **PL011**'s window (③-a1) — trap-and-emulated;
+/// * a **peer guest's RAM** (③-b2b-ii-d) — the live negative test: recognised, checked against the
+///   peer's live image, skipped, and the guest carries on ([`handle_peer_fault`]);
+/// * anything else — a real fault in a guest that is supposed to have everything it touches either
+///   mapped or emulated, reported with full syndrome and parked (the `LINUX GUEST TRAP` string the
+///   gate forbids). **A fault inside the guest's OWN window lands here deliberately**: its image is
+///   supposed to map every frame it owns, so a fault there means the emitter is wrong, which is a
+///   different failure and must stay loud.
 ///
 /// **The address arithmetic is not the synthetic path's.** `guest.rs` reads the whole faulting
 /// address out of `FAR_EL2`, which is sound *there* because the synthetic guests run with stage-1
