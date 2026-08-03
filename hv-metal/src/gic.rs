@@ -75,6 +75,13 @@ const LR_STATE_PENDING: u64 = 0b01 << 62;
 /// the level, and EL2 gets no signal when that happens. `HW=1` is the hardware's answer: the guest's
 /// own EOI of the *virtual* interrupt deactivates the *physical* interrupt named by `pINTID`, with no
 /// EL2 involvement at all. This is how KVM forwards the arch timer, for the same reason.
+///
+/// **What the delegation costs, and where it is taken back (③-b2b-ii-c1).** "No EL2 involvement" is
+/// the point and also the limit: the mapping names *a* guest as the one who will end this physical
+/// interrupt, and there is one physical timer PPI on this machine. At a vCPU switch that guest stops
+/// running, so the promise stops being keepable — [`VgicCtx::release_hardware_mappings`] clears this
+/// bit on the outgoing context and EL2 does the deactivation itself
+/// ([`release_forwarded_timer`]).
 const LR_HW: u64 = 1 << 61;
 /// `ICH_LR<n>_EL2.pINTID`, bits [41:32] — the **physical** INTID a `HW=1` list register is mapped to.
 /// Ten bits, so it names INTIDs 0..=1023 (the SPI/PPI/SGI range); LPIs are out of its reach and out of
@@ -282,9 +289,15 @@ pub(crate) fn sgi1r_intid(value: u64) -> u32 {
 /// **Deactivate** a physical interrupt EL2 handled itself (`ICC_DIR_EL1`).
 ///
 /// Only meaningful with [`set_eoi_mode_split`] in effect: there, [`eoi_physical`] drops the running
-/// priority and this ends the interrupt's Active state. A *forwarded* interrupt never comes here —
-/// the guest's EOI deactivates it through [`LR_HW`] — so this is for the interrupts EL2 consumes or
-/// declines, where nobody else will ever do it and the entry would otherwise stay Active forever.
+/// priority and this ends the interrupt's Active state. So this is for the interrupts EL2 consumes
+/// or declines, where nobody else will ever do it and the entry would otherwise stay Active forever.
+///
+/// **This doc used to say "a *forwarded* interrupt never comes here — the guest's EOI deactivates it
+/// through [`LR_HW`]", and ③-b2b-ii-c1 made that false.** It was true of a machine with one guest,
+/// and it is exactly the assumption a second guest breaks: `HW=1` delegates deactivation to *a*
+/// guest, and at a switch the line stops belonging to the guest it was delegated to. So a forwarded
+/// interrupt does come here now, from [`release_forwarded_timer`], once per switch — recorded rather
+/// than quietly edited, because the sentence was not wrong when it was written.
 #[cfg(feature = "real-linux")]
 pub(crate) fn deactivate_physical(intid: u32) {
     // SAFETY: `ICC_DIR_EL1` at EL2 is the physical CPU interface's deactivate register; writing an
