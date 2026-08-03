@@ -29,6 +29,12 @@
 //! on QEMU `virt`, and ③-b1 because the emulated distributor reports a `GICD_TYPER` covering the
 //! INTIDs the existing DTB already names.
 //!
+//! **③-b2b-ii-d added the first node that tree has ever gained, and the distinction is worth
+//! keeping sharp.** The property earned above is that *taking a device away from a guest never
+//! required editing its description*; that is untouched. The peer-probe node is not an
+//! accommodation of our emulation — it is the negative test's instrument, the one node in the tree
+//! that exists in order to FAIL. Say "the DTS gained a probe", not "the DTS is untouched".
+//!
 //! So **four** things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` Stage-2
 //! **data abort**, which [`handle_linux_sync`] routes to the emulated GIC or the emulated PL011 and
 //! otherwise reports as a bring-up fault; an `EC=0x18` **trapped system register**
@@ -113,6 +119,20 @@
 //! `wfi` into a voluntary yield, which closes it — and the residue is declared rather than left for
 //! the next hang to find: EL2 still has no timer of its own, so the guarantee is behavioural, and
 //! its structural closure is `CNTHP_*_EL2` armed on every switch-in.
+//!
+//! ## ③-b2b-ii-d: a guest reaches for its peer's memory and the hardware says no
+//!
+//! Each guest's device tree names an AMBA peripheral at the base of the OTHER guest's half, so the
+//! kernel's bus scan reads its identification registers during boot and every read is refused. What
+//! makes that a test rather than an anecdote is what EL2 checks at the moment of the fault
+//! ([`handle_peer_fault`]): the address is unmapped in the faulting guest's image, resolves **to
+//! itself** in the peer's live emitted image, and the peer's loaded kernel is sitting there. An
+//! address that is merely unbacked would fault for a boring reason — and pointing the node at one
+//! (probed) turns the refusal into a plain `LINUX GUEST TRAP` instead, which is how we know the
+//! difference is being drawn.
+//!
+//! Both directions, and the guest **survives**: every marker after it is printed by a kernel that
+//! took the abort and carried on, which is what separates a negative test from a crash.
 //!
 //! The headline is one string: **`[dom 2] baleen-guest-ram: 64000000-7fffffff:SystemRAM`**. It is
 //! guest B's userspace reading guest B's `/proc/iomem`, which needs B's kernel to have parsed B's
@@ -1098,6 +1118,18 @@ enum Handover {
     PowerOff,
 }
 
+/// How many times each guest has touched a PEER's memory and been refused by the hardware
+/// (③-b2b-ii-d).
+static PEER_FAULTS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// How many peer faults EL2 will service for one guest before treating the guest as looping.
+///
+/// The probe below produces a fixed, small number of them (one AMBA identification read per
+/// register), so a count far past that is not the negative test — it is a guest that never makes
+/// progress, and skipping its faulting instruction forever would turn a fault into a hang. Bounded
+/// rather than trusted, on the same reasoning as every other refusal on this path.
+const MAX_PEER_FAULTS: u64 = 64;
+
 /// Each guest's VMID-tagged `VTTBR_EL2`, as the proven emitter produced it (③-b2b-ii-c2).
 ///
 /// Recorded at setup because a switch has to *install* the incoming domain's Stage-2, and the value
@@ -1177,6 +1209,99 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     drop(cell);
 
     switch_context(slot, next, Handover::Tick, frame);
+}
+
+/// Which guest's half of the RAM window contains `ipa`, if any (③-b2b-ii-d).
+///
+/// Derived from the same `first_frame`/`LINUX_SUP_FRAMES_PER_GUEST` split the model ownership and
+/// the emitted images come from, so "whose memory is this" has one answer on this path and it is the
+/// one the emitter used.
+fn guest_owning(ipa: u64) -> Option<usize> {
+    (0..NUM_GUESTS).find(|&slot| {
+        let base = guest_ram_base(slot);
+        (base..base + stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES).contains(&ipa)
+    })
+}
+
+/// **③-b2b-ii-d — a guest reached into its peer's memory, and the hardware said no.**
+///
+/// ## What makes this a test rather than an anecdote
+///
+/// An address that is simply not backed faults for a boring reason. This one is not: `ipa` is real
+/// DRAM, owned in the model by the peer, mapped by the peer's **live** Stage-2 image, and — checked
+/// here, from EL2, at the moment of the fault — actually holding the peer's loaded kernel. So the
+/// three things that could each have made the refusal uninteresting are each ruled out by reading
+/// them rather than by assuming them:
+///
+/// * **it resolves in the peer's image** — walked from the peer's emitted descriptors, so the frame
+///   is not merely unmapped everywhere;
+/// * **it resolves to itself** — the identity mapping the peer's DTB and the arm64 boot protocol
+///   both require, so the peer really uses this address;
+/// * **the bytes are there** — EL2 runs MMU-off and can read what the faulting guest cannot, and
+///   what it finds at the peer's base is the `ARM\x64` header of a kernel that is currently running.
+///
+/// ## The guest SURVIVES, and that is deliberate
+///
+/// Skipping the faulting instruction leaves the guest's destination register holding whatever it
+/// held before, which is exactly what a device that is not there would give it. The alternative —
+/// killing the guest — would make the negative test indistinguishable from a crash, and would mean
+/// the boot could never assert both that the access was refused *and* that everything else kept
+/// working. Bounded by [`MAX_PEER_FAULTS`] so a guest that loops on it cannot spin EL2 forever.
+fn handle_peer_fault(faulting: usize, owner: usize, ipa: u64, uart: &mut Pl011) {
+    let n = PEER_FAULTS[faulting].fetch_add(1, Ordering::Relaxed) + 1;
+    if n > MAX_PEER_FAULTS {
+        let _ = writeln!(
+            uart,
+            "baleen: LINUX GUEST TRAP: dom {} has faulted on dom {}'s memory {n} times (cap \
+             {MAX_PEER_FAULTS}) — it is not probing, it is looping; halting",
+            slot_dom(faulting),
+            slot_dom(owner)
+        );
+        crate::park();
+    }
+
+    // Only the first one is reported in full: the AMBA identification read produces a fixed handful
+    // of these, and eight identical paragraphs would bury the boot's other output.
+    if n == 1 {
+        let peer_l1 = hv_s2::arm64::vttbr_table(VTTBR[owner].load(Ordering::Relaxed));
+        let mine_l1 = hv_s2::arm64::vttbr_table(VTTBR[faulting].load(Ordering::Relaxed));
+        let in_peer = stage2::walk_stage2(peer_l1, ipa);
+        let in_mine = stage2::walk_stage2(mine_l1, ipa);
+        let identity = in_peer.map(|r| r.pa == ipa).unwrap_or(false);
+        let magic = peek::u32_at(guest_ram_base(owner) + IMAGE_MAGIC_OFF);
+
+        if in_mine.is_none() && identity && magic == IMAGE_MAGIC {
+            let _ = writeln!(
+                uart,
+                "baleen: peerfault OK: dom {} touched dom {}'s memory at IPA 0x{ipa:08x} and the \
+                 HARDWARE refused it — that address is unmapped in dom {}'s image, resolves to \
+                 itself in dom {}'s live emitted image, and dom {}'s loaded kernel ('ARM\\x64') is \
+                 sitting there right now; dom {} took the abort and kept running",
+                slot_dom(faulting),
+                slot_dom(owner),
+                slot_dom(faulting),
+                slot_dom(owner),
+                slot_dom(owner),
+                slot_dom(faulting)
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: peerfault FAIL: dom {} faulted at IPA 0x{ipa:08x}, but the refusal proves \
+                 nothing — mapped in its own image: {}; resolves to itself in dom {}'s: {}; dom \
+                 {}'s kernel magic there: 0x{magic:08x}",
+                slot_dom(faulting),
+                in_mine.is_some(),
+                slot_dom(owner),
+                identity,
+                slot_dom(owner)
+            );
+            crate::park();
+        }
+    }
+
+    // A data abort's preferred return is the FAULTING instruction.
+    crate::guest::advance_elr_past_fault();
 }
 
 /// **Retire the guest that issued `SYSTEM_OFF` and hand the CPU to a peer** (③-b2b-ii-c2).
@@ -1483,6 +1608,22 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
         return;
     }
 
+    // ③-b2b-ii-d — **THE LIVE NEGATIVE TEST.** A guest reaching into a PEER's half of the window is
+    // not a bring-up fault: it is the thing this whole path exists to make impossible, arriving as
+    // the hardware refusing it. Recognised here, before the catch-all below turns it into a
+    // `LINUX GUEST TRAP` that the gate forbids.
+    //
+    // A fault inside the guest's OWN window deliberately falls through to that catch-all — its
+    // Stage-2 image is supposed to map every frame it owns, so a fault there means the EMITTER is
+    // wrong, which is a different failure and must stay loud.
+    let faulting = current_slot();
+    if let Some(owner) = guest_owning(ipa) {
+        if owner != faulting {
+            handle_peer_fault(faulting, owner, ipa, uart);
+            return;
+        }
+    }
+
     if !vpl011::in_window(ipa) {
         let _ = writeln!(
             uart,
@@ -1518,7 +1659,7 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
         crate::park();
     }
 
-    let slot = current_slot();
+    let slot = faulting;
     let mut dev = VPL011.borrow_mut();
     let transmitted = if a.wnr {
         // A store: the value is the guest's source register (`SRT` 31 is `XZR`, which reads zero).
@@ -2213,7 +2354,7 @@ fn report_wfi_yield(uart: &mut Pl011) {
 
 /// The per-guest counters, named by the mechanism that writes each one. One array, so the count in
 /// the report below is derived and a counter cannot be added without appearing there.
-const PER_GUEST_COUNTERS: [&str; 10] = [
+const PER_GUEST_COUNTERS: [&str; 11] = [
     "GIC register traps",
     "INTID enables",
     "PL011 register traps",
@@ -2224,6 +2365,7 @@ const PER_GUEST_COUNTERS: [&str; 10] = [
     "scheduler switches",
     "released hardware mappings",
     "controller-confirmed deactivations",
+    "refused peer accesses",
 ];
 
 /// **③-b2b-ii-a's witness, inverted by ③-b2b-ii-c2: the per-guest state is INDEXED, not SHARED.**
@@ -2263,6 +2405,7 @@ fn report_per_guest_state(uart: &mut Pl011) {
             SWITCHES[slot].load(Ordering::Relaxed),
             HW_RELEASED[slot].load(Ordering::Relaxed),
             TIMER_DEACTIVATED[slot].load(Ordering::Relaxed),
+            PEER_FAULTS[slot].load(Ordering::Relaxed),
         ]
     };
 
@@ -2293,7 +2436,7 @@ fn report_per_guest_state(uart: &mut Pl011) {
                     uart,
                     "baleen: perguest: dom {} — {} GIC traps, {} INTID enables, {} PL011 traps, {} \
                      console bytes on {} lines, {} forwarded ticks, {} SGIs, {} dispatches, {} \
-                     released mappings, {} confirmed deactivations",
+                     released mappings, {} confirmed deactivations, {} refused peer accesses",
                     slot_dom(slot),
                     c[0],
                     c[1],
@@ -2304,7 +2447,8 @@ fn report_per_guest_state(uart: &mut Pl011) {
                     c[6],
                     c[7],
                     c[8],
-                    c[9]
+                    c[9],
+                    c[10]
                 );
             }
         }

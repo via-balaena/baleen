@@ -174,6 +174,11 @@ fn guest_load_addrs(slot: u64) -> GuestLoad {
     }
 }
 
+/// The window belonging to guest `slot`'s peer — the address its peer-probe node names (③-b2b-ii-d).
+fn peer_of(slot: u64) -> GuestLoad {
+    guest_load_addrs((slot + 1) % NUM_GUESTS)
+}
+
 /// Where one guest's blobs go and what RAM window its DTB advertises.
 struct GuestLoad {
     kernel: u64,
@@ -374,6 +379,16 @@ fn render_guest_dtb(
         (
             format!("linux,initrd-end = <0x{:x}>;", a.initrd),
             format!("linux,initrd-end = <0x{:x}>;", at.initrd + initrd_size),
+        ),
+        // ③-b2b-ii-d: the peer-probe node points at the OTHER guest's base — derived from the same
+        // rotation `hv-metal`'s `next_runnable` uses, so "who is my peer" has one answer.
+        (
+            format!("peer-probe@{:x} {{", peer_of(0).ram_base),
+            format!("peer-probe@{:x} {{", peer_of(slot).ram_base),
+        ),
+        (
+            format!("reg = <0x00 0x{:x} 0x00 0x1000>;", peer_of(0).ram_base),
+            format!("reg = <0x00 0x{:x} 0x00 0x1000>;", peer_of(slot).ram_base),
         ),
     ];
 
@@ -592,7 +607,7 @@ const LINUX_MARKERS: &[&str] = &[
     // eight arrays-of-one behave exactly like the eight globals they replaced. What cannot survive a
     // shared field is dom 2 — never dispatched, so every one of its counters must read zero, against
     // a dom 1 that made hundreds of GIC traps and thousands of console bytes on the same boot.
-    "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are INDEXED, not shared — all 10 of them are non-zero for EVERY one of the 2 guests",
+    "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are INDEXED, not shared — all 11 of them are non-zero for EVERY one of the 2 guests",
     // ③-b2b-ii-c1: the ONE physical timer changes hands at every switch. Two counts, because the
     // handoff has two halves and one of them is invisible to the other:
     //
@@ -622,6 +637,22 @@ const LINUX_MARKERS: &[&str] = &[
     // witness refused it.) The read-back is true on every boot and is what actually determines
     // whether an idle guest can hold the CPU with no way for EL2 to take it back.
     "baleen: wfi OK: HCR_EL2.TWI is in force (HCR_EL2 read back as",
+    // ★ ③-b2b-ii-d — THE LIVE NEGATIVE TEST, in both directions. Each guest's device tree names an
+    // AMBA peripheral at the base of the OTHER guest's half of the window, so the kernel's bus scan
+    // reads its identification registers during boot and the hardware refuses every one.
+    //
+    // The IPA is asserted with its value (`…000fe0`) because that value IS the claim: it is the
+    // AMBA peripheral-ID register offset, so the access came from a real driver probe rather than
+    // from anything hv-metal arranged. And the refusal is only interesting because EL2 checked, at
+    // the moment of the fault, that the same address resolves to ITSELF in the peer's LIVE emitted
+    // image and that the peer's loaded kernel is sitting there — an address that is merely unbacked
+    // would fault for a boring reason.
+    //
+    // Both directions, because a one-way test would leave open that the asymmetry, not the map, is
+    // what refused it. And the guest SURVIVES — every marker after this one is printed by a kernel
+    // that took the abort and carried on, which is what separates a negative test from a crash.
+    "baleen: peerfault OK: dom 1 touched dom 2's memory at IPA 0x64000fe0 and the HARDWARE refused it",
+    "baleen: peerfault OK: dom 2 touched dom 1's memory at IPA 0x48000fe0 and the HARDWARE refused it",
     // ③-b2a: TWO domains, TWO Stage-2 images, disjoint — walked from the emitted descriptors
     // rather than recomputed from the layout constants the emitter used (design-lesson #36).
     // The claim is scoped ("over the guest-RAM window") because that is what the walk covers: 448
@@ -672,6 +703,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // guest can hold the pCPU with no way for EL2 to take it back.
     // ③-b2b-ii-c2 follow-up: `HCR_EL2.TWI` did not take effect, so an idle guest holds the pCPU.
     "baleen: wfi FAIL",
+    // ③-b2b-ii-d: a guest reached the peer's memory and the refusal proved nothing — the address is
+    // mapped in its own image too, or it does not resolve in the peer's, or the peer's kernel is not
+    // there. Any of those makes the negative test an anecdote.
+    "baleen: peerfault FAIL",
     // ③-b2b-ii-b: a guest's window does not hold what the loader was told to put there — no kernel
     // magic, a zero image_size, a non-relocatable Image, a kernel overrunning its DTB, or a missing
     // device tree / initramfs. The message names which guest and which of the six checks failed.
