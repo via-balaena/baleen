@@ -210,6 +210,7 @@ use hv_core::{HvCall, Hypervisor};
 use crate::abort::{self, DataAbort, EC_DATA_ABORT};
 use crate::cell::BootCell;
 use crate::console::GuestConsole;
+use crate::ctx::CtxComponent;
 use crate::gic;
 use crate::pl011::Pl011;
 use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
@@ -1673,7 +1674,7 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     // 4. Poison — see `crate::vcpu`. Still the instrument that stops a switch-to-self being vacuous.
     // SAFETY: at EL2 with the context saved, and the restore below is unconditional — the guest's
     // EL1 configuration is garbage only for the handful of instructions between the two.
-    unsafe { vcpu::poison() };
+    unsafe { ctx[next].poison() };
 
     // 5. Install the incoming vCPU. **Only now** does `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` describe the
     //    guest about to run, which is why step 6 cannot be folded into step 3: re-arming the PPI
@@ -3089,9 +3090,13 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
        // records what this build believes a vCPU is made of.
     let _ = write!(
         uart,
-        "baleen: vcpu context = {} registers:",
-        vcpu::CtxReg::ALL.len()
+        "baleen: vcpu context = {} components (",
+        vcpu::CTX_COMPONENTS.len()
     );
+    for (i, c) in vcpu::CTX_COMPONENTS.iter().enumerate() {
+        let _ = write!(uart, "{}{c}", if i == 0 { "" } else { " " });
+    }
+    let _ = write!(uart, ") / {} registers:", vcpu::CtxReg::ALL.len());
     for r in vcpu::CtxReg::ALL {
         let _ = write!(uart, " {}", r.name());
     }

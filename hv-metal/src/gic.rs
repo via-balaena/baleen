@@ -620,28 +620,6 @@ impl VgicCtx {
         vmcr: 0,
     };
 
-    /// Capture this vCPU's live vGIC state.
-    pub(crate) fn save(&mut self) {
-        let n = num_list_registers();
-        for (i, slot) in self.lr.iter_mut().enumerate().take(n) {
-            *slot = read_lr(i);
-        }
-        self.vmcr = read_vmcr();
-    }
-
-    /// Reinstate this vCPU's vGIC state.
-    ///
-    /// # Safety
-    /// The caller must be at EL2 and this context must belong to the vCPU about to be resumed.
-    pub(crate) unsafe fn restore(&self) {
-        let n = num_list_registers();
-        for (i, &lr) in self.lr.iter().enumerate().take(n) {
-            write_lr(i, lr);
-        }
-        // SAFETY: forwarded from this function's contract.
-        unsafe { write_vmcr(self.vmcr) };
-    }
-
     /// **Strip the hardware mapping from every saved list register**, returning how many were
     /// converted (③-b2b-ii-c1).
     ///
@@ -713,6 +691,41 @@ impl VgicCtx {
         // SAFETY: forwarded from this function's contract. `VMCR` affects only the VIRTUAL interface,
         // so EL2's own interrupt handling is untouched while the poison stands.
         unsafe { write_vmcr(0) };
+    }
+}
+
+/// ⑰-a: the vGIC bank as a declared context component, so a switch that forgets it cannot compile.
+/// Same bodies as the inherent `save`/`restore` this replaced — the move is what puts them under the
+/// obligation, not a rewrite.
+impl crate::ctx::CtxComponent for VgicCtx {
+    fn save(&mut self) {
+        let n = num_list_registers();
+        for (i, slot) in self.lr.iter_mut().enumerate().take(n) {
+            *slot = read_lr(i);
+        }
+        self.vmcr = read_vmcr();
+    }
+
+    /// # Safety
+    /// The caller must be at EL2 and this context must belong to the vCPU about to be resumed.
+    unsafe fn restore(&self) {
+        let n = num_list_registers();
+        for (i, &lr) in self.lr.iter().enumerate().take(n) {
+            write_lr(i, lr);
+        }
+        // SAFETY: forwarded from this function's contract.
+        unsafe { write_vmcr(self.vmcr) };
+    }
+}
+
+#[cfg(feature = "real-linux")]
+impl crate::ctx::CtxPoison for VgicCtx {
+    /// # Safety
+    /// Forwarded to [`VgicCtx::poison`], whose contract this is.
+    unsafe fn poison(&self) {
+        // SAFETY: forwarded from this function's contract. `&self` is the type witness only — see
+        // `crate::ctx`.
+        unsafe { Self::poison() };
     }
 }
 
