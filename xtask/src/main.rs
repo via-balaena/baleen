@@ -787,6 +787,18 @@ const LINUX_MARKERS: &[&str] = &[
     // `wfi`, so the yield simply never fires. The concurrency this gate has been asserting since
     // ③-b2b-ii-c2 came from the every-eighth-tick preemption, and now comes from `CNTHP_*_EL2`.
     "baleen: wfi OK: HCR_EL2.TWI is in force (HCR_EL2 read back as",
+    // ★ ⑱-1 — **THE GUEST'S IDENTITY IS EL2'S CHOICE.** A guest's `MPIDR_EL1`/`MIDR_EL1` reads are
+    // served by `VMPIDR_EL2`/`VPIDR_EL2`, both **UNKNOWN at reset**, and hv-metal wrote neither.
+    // MEASURED on QEMU 11.0.3 before the rung: they hold the physical values, which are exactly what
+    // the guests' device trees describe — correct by the implementation's reset choice rather than by
+    // anything the hypervisor did. This rung makes the value a function EL2 evaluates.
+    //
+    // ⚠ The value is UNCHANGED, so no guest behaviour witnesses it and none is claimed. The assertion
+    // is the structural one: both registers read back as what EL2 wrote, on EVERY entry to EL1 —
+    // false on `main`, where the write does not exist. Non-vacuity was PROBED, not argued: writing
+    // `Aff0 = slot` instead of `Aff0 = vCPU` gives dom 2 an MPIDR its own `cpu@0 { reg = <0x00>; }`
+    // does not describe, and dom 2 must then fail to boot.
+    "baleen: identity OK: every entry to EL1 carries an identity EL2 CHOSE",
     // ★ ③-b2b-ii-f — **THE FP/SIMD REGISTER FILE IS PER-GUEST.** The last enumerated member of the
     // "state the hardware does not swap" class, and the one that stayed open longest: `v0..v31`,
     // `FPCR` and `FPSR` are one physical file shared by every context on the CPU, and nothing saved

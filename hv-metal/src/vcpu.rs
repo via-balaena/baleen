@@ -42,6 +42,21 @@
 //! between the two guests at the moment of the switch, which is exactly the register a boot would
 //! otherwise keep getting away with. What was the instrument is now the backstop.
 //!
+//! ## ⚠ What is per-vCPU but deliberately NOT in this table
+//!
+//! This module holds the state a guest **owns and mutates**, which is why save/restore/poison is the
+//! right shape for it. Some per-vCPU state is EL2's instead — the guest cannot write it, so there is
+//! nothing to save, and poisoning it would only break the guest. It is *installed* by
+//! [`crate::linux::switch_context`] from the incoming vCPU's identity rather than carried here:
+//! `VTTBR_EL2` (the domain's Stage-2, since ③-b2b-ii-c2) and, since ⑱-1, `VMPIDR_EL2`/`VPIDR_EL2`
+//! (the `MPIDR_EL1`/`MIDR_EL1` the guest reads).
+//!
+//! **The distinction matters at ⑱-3 and is recorded now so it is not rediscovered then.** With two
+//! vCPUs per guest, "state the guest owns" is saved and restored by the table below; "state EL2 owns
+//! about the vCPU" must be recomputed per switch-in. A register in the second class added to this
+//! table would be saved off the hardware and restored — harmless while its value is constant, and
+//! wrong the moment it is not.
+//!
 //! ## One derivation
 //!
 //! The table is declared **once**, by [`ctx_regs!`], which generates the enum, the `ALL` slice, the
