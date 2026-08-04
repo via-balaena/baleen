@@ -841,6 +841,15 @@ const fn guest_mpidr(vcpu: usize) -> u64 {
 /// argument rather than a search.
 const BOOT_VCPU: usize = 0;
 
+// ⑱-2: this index and `vgic::VCPUS_PER_GUEST` are two statements about the same thing — how many
+// vCPUs a guest has. A boot vCPU the emulated GIC has no redistributor for would read `is_enabled`
+// as false for every banked INTID (fail-closed, so the timer would simply never be forwarded) and
+// nothing would say why.
+const _: () = assert!(
+    BOOT_VCPU < crate::vgic::VCPUS_PER_GUEST,
+    "the boot vCPU must be one the emulated GIC presents a redistributor for"
+);
+
 // `guest.dts` gives `cpu@0` `reg = <0x00>`, and arm64 Linux matches its boot CPU by comparing
 // `MPIDR_EL1 & MPIDR_HWID_BITMASK` against that. Two derivations of one fact (⑭'s defect), pinned:
 // if `guest_mpidr` ever stops agreeing with the device tree the build stops, instead of the guest
@@ -1494,7 +1503,7 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         // two. Now the interrupt is delivered only if the guest asked for it **in its own emulated
         // distributor**, which lives in EL2 memory the guest cannot reach. A guest that has not
         // enabled INTID 27 does not get INTID 27 — and, come ③-b, cannot enable anyone else's.
-        if !VGIC.borrow_mut().at_mut(slot).is_enabled(intid) {
+        if !VGIC.borrow_mut().at_mut(slot).is_enabled(BOOT_VCPU, intid) {
             // Not an error — the guest legitimately runs with its timer masked. Mask it PHYSICALLY
             // too before completing it: the timer PPI is level-triggered, so deactivating while the
             // level is high would re-signal immediately and storm EL2. `handle_vgic_access` re-enables
@@ -2481,7 +2490,7 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     let wants_timer = VGIC
         .borrow_mut()
         .inc_mut(next)
-        .is_enabled(gic::VTIMER_INTID);
+        .is_enabled(BOOT_VCPU, gic::VTIMER_INTID);
     gic::set_ppi_enabled(gic::VTIMER_INTID, wants_timer);
 
     // 7. The pCPU now belongs to `next`, so every handler that asks "which guest?" must get the new
@@ -2774,7 +2783,7 @@ fn handle_vgic_access(
     // It is the RUNNING guest's model, and a data abort can only come from the running guest — but
     // there is one physical redistributor for both, so once ③-b2b-ii-c makes `CURRENT` move, this
     // mirror has to be re-applied on every switch-in as well.
-    let timer_enabled = dev.at_mut(slot).is_enabled(gic::VTIMER_INTID);
+    let timer_enabled = dev.at_mut(slot).is_enabled(BOOT_VCPU, gic::VTIMER_INTID);
     drop(dev);
     if a.wnr {
         gic::set_ppi_enabled(gic::VTIMER_INTID, timer_enabled);
