@@ -3965,3 +3965,27 @@ mod pending_set_algebra {
         }
     }
 }
+
+/// # An **Active** list register: occupied, and never presented
+#[cfg(kani)]
+mod vgic_active_lr {
+    use hv_vdev::vgic_cpuif::{encode_active, lr_is_free, lr_is_hw, lr_state, lr_vintid, LrState};
+
+    /// ∀ vINTID: an Active entry fills a slot an injector must skip, carries no hardware mapping,
+    /// and reads back the vINTID it was given.
+    ///
+    /// Both halves matter for the use it was added for. "Not free" is what makes the bank full; "not
+    /// Pending" is what keeps the guest from ever seeing it. A helper that produced a *Pending* entry
+    /// would fill the bank just as well and hand the guest a spurious interrupt — which is precisely
+    /// the accident this replaced (filling with SGIs 0..3 sent arm64 Linux its `IPI_CPU_STOP`).
+    #[kani::proof]
+    fn an_active_list_register_is_occupied_but_not_pending() {
+        let vintid: u32 = kani::any();
+        let lr = encode_active(vintid);
+
+        assert!(!lr_is_free(lr));
+        assert_eq!(lr_state(lr), LrState::Active);
+        assert!(!lr_is_hw(lr));
+        assert_eq!(lr_vintid(lr), vintid);
+    }
+}

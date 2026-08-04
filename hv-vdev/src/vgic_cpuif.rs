@@ -213,6 +213,19 @@ pub const fn encode_lr(vintid: u32, hw: Option<u32>, priority: u8) -> Option<u64
     }
 }
 
+/// Build a list register in the **Active** state — occupied, but never presented to the guest.
+///
+/// The three-line reason this exists: a list register is "free" iff its State is Invalid, and only a
+/// **Pending** one is offered to the guest's CPU interface. An Active entry therefore fills a slot —
+/// [`lr_is_free`] refuses it, so an injector skips it — while being invisible to the guest.
+///
+/// That is exactly what a test needs to manufacture a full bank without handing the guest an
+/// interrupt it did not ask for. It is here rather than open-coded at the call site because the State
+/// field's position is this module's fact, and ⑰-b′ exists so there is only one copy of it.
+pub const fn encode_active(vintid: u32) -> u64 {
+    (0b10 << LR_STATE_SHIFT) | ((vintid as u64) << LR_VINTID_SHIFT)
+}
+
 /// **Strip the hardware mapping from every occupied list register in a saved bank**, returning how
 /// many were converted (③-b2b-ii-c1).
 ///

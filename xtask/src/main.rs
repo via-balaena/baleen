@@ -792,6 +792,12 @@ const LINUX_MARKERS: &[&str] = &[
     // instead, and every clause below is a READ-BACK: the bank really refuses, the overflow lands in
     // the set, and `ICH_HCR_EL2.UIE` is read back armed and then clear.
     "baleen: lroverflow OK: a FULL list-register bank now DEFERS instead of halting",
+    // ★ The LAST guest-reachable halt on this path, closed. A guest that fills its four list
+    // registers with SGIs it never takes made the next timer forward fail — and that used to
+    // `park()`, killing the peer too. Measured before the fix: `sgis_placed=4
+    // timer_forward_refused=true`. The shipped guest never fills its bank, so the probe manufactures
+    // the condition; the marker is what says it really did.
+    "baleen: tickdefer OK: a FULL list-register bank DEFERS the forwarded timer instead of halting",
 ];
 
 /// What the **fault-probe** boot must show, and it is the whole rung in five lines.
@@ -841,6 +847,7 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // prefix, so a regression that reinstates it reddens here as well as losing the marker above.
     "baleen: LINUX GUEST TRAP",
     "baleen: lroverflow FAIL",
+    "baleen: tickdefer FAIL",
     "Kernel panic",
     "baleen: linux model setup",
     "baleen: vpl011 FAIL",
