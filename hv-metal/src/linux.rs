@@ -772,6 +772,134 @@ fn init_guest_el1() {
     }
 }
 
+// ─── ⑱-1: the identity EL2 gives a guest ─────────────────────────────────────────────────────────
+//
+// A guest's `MRS x, MPIDR_EL1` at EL1 does not read `MPIDR_EL1`. It reads **`VMPIDR_EL2`**, and
+// likewise `MIDR_EL1` reads `VPIDR_EL2` — the two registers that exist so a hypervisor can tell a
+// guest *which CPU it is on* rather than leaking the physical one. hv-metal wrote neither.
+//
+// **Both are architecturally UNKNOWN at reset** (Arm ARM D19, `VMPIDR_EL2`/`VPIDR_EL2`), so until
+// this rung the identity every guest read was whatever the implementation happened to leave behind.
+// **MEASURED on QEMU 11.0.3:** `VMPIDR_EL2 = 0x80000000 = MPIDR_EL1` and `VPIDR_EL2 = 0x410fd083 =
+// MIDR_EL1` — i.e. QEMU resets them to the physical values, which are exactly the values the guests'
+// device trees describe. So the identity was correct here **by the implementation's reset choice,
+// and by nothing hv-metal did**: design-lesson #127's shape, one level below the workload.
+//
+// ⚠ **State the scope honestly.** `main.rs` parks any CPU whose `MPIDR` affinity is non-zero, so
+// hv-metal only ever runs where the physical affinity is 0 — this is therefore *not* a latent bug on
+// a big.LITTLE board, because such a board would not get this far. What it is: a value the
+// architecture leaves unspecified, on which a guest's ability to match its own boot CPU against its
+// device tree depends. An implementation resetting `VMPIDR_EL2` to anything else gives both guests an
+// identity their own `cpu@0 { reg = <0x00>; }` does not describe, and arm64 Linux refuses that.
+//
+// **What this rung changes is WHERE the answer comes from**, not what it is: the value is now a
+// function EL2 evaluates. That is also what ⑱-3 needs — with two vCPUs per guest the identity stops
+// being constant, and the difference between "EL2 computes it" and "the reset left it" is the
+// difference between changing an argument and discovering a missing register.
+//
+// ## ★ THE KILL PROBE, and it came back GUEST-OBSERVED
+//
+// A write nobody reads is decoration (design-lesson #111), and the read-back below cannot tell the
+// difference — it would pass just as well if `VMPIDR_EL2` served no guest at all. So the write was
+// corrupted deliberately: `Aff0 = the guest's SLOT` instead of `Aff0 = the vCPU index`, which leaves
+// dom 1 (slot 0) untouched and gives dom 2 an MPIDR of 1 that its own `cpu@0 { reg = <0x00>; }` does
+// not describe. **MEASURED:**
+//
+// | guest | value | result |
+// |---|---|---|
+// | dom 1 | unchanged | booted to userspace, `BALEEN-STEP0-OK`, powered off normally |
+// | dom 2 | `Aff0 = 1` | `missing boot CPU MPIDR, not enabling secondaries` → **`Kernel panic - not syncing: Attempted to kill the idle task!`** |
+//
+// dom 2 QUOTED ITS OWN MPIDR MISMATCH and died of it. That is the register reaching a guest and the
+// guest acting on it — evidence the read-back cannot give, from the side of the seam EL2 does not
+// own. The differential is what makes it conclusive: the guest whose value changed died, the guest
+// whose value did not, did not.
+
+/// `MPIDR_EL1` bit 31 — RES1 in every ARMv8 implementation, so a computed MPIDR must carry it.
+const MPIDR_RES1: u64 = 1 << 31;
+
+/// The mask arm64 Linux applies (`MPIDR_HWID_BITMASK`) before matching a CPU's MPIDR against a
+/// device tree `reg`: `Aff3:Aff2:Aff1:Aff0`, i.e. everything except the RES1/U/MT flag bits.
+const MPIDR_HWID_BITMASK: u64 = 0xff_00ff_ffff;
+
+/// The `MPIDR_EL1` a guest's vCPU reads — **`Aff0` is the vCPU's index within its own guest.**
+///
+/// **A function of the vCPU, deliberately NOT of the guest slot.** Every guest is its own machine and
+/// every guest's `guest.dts` says `cpu@0 { reg = <0x00>; }`, so dom 1's and dom 2's first vCPUs must
+/// read the *same* MPIDR. Taking a [`Incoming`] here would say the opposite; a bare index is right
+/// because there is exactly one subject, which is the same reason [`PerGuest::at`] takes one.
+///
+/// **`U` (bit 30, "uniprocessor system") is deliberately left clear**, matching the value the guests
+/// already read. Setting it would be defensible at one vCPU and wrong at two, and it would make this
+/// rung change what a guest sees — which would cost the structural witness below its meaning.
+const fn guest_mpidr(vcpu: usize) -> u64 {
+    MPIDR_RES1 | (vcpu as u64)
+}
+
+/// The vCPU every guest currently has, and the only one that runs. ⑱-3 replaces this constant at the
+/// two call sites with the incoming vCPU's index; the seam is named here so that change is an
+/// argument rather than a search.
+const BOOT_VCPU: usize = 0;
+
+// `guest.dts` gives `cpu@0` `reg = <0x00>`, and arm64 Linux matches its boot CPU by comparing
+// `MPIDR_EL1 & MPIDR_HWID_BITMASK` against that. Two derivations of one fact (⑭'s defect), pinned:
+// if `guest_mpidr` ever stops agreeing with the device tree the build stops, instead of the guest
+// booting to `Bad CPU number`.
+const _: () = assert!(
+    guest_mpidr(BOOT_VCPU) & MPIDR_HWID_BITMASK == 0,
+    "guest.dts declares cpu@0 with reg = <0x00>; guest_mpidr(0) must present that same hwid"
+);
+
+/// Times [`set_guest_identity`] ran, and times the registers **read back** as what it wrote.
+/// Compared in [`report_guest_identity`]: a difference means the write did not take.
+static IDENTITY_WRITES: AtomicU64 = AtomicU64::new(0);
+static IDENTITY_VERIFIED: AtomicU64 = AtomicU64::new(0);
+/// The last read-back of each register, so the witness can print the value rather than assert about
+/// one nobody sees.
+static IDENTITY_VMPIDR: AtomicU64 = AtomicU64::new(0);
+static IDENTITY_VPIDR: AtomicU64 = AtomicU64::new(0);
+
+/// Give the vCPU that is about to run the identity **EL2 chose for it**, and read both registers back.
+///
+/// Called from the two — and only two — places a vCPU reaches EL1: the boot `eret` into guest A, and
+/// every [`switch_context`]. One derivation, two call sites (#74); guest A's boot entry is not a
+/// second answer to "what identity does a vCPU get", it is the same function applied to the first one.
+///
+/// `VPIDR_EL2` is **read off the live CPU** rather than written from a literal, for the same reason
+/// `sctlr_at_boot` is: the guest genuinely executes on this PE, so the MIDR it should see IS this
+/// PE's, and a second encoding of that fact would agree only until the board changed.
+///
+/// No `isb` is needed: every path out of here reaches EL1 through an `eret`, which is a
+/// context-synchronising event.
+fn set_guest_identity(vcpu: usize) {
+    let mpidr = guest_mpidr(vcpu);
+    let (midr, vmpidr_back, vpidr_back): (u64, u64, u64);
+    // SAFETY: `VMPIDR_EL2`/`VPIDR_EL2` are RW at EL2 and `MIDR_EL1` is readable there; these are the
+    // registers whose whole purpose is for a hypervisor to write. No memory effect.
+    unsafe {
+        asm!(
+            "mrs {midr}, midr_el1",
+            "msr vmpidr_el2, {mpidr}",
+            "msr vpidr_el2, {midr}",
+            "mrs {a}, vmpidr_el2",
+            "mrs {b}, vpidr_el2",
+            mpidr = in(reg) mpidr,
+            midr = out(reg) midr,
+            a = out(reg) vmpidr_back,
+            b = out(reg) vpidr_back,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    IDENTITY_VMPIDR.store(vmpidr_back, Ordering::Relaxed);
+    IDENTITY_VPIDR.store(vpidr_back, Ordering::Relaxed);
+    IDENTITY_WRITES.fetch_add(1, Ordering::Relaxed);
+    // Both halves, against what was actually written — a read-back that only checked `VMPIDR_EL2`
+    // would pass with `VPIDR_EL2` never written at all, which is the defect this rung closes.
+    if vmpidr_back == mpidr && vpidr_back == midr {
+        IDENTITY_VERIFIED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // ─── the Linux-mode EL2 exception vectors ────────────────────────────────────────────────────────
 // A dedicated vector table installed just before the `eret` into Linux — separate from the synthetic
 // path's (`exceptions.rs`), so the synthetic code is untouched. Slot 8 (lower-EL sync) → the PSCI /
@@ -2107,6 +2235,7 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     report_timer_handoff(uart);
     report_el2_slice(uart);
     report_wfi_yield(uart);
+    report_guest_identity(uart);
     report_fp_isolation(uart);
     report_pending_absorption(uart);
     #[cfg(feature = "selftest")]
@@ -2253,7 +2382,9 @@ fn sched_on(hv: &mut Hypervisor, dom: DomId, call: HvCall, what: &str) {
 /// which turns two of them from identities into real work: the context restored is a different
 /// vCPU's, and `VTTBR_EL2` becomes a different domain's VMID-tagged Stage-2. ③-b2b-ii-e adds an
 /// eighth step, and it is the only one about the guest that is *arriving* rather than the one
-/// leaving: its slice starts here.
+/// leaving: its slice starts here. ⑱-1 adds a second such step (5b′): the incoming vCPU's
+/// **identity**, written beside its address space because both are EL2-owned configuration
+/// describing the guest about to run rather than state that guest owns.
 /// ⚠ **The two parameters are DIFFERENT TYPES on purpose** — see [`crate::role`]. Both were
 /// `usize`, and two of the eighteen indexed uses below could be swapped with the boot gate
 /// staying green (MEASURED). A swap is now a compile error.
@@ -2317,6 +2448,13 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     //     fault at level 2. A's map does not reach B's memory even to fetch one instruction, and a
     //     running guest is what says so, rather than a walk over the descriptors.
     crate::guest::set_vttbr_no_flush(VTTBR.inc(next).load(Ordering::Relaxed));
+
+    // 5b′. ⑱-1 — and the incoming vCPU's IDENTITY, next to its address space because they are the
+    //      same kind of thing: EL2-owned configuration that describes the guest about to run rather
+    //      than state the guest owns. Written on every switch-in and not once at boot, because at
+    //      ⑱-3 the answer stops being constant — a boot-time write would then be silently stale for
+    //      every vCPU but the first.
+    set_guest_identity(BOOT_VCPU);
 
     // 5c. ③-b2b-ii-f — read the FP file back off the hardware and confirm it is the incoming vCPU's.
     //     Structural: true on every switch regardless of what any guest does, which is what makes it
@@ -3267,6 +3405,42 @@ fn report_timer_handoff(uart: &mut Pl011) {
     }
 }
 
+/// ⑱-1 — **the identity a guest reads is one EL2 wrote.**
+///
+/// Structural, and deliberately so. The value is unchanged from what QEMU's reset already provided
+/// (measured `0x80000000`/`0x410fd083` before this rung and after it), so **no guest behaviour can
+/// witness this** — a count of "guests that booted" would have been just as green on `main`, which
+/// is design-lesson #99's test. What is assertable is that the registers were *written by us* and
+/// **read back as what we wrote**, on every entry to EL1 rather than on some of them. That is true
+/// every boot, unsatisfiable by luck, and false on `main` — where the write does not exist.
+///
+/// The non-vacuity evidence is the kill probe recorded beside [`set_guest_identity`], which is
+/// guest-observed and therefore stronger than anything this function can assert.
+fn report_guest_identity(uart: &mut Pl011) {
+    let writes = IDENTITY_WRITES.load(Ordering::Relaxed);
+    let verified = IDENTITY_VERIFIED.load(Ordering::Relaxed);
+    let vmpidr = IDENTITY_VMPIDR.load(Ordering::Relaxed);
+    let vpidr = IDENTITY_VPIDR.load(Ordering::Relaxed);
+    if writes > 0 && verified == writes {
+        let _ = writeln!(
+            uart,
+            "baleen: identity OK: every entry to EL1 carries an identity EL2 CHOSE — VMPIDR_EL2 \
+             read back as 0x{vmpidr:x} (the MPIDR_EL1 a guest reads, Aff0 = its own vCPU index) and \
+             VPIDR_EL2 as 0x{vpidr:x} (MIDR_EL1, taken off the PE the guest really runs on), \
+             {verified} of {writes} entries. Both are UNKNOWN at reset, so before this the guests' \
+             identity was the implementation's choice and not the hypervisor's"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: identity FAIL: {verified} of {writes} entries read back the identity EL2 wrote \
+             (VMPIDR_EL2 0x{vmpidr:x}, VPIDR_EL2 0x{vpidr:x}) — a guest is running with an identity \
+             nothing chose"
+        );
+        crate::park();
+    }
+}
+
 /// **The witness for the `WFI` yield**, and it is a READ-BACK rather than a count.
 ///
 /// **The obvious witness is wrong, and it was wrong in the shape this arc keeps hitting.** Counting
@@ -3805,6 +3979,9 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     enable_stage2(vttbr[SLOT_A]);
     enable_guest_hw_access();
     init_guest_el1();
+    // ⑱-1 — guest A is the one vCPU that reaches EL1 by an `eret` rather than by a context restore,
+    // so it needs the identity installed here too. Same function, not a second answer.
+    set_guest_identity(BOOT_VCPU);
 
     // ③-b2b-ii-c2 — **seed every guest that is not the one this `eret` enters.**
     //
