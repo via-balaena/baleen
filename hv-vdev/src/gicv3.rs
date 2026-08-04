@@ -76,15 +76,34 @@
 //!   **Recorded, not changed.** Making word 0 read zero would be architecturally right and would
 //!   remove a guest-triggerable retirement; it also changes the guest's device surface, so it is a
 //!   decision of its own rather than a detail of pinning a declaration.
-//! * **One redistributor, `Last` set.** Single-vCPU guest. A second vCPU needs a second frame and
-//!   the affinity routing that `IROUTER` currently records and does not act on.
-//! * **`IROUTER` is recorded, not honoured** — with one vCPU every SPI can only land in one place.
-//!   Pinned as both halves: the value reads back, and writing any routing for any SPI changes no
-//!   INTID's enable.
+//! * ~~**One redistributor, `Last` set.**~~ **CLOSED BY ⑱-2.** The model presents one redistributor
+//!   **per vCPU** — [`VirtGic`] is generic over `VCPUS` — each with its own banked INTIDs 0..31, its
+//!   own `GICR_WAKER` handshake, and a `GICR_TYPER` carrying its own affinity and processor number
+//!   with `Last` on exactly the final one. `hv-metal` still deploys `VirtGic<1>`, so **nothing that
+//!   boots exercises the second redistributor** — the evidence is the proofs, listed below.
+//! * **`IROUTER` is recorded, not honoured** — every SPI can only land in one place. Pinned as both
+//!   halves: the value reads back, and writing any routing for any SPI changes no INTID's enable.
+//!   **Still open after ⑱-2**, and now the only one of the three that is: the model can *describe*
+//!   more than one vCPU, but SPI routing still does not choose between them. That is ⑱-6, and it
+//!   needs a scheduler that can run the vCPU an SPI would be routed to (⑱-3).
 //!
-//! **Why none of the three is CLOSED here:** each needs a second vCPU per guest to matter at all, so
-//! implementing them would add unexercised code to the guest's device surface — the thing
+//! **Why `IROUTER` is not CLOSED here:** it needs a second vCPU per guest to *matter*, so
+//! implementing it now would add unexercised code to the guest's device surface — the thing
 //! design-lesson #71 and III-2's "deferred for want of a consumer" both warn against.
+//!
+//! ## ⑱-2 — what proves the multi-redistributor model, given that no boot can
+//!
+//! The metal deploys one vCPU, so **every property below is invisible to the boot gate** and the
+//! proofs are the whole of the evidence. In `hv-verify`'s `device_models`:
+//! `a_write_to_one_redistributor_changes_nothing_another_reads` ·
+//! `enabling_an_intid_for_one_vcpu_does_not_enable_it_for_another` (**the isolation pair — read the
+//! note on that second one, neither catches what the other does**) ·
+//! `the_last_redistributor_is_the_only_one_that_says_so` · `the_typer_reports_the_vcpu_affinity` ·
+//! `the_decode_is_a_partition_across_redistributors` ·
+//! `an_address_past_the_last_redistributor_is_in_no_frame` ·
+//! `a_layout_valid_for_two_has_room_for_two` · two totality harnesses at `VCPUS = 2` · and
+//! `the_second_redistributor_is_reached_and_is_its_own` for non-vacuity. **Four kill probes were run
+//! and are tabulated beside those harnesses.**
 
 /// The guest's INTID space: 288 = `(ITLinesNumber + 1) * 32` with `ITLinesNumber = 8`, i.e. SGIs and
 /// PPIs 0..31 plus SPIs 32..287.
@@ -196,10 +215,32 @@ const BALEEN_IIDR: u32 = 0x0000_5ba1;
 /// (measured, see the module docs).
 const PIDR2_GICV3: u32 = 3 << 4;
 
-/// `GICR_TYPER`: `Last` (bit 4) — this is the only redistributor — with processor number 0 and
-/// affinity 0. No LPI support advertised, which is why nothing in the model handles the LPI
-/// configuration/pending tables.
-const GICR_TYPER_VALUE: u64 = 1 << 4;
+/// `GICR_TYPER.Last` (bit 4) — "this is the last redistributor in the region". **A guest walks the
+/// redistributor region reading `GICR_TYPER` and stops at the frame that sets this**, which is why
+/// exactly one must, and why it must be the last one ([`VirtGic::gicr_typer`]).
+const GICR_TYPER_LAST: u64 = 1 << 4;
+
+/// `GICR_TYPER.Processor_Number`, bits `[15:8]`.
+const GICR_TYPER_PROC_SHIFT: u32 = 8;
+
+/// `GICR_TYPER.Affinity_Value`, bits `[63:32]` — `Aff3:Aff2:Aff1:Aff0`, one byte each, so `Aff0`
+/// lands at bit 32.
+const GICR_TYPER_AFF_SHIFT: u32 = 32;
+
+/// **The affinity a vCPU has, and the ONE place that answer is derived.**
+///
+/// Two artifacts must agree about which vCPU is which: this model, through `GICR_TYPER`'s affinity
+/// field, and the `MPIDR_EL1` the guest reads — which on baleen is `VMPIDR_EL2`, written by
+/// `hv-metal`'s `guest_mpidr` (⑱-1). **A guest matches the two against each other**: arm64 Linux's
+/// `gic_populate_rdist` walks the redistributors looking for the frame whose affinity equals its own
+/// MPIDR, and fails the CPU if none does. Two encodings of that mapping would agree until somebody
+/// changed one, so `hv-metal` calls this rather than repeating it — design-lesson #74.
+///
+/// `Aff0 = vcpu`, every other affinity level zero: one cluster, N cores.
+#[must_use]
+pub const fn vcpu_affinity(vcpu: usize) -> u64 {
+    vcpu as u64
+}
 
 /// `GICR_WAKER.ProcessorSleep` (bit 1) — written by the guest to wake its redistributor.
 const WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
@@ -221,25 +262,40 @@ pub struct GicLayout {
     gicr_end: u64,
 }
 
-/// Which of the three emulated frames an address lands in.
+/// Which emulated frame an address lands in — and, for the redistributor frames, **whose**.
+///
+/// ⑱-2 gave the two redistributor variants a vCPU index. There is one redistributor per vCPU and
+/// each owns its own copy of INTIDs 0..31, so "which frame" is not a complete answer to where a
+/// guest access goes; without the index the model would decode N redistributors onto one bank, which
+/// is precisely the aliasing `the_decode_is_a_partition` exists to forbid.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GicFrame {
-    /// The distributor.
+    /// The distributor — one per guest, holding the SPIs.
     Dist,
-    /// The redistributor's RD frame.
-    Redist,
-    /// The redistributor's SGI frame — INTIDs 0..31, this vCPU's SGIs and PPIs.
-    Sgi,
+    /// vCPU `n`'s redistributor RD frame.
+    Redist(usize),
+    /// vCPU `n`'s redistributor SGI frame — INTIDs 0..31, that vCPU's own SGIs and PPIs.
+    Sgi(usize),
 }
 
 impl GicFrame {
-    /// The frame's architectural name, for a diagnostic.
+    /// The frame's architectural name, for a diagnostic. **Not the vCPU** — the index is reported
+    /// separately by callers that have one, so this stays a `&'static str` and needs no allocation.
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             GicFrame::Dist => "GICD",
-            GicFrame::Redist => "GICR",
-            GicFrame::Sgi => "GICR_SGI",
+            GicFrame::Redist(_) => "GICR",
+            GicFrame::Sgi(_) => "GICR_SGI",
+        }
+    }
+
+    /// The vCPU whose redistributor this frame belongs to, or `None` for the distributor.
+    #[must_use]
+    pub const fn vcpu(self) -> Option<usize> {
+        match self {
+            GicFrame::Dist => None,
+            GicFrame::Redist(n) | GicFrame::Sgi(n) => Some(n),
         }
     }
 }
@@ -289,8 +345,18 @@ impl GicLayout {
     /// ever stated that; it was true of the one board in play and would have failed silently on a
     /// second. Note the decode is **safe** regardless — it cannot underflow or index out of range
     /// for any layout at all — so this is about the decode being *right*, not about it being sound.
+    ///
+    /// ⑱-2 made the redistributor requirement a function of `vcpus`: **every** vCPU's pair of frames
+    /// must fit, not just the first one's. A layout that housed one redistributor and was then asked
+    /// for two would decode vCPU 1's frames to addresses past `gicr_end`, i.e. outside the window the
+    /// guest was told about.
     #[must_use]
-    pub const fn validate(&self) -> bool {
+    pub const fn validate(&self, vcpus: usize) -> bool {
+        // A GIC with no redistributor has no CPU interface at all; the decode below would also have
+        // no frame to resolve into.
+        if vcpus == 0 {
+            return false;
+        }
         // No arithmetic in the decode may wrap, ...
         let Some(gicd_end) = self.gicd_base.checked_add(self.gicd_len) else {
             return false;
@@ -299,8 +365,11 @@ impl GicLayout {
         if gicd_end > self.gicr_rd_base {
             return false;
         }
-        // ... and the redistributor must be large enough for both of its frames.
-        match self.gicr_rd_base.checked_add(GICR_FRAMES * GICR_FRAME) {
+        // ... and the redistributor region must be large enough for EVERY vCPU's pair of frames.
+        let Some(span) = (vcpus as u64).checked_mul(GICR_FRAMES * GICR_FRAME) else {
+            return false;
+        };
+        match self.gicr_rd_base.checked_add(span) {
             Some(need) => need <= self.gicr_end,
             None => false,
         }
@@ -316,11 +385,17 @@ impl GicLayout {
 
     /// Split a guest IPA into `(frame, offset within frame)`, or `None` if it is in no frame at all.
     ///
-    /// The redistributor region `guest.dts` declares is much larger than the two frames a single-CPU
-    /// guest has (it is sized for the machine's maximum CPU count). Everything past the SGI frame is
-    /// therefore *in the window* but in no frame, and lands on the unhandled path — reported, not
-    /// silently absorbed, because an access there means the guest believes in a redistributor that
-    /// does not exist.
+    /// The redistributor region `guest.dts` declares is much larger than the `vcpus` redistributors
+    /// a guest actually has (it is sized for the machine's maximum CPU count). Everything past the
+    /// last vCPU's SGI frame is therefore *in the window* but in no frame, and lands on the unhandled
+    /// path — reported, not silently absorbed, because an access there means the guest believes in a
+    /// redistributor that does not exist.
+    ///
+    /// ⚠ **⑱-2 made that sentence TRUE.** It was already the doc, but the code mapped every offset
+    /// at or past the first RD frame to `Sgi` with an ever-growing offset; such an access was
+    /// reported as unhandled *`GICR_SGI`* by falling off the end of that frame's register list rather
+    /// than by being recognised as out of frame. With `vcpus` redistributors the arithmetic has to
+    /// name one, so the bound is now checked and the answer is `None`.
     ///
     /// **Total, not caller-guarded.** This used to subtract `GICD_BASE` unconditionally, which
     /// UNDERFLOWS for any address below the distributor — wrapping in release to a huge offset that
@@ -329,7 +404,7 @@ impl GicLayout {
     /// device model reached with a guest-derived address should not have preconditions its own entry
     /// points do not enforce.
     #[must_use]
-    pub const fn frame_of(&self, ipa: u64) -> Option<(GicFrame, u64)> {
+    pub const fn frame_of(&self, ipa: u64, vcpus: usize) -> Option<(GicFrame, u64)> {
         if !self.in_window(ipa) {
             return None;
         }
@@ -337,10 +412,20 @@ impl GicLayout {
             return Some((GicFrame::Dist, ipa - self.gicd_base));
         }
         let off = ipa - self.gicr_rd_base;
-        Some(if off < GICR_FRAME {
-            (GicFrame::Redist, off)
+        // Which redistributor, and where within its pair of frames. The division cannot divide by
+        // zero (`GICR_FRAMES * GICR_FRAME` is a non-zero constant) and `n` is bounds-checked against
+        // `vcpus` before it is ever used as an index.
+        let pair = GICR_FRAMES * GICR_FRAME;
+        let n = off / pair;
+        if n >= vcpus as u64 {
+            return None;
+        }
+        let within = off % pair;
+        let n = n as usize;
+        Some(if within < GICR_FRAME {
+            (GicFrame::Redist(n), within)
         } else {
-            (GicFrame::Sgi, off - GICR_FRAME)
+            (GicFrame::Sgi(n), within - GICR_FRAME)
         })
     }
 }
@@ -366,34 +451,88 @@ pub struct Unhandled {
 /// not used by the metal, and deriving them is what keeps the theorem a comparison of the *entire*
 /// struct rather than of a hand-picked list of fields.
 #[derive(Clone, PartialEq, Eq)]
-pub struct VirtGic {
+pub struct VirtGic<const VCPUS: usize> {
     /// Where this distributor sits in the guest's address space.
     layout: GicLayout,
     /// `GICD_CTLR`, minus the bits this model forces ([`CTLR_ARE_NS`] on, `RWP` off).
     ctlr: u32,
-    /// `GICR_WAKER.ProcessorSleep`. Starts asleep, as a redistributor does out of reset.
-    asleep: bool,
-    /// Interrupt-enable bits, one per INTID. **The load-bearing state**: the caller consults it
-    /// before forwarding a physical interrupt.
+    /// **One redistributor per vCPU**, each owning its own copy of INTIDs 0..31 (⑱-2).
+    redist: [RedistBank; VCPUS],
+    /// SPI enable bits. **The load-bearing state**: the caller consults it before forwarding a
+    /// physical interrupt.
+    ///
+    /// ⚠ **Words below `FIRST_SPI / 32` are permanently zero and that is a theorem, not an
+    /// intention.** INTIDs 0..31 are redistributor-banked and live in [`RedistBank`]; the
+    /// distributor's decode refuses them (`dist_word_index`), which
+    /// `the_distributor_cannot_reach_a_redistributor_banked_intid` proves. The arrays keep their
+    /// full length so that every index is `intid / 32` with no rebasing arithmetic — a subtraction
+    /// repeated at a dozen sites is exactly the sort of thing that goes wrong once.
     enabled: [u32; WORDS],
-    /// Group assignment (1 = Group 1, which is all this port delivers).
+    /// Group assignment (1 = Group 1, which is all this port delivers). Same banking as `enabled`.
     group: [u32; WORDS],
-    /// Per-INTID priority.
+    /// Per-INTID priority. Same banking as `enabled`.
     priority: [u8; NUM_INTIDS],
-    /// Per-INTID configuration, 2 bits each: edge/level.
+    /// Per-INTID configuration, 2 bits each: edge/level. Same banking as `enabled`.
     icfgr: [u32; NUM_INTIDS / 16],
     /// Per-SPI affinity routing. Recorded, not acted on — see the module docs' residue list.
     irouter: [u64; NUM_INTIDS - FIRST_SPI],
 }
 
-impl VirtGic {
-    /// A distributor out of reset: everything disabled, redistributor asleep.
+/// **One vCPU's redistributor** — its wake state and its own copy of INTIDs 0..31.
+///
+/// The architecture banks SGIs and PPIs per-PE, and that banking is the whole reason this type
+/// exists: vCPU 0 enabling its timer PPI must not enable vCPU 1's. Before ⑱-2 these fields were word
+/// 0 of the distributor's arrays, which is correct for exactly one vCPU and silently wrong for two —
+/// design-lesson #150's shape, caught before the second tenant arrived rather than after.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RedistBank {
+    /// `GICR_WAKER.ProcessorSleep`. Starts asleep, as a redistributor does out of reset. **Per
+    /// redistributor**: each vCPU performs its own wake handshake as it comes up.
+    asleep: bool,
+    /// Enable bits for this vCPU's INTIDs 0..31.
+    enabled: u32,
+    /// Group assignment for this vCPU's INTIDs 0..31.
+    group: u32,
+    /// Priority for this vCPU's INTIDs 0..31.
+    priority: [u8; FIRST_SPI],
+    /// Edge/level configuration, 2 bits per INTID, for this vCPU's INTIDs 0..31.
+    icfgr: [u32; FIRST_SPI / 16],
+}
+
+impl RedistBank {
+    const AT_RESET: Self = Self {
+        asleep: true,
+        enabled: 0,
+        group: 0,
+        priority: [0; FIRST_SPI],
+        icfgr: [0; FIRST_SPI / 16],
+    };
+}
+
+impl<const VCPUS: usize> VirtGic<VCPUS> {
+    /// A distributor out of reset: everything disabled, every redistributor asleep.
     #[must_use]
     pub const fn new(layout: GicLayout) -> Self {
+        // `GICR_TYPER.Processor_Number` is bits [15:8] — eight of them. A `VCPUS` past 255 would
+        // shift a processor number straight through that field into the reserved bits above it, and
+        // every redistributor from 256 on would report a number that is not its own. Nothing else in
+        // the model has an opinion about the count, so this is where the ceiling belongs: an
+        // instantiation that exceeds it does not compile, rather than producing a device whose
+        // registers quietly disagree with each other.
+        //
+        // (The AFFINITY field does not need this. `Aff0` overflowing into `Aff1` is what a packed
+        // affinity is supposed to do, and `hv-metal`'s `guest_mpidr` packs it the same way, so the
+        // two stay in agreement past 255 even though the processor number would not.)
+        const {
+            assert!(
+                VCPUS <= 255,
+                "GICR_TYPER.Processor_Number is eight bits wide"
+            )
+        };
         Self {
             layout,
             ctlr: 0,
-            asleep: true,
+            redist: [RedistBank::AT_RESET; VCPUS],
             enabled: [0; WORDS],
             group: [0; WORDS],
             priority: [0; NUM_INTIDS],
@@ -402,12 +541,41 @@ impl VirtGic {
         }
     }
 
-    /// **Is `intid` enabled in the guest's own distributor?** The mediation seam: EL2 forwards a
-    /// physical interrupt only when the guest has asked for it, rather than whenever one arrives.
+    /// **Is `intid` enabled for `vcpu`, in the guest's own interrupt controller?** The mediation
+    /// seam: EL2 forwards a physical interrupt only when the guest has asked for it, rather than
+    /// whenever one arrives.
+    ///
+    /// ⑱-2 added the `vcpu` argument, and it is not decoration: **INTIDs 0..31 are banked per
+    /// redistributor**, so "is the timer PPI enabled" has a different answer per vCPU and the caller
+    /// must say which one it is asking about. SPIs live in the distributor and are shared, so the
+    /// argument does not affect them. An out-of-range `vcpu` or `intid` reads as **not enabled**,
+    /// which is the fail-closed direction: EL2 declines to forward.
     #[must_use]
-    pub fn is_enabled(&self, intid: u32) -> bool {
+    pub fn is_enabled(&self, vcpu: usize, intid: u32) -> bool {
         let i = intid as usize;
-        i < NUM_INTIDS && self.enabled[i / 32] & (1 << (i % 32)) != 0
+        if i >= NUM_INTIDS {
+            return false;
+        }
+        if i < FIRST_SPI {
+            return match self.redist.get(vcpu) {
+                Some(r) => r.enabled & (1 << i) != 0,
+                None => false,
+            };
+        }
+        self.enabled[i / 32] & (1 << (i % 32)) != 0
+    }
+
+    /// `GICR_TYPER` as vCPU `n` sees it — affinity, processor number, and **`Last` on exactly the
+    /// final redistributor**.
+    ///
+    /// A guest discovers its redistributors by walking the region and reading this until it finds
+    /// `Last`. Setting it on none makes the walk run off the end of the window; setting it on more
+    /// than one truncates the walk early, so a later vCPU never finds its frame and does not come up.
+    /// `the_last_redistributor_is_the_only_one_that_says_so` pins both halves.
+    #[must_use]
+    pub const fn gicr_typer(n: usize) -> u64 {
+        let last = if n + 1 == VCPUS { GICR_TYPER_LAST } else { 0 };
+        last | ((n as u64) << GICR_TYPER_PROC_SHIFT) | (vcpu_affinity(n) << GICR_TYPER_AFF_SHIFT)
     }
 
     /// Service a guest **read** of the emulated GIC at `ipa`, `size` bytes wide.
@@ -416,7 +584,7 @@ impl VirtGic {
     /// signature rather than a comment — it was `&mut self` until ⑯, purely because a witness
     /// counter lived in the struct.
     pub fn mmio_read(&self, ipa: u64, size: u64) -> Result<u64, Unhandled> {
-        let Some((frame, off)) = self.layout.frame_of(ipa) else {
+        let Some((frame, off)) = self.layout.frame_of(ipa, VCPUS) else {
             return Err(Unhandled {
                 frame: "outside every emulated GIC frame",
                 offset: ipa,
@@ -424,8 +592,8 @@ impl VirtGic {
         };
         match frame {
             GicFrame::Dist => self.dist_read(off, size),
-            GicFrame::Redist => self.redist_read(off),
-            GicFrame::Sgi => self.sgi_read(off),
+            GicFrame::Redist(n) => self.redist_read(n, off),
+            GicFrame::Sgi(n) => self.sgi_read(n, off),
         }
         .ok_or(Unhandled {
             frame: frame.name(),
@@ -440,7 +608,7 @@ impl VirtGic {
     /// byte. On `Err` the model's state is unchanged, which is what lets a caller park on an
     /// unmodelled register without wondering whether half of it was applied.
     pub fn mmio_write(&mut self, ipa: u64, size: u64, value: u64) -> Result<u32, Unhandled> {
-        let Some((frame, off)) = self.layout.frame_of(ipa) else {
+        let Some((frame, off)) = self.layout.frame_of(ipa, VCPUS) else {
             return Err(Unhandled {
                 frame: "outside every emulated GIC frame",
                 offset: ipa,
@@ -448,8 +616,8 @@ impl VirtGic {
         };
         match frame {
             GicFrame::Dist => self.dist_write(off, size, value),
-            GicFrame::Redist => self.redist_write(off, value as u32),
-            GicFrame::Sgi => self.sgi_write(off, value as u32),
+            GicFrame::Redist(n) => self.redist_write(n, off, value as u32),
+            GicFrame::Sgi(n) => self.sgi_write(n, off, value as u32),
         }
         .ok_or(Unhandled {
             frame: frame.name(),
@@ -565,13 +733,16 @@ impl VirtGic {
 
     // ─── the redistributor's RD frame ────────────────────────────────────────────────────────────
 
-    fn redist_read(&self, off: u64) -> Option<u64> {
+    /// `n` is in range for `redist`: [`GicLayout::frame_of`] checked it against `VCPUS` before
+    /// naming this frame, which is why the index below is not re-checked here.
+    fn redist_read(&self, n: usize, off: u64) -> Option<u64> {
+        let bank = self.redist.get(n)?;
         let v = match off {
             GICR_CTLR => 0u64,
             GICR_IIDR => BALEEN_IIDR as u64,
-            GICR_TYPER => GICR_TYPER_VALUE,
+            GICR_TYPER => Self::gicr_typer(n),
             GICR_WAKER => {
-                if self.asleep {
+                if bank.asleep {
                     (WAKER_PROCESSOR_SLEEP | WAKER_CHILDREN_ASLEEP) as u64
                 } else {
                     0
@@ -583,12 +754,13 @@ impl VirtGic {
         Some(v)
     }
 
-    fn redist_write(&mut self, off: u64, value: u32) -> Option<u32> {
+    fn redist_write(&mut self, n: usize, off: u64, value: u32) -> Option<u32> {
+        let bank = self.redist.get_mut(n)?;
         match off {
             // `ChildrenAsleep` is read-only; only `ProcessorSleep` is taken from the write, and the
             // read side mirrors it so the guest's wake handshake terminates.
             GICR_WAKER => {
-                self.asleep = value & WAKER_PROCESSOR_SLEEP != 0;
+                bank.asleep = value & WAKER_PROCESSOR_SLEEP != 0;
                 Some(0)
             }
             GICR_CTLR | GICR_IIDR | GICR_TYPER | GICR_PIDR2 => Some(0),
@@ -598,20 +770,24 @@ impl VirtGic {
 
     // ─── the redistributor's SGI frame: INTIDs 0..31, this vCPU's SGIs and PPIs ──────────────────
 
-    fn sgi_read(&self, off: u64) -> Option<u64> {
+    /// **Every field read here comes from `redist[n]`, not from the distributor's arrays.** That is
+    /// the whole of ⑱-2's state change: before it, these were word 0 of the shared banks, so two
+    /// vCPUs' SGI frames would have aliased onto one another's enables.
+    fn sgi_read(&self, n: usize, off: u64) -> Option<u64> {
+        let bank = self.redist.get(n)?;
         let v = match off {
-            GICR_IGROUPR0 => self.group[0],
-            GICR_ISENABLER0 | GICR_ICENABLER0 => self.enabled[0],
+            GICR_IGROUPR0 => bank.group,
+            GICR_ISENABLER0 | GICR_ICENABLER0 => bank.enabled,
             // Declared residue, as in the distributor.
             GICR_ISPENDR0 | GICR_ICPENDR0 | GICR_ISACTIVER0 | GICR_ICACTIVER0 => 0,
-            GICR_ICFGR0 => self.icfgr[0],
-            GICR_ICFGR1 => self.icfgr[1],
+            GICR_ICFGR0 => bank.icfgr[0],
+            GICR_ICFGR1 => bank.icfgr[1],
             _ => {
                 if (GICR_IPRIORITYR..GICR_IPRIORITYR + FIRST_SPI as u64).contains(&off) {
                     let base = (off - GICR_IPRIORITYR) as usize & !3;
                     let mut v = 0u32;
                     for k in 0..4 {
-                        v |= (self.priority[base + k] as u32) << (8 * k);
+                        v |= (bank.priority[base + k] as u32) << (8 * k);
                     }
                     v
                 } else {
@@ -622,19 +798,24 @@ impl VirtGic {
         Some(v as u64)
     }
 
-    fn sgi_write(&mut self, off: u64, value: u32) -> Option<u32> {
+    fn sgi_write(&mut self, n: usize, off: u64, value: u32) -> Option<u32> {
+        let bank = self.redist.get_mut(n)?;
         match off {
-            GICR_IGROUPR0 => self.group[0] = value,
-            GICR_ISENABLER0 => return Some(self.set_enabled(0, value)),
-            GICR_ICENABLER0 => self.enabled[0] &= !value,
+            GICR_IGROUPR0 => bank.group = value,
+            GICR_ISENABLER0 => {
+                let newly = value & !bank.enabled;
+                bank.enabled |= value;
+                return Some(newly.count_ones());
+            }
+            GICR_ICENABLER0 => bank.enabled &= !value,
             GICR_ISPENDR0 | GICR_ICPENDR0 | GICR_ISACTIVER0 | GICR_ICACTIVER0 => {}
-            GICR_ICFGR0 => self.icfgr[0] = value,
-            GICR_ICFGR1 => self.icfgr[1] = value,
+            GICR_ICFGR0 => bank.icfgr[0] = value,
+            GICR_ICFGR1 => bank.icfgr[1] = value,
             _ => {
                 if (GICR_IPRIORITYR..GICR_IPRIORITYR + FIRST_SPI as u64).contains(&off) {
                     let base = (off - GICR_IPRIORITYR) as usize & !3;
                     for k in 0..4 {
-                        self.priority[base + k] = (value >> (8 * k)) as u8;
+                        bank.priority[base + k] = (value >> (8 * k)) as u8;
                     }
                 } else {
                     return None;

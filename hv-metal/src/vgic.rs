@@ -56,9 +56,20 @@ pub(crate) const LAYOUT: GicLayout = GicLayout::new(GICD_BASE, GICD_LEN, GICR_RD
 /// silently on a second one; the decode is memory-safe for any layout at all, so nothing would have
 /// crashed — the frames would simply have stopped meaning what their names say.
 const _: () = assert!(
-    LAYOUT.validate(),
+    LAYOUT.validate(VCPUS_PER_GUEST),
     "the emulated GIC's layout is one the decode cannot honour"
 );
+
+/// **How many redistributors this guest's emulated GIC presents — one per vCPU.**
+///
+/// ⑱-2 made the model take this as a parameter; the metal still deploys **one**, because ⑱-3 is
+/// what gives a guest a second vCPU. Raising this alone would advertise a redistributor for a vCPU
+/// that never runs, so it moves with the scheduler and not before — that is ⑱-3.
+///
+/// The `const assert!` above is what makes the pairing checkable: raise this past what the
+/// redistributor region can hold and the build stops, rather than the guest discovering a frame
+/// outside the window its own device tree describes.
+pub(crate) const VCPUS_PER_GUEST: usize = 1;
 
 /// The interrupt EL2 forwards on the guest's behalf must exist in the distributor the guest sees.
 const _: () = assert!(
@@ -90,7 +101,7 @@ pub(crate) fn in_window(ipa: u64) -> bool {
 /// isolation; the tallies here are what the boot gate reads and mean nothing to a driver.
 pub(crate) struct DeployedGic {
     /// The model, under the fence.
-    dev: VirtGic,
+    dev: VirtGic<VCPUS_PER_GUEST>,
     /// How many register accesses the guest has made — the witness counter.
     traps: u64,
     /// How many INTIDs the guest has ever newly enabled — the witness's discriminating half.
@@ -111,10 +122,15 @@ impl DeployedGic {
         }
     }
 
-    /// **Is `intid` enabled in the guest's own distributor?** The mediation seam: EL2 forwards a
-    /// physical interrupt only when the guest has asked for it, rather than whenever one arrives.
-    pub(crate) fn is_enabled(&self, intid: u32) -> bool {
-        self.dev.is_enabled(intid)
+    /// **Is `intid` enabled for `vcpu`, in the guest's own interrupt controller?** The mediation
+    /// seam: EL2 forwards a physical interrupt only when the guest has asked for it, rather than
+    /// whenever one arrives.
+    ///
+    /// ⑱-2 added `vcpu` because INTIDs 0..31 — which include the timer PPI this seam is mostly asked
+    /// about — are banked per redistributor. Call sites name the vCPU explicitly so ⑱-3 changes an
+    /// argument rather than having to find them.
+    pub(crate) fn is_enabled(&self, vcpu: usize, intid: u32) -> bool {
+        self.dev.is_enabled(vcpu, intid)
     }
 
     /// `(register traps, INTIDs ever newly enabled)` — the ③-b1 witness.

@@ -3266,8 +3266,17 @@ mod device_path_composition {
 /// property below. Conformance is the boot, and should be.
 #[cfg(kani)]
 mod device_models {
-    use hv_vdev::gicv3::{GicFrame, GicLayout, VirtGic, NUM_INTIDS};
+    use hv_vdev::gicv3::{vcpu_affinity, GicFrame, GicLayout, VirtGic, NUM_INTIDS};
     use hv_vdev::pl011::{NeedleMatcher, VirtPl011};
+
+    /// **The deployed shape: one vCPU, one redistributor** — what `hv-metal` instantiates today.
+    /// The harnesses below that carry over from ⑯ keep it, so they still say something about the
+    /// configuration that actually boots.
+    type Gic1 = VirtGic<1>;
+
+    /// **Two vCPUs, two redistributors** — the shape ⑱-3 will deploy, proven before it exists.
+    /// Every property that only *has* content with more than one redistributor is stated here.
+    type Gic2 = VirtGic<2>;
 
     // ─── the deployed address map, mirrored from `hv-metal::gic` ─────────────────────────────────
     //
@@ -3313,7 +3322,7 @@ mod device_models {
     /// That is the property #108 had to repair before it was true at all — the distributor's copies
     /// of 0..31 are RES0 under `GICD_CTLR.ARE_NS`, which this model forces.
     fn may_change_enable(l: &GicLayout, ipa: u64, i: u32) -> bool {
-        let Some((frame, off)) = l.frame_of(ipa) else {
+        let Some((frame, off)) = l.frame_of(ipa, 1) else {
             return false;
         };
         let word = u64::from(i / 32);
@@ -3323,8 +3332,8 @@ mod device_models {
                 i >= 32 && (off == ISENABLER + 4 * word || off == ICENABLER + 4 * word)
             }
             // The SGI frame owns exactly INTIDs 0..31, in word 0 of its own banks.
-            GicFrame::Sgi => i < 32 && (off == ISENABLER || off == ICENABLER),
-            GicFrame::Redist => false,
+            GicFrame::Sgi(_) => i < 32 && (off == ISENABLER || off == ICENABLER),
+            GicFrame::Redist(_) => false,
         }
     }
 
@@ -3344,7 +3353,7 @@ mod device_models {
     #[kani::proof]
     fn gic_mmio_is_total_for_every_guest_offset() {
         let l = deployed();
-        let mut g = VirtGic::new(l);
+        let mut g = Gic1::new(l);
         let (w_ipa, w_size, w_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         let _ = g.mmio_write(w_ipa, w_size, w_val);
         let (r_ipa, r_size): (u64, u64) = (kani::any(), kani::any());
@@ -3357,7 +3366,7 @@ mod device_models {
     #[kani::proof]
     fn gic_mmio_is_total_for_every_layout() {
         let l = symbolic_layout();
-        let mut g = VirtGic::new(l);
+        let mut g = Gic1::new(l);
         let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         let _ = g.mmio_write(ipa, size, value);
         let _ = g.mmio_read(ipa, size);
@@ -3390,7 +3399,7 @@ mod device_models {
     #[kani::proof]
     fn a_failed_write_changes_nothing() {
         let l = deployed();
-        let mut g = VirtGic::new(l);
+        let mut g = Gic1::new(l);
 
         // Perturb into a non-reset state cheaply: a CONCRETE enable register, a SYMBOLIC value. A
         // fully symbolic perturbing write makes the whole-struct comparison below cost >10 minutes
@@ -3424,19 +3433,19 @@ mod device_models {
     #[kani::proof]
     fn a_write_changes_only_the_enables_it_names() {
         let l = deployed();
-        let mut g = VirtGic::new(l);
+        let mut g = Gic1::new(l);
         let (p_ipa, p_size, p_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         let _ = g.mmio_write(p_ipa, p_size, p_val);
 
         let i: u32 = kani::any();
         kani::assume((i as usize) < NUM_INTIDS);
-        let before = g.is_enabled(i);
+        let before = g.is_enabled(0, i);
 
         let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         let _ = g.mmio_write(ipa, size, value);
 
         assert!(
-            g.is_enabled(i) == before || may_change_enable(&l, ipa, i),
+            g.is_enabled(0, i) == before || may_change_enable(&l, ipa, i),
             "an access that is not an enable register covering this INTID changed its \
              deliverability"
         );
@@ -3462,20 +3471,20 @@ mod device_models {
     #[kani::proof]
     fn the_distributor_cannot_reach_a_redistributor_banked_intid() {
         let l = deployed();
-        let mut g = VirtGic::new(l);
+        let mut g = Gic1::new(l);
         let (p_ipa, p_size, p_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         let _ = g.mmio_write(p_ipa, p_size, p_val);
 
         let i: u32 = kani::any();
         kani::assume(i < 32);
-        let before = g.is_enabled(i);
+        let before = g.is_enabled(0, i);
 
         let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
-        kani::assume(matches!(l.frame_of(ipa), Some((GicFrame::Dist, _))));
+        kani::assume(matches!(l.frame_of(ipa, 1), Some((GicFrame::Dist, _))));
         let _ = g.mmio_write(ipa, size, value);
 
         assert!(
-            g.is_enabled(i) == before,
+            g.is_enabled(0, i) == before,
             "a DISTRIBUTOR access changed a redistributor-banked INTID's enable: the two frames \
              are sharing state the architecture reserves"
         );
@@ -3493,19 +3502,22 @@ mod device_models {
     #[kani::proof]
     fn the_distributor_frame_cannot_change_anything_the_sgi_frame_reads() {
         let l = deployed();
-        let mut g = VirtGic::new(l);
+        let mut g = Gic1::new(l);
 
         // Bounded so the harness's own address arithmetic cannot overflow — the `frame_of` assume
         // below is what actually pins it into the SGI frame.
         let sgi_off: u64 = kani::any();
         kani::assume(sgi_off < REDIST_FRAME_BYTES);
         let sgi_ipa = GICR_RD_BASE + REDIST_FRAME_BYTES + sgi_off;
-        kani::assume(matches!(l.frame_of(sgi_ipa), Some((GicFrame::Sgi, _))));
+        kani::assume(matches!(
+            l.frame_of(sgi_ipa, 1),
+            Some((GicFrame::Sgi(_), _))
+        ));
 
         let before = g.mmio_read(sgi_ipa, 4).ok();
 
         let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
-        kani::assume(matches!(l.frame_of(ipa), Some((GicFrame::Dist, _))));
+        kani::assume(matches!(l.frame_of(ipa, 1), Some((GicFrame::Dist, _))));
         let _ = g.mmio_write(ipa, size, value);
 
         assert!(
@@ -3519,20 +3531,20 @@ mod device_models {
     #[kani::proof]
     fn the_sgi_frame_cannot_reach_an_spi() {
         let l = deployed();
-        let mut g = VirtGic::new(l);
+        let mut g = Gic1::new(l);
         let (p_ipa, p_size, p_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         let _ = g.mmio_write(p_ipa, p_size, p_val);
 
         let i: u32 = kani::any();
         kani::assume(i >= 32 && (i as usize) < NUM_INTIDS);
-        let before = g.is_enabled(i);
+        let before = g.is_enabled(0, i);
 
         let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
-        kani::assume(matches!(l.frame_of(ipa), Some((GicFrame::Sgi, _))));
+        kani::assume(matches!(l.frame_of(ipa, 1), Some((GicFrame::Sgi(_), _))));
         let _ = g.mmio_write(ipa, size, value);
 
         assert!(
-            g.is_enabled(i) == before,
+            g.is_enabled(0, i) == before,
             "an SGI-frame access changed an SPI's enable"
         );
     }
@@ -3549,7 +3561,7 @@ mod device_models {
     #[kani::proof]
     fn a_valid_layout_decodes_within_the_frame_it_names() {
         let l = symbolic_layout();
-        kani::assume(l.validate());
+        kani::assume(l.validate(1));
         let ipa: u64 = kani::any();
 
         // The property `validate` actually buys: an address in the DISTRIBUTOR's window decodes as
@@ -3557,18 +3569,18 @@ mod device_models {
         // send part of it to the redistributor instead — silently, and without any memory error.
         if ipa >= l.gicd_base() && ipa - l.gicd_base() < l.gicd_len() {
             assert!(
-                matches!(l.frame_of(ipa), Some((GicFrame::Dist, _))),
+                matches!(l.frame_of(ipa, 1), Some((GicFrame::Dist, _))),
                 "an address inside the distributor window did not decode as the distributor"
             );
         }
 
         // And every decoded offset lies inside the frame it names.
-        if let Some((frame, off)) = l.frame_of(ipa) {
+        if let Some((frame, off)) = l.frame_of(ipa, 1) {
             match frame {
                 GicFrame::Dist => assert!(off < l.gicd_len()),
-                GicFrame::Redist => assert!(off < REDIST_FRAME_BYTES),
+                GicFrame::Redist(_) => assert!(off < REDIST_FRAME_BYTES),
                 // `validate` guarantees room for both frames, so this subtraction cannot wrap.
-                GicFrame::Sgi => {
+                GicFrame::Sgi(_) => {
                     assert!(off < l.gicr_end() - l.gicr_rd_base() - REDIST_FRAME_BYTES)
                 }
             }
@@ -3577,6 +3589,292 @@ mod device_models {
 
     /// One redistributor frame, stated here independently of the model's own constant.
     const REDIST_FRAME_BYTES: u64 = 0x1_0000;
+
+    /// One whole redistributor — the RD frame and the SGI frame — likewise stated independently.
+    const REDIST_PAIR_BYTES: u64 = 2 * REDIST_FRAME_BYTES;
+
+    // ─── ⑱-2 · MORE THAN ONE REDISTRIBUTOR ───────────────────────────────────────────────────────
+    //
+    // Everything below has NO CONTENT at one vCPU, which is exactly why it is worth proving now:
+    // `hv-metal` deploys `VirtGic<1>`, so nothing that boots can distinguish a model that banks
+    // INTIDs 0..31 per redistributor from one that shares a single copy. Before ⑱-2 the model shared
+    // it, and a boot would have gone on being green through ⑱-3 until two vCPUs disagreed about
+    // their own timer.
+    //
+    // ★ THE KILL PROBES, RUN — because "a theorem now exists" is a weak probe (design-lesson #105).
+    // Each was applied to `hv-vdev` and the suite re-run:
+    //
+    // | probe | result |
+    // |---|---|
+    // | `sgi_read`/`sgi_write` use bank 0 for every vCPU (write-side aliasing) | `a_write_to_one_redistributor_…` and `the_second_redistributor_is_reached…` **RED** |
+    // | …and `is_enabled` too (the faithful pre-⑱-2 model) | `enabling_an_intid_for_one_vcpu_…` **RED** as well |
+    // | `gicr_typer` sets `Last` on every redistributor | `the_last_redistributor_is_the_only_one_that_says_so` **RED** |
+    // | drop `frame_of`'s `n >= vcpus` bound | `an_address_past_the_last_redistributor…` and `the_decode_is_a_partition…` **RED** |
+    //
+    // ⚠ The last probe left `gic_mmio_is_total_with_two_redistributors` **GREEN**, and that is
+    // correct rather than a gap: `redist.get(n)` returns `None` for an out-of-range index, so an
+    // unbounded decode is still memory-safe. The bound is about the decode being RIGHT, not about it
+    // being SOUND — the same distinction `GicLayout::validate` is documented with.
+
+    /// **★ THE ISOLATION THEOREM OF THIS RUNG: a write to one vCPU's redistributor changes nothing
+    /// another vCPU reads.**
+    ///
+    /// ∀ (write into redistributor `a`'s frames, offset in redistributor `b`'s SGI frame) with
+    /// `a != b`: what `b` reads back is unchanged. INTIDs 0..31 are SGIs and PPIs — which is to say
+    /// **the timer PPI EL2 mediates on**, and the IPI lines a guest's own vCPUs signal each other
+    /// with. Sharing them across vCPUs would mean vCPU 0 enabling its timer enabled vCPU 1's, and the
+    /// mediation seam `is_enabled` would give the same answer for both.
+    ///
+    /// This is `the_distributor_frame_cannot_change_anything_the_sgi_frame_reads` one axis over: that
+    /// one separates the two *frame kinds*, this one separates the *redistributors*.
+    #[kani::proof]
+    fn a_write_to_one_redistributor_changes_nothing_another_reads() {
+        let l = deployed();
+        let mut g = Gic2::new(l);
+
+        // An offset in vCPU 1's SGI frame, and a write anywhere in vCPU 0's pair of frames.
+        let obs_off: u64 = kani::any();
+        kani::assume(obs_off < REDIST_FRAME_BYTES);
+        let obs = GICR_RD_BASE + REDIST_PAIR_BYTES + REDIST_FRAME_BYTES + obs_off;
+        kani::assume(matches!(l.frame_of(obs, 2), Some((GicFrame::Sgi(1), _))));
+
+        let before = g.mmio_read(obs, 4).ok();
+
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        kani::assume(matches!(
+            l.frame_of(ipa, 2),
+            Some((GicFrame::Redist(0), _)) | Some((GicFrame::Sgi(0), _))
+        ));
+        // The assumptions above pin BOTH addresses into specific frames of specific redistributors.
+        // If either were unsatisfiable this harness would prove nothing while reporting SUCCESS, so
+        // say out loud that a run reaches here — and that it reaches a write vCPU 0 actually accepts.
+        kani::cover!(
+            true,
+            "the two-redistributor address assumptions are satisfiable"
+        );
+        kani::cover!(
+            g.clone().mmio_write(ipa, size, value).is_ok(),
+            "a write vCPU 0's redistributor ACCEPTS is in scope, not only refused ones"
+        );
+        let _ = g.mmio_write(ipa, size, value);
+
+        assert!(
+            g.mmio_read(obs, 4).ok() == before,
+            "a write to vCPU 0's redistributor changed what vCPU 1's reads back — the two are \
+             sharing state the architecture banks per-PE"
+        );
+    }
+
+    /// The same separation through the **mediation seam** rather than through a read: enabling an
+    /// INTID for one vCPU must not enable it for another.
+    ///
+    /// Stated separately from the read-back above because `is_enabled` is the function `hv-metal`
+    /// actually gates injection on — a model could keep the register banks distinct and still route
+    /// the seam to the wrong one.
+    ///
+    /// ⚠ **WHAT THIS HARNESS CANNOT SEE, found by running the probe rather than by reading it.**
+    /// Sharing the bank on the *write* path alone — `sgi_write` sending every redistributor's writes
+    /// to bank 0 — leaves this harness **GREEN**, because `is_enabled(1, ..)` then reads a bank
+    /// nothing ever wrote and correctly answers "not enabled". Only sharing *both* paths, which is
+    /// the faithful pre-⑱-2 model, turns it red. So it is
+    /// [`a_write_to_one_redistributor_changes_nothing_another_reads`] that catches a one-sided
+    /// aliasing, and this one that catches the seam being routed to the wrong bank; **the pair is the
+    /// property, neither alone.** Same shape as ⑯'s enables-only note one axis over.
+    #[kani::proof]
+    fn enabling_an_intid_for_one_vcpu_does_not_enable_it_for_another() {
+        let l = deployed();
+        let mut g = Gic2::new(l);
+
+        let i: u32 = kani::any();
+        kani::assume(i < 32);
+        assert!(!g.is_enabled(1, i));
+
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        kani::assume(matches!(
+            l.frame_of(ipa, 2),
+            Some((GicFrame::Redist(0), _)) | Some((GicFrame::Sgi(0), _))
+        ));
+        kani::cover!(
+            g.clone().mmio_write(ipa, size, value).is_ok(),
+            "a write vCPU 0's redistributor ACCEPTS is in scope"
+        );
+        let _ = g.mmio_write(ipa, size, value);
+
+        // ...and it really did enable something for vCPU 0, or "vCPU 1 is unaffected" is free.
+        kani::cover!(
+            g.is_enabled(0, i),
+            "a write that enables the INTID for vCPU 0 is in scope"
+        );
+
+        assert!(
+            !g.is_enabled(1, i),
+            "a write to vCPU 0's redistributor made an INTID deliverable to vCPU 1"
+        );
+    }
+
+    /// **Exactly one redistributor reports `Last`, and it is the final one.**
+    ///
+    /// A guest finds its redistributors by walking the region reading `GICR_TYPER` until `Last` is
+    /// set. Set it nowhere and the walk runs off the end of the window; set it on more than one and
+    /// the walk stops early, so a later vCPU never finds its frame and does not come up. Neither
+    /// failure is memory-unsafe and neither is visible at one vCPU, which is why it is a theorem
+    /// rather than a comment.
+    #[kani::proof]
+    fn the_last_redistributor_is_the_only_one_that_says_so() {
+        const LAST_BIT: u64 = 1 << 4;
+        let n: usize = kani::any();
+        kani::assume(n < 2);
+        let says_last = Gic2::gicr_typer(n) & LAST_BIT != 0;
+        assert!(
+            says_last == (n == 1),
+            "exactly the final redistributor must set GICR_TYPER.Last"
+        );
+    }
+
+    /// **`GICR_TYPER`'s affinity field is the vCPU's affinity** — the agreement a guest checks.
+    ///
+    /// `gic_populate_rdist` matches this field against the CPU's own `MPIDR_EL1`, which on baleen is
+    /// `VMPIDR_EL2` as written by `hv-metal`'s `guest_mpidr` (⑱-1). Both sides derive from
+    /// [`vcpu_affinity`], so this harness is checking that the *encoding into the register* preserves
+    /// what the shared derivation says — not that two independent constants happen to match, which is
+    /// a defect the single derivation already prevents.
+    #[kani::proof]
+    fn the_typer_reports_the_vcpu_affinity() {
+        let n: usize = kani::any();
+        kani::assume(n < 2);
+        let aff = (Gic2::gicr_typer(n) >> 32) & 0xffff_ffff;
+        assert!(
+            aff == vcpu_affinity(n),
+            "GICR_TYPER's affinity field must be the vCPU's affinity, or a guest cannot find its \
+             own redistributor"
+        );
+    }
+
+    /// **The decode is a partition across redistributors, checked against an ADDRESS FORMULA written
+    /// out here rather than by calling the model.**
+    ///
+    /// ∀ ipa: if the decode names vCPU `n`'s frame at offset `o`, then the address is exactly
+    /// `gicr_rd_base + n * 128 KiB (+ 64 KiB for the SGI frame) + o`, and `o` is inside one frame.
+    /// Because the map from `(n, frame, o)` back to an address is injective, that is precisely the
+    /// statement that no address lands in two vCPUs' frames.
+    ///
+    /// The formula is a **second, independent derivation** (design-lesson #36): asking the model
+    /// whether it agrees with itself would prove nothing.
+    #[kani::proof]
+    fn the_decode_is_a_partition_across_redistributors() {
+        let l = deployed();
+        let ipa: u64 = kani::any();
+        match l.frame_of(ipa, 2) {
+            Some((GicFrame::Redist(n), o)) => {
+                assert!(n < 2 && o < REDIST_FRAME_BYTES);
+                assert!(ipa == GICR_RD_BASE + (n as u64) * REDIST_PAIR_BYTES + o);
+            }
+            Some((GicFrame::Sgi(n), o)) => {
+                assert!(n < 2 && o < REDIST_FRAME_BYTES);
+                assert!(
+                    ipa == GICR_RD_BASE + (n as u64) * REDIST_PAIR_BYTES + REDIST_FRAME_BYTES + o
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// **An address past the last redistributor is in NO frame.**
+    ///
+    /// The redistributor region a device tree declares is sized for the machine's maximum CPU count,
+    /// so most of it belongs to no vCPU. Before ⑱-2 every such address decoded as `Sgi` with an
+    /// ever-growing offset and was refused only by falling off the end of that frame's register list;
+    /// it failed closed, but for the wrong reason, and with two redistributors the same arithmetic
+    /// would have had to name one of them.
+    #[kani::proof]
+    fn an_address_past_the_last_redistributor_is_in_no_frame() {
+        let l = deployed();
+        let ipa: u64 = kani::any();
+        kani::assume(ipa >= GICR_RD_BASE + 2 * REDIST_PAIR_BYTES && ipa < GICR_END);
+        kani::cover!(
+            true,
+            "the region really does extend past two redistributors"
+        );
+        assert!(
+            l.frame_of(ipa, 2).is_none(),
+            "an address beyond the last vCPU's redistributor decoded into a frame"
+        );
+    }
+
+    /// Totality with two redistributors — the same guarantee as the one-vCPU harness, over the
+    /// arithmetic that now has to pick a redistributor before it can pick a register.
+    #[kani::proof]
+    fn gic_mmio_is_total_with_two_redistributors() {
+        let l = deployed();
+        let mut g = Gic2::new(l);
+        let (w_ipa, w_size, w_val): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(w_ipa, w_size, w_val);
+        let (r_ipa, r_size): (u64, u64) = (kani::any(), kani::any());
+        let _ = g.mmio_read(r_ipa, r_size);
+    }
+
+    /// Totality with two redistributors over a **symbolic layout** — no address map can make the
+    /// per-redistributor arithmetic index out of range. `validate` is deliberately not assumed.
+    #[kani::proof]
+    fn two_redistributors_are_total_for_every_layout() {
+        let l = symbolic_layout();
+        let mut g = Gic2::new(l);
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(ipa, size, value);
+        let _ = g.mmio_read(ipa, size);
+    }
+
+    /// **`validate` accounts for EVERY vCPU's frames, not just the first's.**
+    ///
+    /// A layout with room for one redistributor accepted for two would put vCPU 1's frames past
+    /// `gicr_end`, i.e. outside the window the guest's device tree describes.
+    #[kani::proof]
+    fn a_layout_valid_for_two_has_room_for_two() {
+        let l = symbolic_layout();
+        kani::assume(l.validate(2));
+        // `validate(2)` must be satisfiable, or "every layout valid for two has room for two" is a
+        // statement about the empty set.
+        kani::cover!(true, "some symbolic layout is valid for two vCPUs");
+        assert!(
+            l.gicr_rd_base() + 2 * REDIST_PAIR_BYTES <= l.gicr_end(),
+            "a layout accepted for two vCPUs must hold two whole redistributors"
+        );
+        // And accepting it for two implies accepting it for one — a smaller machine fits.
+        assert!(
+            l.validate(1),
+            "a layout valid for two vCPUs must be valid for one"
+        );
+    }
+
+    /// **Non-vacuity for the second redistributor.** Everything above is of the form "vCPU 1 is
+    /// unaffected", which a model where vCPU 1's frame is simply unreachable would satisfy. This
+    /// shows the second redistributor is really there and really independent: enable an INTID
+    /// through vCPU 1's own SGI frame, and see it in vCPU 1 and NOT in vCPU 0.
+    #[kani::proof]
+    fn the_second_redistributor_is_reached_and_is_its_own() {
+        let l = deployed();
+        let mut g = Gic2::new(l);
+        let sgi1 = GICR_RD_BASE + REDIST_PAIR_BYTES + REDIST_FRAME_BYTES;
+
+        assert!(!g.is_enabled(0, 27) && !g.is_enabled(1, 27));
+        let ok = g.mmio_write(sgi1 + ISENABLER, 4, 1 << 27);
+        assert!(
+            matches!(ok, Ok(1)),
+            "vCPU 1's GICR_ISENABLER0 must newly enable exactly one INTID"
+        );
+        assert!(
+            g.is_enabled(1, 27),
+            "the enable must be visible through the mediation seam for vCPU 1"
+        );
+        assert!(
+            !g.is_enabled(0, 27),
+            "and must NOT be visible for vCPU 0 — that is the banking"
+        );
+        assert!(
+            matches!(g.mmio_read(sgi1 + ISENABLER, 4), Ok(v) if v == 1 << 27),
+            "and must read back from vCPU 1's own frame"
+        );
+    }
 
     // ─── non-vacuity ─────────────────────────────────────────────────────────────────────────────
 
@@ -3587,15 +3885,15 @@ mod device_models {
     #[kani::proof]
     fn the_decode_is_reached_and_does_something() {
         let l = deployed();
-        let mut g = VirtGic::new(l);
-        assert!(!g.is_enabled(32));
+        let mut g = Gic1::new(l);
+        assert!(!g.is_enabled(0, 32));
         let ok = g.mmio_write(GICD_BASE + ISENABLER + 4, 4, 1);
         assert!(
             matches!(ok, Ok(1)),
             "GICD_ISENABLER1 bit 0 must newly enable exactly INTID 32"
         );
         assert!(
-            g.is_enabled(32),
+            g.is_enabled(0, 32),
             "the enable must be observable through the mediation seam"
         );
         assert!(
@@ -4095,6 +4393,10 @@ mod vgic_active_lr {
 mod gic_declared_residues {
     use hv_vdev::gicv3::{GicLayout, VirtGic, NUM_INTIDS};
 
+    /// The deployed shape — one vCPU, one redistributor. These residues are statements about what
+    /// the model does NOT implement, so they are pinned at the configuration that actually boots.
+    type Gic1 = VirtGic<1>;
+
     const GICD_BASE: u64 = 0x0800_0000;
     const GICD_LEN: u64 = 0x0001_0000;
     const GICR_RD_BASE: u64 = 0x080A_0000;
@@ -4124,7 +4426,7 @@ mod gic_declared_residues {
     /// silently making the docs wrong.
     #[kani::proof]
     fn spi_pending_and_active_are_accepted_and_read_zero() {
-        let mut g = VirtGic::new(deployed());
+        let mut g = Gic1::new(deployed());
 
         let bank: u64 = kani::any();
         kani::assume(
@@ -4162,7 +4464,7 @@ mod gic_declared_residues {
     /// its own decision rather than riding along in a rung about pinning declarations.
     #[kani::proof]
     fn distributor_pending_and_active_are_refused_for_redistributor_banked_intids() {
-        let mut g = VirtGic::new(deployed());
+        let mut g = Gic1::new(deployed());
 
         let bank: u64 = kani::any();
         kani::assume(
@@ -4178,14 +4480,23 @@ mod gic_declared_residues {
         );
     }
 
-    /// **Residue 2, pinned: there is exactly ONE redistributor and it says so.**
+    /// **The DEPLOYED shape announces exactly one redistributor** — and after ⑱-2 that is all this
+    /// says.
     ///
     /// `GICR_TYPER.Last` (bit 4) is what tells a probing kernel to stop walking the redistributor
     /// list. Asserted over an arbitrary prior write so it is a property of the model, not of a fresh
-    /// reset — a second frame could not be announced without this failing.
+    /// reset.
+    ///
+    /// ⚠ **This was residue 2 and is no longer a residue at all.** It used to pin a *limitation*:
+    /// the model could not describe more than one redistributor. ⑱-2 closed that —
+    /// `VirtGic<VCPUS>` presents one per vCPU, proven by the `device_models` harnesses named in the
+    /// crate docs. What survives here is the narrower and still-useful fact that **`hv-metal`
+    /// instantiates `VirtGic<1>`**, so the guest that actually boots is told there is one. It goes
+    /// red if the metal's vCPU count and the guest's device surface ever drift apart, which is
+    /// exactly what ⑱-3 will change on purpose.
     #[kani::proof]
     fn exactly_one_redistributor_and_it_reports_last() {
-        let mut g = VirtGic::new(deployed());
+        let mut g = Gic1::new(deployed());
         let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
         let _ = g.mmio_write(ipa, size, value);
 
@@ -4206,11 +4517,11 @@ mod gic_declared_residues {
     /// some interrupts and not others.
     #[kani::proof]
     fn irouter_is_recorded_and_honoured_by_nothing() {
-        let mut g = VirtGic::new(deployed());
+        let mut g = Gic1::new(deployed());
 
         let probe: u32 = kani::any();
         kani::assume((probe as usize) < NUM_INTIDS);
-        let before = g.is_enabled(probe);
+        let before = g.is_enabled(0, probe);
 
         let spi: u64 = kani::any();
         kani::assume(spi >= FIRST_SPI && spi < NUM_INTIDS as u64);
@@ -4225,7 +4536,7 @@ mod gic_declared_residues {
             "IROUTER must be recorded"
         );
         assert_eq!(
-            g.is_enabled(probe),
+            g.is_enabled(0, probe),
             before,
             "routing must change no INTID's enable — it is recorded, not honoured"
         );
@@ -4234,7 +4545,7 @@ mod gic_declared_residues {
     /// The redistributor's own pending/active copies, same declaration, same pinning.
     #[kani::proof]
     fn redistributor_pending_and_active_read_zero() {
-        let mut g = VirtGic::new(deployed());
+        let mut g = Gic1::new(deployed());
         let bank: u64 = kani::any();
         kani::assume(
             bank == D_ISPENDR || bank == D_ICPENDR || bank == D_ISACTIVER || bank == D_ICACTIVER,
