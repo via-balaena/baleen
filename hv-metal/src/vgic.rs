@@ -56,20 +56,15 @@ pub(crate) const LAYOUT: GicLayout = GicLayout::new(GICD_BASE, GICD_LEN, GICR_RD
 /// silently on a second one; the decode is memory-safe for any layout at all, so nothing would have
 /// crashed — the frames would simply have stopped meaning what their names say.
 const _: () = assert!(
-    LAYOUT.validate(VCPUS_PER_GUEST),
+    LAYOUT.validate(crate::role::VCPUS_PER_GUEST),
     "the emulated GIC's layout is one the decode cannot honour"
 );
 
-/// **How many redistributors this guest's emulated GIC presents — one per vCPU.**
-///
-/// ⑱-2 made the model take this as a parameter; the metal still deploys **one**, because ⑱-3 is
-/// what gives a guest a second vCPU. Raising this alone would advertise a redistributor for a vCPU
-/// that never runs, so it moves with the scheduler and not before — that is ⑱-3.
-///
-/// The `const assert!` above is what makes the pairing checkable: raise this past what the
-/// redistributor region can hold and the build stops, rather than the guest discovering a frame
-/// outside the window its own device tree describes.
-pub(crate) const VCPUS_PER_GUEST: usize = 1;
+// ⑱-3a: `VCPUS_PER_GUEST` moved to `crate::role`, which owns the vCPU axis and its types, so there
+// is one statement of how many vCPUs a guest has rather than one per consumer. The `const assert!`
+// above is what makes the pairing checkable from here: raise the count past what the redistributor
+// region can hold and the build stops, rather than the guest discovering a frame outside the window
+// its own device tree describes.
 
 /// The interrupt EL2 forwards on the guest's behalf must exist in the distributor the guest sees.
 const _: () = assert!(
@@ -101,7 +96,7 @@ pub(crate) fn in_window(ipa: u64) -> bool {
 /// isolation; the tallies here are what the boot gate reads and mean nothing to a driver.
 pub(crate) struct DeployedGic {
     /// The model, under the fence.
-    dev: VirtGic<VCPUS_PER_GUEST>,
+    dev: VirtGic<{ crate::role::VCPUS_PER_GUEST }>,
     /// How many register accesses the guest has made — the witness counter.
     traps: u64,
     /// How many INTIDs the guest has ever newly enabled — the witness's discriminating half.
@@ -111,6 +106,13 @@ pub(crate) struct DeployedGic {
     /// would never have been seen.
     enables: u64,
 }
+
+/// **A guest's distributor is per-GUEST, and ⑱-2 is why that stays true with more than one vCPU:**
+/// the per-vCPU part of a GICv3 — the redistributors, with their banked INTIDs 0..31 — lives INSIDE
+/// [`VirtGic`] as `VirtGic<VCPUS_PER_GUEST>`, not as a second axis out here. Declaring only
+/// [`PerGuestState`] makes a `PerVcpu<DeployedGic, ..>` a build error, which is the right answer: it
+/// would give each vCPU its own copy of the SPIs the guest shares.
+impl crate::role::PerGuestState for DeployedGic {}
 
 impl DeployedGic {
     /// A distributor out of reset, with an unfired witness.
