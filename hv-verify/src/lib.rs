@@ -2457,7 +2457,39 @@ mod smmu_stream_derivation {
     /// Nothing is assumed here — the StreamID map may alias, sit outside the table, or name a domain
     /// with no Stage-2 tables — so this is also the totality statement: every input reaches one of
     /// the two arms.
+    ///
+    /// ## Why this harness names a solver — MEASURED, and it is the memory that matters
+    ///
+    /// This is the **memory-heaviest harness in the suite**, and the `kani proofs (PR)` job has twice
+    /// been killed by the runner mid-run — `The runner has received a shutdown signal`, no failing
+    /// proof, an orphaned `cbmc` reaped — while checking one of the two harnesses in this module.
+    /// Peak concurrent `cbmc` RSS across the suite measures **~10.5 GiB on a 16 GB runner** shared
+    /// with the OS, the agent and rustc; Kani's `-j` dispatch order is nondeterministic, which is why
+    /// it kills intermittently rather than always.
+    ///
+    /// | solver | peak RSS | wall |
+    /// |---|---|---|
+    /// | CaDiCaL (Kani's default) | **8.6 GiB** | 41 s |
+    /// | kissat | 2.6 GiB | 371 s |
+    /// | **minisat** | **3.4 GiB** | **22 s** |
+    ///
+    /// **−61% memory and roughly twice as fast, and nothing about the THEOREM changes** — same
+    /// harness, same symbolic world, a different SAT backend. That last point is why this is the
+    /// lever to reach for: the obvious memory saving would be narrowing the symbolic `u32` StreamIDs,
+    /// and the module doc above says the StreamID axis being symbolic *is* the property. Trading
+    /// proof strength for gate reliability is not a trade to make quietly.
+    ///
+    /// ⚠ **This does NOT close the OOM problem, and the pin must not be read as having done so.**
+    /// Pinning it moved the SUITE peak only 10.5 → ~9.7 GiB, so the peak is a combination not yet
+    /// identified. (`-j 2` was measured too and is REFUTED as a lever: 9.9 GiB, and *slower*.)
+    ///
+    /// ⚠ **And do not quote a suite-WALL improvement for this pin.** The first run with it measured
+    /// 5:58 against 8:21 without, which looked like −29% — and a second run with it measured
+    /// **7:52**. Suite wall is dominated by `-j` dispatch-order variance, so n=1 either side proves
+    /// nothing. **The per-HARNESS numbers in the table above are the trustworthy ones**: they are the
+    /// same harness measured twice under two solvers, not two runs of a 93-harness makespan.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn a_refused_derivation_leaves_the_table_denying_every_stream() {
         let mut words = [0u64; WORDS];
         // Start from a table that already permits, so "denies everything" cannot pass by the storage
@@ -2488,7 +2520,12 @@ mod smmu_stream_derivation {
     /// StreamID share one STE, so whichever is bound last decides where *both* land, and one
     /// domain's bus master silently walks another domain's tables. Unreachable at the metal's single
     /// device, which is exactly why it is proven rather than argued.
+    ///
+    /// Solver pinned for the same measured reason as the harness above — this is the
+    /// **second**-heaviest in the suite (6.4 GiB under CaDiCaL), and the second of the two runner
+    /// kills landed on it specifically.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn a_map_that_aliases_two_devices_onto_one_entry_is_refused() {
         let mut words = [0u64; WORDS];
         let log2 = any_log2();
