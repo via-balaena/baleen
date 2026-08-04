@@ -37,9 +37,27 @@
 //!
 //! So **four** things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` Stage-2
 //! **data abort**, which [`handle_linux_sync`] routes to the emulated GIC or the emulated PL011 and
-//! otherwise reports as a bring-up fault; an `EC=0x18` **trapped system register**
+//! otherwise treats as a guest fault; an `EC=0x18` **trapped system register**
 //! ([`handle_linux_sysreg_trap`], the guest's `ICC_SGI1R_EL1` writes); and every **physical IRQ**
 //! ([`handle_linux_irq`]).
+//!
+//! ## ★ What happens when a guest does something EL2 has no rule for
+//!
+//! **The offending domain is retired; the machine keeps running** ([`fault_retire`]). This used to be
+//! `crate::park()` at every one of those sites, and that was a defensible call **while there was one
+//! guest** — halting hurt only the guest that caused it, and guessing at an undecodable access is
+//! worse than stopping loudly. **The second guest changed the meaning of every one of them without
+//! changing a line**: a halt now takes down a peer that did nothing, which is a cross-domain denial
+//! of service. Same shape as honest-ledger item 9 — *sound with one guest, false with two*.
+//!
+//! They were cheap to reach, too. Six of the seven were a **single instruction**: `ISV=0` is simply
+//! what a load/store PAIR produces, so `stp x0, x1, [gic_base]` halted the hypervisor.
+//!
+//! `crate::park()` still exists here, and now means one thing only: **EL2 itself is in a state it
+//! cannot describe** (the model refused a transition, a `BootCell` was already borrowed). Those are
+//! not guest-reachable. The diagnostics for guest faults are prefixed `guest FAULT:` rather than
+//! `LINUX GUEST TRAP:` so that the latter keeps that narrower meaning — and stays forbidden by the
+//! boot gate in *both* of its runs.
 //!
 //! ## ③-a2: the guest's interrupts stop being its own
 //!
@@ -1798,12 +1816,63 @@ fn handle_peer_fault(faulting: usize, owner: usize, ipa: u64, uart: &mut Pl011) 
 /// trampoline's frame rather than the IRQ one. The two frames are the same layout and the two
 /// trampolines the same save/restore discipline, so a switch out of an `HVC` is a switch — this path
 /// does not get its own.
-fn power_off_and_hand_over(cur: usize, frame: &mut LinuxFrame, uart: &mut Pl011) -> bool {
+/// **Why a domain stopped being runnable** — EL2's record, because the MODEL cannot carry it.
+///
+/// `hv-core` has one state for both: `SchedOffline` makes a vCPU `Offline`, and that is correct —
+/// "may this vCPU be dispatched" is the only question the scheduler is entitled to answer, and the
+/// answer is the same either way. **But the boot transcript is not entitled to conflate them.**
+/// Without this, `report_per_guest_state` would print *"dom N issued PSCI SYSTEM_OFF — a real Linux
+/// kernel booted and shut down"* for a domain that was KILLED, which is a witness that lies about the
+/// one thing the reader most needs to know.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Retirement {
+    /// Still running, or never started.
+    Live,
+    /// Issued PSCI `SYSTEM_OFF` — a clean shutdown.
+    PoweredOff,
+    /// Did something EL2 has no rule for and was retired for it.
+    Faulted,
+}
+
+/// Per-slot retirement reason. `u8` because it is written from trap handlers.
+static RETIREMENT: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+fn set_retirement(slot: usize, why: Retirement) {
+    RETIREMENT[slot].store(
+        match why {
+            Retirement::Live => 0,
+            Retirement::PoweredOff => 1,
+            Retirement::Faulted => 2,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+fn retirement_of(slot: usize) -> Retirement {
+    match RETIREMENT[slot].load(Ordering::Relaxed) {
+        1 => Retirement::PoweredOff,
+        2 => Retirement::Faulted,
+        _ => Retirement::Live,
+    }
+}
+
+/// **Retire `cur` in the model and hand the pCPU to a runnable peer.** `false` = nobody is left.
+///
+/// The one derivation of retire-and-hand-over. `power_off_and_hand_over` and [`fault_retire`] are
+/// both thin callers of it: a clean shutdown and a killed guest differ in the REASON recorded and in
+/// what is printed, never in the mechanism, and two copies of a scheduler handover is exactly the
+/// second-derivation defect this file has removed three times over.
+fn retire_and_hand_over(
+    cur: usize,
+    frame: &mut LinuxFrame,
+    uart: &mut Pl011,
+    why: Retirement,
+) -> bool {
+    set_retirement(cur, why);
     let Some(mut cell) = crate::guest::GUEST_HV.try_borrow_mut() else {
         let _ = writeln!(
             uart,
-            "baleen: LINUX GUEST TRAP: dom {} issued SYSTEM_OFF while the model was borrowed; \
-             halting",
+            "baleen: LINUX GUEST TRAP: dom {} retired while the model was borrowed; halting",
             slot_dom(cur)
         );
         crate::park();
@@ -1822,7 +1891,7 @@ fn power_off_and_hand_over(cur: usize, frame: &mut LinuxFrame, uart: &mut Pl011)
             vcpu: LINUX_VCPU,
             now,
         },
-        "retire the powered-off vcpu",
+        "retire the vcpu",
     );
     let Some(next) = next_runnable(hv, cur) else {
         return false;
@@ -1836,6 +1905,121 @@ fn power_off_and_hand_over(cur: usize, frame: &mut LinuxFrame, uart: &mut Pl011)
     drop(cell);
     switch_context(cur, next, frame);
     true
+}
+
+/// **A guest did something EL2 has no rule for: retire THAT GUEST, not the machine.**
+///
+/// ## ★ Why every one of these used to halt, and why that stopped being right
+///
+/// Each call site below used to `crate::park()`. That was a defensible decision **when there was one
+/// guest**: halting hurt only the guest that caused it, and a wrong guess about an undecodable access
+/// is worse than a loud stop. **The second guest changed the meaning of every one of them without
+/// changing a line of code** — a halt now takes down a peer that did nothing. That is the same shape
+/// as honest-ledger item 9 (*"sound with one guest, FALSE with two"*).
+///
+/// And they are cheap to reach. Six of the seven are a **single instruction**: `ISV=0` is simply what
+/// a load/store PAIR produces, so `stp x0, x1, [gic_base]` halted the hypervisor. The code said so
+/// itself — *"None of them is reachable from the PL011 accesses a Linux driver actually makes"* —
+/// which is a statement about a COOPERATIVE driver, not about a guest.
+///
+/// ## What replaces it
+///
+/// The offending domain is retired (`SchedOffline`, the same transition a clean `SYSTEM_OFF` uses,
+/// because a killed domain likewise never runs again) and the pCPU goes to whoever is still
+/// `Runnable`. Only when nobody is does the boot end.
+///
+/// ⚠ **The caller must `return` immediately after this.** Unlike the `park()` it replaces, this
+/// function RETURNS, and the trampoline will `eret` into whichever guest is now current. Falling
+/// through would resume the guest that just faulted — with its context already switched away.
+fn fault_retire(cur: usize, frame: &mut LinuxFrame, uart: &mut Pl011, what: &str) {
+    CONSOLE.borrow_mut().flush(cur, uart);
+    let _ = writeln!(
+        uart,
+        "baleen: dom {} RETIRED — {what}. The domain is stopped; the machine is not.",
+        slot_dom(cur)
+    );
+    if !retire_and_hand_over(cur, frame, uart, Retirement::Faulted) {
+        end_of_boot(uart);
+    }
+}
+
+/// Flush every console, print every witness, and leave QEMU cleanly.
+///
+/// Extracted from the PSCI `SYSTEM_OFF` arm so the fault path can end the boot the same way. One
+/// derivation: a boot that ends because the last guest was RETIRED must report exactly what a boot
+/// that ends because the last guest powered off reports, or the two endings would drift and only one
+/// of them would be tested.
+fn end_of_boot(uart: &mut Pl011) -> ! {
+    let mut console = CONSOLE.borrow_mut();
+    for slot in 0..NUM_GUESTS {
+        console.flush(slot, uart);
+    }
+    drop(console);
+    // FIRST, deliberately. Every `report_*` below can `park()` on a failed assertion, and the
+    // retirement record is the one line that explains WHY a later report might legitimately fail —
+    // printing it last meant a faulted boot lost the very fact that made sense of the failure.
+    // (Found by the fault probe: `report_per_guest_state` parked on a retired domain's zero counter
+    // before this line was ever reached.)
+    report_retirements(uart);
+    report_vpl011(uart);
+    report_interrupt_mediation(uart);
+    report_timer_handoff(uart);
+    report_el2_slice(uart);
+    report_wfi_yield(uart);
+    report_fp_isolation(uart);
+    report_pending_absorption(uart);
+    #[cfg(feature = "selftest")]
+    report_lr_overflow(uart);
+    report_per_guest_state(uart);
+    if (0..NUM_GUESTS).all(|s| retirement_of(s) == Retirement::PoweredOff) {
+        let _ = writeln!(
+            uart,
+            "baleen: every real Linux guest has powered off — {NUM_GUESTS} unmodified \
+             kernels ran isolated on hv-metal's EL2 and shut down (M5 Arc 5e)"
+        );
+    }
+    semihosting_exit(); // clean QEMU exit (falls through to a fault→park if -semihosting off)
+}
+
+/// **Whether `slot`'s per-guest witnesses may be ASSERTED.**
+///
+/// A domain retired for a fault stopped part-way through its own boot, so the mechanisms it never
+/// reached have correct zeros — its counters record HOW FAR IT GOT, not whether the hypervisor
+/// works. Asserting them anyway is design-lesson #127 in its purest form, and the fault probe caught
+/// three separate reports doing it (`perguest`, `vpl011`, `vsgi`), each of which parked or FAILED a
+/// boot over a zero that was right.
+///
+/// **The shipped configuration is unaffected**: with both guests powering off cleanly this returns
+/// `true` for every slot and every assertion runs exactly as before. The guard only ever fires on a
+/// boot where a domain was killed — which, before this rung, could not happen at all.
+fn witnesses_assertable(slot: usize) -> bool {
+    retirement_of(slot) != Retirement::Faulted
+}
+
+/// How each domain's run ended — the line that keeps a retirement from reading as a shutdown.
+fn report_retirements(uart: &mut Pl011) {
+    for slot in 0..NUM_GUESTS {
+        let dom = slot_dom(slot);
+        match retirement_of(slot) {
+            Retirement::PoweredOff => {
+                let _ = writeln!(uart, "baleen: retire dom {dom}: powered off cleanly");
+            }
+            Retirement::Faulted => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: retire dom {dom}: RETIRED FOR A FAULT — it was stopped and the machine \
+                     kept running"
+                );
+            }
+            Retirement::Live => {
+                let _ = writeln!(uart, "baleen: retire dom {dom}: never retired");
+            }
+        }
+    }
+}
+
+fn power_off_and_hand_over(cur: usize, frame: &mut LinuxFrame, uart: &mut Pl011) -> bool {
+    retire_and_hand_over(cur, frame, uart, Retirement::PoweredOff)
 }
 
 /// **Which guest gets the pCPU next** — round-robin from `cur` over the slots the MODEL says are
@@ -2067,27 +2251,7 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 if power_off_and_hand_over(cur, frame, &mut uart) {
                     return;
                 }
-                let mut console = CONSOLE.borrow_mut();
-                for slot in 0..NUM_GUESTS {
-                    console.flush(slot, &mut uart);
-                }
-                drop(console);
-                report_vpl011(&mut uart);
-                report_interrupt_mediation(&mut uart);
-                report_timer_handoff(&mut uart);
-                report_el2_slice(&mut uart);
-                report_wfi_yield(&mut uart);
-                report_fp_isolation(&mut uart);
-                report_pending_absorption(&mut uart);
-                #[cfg(feature = "selftest")]
-                report_lr_overflow(&mut uart);
-                report_per_guest_state(&mut uart);
-                let _ = writeln!(
-                    uart,
-                    "baleen: every real Linux guest has powered off — {NUM_GUESTS} unmodified \
-                     kernels ran isolated on hv-metal's EL2 and shut down (M5 Arc 5e)"
-                );
-                semihosting_exit(); // clean QEMU exit (falls through to a fault→park if -semihosting off)
+                end_of_boot(&mut uart);
             }
             other => {
                 frame.x[0] = PSCI_NOT_SUPPORTED;
@@ -2103,9 +2267,16 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
     // Not an HVC: a genuine fault. Report and halt (the diagnostic that drives bring-up).
     let _ = writeln!(
         uart,
-        "baleen: LINUX GUEST TRAP: EC=0x{ec:02x} ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x} — halting"
+        "baleen: guest FAULT: EC=0x{ec:02x} ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x}"
     );
-    crate::park();
+    // SAFETY: the trampoline gave us its on-stack frame; single-CPU, non-nested.
+    let frame = unsafe { &mut *frame };
+    fault_retire(
+        current_slot(),
+        frame,
+        &mut uart,
+        "took an exception EL2 has no rule for",
+    );
 }
 
 /// Route a guest **Stage-2 data abort** (`EC=0x24`) to one of four outcomes:
@@ -2158,11 +2329,17 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
     if !vpl011::in_window(ipa) {
         let _ = writeln!(
             uart,
-            "baleen: LINUX GUEST TRAP: EC=0x{ec:02x} data abort outside every emulated device — \
-             IPA=0x{ipa:016x} ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x} — halting",
+            "baleen: guest FAULT: EC=0x{ec:02x} data abort outside every emulated device — \
+             IPA=0x{ipa:016x} ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x}",
             ec = EC_DATA_ABORT
         );
-        crate::park();
+        fault_retire(
+            faulting,
+            frame,
+            uart,
+            "faulted outside every emulated device",
+        );
+        return;
     }
 
     // Three ways an access can be undecodable. Each is fatal rather than guessed at: emulating the
@@ -2173,21 +2350,22 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
     if !a.isv || a.fnv || a.s1ptw {
         let _ = writeln!(
             uart,
-            "baleen: LINUX GUEST TRAP: undecodable PL011 access at IPA=0x{ipa:016x} \
-             (ISV={} FnV={} S1PTW={}) ESR=0x{esr:08x} — halting",
+            "baleen: guest FAULT: undecodable PL011 access at IPA=0x{ipa:016x} \
+             (ISV={} FnV={} S1PTW={}) ESR=0x{esr:08x}",
             a.isv as u8, a.fnv as u8, a.s1ptw as u8
         );
-        crate::park();
+        fault_retire(faulting, frame, uart, "made an undecodable PL011 access");
+        return;
     }
     let offset = ipa - vpl011::VPL011_BASE;
     if !offset.is_multiple_of(a.access_bytes()) {
         let _ = writeln!(
             uart,
-            "baleen: LINUX GUEST TRAP: misaligned PL011 access at IPA=0x{ipa:016x} \
-             ({} bytes) — halting",
+            "baleen: guest FAULT: misaligned PL011 access at IPA=0x{ipa:016x} ({} bytes)",
             a.access_bytes()
         );
-        crate::park();
+        fault_retire(faulting, frame, uart, "made a misaligned PL011 access");
+        return;
     }
 
     let slot = faulting;
@@ -2240,11 +2418,17 @@ fn handle_vgic_access(
     if !a.isv || a.fnv || a.s1ptw {
         let _ = writeln!(
             uart,
-            "baleen: LINUX GUEST TRAP: undecodable GIC access at IPA=0x{ipa:016x} \
-             (ISV={} FnV={} S1PTW={}) ESR=0x{esr:08x} — halting",
+            "baleen: guest FAULT: undecodable GIC access at IPA=0x{ipa:016x} \
+             (ISV={} FnV={} S1PTW={}) ESR=0x{esr:08x}",
             a.isv as u8, a.fnv as u8, a.s1ptw as u8
         );
-        crate::park();
+        fault_retire(
+            current_slot(),
+            frame,
+            uart,
+            "made an undecodable GIC access",
+        );
+        return;
     }
 
     let slot = current_slot();
@@ -2280,15 +2464,21 @@ fn handle_vgic_access(
     if let Err(u) = outcome {
         let _ = writeln!(
             uart,
-            "baleen: LINUX GUEST TRAP: unmodelled {} register at offset 0x{:04x} \
+            "baleen: guest FAULT: unmodelled {} register at offset 0x{:04x} \
              (IPA=0x{ipa:016x} {} {} bytes) ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x} \
-             — halting",
+            ",
             u.frame,
             u.offset,
             if a.wnr { "write" } else { "read" },
             a.access_bytes()
         );
-        crate::park();
+        fault_retire(
+            slot,
+            frame,
+            uart,
+            "touched a register its distributor does not model",
+        );
+        return;
     }
 
     // A data abort's preferred return is the FAULTING instruction.
@@ -2464,8 +2654,8 @@ fn handle_linux_sysreg_trap(
 
     let _ = writeln!(
         uart,
-        "baleen: LINUX GUEST TRAP: unhandled system-register access (Op0={} Op1={} CRn={} CRm={} \
-         Op2={} {}) ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x} — halting",
+        "baleen: guest FAULT: unhandled system-register access (Op0={} Op1={} CRn={} CRm={} \
+         Op2={} {}) ELR=0x{elr:016x} FAR=0x{far:016x} ESR=0x{esr:08x}",
         (iss >> 20) & 0x3,
         (iss >> 14) & 0x7,
         (iss >> 10) & 0xf,
@@ -2473,7 +2663,12 @@ fn handle_linux_sysreg_trap(
         (iss >> 17) & 0x7,
         if iss & 1 == 0 { "write" } else { "read" },
     );
-    crate::park();
+    fault_retire(
+        current_slot(),
+        frame,
+        uart,
+        "accessed a system register EL2 has no rule for",
+    );
 }
 
 /// Read `HPFAR_EL2` — the architectural source of the faulting **IPA** for a Stage-2 abort.
@@ -2511,6 +2706,10 @@ fn read_hpfar() -> u64 {
 /// discriminate, only harder to notice.
 fn report_vpl011(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
+        // A retired domain's witnesses are not assertable — see `witnesses_assertable`.
+        if !witnesses_assertable(slot) {
+            continue;
+        }
         let dom = slot_dom(slot);
         let (ok, traps, dr_writes) = VPL011.borrow_mut()[slot].witness();
         if ok {
@@ -2551,6 +2750,10 @@ fn report_vpl011(uart: &mut Pl011) {
 /// ground.
 fn report_interrupt_mediation(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
+        // A retired domain's witnesses are not assertable — see `witnesses_assertable`.
+        if !witnesses_assertable(slot) {
+            continue;
+        }
         let dom = slot_dom(slot);
         let n = TIMER_FORWARDED[slot].load(Ordering::Relaxed);
         if n > 0 {
@@ -3157,6 +3360,25 @@ fn report_per_guest_state(uart: &mut Pl011) {
     // "this guest's GIC model is the other one's" are different bugs and the counter says which.
     let mut dead = None;
     for slot in 0..NUM_GUESTS {
+        // ⚠ **A domain RETIRED FOR A FAULT is skipped, and this is not a loosened check.** These
+        // counters assert that each guest exercised each mechanism; a guest stopped part-way through
+        // its own boot legitimately never reached some of them, so its zeros record HOW FAR IT GOT
+        // rather than a defect. Asserting them anyway is design-lesson #127 — a claim about the
+        // workload wearing the clothes of an invariant — and it is exactly what the fault probe
+        // caught: dom 1, retired during its AMBA bus scan, had never raised an SGI, and this loop
+        // parked the boot over a zero that was correct.
+        //
+        // The shipped configuration is UNAFFECTED: both guests power off cleanly, neither is
+        // skipped, and every counter is asserted exactly as before.
+        if retirement_of(slot) == Retirement::Faulted {
+            let _ = writeln!(
+                uart,
+                "baleen: perguest: dom {} was RETIRED FOR A FAULT — its counters are not asserted, \
+                 because a guest stopped part-way through its boot has correct zeros",
+                slot_dom(slot)
+            );
+            continue;
+        }
         for (name, value) in PER_GUEST_COUNTERS.iter().zip(sample(slot)) {
             if value == 0 && dead.is_none() {
                 dead = Some((slot_dom(slot), *name));
