@@ -46,8 +46,19 @@ fn main() {
         //   `qemu-linux-test` the headless gate: same QEMU line, output captured, markers asserted.
         // Both go through ONE `qemu_linux` (design-lesson #14c) — the gate must not be able to
         // pass against a QEMU invocation the demo does not use.
-        "qemu-linux" => qemu_linux(false),
-        "qemu-linux-test" => qemu_linux(true),
+        "qemu-linux" => qemu_linux(false, false),
+        // TWO boots, and the second is the rung's witness. The first is the shipped configuration
+        // (both guests power off); the second inserts a fault-probe node into dom 1's device tree so
+        // its own driver core commits a fault EL2 has no rule for. Before the retire rung that
+        // parked the machine and took dom 2 down with it. ~2 s for the pair.
+        "qemu-linux-test" => {
+            // NOT `a && b`: that short-circuits, so a failing shipped boot would skip the fault
+            // boot entirely and the log would say nothing about it. Both always run, and the run
+            // that failed is always named.
+            let shipped = qemu_linux(true, false);
+            let faulted = qemu_linux(true, true);
+            shipped && faulted
+        }
         "metal-lint" => metal_lint(),
         "doc-markers" => doc_markers(),
         "ci" => {
@@ -174,6 +185,15 @@ fn guest_load_addrs(slot: u64) -> GuestLoad {
     }
 }
 
+/// Where the fault-probe node sits — an IPA in **no** window this build maps or emulates.
+///
+/// Chosen and CHECKED against the four things that could make it inert: the emulated GIC
+/// (`0x0800_0000..0x0900_0000`), the emulated PL011 (`0x0900_0000` + `0x1000`), guest RAM (from
+/// `0x4800_0000`), and the Stage-2 device pass-through window, which `hv-metal` pins to ZERO with a
+/// `const assert!`. A node inside any of them would be serviced instead of faulting, and the probe
+/// would pass while testing nothing.
+const FAULT_PROBE_ADDR: u64 = 0x0C00_0000;
+
 /// The window belonging to guest `slot`'s peer — the address its peer-probe node names (③-b2b-ii-d).
 fn peer_of(slot: u64) -> GuestLoad {
     guest_load_addrs((slot + 1) % NUM_GUESTS)
@@ -202,7 +222,7 @@ struct GuestLoad {
 /// The `Image` and `initramfs` come from `$BALEEN_LINUX_DIR` (default `.baleen-linux`, relative to
 /// the repo root like every other path in this file, and the same location CI uses);
 /// `hv-metal/linux/fetch-guest-image.sh` builds both from checksum-pinned official Alpine downloads.
-fn qemu_linux(check: bool) -> bool {
+fn qemu_linux(check: bool, fault_probe: bool) -> bool {
     use std::path::PathBuf;
 
     let task = if check {
@@ -248,7 +268,7 @@ fn qemu_linux(check: bool) -> bool {
     let initrd_size = std::fs::metadata(&initrd).map(|m| m.len()).unwrap_or(0);
     let mut dtbs = Vec::new();
     for slot in 0..NUM_GUESTS {
-        match render_guest_dtb(task, &dir, slot, initrd_size) {
+        match render_guest_dtb(task, &dir, slot, initrd_size, fault_probe) {
             Some(path) => dtbs.push(path),
             None => return false,
         }
@@ -328,7 +348,7 @@ fn qemu_linux(check: bool) -> bool {
     if !check {
         return run("qemu-system-aarch64", &argv);
     }
-    boot_and_check_linux(&argv)
+    boot_and_check_linux(&argv, fault_probe)
 }
 
 /// Render and compile guest `slot`'s device tree from `hv-metal/linux/guest.dts`, returning the
@@ -348,6 +368,7 @@ fn render_guest_dtb(
     dir: &std::path::Path,
     slot: u64,
     initrd_size: u64,
+    fault_probe: bool,
 ) -> Option<std::path::PathBuf> {
     let src = "hv-metal/linux/guest.dts";
     let dts = match std::fs::read_to_string(src) {
@@ -408,8 +429,46 @@ fn render_guest_dtb(
         rendered = rendered.replace(needle, replacement);
     }
 
-    let dts_out = dir.join(format!("guest-dom{dom}.dts"));
-    let dtb_out = dir.join(format!("guest-dom{dom}.dtb"));
+    // ── the fault probe (dom 1 only, probe run only) ────────────────────────────────────────────
+    //
+    // **A node, not a simulated call, and the precedent is ③-b2b-ii-d.** That rung made the guest's
+    // OWN driver core touch a peer address by describing an AMBA peripheral there; the kernel's bus
+    // scan reads the identification registers during boot, and the read is the test. The same trick
+    // makes a guest commit a fault EL2 has no rule for, so what is witnessed is a REAL guest-caused
+    // fault rather than EL2 invoking its own retire path.
+    //
+    // `FAULT_PROBE_ADDR` is outside EVERY window this build maps or emulates — the emulated GIC
+    // (0x0800_0000..0x0900_0000), the emulated PL011 (0x0900_0000 + 0x1000), both guests' RAM (from
+    // 0x4800_0000), and a Stage-2 device pass-through window that is a `const assert!`-ed ZERO. So
+    // the scan's read of base+0xFE0 lands in no window and takes the "outside every emulated device"
+    // path, which before this rung parked the machine.
+    //
+    // **Inserted here rather than living in `guest.dts`**, because a second `.dts` would be a second
+    // declaration of the twenty lines that must not differ — the defect ⑭ spent a rung removing —
+    // and because the node must exist for exactly one guest in exactly one run. Dom 2 gets no node,
+    // which is what lets the witness say "the PEER ran to completion".
+    if fault_probe && slot == 0 {
+        let anchor = "\n\tapb-pclk {";
+        if !rendered.contains(anchor) {
+            eprintln!(
+                "xtask {task}: {src} has no `apb-pclk` node to anchor the fault probe against — \
+                 the fault-probe boot would describe a machine with nothing to fault on, and would \
+                 pass by doing nothing."
+            );
+            return None;
+        }
+        let node = format!(
+            "\n\tfault-probe@{addr:x} {{\n\t\tcompatible = \"arm,pl011\", \"arm,primecell\";\n\t\t\
+             reg = <0x00 0x{addr:x} 0x00 0x1000>;\n\t\tclocks = <0x8000 0x8000>;\n\t\t\
+             clock-names = \"uartclk\", \"apb_pclk\";\n\t}};\n",
+            addr = FAULT_PROBE_ADDR
+        );
+        rendered = rendered.replacen(anchor, &format!("{node}{anchor}"), 1);
+    }
+
+    let suffix = if fault_probe { "-fault" } else { "" };
+    let dts_out = dir.join(format!("guest-dom{dom}{suffix}.dts"));
+    let dtb_out = dir.join(format!("guest-dom{dom}{suffix}.dtb"));
     if let Err(e) = std::fs::write(&dts_out, rendered) {
         eprintln!("xtask {task}: cannot write {}: {e}", dts_out.display());
         return None;
@@ -735,6 +794,38 @@ const LINUX_MARKERS: &[&str] = &[
     "baleen: lroverflow OK: a FULL list-register bank now DEFERS instead of halting",
 ];
 
+/// What the **fault-probe** boot must show, and it is the whole rung in five lines.
+///
+/// Dom 1's own driver core touches a node describing a peripheral at an address in no window, taking
+/// a Stage-2 abort EL2 has no rule for. Before this rung that parked the machine and dom 2 — which
+/// did nothing — died with it. Now dom 1 is retired and **dom 2 runs to completion and powers off**.
+///
+/// **Every one of these is load-bearing.** Without the `RETIRED` line the fault never happened and
+/// the probe is inert; without dom 2's `SYSTEM_OFF` the peer did not survive, which is the entire
+/// claim; and `retire dom 1: RETIRED FOR A FAULT` is what stops a killed domain being reported as a
+/// clean shutdown — the witness-that-lies this rung had to avoid.
+///
+/// ⚠ **`every real Linux guest has powered off` is deliberately ABSENT**, and its absence is checked
+/// by `LINUX_FAULT_FORBIDDEN`: a boot in which a domain was killed must not claim they all shut down.
+const LINUX_FAULT_MARKERS: &[&str] = &[
+    "baleen: guest FAULT: EC=0x24 data abort outside every emulated device",
+    "baleen: dom 1 RETIRED —",
+    "baleen: retire dom 1: RETIRED FOR A FAULT — it was stopped and the machine kept running",
+    "baleen: retire dom 2: powered off cleanly",
+    "baleen: dom 2 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
+];
+
+/// Strings the fault-probe boot must NOT show, on top of [`LINUX_FORBIDDEN`].
+///
+/// The summary line claims every guest powered off. One of them was KILLED, so a build that still
+/// printed it would be reporting a clean two-kernel shutdown for a boot where a kernel was retired —
+/// exactly the conflation `Retirement` exists to prevent, and the reason `end_of_boot` gates that
+/// line on every slot being `PoweredOff`.
+const LINUX_FAULT_FORBIDDEN: &[&str] = &[
+    "baleen: every real Linux guest has powered off",
+    "baleen: dom 1 issued PSCI SYSTEM_OFF",
+];
+
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
 ///
 /// `LINUX GUEST TRAP` is the sharp one: `handle_linux_sync` prints it for any lower-EL synchronous
@@ -809,7 +900,7 @@ const LINUX_WAIT_SECS_DEFAULT: u64 = 300;
 /// Boot the real-Linux config headlessly and assert its markers. Returns whether every required
 /// marker appeared and no forbidden one did; dumps the whole serial log on failure, since a boot
 /// failure is diagnosed from the log or not at all.
-fn boot_and_check_linux(argv: &[&str]) -> bool {
+fn boot_and_check_linux(argv: &[&str], fault_probe: bool) -> bool {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
@@ -884,7 +975,17 @@ fn boot_and_check_linux(argv: &[&str]) -> bool {
     }
 
     let mut failed = timed_out;
-    for m in LINUX_MARKERS {
+    // The fault-probe boot ends differently ON PURPOSE, so it gets its own corpus: dom 1 is retired
+    // mid-boot and never issues `SYSTEM_OFF`, so half of `LINUX_MARKERS` would be legitimately
+    // absent. `LINUX_FORBIDDEN` is SHARED and unweakened — `LINUX GUEST TRAP` now means "EL2 hit
+    // something fatal", which must not happen in either run, and the guest-fault diagnostics were
+    // renamed to `guest FAULT:` precisely so that canary keeps its meaning here.
+    let markers: &[&str] = if fault_probe {
+        LINUX_FAULT_MARKERS
+    } else {
+        LINUX_MARKERS
+    };
+    for m in markers {
         if serial.contains(m) {
             println!("qemu-linux-test: OK — found '{m}'");
         } else {
@@ -892,7 +993,12 @@ fn boot_and_check_linux(argv: &[&str]) -> bool {
             failed = true;
         }
     }
-    for m in LINUX_FORBIDDEN {
+    let forbidden = LINUX_FORBIDDEN.iter().chain(if fault_probe {
+        LINUX_FAULT_FORBIDDEN.iter()
+    } else {
+        [].iter()
+    });
+    for m in forbidden {
         if serial.contains(m) {
             println!("qemu-linux-test: FAIL — FORBIDDEN marker '{m}' appeared");
             failed = true;
@@ -1069,9 +1175,15 @@ fn doc_markers() -> bool {
     eprintln!("$ xtask doc-markers");
 
     // The gate corpus.
+    // ALL FOUR corpora, including the fault-probe run's. A marker outside this census is outside the
+    // drift check that is this task's whole purpose: a doc could quote it, `hv-metal` could reword
+    // it, and nothing would notice. The fault corpus is small and new, which is exactly when it is
+    // cheapest to include and easiest to forget.
     let mut gate: Vec<String> = LINUX_MARKERS
         .iter()
         .chain(LINUX_FORBIDDEN.iter())
+        .chain(LINUX_FAULT_MARKERS.iter())
+        .chain(LINUX_FAULT_FORBIDDEN.iter())
         .map(|m| collapse(m))
         .collect();
     let script = match std::fs::read_to_string(BOOT_TEST) {
