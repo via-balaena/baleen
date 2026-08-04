@@ -4077,3 +4077,176 @@ mod vgic_active_lr {
         assert_eq!(lr_vintid(lr), vintid);
     }
 }
+
+/// # ③-b1's three declared residues, turned from PROSE into THEOREMS
+///
+/// `hv_vdev::gicv3`'s module docs declare three things the emulated distributor deliberately does not
+/// do. **Each of the three needs a SECOND vCPU per guest to matter** — `IROUTER` can only route one
+/// way with one vCPU, one redistributor is the whole set, and the shipped kernel never reads
+/// pending/active. So closing them would add unexercised code to the guest's device surface, which is
+/// what design-lesson #71 and III-2's "deferred for want of a consumer" both warn against.
+///
+/// **What was worth doing instead: making the declarations machine-checked.** A prose residue drifts
+/// — someone half-implements pending state, the docs still say "reads as zero", and the boot cannot
+/// tell because the shipped guest never looks. As theorems they cannot: the model is now pinned to
+/// exactly the behaviour the ledger claims for it, and a half-implementation fails the gate rather
+/// than the reader.
+#[cfg(kani)]
+mod gic_declared_residues {
+    use hv_vdev::gicv3::{GicLayout, VirtGic, NUM_INTIDS};
+
+    const GICD_BASE: u64 = 0x0800_0000;
+    const GICD_LEN: u64 = 0x0001_0000;
+    const GICR_RD_BASE: u64 = 0x080A_0000;
+    const GICR_END: u64 = 0x0900_0000;
+
+    fn deployed() -> GicLayout {
+        GicLayout::new(GICD_BASE, GICD_LEN, GICR_RD_BASE, GICR_END)
+    }
+
+    // Offsets written out here rather than taken from `hv_vdev`, so the spec and the model stay two
+    // derivations (design-lesson #106).
+    const D_ISPENDR: u64 = 0x0200;
+    const D_ICPENDR: u64 = 0x0280;
+    const D_ISACTIVER: u64 = 0x0300;
+    const D_ICACTIVER: u64 = 0x0380;
+    const R_SGI_FRAME: u64 = 0x1_0000;
+    const GICR_TYPER: u64 = 0x0008;
+    const GICD_IROUTER: u64 = 0x6000;
+    const FIRST_SPI: u64 = 32;
+
+    /// **Residue 1a, pinned: an SPI's pending/active word is write-accepted and reads ZERO** —
+    /// ∀ word, ∀ value.
+    ///
+    /// The write runs first and its value is symbolic, so this is not "zero because nothing was
+    /// stored": the model *accepts* the write and still answers zero, which is the declared
+    /// behaviour. A half-implementation that started remembering a pending bit fails here instead of
+    /// silently making the docs wrong.
+    #[kani::proof]
+    fn spi_pending_and_active_are_accepted_and_read_zero() {
+        let mut g = VirtGic::new(deployed());
+
+        let bank: u64 = kani::any();
+        kani::assume(
+            bank == D_ISPENDR || bank == D_ICPENDR || bank == D_ISACTIVER || bank == D_ICACTIVER,
+        );
+        let word: u64 = kani::any();
+        // Word 0 is INTIDs 0..31 — banked in the REDISTRIBUTOR, and a different case entirely; see
+        // the harness below, which is where that fact got pinned down.
+        kani::assume(word >= 1 && word < (NUM_INTIDS as u64).div_ceil(32));
+        let value: u64 = kani::any();
+
+        let off = bank + 4 * word;
+        let _ = g.mmio_write(GICD_BASE + off, 4, value);
+        assert_eq!(
+            g.mmio_read(GICD_BASE + off, 4).ok(),
+            Some(0),
+            "an SPI pending/active word must read zero however it was written"
+        );
+    }
+
+    /// **Residue 1b: word 0 of those banks is REFUSED, not zero — and the prose used to say
+    /// otherwise.**
+    ///
+    /// ⚠ **This is what the rung actually found.** `hv_vdev::gicv3`'s residue read *"pending/active
+    /// state is write-accepted and reads as zero"*, flatly. It is not: INTIDs 0..31 are banked in the
+    /// redistributor and excluded from the distributor's decode (`ARE_NS` makes the distributor's
+    /// copies RES0 — the property #108 had to repair), so word 0 falls through to `Unhandled`.
+    ///
+    /// **And a refusal is no longer inert.** Since #129 an unmodelled register RETIRES the guest, so
+    /// a guest reading `GICD_ISPENDR0` — architecturally a RES0 read that should return zero — is
+    /// stopped. The shipped kernel never does it, which is why it went unnoticed for three arcs.
+    ///
+    /// **Recorded, not changed.** Making word 0 read zero would be architecturally right and would
+    /// remove a guest-triggerable retirement, but it changes the guest's device surface and deserves
+    /// its own decision rather than riding along in a rung about pinning declarations.
+    #[kani::proof]
+    fn distributor_pending_and_active_are_refused_for_redistributor_banked_intids() {
+        let mut g = VirtGic::new(deployed());
+
+        let bank: u64 = kani::any();
+        kani::assume(
+            bank == D_ISPENDR || bank == D_ICPENDR || bank == D_ISACTIVER || bank == D_ICACTIVER,
+        );
+        let value: u64 = kani::any();
+
+        let _ = g.mmio_write(GICD_BASE + bank, 4, value);
+        assert_eq!(
+            g.mmio_read(GICD_BASE + bank, 4).ok(),
+            None,
+            "the distributor's copy of INTIDs 0..31 is redistributor-banked and refused"
+        );
+    }
+
+    /// **Residue 2, pinned: there is exactly ONE redistributor and it says so.**
+    ///
+    /// `GICR_TYPER.Last` (bit 4) is what tells a probing kernel to stop walking the redistributor
+    /// list. Asserted over an arbitrary prior write so it is a property of the model, not of a fresh
+    /// reset — a second frame could not be announced without this failing.
+    #[kani::proof]
+    fn exactly_one_redistributor_and_it_reports_last() {
+        let mut g = VirtGic::new(deployed());
+        let (ipa, size, value): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+        let _ = g.mmio_write(ipa, size, value);
+
+        let typer = g.mmio_read(GICR_RD_BASE + GICR_TYPER, 4).ok();
+        assert_eq!(
+            typer,
+            Some(1 << 4),
+            "the sole redistributor must report Last"
+        );
+    }
+
+    /// **Residue 3, pinned: `IROUTER` is RECORDED and HONOURED BY NOTHING.**
+    ///
+    /// Two halves, and the second is the one prose could not hold still. *Recorded*: the value reads
+    /// back. *Not honoured*: writing any routing, for any SPI, changes **no INTID's enable** — the
+    /// only guest-observable thing routing could plausibly disturb. With one vCPU that is the correct
+    /// behaviour; the theorem is what stops it drifting into a partial implementation that routes
+    /// some interrupts and not others.
+    #[kani::proof]
+    fn irouter_is_recorded_and_honoured_by_nothing() {
+        let mut g = VirtGic::new(deployed());
+
+        let probe: u32 = kani::any();
+        kani::assume((probe as usize) < NUM_INTIDS);
+        let before = g.is_enabled(probe);
+
+        let spi: u64 = kani::any();
+        kani::assume(spi >= FIRST_SPI && spi < NUM_INTIDS as u64);
+        let route: u64 = kani::any();
+
+        let off = GICD_IROUTER + 8 * spi;
+        let _ = g.mmio_write(GICD_BASE + off, 8, route);
+
+        assert_eq!(
+            g.mmio_read(GICD_BASE + off, 8).ok(),
+            Some(route),
+            "IROUTER must be recorded"
+        );
+        assert_eq!(
+            g.is_enabled(probe),
+            before,
+            "routing must change no INTID's enable — it is recorded, not honoured"
+        );
+    }
+
+    /// The redistributor's own pending/active copies, same declaration, same pinning.
+    #[kani::proof]
+    fn redistributor_pending_and_active_read_zero() {
+        let mut g = VirtGic::new(deployed());
+        let bank: u64 = kani::any();
+        kani::assume(
+            bank == D_ISPENDR || bank == D_ICPENDR || bank == D_ISACTIVER || bank == D_ICACTIVER,
+        );
+        let value: u64 = kani::any();
+
+        let off = GICR_RD_BASE + R_SGI_FRAME + bank;
+        let _ = g.mmio_write(off, 4, value);
+        assert_eq!(
+            g.mmio_read(off, 4).ok(),
+            Some(0),
+            "SGI-frame pending/active must read zero"
+        );
+    }
+}

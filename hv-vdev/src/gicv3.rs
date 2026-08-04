@@ -56,13 +56,35 @@
 //!
 //! ## Declared residue — read before extending
 //!
-//! * **Pending/active state is write-accepted and reads as zero.** The trace shows the kernel never
-//!   reads `ISPENDR`/`ISACTIVER` on this path, so modelling them would be untested code on a live
-//!   path (design-lesson #71's shape). A guest that polls them gets zeros, which is wrong; it is
-//!   declared here rather than half-built.
+//! **All three are now PINNED BY KANI** (`hv-verify`'s `gic_declared_residues`), because a prose
+//! residue drifts: someone half-implements pending state, the docs still say "reads as zero", and no
+//! boot can tell because the shipped guest never looks. As theorems they cannot drift.
+//!
+//! * **Pending/active state is write-accepted and reads as zero — FOR SPIs.** The trace shows the
+//!   kernel never reads `ISPENDR`/`ISACTIVER` on this path, so modelling them would be untested code
+//!   on a live path (design-lesson #71's shape). A guest that polls them gets zeros, which is wrong;
+//!   it is declared here rather than half-built.
+//!
+//!   ⚠ **This used to say "reads as zero" flatly, and that was WRONG — the proof found it.** Word 0
+//!   of those distributor banks is INTIDs 0..31, which are banked in the REDISTRIBUTOR and excluded
+//!   from the distributor's decode (`ARE_NS` makes the distributor's copies RES0 — see the bank-
+//!   overlap note below). So word 0 is **refused**, not zeroed. **And a refusal is no longer inert:**
+//!   since the retire rung an unmodelled register stops the guest, so a guest reading `GICD_ISPENDR0`
+//!   — architecturally a RES0 read that should return zero — is retired. The redistributor's own
+//!   copies, where 0..31 legitimately live, do read zero.
+//!
+//!   **Recorded, not changed.** Making word 0 read zero would be architecturally right and would
+//!   remove a guest-triggerable retirement; it also changes the guest's device surface, so it is a
+//!   decision of its own rather than a detail of pinning a declaration.
 //! * **One redistributor, `Last` set.** Single-vCPU guest. A second vCPU needs a second frame and
 //!   the affinity routing that `IROUTER` currently records and does not act on.
 //! * **`IROUTER` is recorded, not honoured** — with one vCPU every SPI can only land in one place.
+//!   Pinned as both halves: the value reads back, and writing any routing for any SPI changes no
+//!   INTID's enable.
+//!
+//! **Why none of the three is CLOSED here:** each needs a second vCPU per guest to matter at all, so
+//! implementing them would add unexercised code to the guest's device surface — the thing
+//! design-lesson #71 and III-2's "deferred for want of a consumer" both warn against.
 
 /// The guest's INTID space: 288 = `(ITLinesNumber + 1) * 32` with `ITLinesNumber = 8`, i.e. SGIs and
 /// PPIs 0..31 plus SPIs 32..287.
