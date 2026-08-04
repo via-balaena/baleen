@@ -1276,7 +1276,11 @@ mod stage2_device_region {
     /// entries and disjoint in both IPA and PA. This proves `validate`'s pairwise loop leaves no pair
     /// unchecked — the exact regression `regions()` replaced three open-coded pairs to prevent (M5
     /// Arc 6b) — for an arbitrary pair `(i, j)`, not just the four the metal happens to build.
+    /// Solver pinned — MEASURED **3.20 → 1.09 GiB, 23 s → 15 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     #[kani::unwind(5)]
     fn validate_ok_implies_regions_pairwise_disjoint() {
         let l = symbolic_layout();
@@ -1491,7 +1495,11 @@ mod smmu_stream_table {
     /// every StreamID again — including the one that was bound. This is what makes the metal's
     /// bypass→deny transition a *restoration* of the default rather than a different state that
     /// merely happens to abort.
+    /// Solver pinned — MEASURED **5.20 → 3.13 GiB, 17 s → 10 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn unbind_restores_deny_for_every_streamid() {
         let mut words = [0u64; WORDS];
         let log2 = any_log2();
@@ -1838,7 +1846,11 @@ mod smmu_stream_binding {
     /// **A bound stream names exactly the domain it was given, ∀ table and ∀ VMID.** Every field
     /// round-trips through the independent decode seam — so no table base is truncated into a
     /// different table and no VMID is narrowed into another domain's.
+    /// Solver pinned — MEASURED **4.00 → 1.88 GiB, 20 s →  6 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn a_bound_stream_names_exactly_the_domain_it_was_given() {
         let mut words = [0u64; WORDS];
         let log2 = any_log2();
@@ -1857,7 +1869,11 @@ mod smmu_stream_binding {
     /// **Binding a stream to a domain leaves every other stream denied, ∀ other StreamID.** The
     /// rung-2 property survives translation: giving one device access to one domain's memory gives no
     /// other device access to anything.
+    /// Solver pinned — MEASURED **3.40 → 1.90 GiB, 10 s →  6 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn binding_a_stream_to_a_domain_leaves_every_other_denied() {
         let mut words = [0u64; WORDS];
         let log2 = any_log2();
@@ -1878,7 +1894,11 @@ mod smmu_stream_binding {
     /// from one domain's tables to another's inside a single boot; a rebind that left any field of
     /// the previous binding behind would leave the device walking a mixture — the old table under the
     /// new VMID, say, which is a table nobody authorized.
+    /// Solver pinned — MEASURED **7.57 → 3.03 GiB, 25 s → 13 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn rebinding_a_stream_leaves_no_trace_of_the_previous_domain() {
         let mut words = [0u64; WORDS];
         let log2 = any_log2();
@@ -1894,7 +1914,11 @@ mod smmu_stream_binding {
 
     /// **`unbind` is still a true inverse, ∀ StreamID.** A domain binding is torn down to the same
     /// fail-closed default a bypass binding is — the state the whole table starts in.
+    /// Solver pinned — MEASURED **6.70 → 3.24 GiB, 28 s → 13 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn unbinding_a_domain_binding_restores_the_deny() {
         let mut words = [0u64; WORDS];
         let log2 = any_log2();
@@ -1916,7 +1940,11 @@ mod smmu_stream_binding {
     /// name a *smaller* permission — it names a **different domain's table**. So an address the field
     /// cannot carry exactly, or a VMID the CPU regime cannot express, must leave the entry denying
     /// rather than approximate it.
+    /// Solver pinned — MEASURED **3.95 → 1.89 GiB, 16 s →  6 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn a_binding_that_cannot_be_named_exactly_is_refused_and_writes_nothing() {
         let mut words = [0u64; WORDS];
         let log2 = any_log2();
@@ -2458,36 +2486,55 @@ mod smmu_stream_derivation {
     /// with no Stage-2 tables — so this is also the totality statement: every input reaches one of
     /// the two arms.
     ///
-    /// ## Why this harness names a solver — MEASURED, and it is the memory that matters
+    /// ## Why ten harnesses name a solver — THE FULL SWEEP, and this is its record
     ///
-    /// This is the **memory-heaviest harness in the suite**, and the `kani proofs (PR)` job has twice
-    /// been killed by the runner mid-run — `The runner has received a shutdown signal`, no failing
-    /// proof, an orphaned `cbmc` reaped — while checking one of the two harnesses in this module.
-    /// Peak concurrent `cbmc` RSS across the suite measures **~10.5 GiB on a 16 GB runner** shared
-    /// with the OS, the agent and rustc; Kani's `-j` dispatch order is nondeterministic, which is why
-    /// it kills intermittently rather than always.
+    /// The `kani proofs (PR)` job has been killed by the runner mid-run — `The runner has received a
+    /// shutdown signal`, **no failing proof**, an orphaned `cbmc` reaped. Peak concurrent `cbmc` RSS
+    /// across the suite measured **~10.5 GiB on a 16 GB runner** shared with the OS, the agent and
+    /// rustc, and Kani's `-j` dispatch order is nondeterministic — which is why it killed
+    /// intermittently rather than always.
     ///
-    /// | solver | peak RSS | wall |
+    /// **All 93 harnesses were then measured individually** (peak RSS, 0.25 s sampling). The result
+    /// reordered the problem: 20 of 93 exceed 1 GiB, and the worst PAIR summed to **14.28 GiB** — so
+    /// any two heavies coinciding could exhaust the runner on its own.
+    ///
+    /// ### CaDiCaL (Kani's default) → minisat, measured per harness
+    ///
+    /// | harness | default | minisat |
     /// |---|---|---|
-    /// | CaDiCaL (Kani's default) | **8.6 GiB** | 41 s |
-    /// | kissat | 2.6 GiB | 371 s |
-    /// | **minisat** | **3.4 GiB** | **22 s** |
+    /// | `smmu_stream_binding::rebinding_a_stream…` | 7.57 GiB / 25 s | **3.03 GiB / 13 s** |
+    /// | `smmu_stream_derivation::the_refinement_check…` | 6.71 GiB / 63 s | **2.10 GiB / 21 s** |
+    /// | `smmu_stream_binding::unbinding_a_domain…` | 6.70 GiB / 28 s | **3.24 GiB / 13 s** |
+    /// | `smmu_stream_table::unbind_restores_deny…` | 5.20 GiB / 17 s | **3.13 GiB / 10 s** |
+    /// | *this harness* | 8.6 GiB / 41 s | **3.47 GiB / 22 s** |
+    /// | `…a_map_that_aliases_two_devices…` | 6.4 GiB / — | **3.36 GiB / 15 s** |
+    /// | three more `smmu_stream_binding` | 3.4–4.0 GiB | **~1.9 GiB / 6 s** |
+    /// | `stage2_device_region::…pairwise_disjoint` | 3.20 GiB / 23 s | **1.09 GiB / 15 s** |
     ///
-    /// **−61% memory and roughly twice as fast, and nothing about the THEOREM changes** — same
-    /// harness, same symbolic world, a different SAT backend. That last point is why this is the
-    /// lever to reach for: the obvious memory saving would be narrowing the symbolic `u32` StreamIDs,
-    /// and the module doc above says the StreamID axis being symbolic *is* the property. Trading
-    /// proof strength for gate reliability is not a trade to make quietly.
+    /// **Suite effect, n=2 each side:** peak **10.5 → 8.1–8.25 GiB**, wall **8:21 → 4:29–4:54**.
     ///
-    /// ⚠ **This does NOT close the OOM problem, and the pin must not be read as having done so.**
-    /// Pinning it moved the SUITE peak only 10.5 → ~9.7 GiB, so the peak is a combination not yet
-    /// identified. (`-j 2` was measured too and is REFUTED as a lever: 9.9 GiB, and *slower*.)
+    /// ### ⚠ minisat is NOT universally better — the exception is the point
     ///
-    /// ⚠ **And do not quote a suite-WALL improvement for this pin.** The first run with it measured
-    /// 5:58 against 8:21 without, which looked like −29% — and a second run with it measured
-    /// **7:52**. Suite wall is dominated by `-j` dispatch-order variance, so n=1 either side proves
-    /// nothing. **The per-HARNESS numbers in the table above are the trustworthy ones**: they are the
-    /// same harness measured twice under two solvers, not two runs of a 93-harness makespan.
+    /// `foreign_link_state_machine`'s two harnesses are the opposite: `real_revoke…` measured
+    /// **6.07 GiB / 166 s under CaDiCaL and 5.33 GiB / 178 s under minisat** (a marginal memory win
+    /// and *slower*), and `real_link…` was **still running after 13 minutes** under minisat against
+    /// 122 s by default. **They are deliberately left on CaDiCaL**, and they are now the suite's two
+    /// heaviest — 6.07 + 4.50 GiB, i.e. ~10.6 GiB if they coincide.
+    ///
+    /// So the memory ceiling is **reduced, not removed**, and the remaining lever for that pair is
+    /// the recorded one: their harness WORLD SIZE. That is a proof-strength trade and is not made
+    /// here. Nor is the other tempting saving — narrowing the symbolic `u32` StreamIDs — because this
+    /// module's docs say the StreamID axis being symbolic *is* the property.
+    ///
+    /// ### What was refuted along the way, so it is not re-tried
+    ///
+    /// * **`-j 2` is not a lever**: 9.9 GiB against `-j 4`'s 10.5 (5%), and *slower*. The peak is a
+    ///   few large harnesses, not concurrency.
+    /// * **A single-harness sample is not a ranking.** An earlier pass measured three harnesses,
+    ///   concluded `foreign_link` was not a memory problem, and was wrong on both counts — the real
+    ///   #1 (`rebinding_a_stream…`, 7.57 GiB) had never been measured, and `foreign_link`'s heavier
+    ///   sibling had not either. The full sweep is why this table can be trusted and that one could
+    ///   not.
     #[kani::proof]
     #[kani::solver(minisat)]
     fn a_refused_derivation_leaves_the_table_denying_every_stream() {
@@ -2579,7 +2626,11 @@ mod smmu_stream_derivation {
     /// has to be worth asserting: green whenever the derivation succeeded, and red for ∀ StreamID
     /// the relation does not authorize the moment that stream is permitted. Without the second half
     /// it would be a check that cannot fail, which reads as evidence when it is none (#71).
+    /// Solver pinned — MEASURED **6.71 → 2.10 GiB, 63 s → 21 s** (CaDiCaL → minisat). See
+    /// `smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream`
+    /// for the full sweep and why the SOLVER, not the world size, is the lever here.
     #[kani::proof]
+    #[kani::solver(minisat)]
     fn the_refinement_check_is_the_property_and_can_fail() {
         let mut words = [0u64; WORDS];
         let log2 = MAX_HARNESS_LOG2;
