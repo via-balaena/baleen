@@ -69,6 +69,17 @@ pub(crate) struct PendingSet {
     words: [AtomicU64; PENDING_WORDS],
 }
 
+/// **A pending set belongs to ONE vCPU.** III-1 established this on the synthetic path — its own
+/// reasoning is that a shared set "would reopen the cross-vCPU leak 8b/III-3 closed" — and until
+/// ⑱-3a the real-Linux path's `LINUX_PENDING` was per-GUEST, which at one vCPU per guest is the same
+/// arrangement by coincidence. Declaring only [`PerVcpuState`] makes that coincidence a build error.
+///
+/// `cfg`-gated because `crate::role` is: the synthetic path indexes its own `VCPU_PENDING` array
+/// directly and has no `PerVcpu`, so there is no container for this claim to constrain there. ⑭'s
+/// rule — say which configuration an item belongs to, rather than `allow(dead_code)` over it.
+#[cfg(feature = "real-linux")]
+impl crate::role::PerVcpuState for PendingSet {}
+
 impl PendingSet {
     /// An empty set.
     ///

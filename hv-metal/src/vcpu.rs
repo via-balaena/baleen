@@ -331,6 +331,9 @@ pub(crate) struct VcpuCtx {
     fp: crate::fp::FpCtx,
 }
 
+/// The register state one vCPU owns — per-vCPU by definition, and the reason `PerVcpu` exists.
+impl crate::role::PerVcpuState for VcpuCtx {}
+
 impl VcpuCtx {
     /// An empty context.
     pub(crate) const fn new() -> Self {

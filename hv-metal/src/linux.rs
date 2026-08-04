@@ -242,7 +242,7 @@ use crate::console::GuestConsole;
 use crate::ctx::CtxComponent;
 use crate::gic;
 use crate::pl011::Pl011;
-use crate::role::{Incoming, Outgoing, PerGuest};
+use crate::role::{Incoming, Outgoing, PerGuest, PerVcpu, Running, BOOT_VCPU, VCPUS_PER_GUEST};
 use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
 use crate::vcpu;
 use crate::vgic::{self, DeployedGic};
@@ -328,11 +328,27 @@ const PCPU0: u32 = 0;
 /// Plain atomic, not a [`BootCell`]: written from EL2 exception handlers, which is `crate::cell`'s
 /// class-3 hazard. An atomic has no borrow to overlap — the same reasoning [`TIMER_FORWARDED`] and
 /// `guest.rs`'s `VCPU_PENDING` record.
-static CURRENT: AtomicUsize = AtomicUsize::new(SLOT_A);
+///
+/// ⑱-3a: this now holds a **(guest, vCPU) pair**, packed by [`Running::pack`]. The packing lives in
+/// `crate::role` because a second encoding of "who is running" is the defect ⑭ spent a rung removing,
+/// and because keeping it there is what stops this file rebuilding a role out of arithmetic.
+static CURRENT: AtomicUsize = AtomicUsize::new(Running::at_boot(SLOT_A).pack());
 
-/// The guest slot currently executing at EL1.
+/// The vCPU currently executing at EL1.
+fn current_vcpu() -> Running {
+    Running::unpack(CURRENT.load(Ordering::Relaxed))
+}
+
+/// The **guest** currently executing at EL1 — the projection the report and handler code wants,
+/// where there is one subject and no role to confuse.
+///
+/// ⚠ **Kept as its own function precisely because the projection must be explicit.** With
+/// `VCPUS_PER_GUEST == 1` the packing is the identity, so `CURRENT.load()` would still return the
+/// right slot by arithmetic coincidence — and would silently stop doing so at ⑱-3b. That is the
+/// shape of defect this whole arc is spent on; it is not worth reproducing in the one line that
+/// would be cheapest to get wrong.
 fn current_slot() -> usize {
-    CURRENT.load(Ordering::Relaxed)
+    current_vcpu().guest()
 }
 
 // ─── the memory contract ─────────────────────────────────────────────────────────────────────────
@@ -836,19 +852,8 @@ const fn guest_mpidr(vcpu: usize) -> u64 {
     MPIDR_RES1 | (vcpu as u64)
 }
 
-/// The vCPU every guest currently has, and the only one that runs. ⑱-3 replaces this constant at the
-/// two call sites with the incoming vCPU's index; the seam is named here so that change is an
-/// argument rather than a search.
-const BOOT_VCPU: usize = 0;
-
-// ⑱-2: this index and `vgic::VCPUS_PER_GUEST` are two statements about the same thing — how many
-// vCPUs a guest has. A boot vCPU the emulated GIC has no redistributor for would read `is_enabled`
-// as false for every banked INTID (fail-closed, so the timer would simply never be forwarded) and
-// nothing would say why.
-const _: () = assert!(
-    BOOT_VCPU < crate::vgic::VCPUS_PER_GUEST,
-    "the boot vCPU must be one the emulated GIC presents a redistributor for"
-);
+// ⑱-3a: `BOOT_VCPU` and `VCPUS_PER_GUEST` moved to `crate::role`, which owns the vCPU axis and so
+// should own its count. Every use below is imported from there; the pairing assert moved with them.
 
 // `guest.dts` gives `cpu@0` `reg = <0x00>`, and arm64 Linux matches its boot CPU by comparing
 // `MPIDR_EL1 & MPIDR_HWID_BITMASK` against that. Two derivations of one fact (⑭'s defect), pinned:
@@ -1203,8 +1208,16 @@ static TICK_DEFER_PROBED: core::sync::atomic::AtomicBool =
 /// A **set**, not a queue, for III-1's reason: a queue's "full" is the old halt relocated, while a set
 /// over every INTID the distributor can name has no full state at all. See [`crate::pending`], which
 /// is the one type both switches now share.
-static LINUX_PENDING: PerGuest<crate::pending::PendingSet, NUM_GUESTS> =
-    PerGuest::new([const { crate::pending::PendingSet::new() }; NUM_GUESTS]);
+///
+/// **⑱-3a: one per vCPU, not per guest** — and III-1 is the reason for that too. Its own docs say a
+/// shared set "would reopen the cross-vCPU leak 8b/III-3 closed"; the synthetic path has been
+/// per-vCPU since, while this one was per-guest, which at one vCPU per guest is the same arrangement
+/// by coincidence. At two it would let one vCPU drain its sibling's SGIs into its own list
+/// registers. `PendingSet` declares only `PerVcpuState`, so the coincidence cannot come back.
+static LINUX_PENDING: PerVcpu<crate::pending::PendingSet, NUM_GUESTS, VCPUS_PER_GUEST> =
+    PerVcpu::new(
+        [const { [const { crate::pending::PendingSet::new() }; VCPUS_PER_GUEST] }; NUM_GUESTS],
+    );
 
 /// vINTs that found no free list register and were recorded in the pending set instead.
 static SGIS_DEFERRED: PerGuest<AtomicU64, NUM_GUESTS> =
@@ -1600,7 +1613,7 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         MAINT_TAKEN.at(slot).fetch_add(1, Ordering::Relaxed);
         // Drain FIRST: the interrupt is level-based on `UIE` + bank occupancy, and the drain is what
         // clears `UIE` when nothing is left. Deactivating before that could re-assert immediately.
-        let _ = flush_pending_to_lrs(LINUX_PENDING.at(slot), SGIS_DRAINED.at(slot));
+        let _ = flush_pending_to_lrs(LINUX_PENDING.at(slot, BOOT_VCPU), SGIS_DRAINED.at(slot));
         gic::eoi_physical(intid);
         gic::deactivate_physical(intid);
         return;
@@ -1765,12 +1778,14 @@ fn note_el2_entry() {
 /// **Borrowed from the IRQ handler only.** Exception entry to EL2 sets `PSTATE.I`, so no EL2 code can
 /// be interrupted while holding this — the class-3 re-entrancy hazard `crate::cell` documents needs
 /// a handler that runs with interrupts unmasked, and neither Linux-path handler does.
-/// **One per guest since ③-b2b-ii-a**, because a context is what a switch *between* guests moves:
-/// with one slot, a switch-to-self resumes the same registers it saved, and the array is what makes
-/// "resume the OTHER guest" expressible at all.
-static VCPU_CTX: BootCell<PerGuest<vcpu::VcpuCtx, NUM_GUESTS>> = BootCell::new(
+/// **One per guest since ③-b2b-ii-a, and one per vCPU since ⑱-3a**, because a context is what a
+/// switch moves: with one slot, a switch-to-self resumes the same registers it saved, and the array
+/// is what makes "resume the OTHER one" expressible at all. The vCPU axis is not a generalisation
+/// for its own sake — `VcpuCtx` declares only `PerVcpuState`, so putting it back on a single axis
+/// does not compile.
+static VCPU_CTX: BootCell<PerVcpu<vcpu::VcpuCtx, NUM_GUESTS, VCPUS_PER_GUEST>> = BootCell::new(
     "LINUX_VCPU_CTX",
-    PerGuest::new([VCPU_CTX_EMPTY; NUM_GUESTS]),
+    PerVcpu::new([const { [VCPU_CTX_EMPTY; VCPUS_PER_GUEST] }; NUM_GUESTS]),
 );
 
 /// An empty context. Named because an array repeat expression needs a constant operand.
@@ -1956,7 +1971,11 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     sched_on(hv, slot_dom(next), scheduler_run(now), "run the next vcpu");
     drop(cell);
 
-    switch_context(Outgoing::slot(slot), Incoming::slot(next), frame);
+    switch_context(
+        Outgoing::at(slot, BOOT_VCPU),
+        Incoming::at(next, BOOT_VCPU),
+        frame,
+    );
 }
 
 /// Which guest's half of the RAM window contains `ipa`, if any (③-b2b-ii-d).
@@ -2181,7 +2200,11 @@ fn retire_and_hand_over(
         "run the surviving vcpu",
     );
     drop(cell);
-    switch_context(Outgoing::slot(cur), Incoming::slot(next), frame);
+    switch_context(
+        Outgoing::at(cur, BOOT_VCPU),
+        Incoming::at(next, BOOT_VCPU),
+        frame,
+    );
     true
 }
 
@@ -2496,7 +2519,7 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     // 7. The pCPU now belongs to `next`, so every handler that asks "which guest?" must get the new
     //    answer from here on. Stored LAST: everything above still had to speak about `cur`.
     // The incoming guest becomes the running one — the ONE sanctioned role transition.
-    CURRENT.store(next.now_running().index(), Ordering::Relaxed);
+    CURRENT.store(next.now_running().pack(), Ordering::Relaxed);
     SWITCHES.inc(next).fetch_add(1, Ordering::Relaxed);
 
     // 8. ③-b2b-ii-e — the incoming guest gets a FULL slice, whichever of the three handovers got us
@@ -2937,7 +2960,11 @@ fn handle_linux_wfi(frame: &mut LinuxFrame) {
     );
     drop(cell);
     WFI_YIELDS[cur].fetch_add(1, Ordering::Relaxed);
-    switch_context(Outgoing::slot(cur), Incoming::slot(peer), frame);
+    switch_context(
+        Outgoing::at(cur, BOOT_VCPU),
+        Incoming::at(peer, BOOT_VCPU),
+        frame,
+    );
 }
 
 /// The `ICC_SGI1R_EL1` system-register encoding as it appears in an `EC=0x18` ISS: `Op0=3, Op1=0,
@@ -2975,7 +3002,7 @@ fn handle_linux_sysreg_trap(
         //   unwritable rather than merely unwritten.
         let slot = current_slot();
         deliver_or_defer_sgi(
-            LINUX_PENDING.at(slot),
+            LINUX_PENDING.at(slot, BOOT_VCPU),
             SGIS_DELIVERED.at(slot),
             SGIS_DEFERRED.at(slot),
             intid,
@@ -4012,7 +4039,7 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     {
         let mut ctx = VCPU_CTX.borrow_mut();
         for slot in (0..NUM_GUESTS).filter(|&s| s != SLOT_A) {
-            ctx.at_mut(slot).seed_boot(
+            ctx.at_mut(slot, BOOT_VCPU).seed_boot(
                 kernel_entry(slot),
                 dtb_addr(slot),
                 SPSR_EL2_LINUX,
