@@ -53,11 +53,19 @@
 //! They were cheap to reach, too. Six of the seven were a **single instruction**: `ISV=0` is simply
 //! what a load/store PAIR produces, so `stp x0, x1, [gic_base]` halted the hypervisor.
 //!
-//! `crate::park()` still exists here, and now means one thing only: **EL2 itself is in a state it
-//! cannot describe** (the model refused a transition, a `BootCell` was already borrowed). Those are
-//! not guest-reachable. The diagnostics for guest faults are prefixed `guest FAULT:` rather than
-//! `LINUX GUEST TRAP:` so that the latter keeps that narrower meaning — and stays forbidden by the
-//! boot gate in *both* of its runs.
+//! `crate::park()` still exists here, and now means **EL2 itself is in a state it cannot describe**
+//! (the model refused a transition, a `BootCell` was already borrowed). The diagnostics for guest
+//! faults are prefixed `guest FAULT:` rather than `LINUX GUEST TRAP:` so that the latter keeps that
+//! narrower meaning — and stays forbidden by the boot gate in *both* of its runs.
+//!
+//! ⚠ **ONE GUEST-REACHABLE HALT REMAINS, and it is declared rather than implied.** The sweep that
+//! drove this work reported eight sites; there are **nine**. [`handle_peer_fault`] parks when a guest
+//! exceeds `MAX_PEER_FAULTS`, and a guest reaches that with a two-instruction loop — fault on a peer
+//! address, be skipped, resume, repeat. The cap was written as a runaway backstop for a *probing*
+//! guest and is a denial of service in the hands of a looping one. Its fix is the one this file
+//! already has — retire the domain, do not halt the machine — but [`handle_peer_fault`] has no
+//! `LinuxFrame` to switch away on, so it is a rung rather than a patch. **Until it lands, the
+//! sentence "no `park()` here is guest-reachable" is FALSE; do not write it.**
 //!
 //! ## ③-a2: the guest's interrupts stop being its own
 //!
@@ -1007,6 +1015,30 @@ static TIMER_FORWARDED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; 
 /// atomic rather than a [`BootCell`], and per guest for the same reason.
 static SGIS_DELIVERED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
+/// Forwarded timer interrupts EL2 could not place, because the guest's list-register bank was full.
+///
+/// **The last guest-reachable halt on this path, and it was reachable by four instructions.** A guest
+/// that fills its four list registers with SGIs it never takes (mask interrupts, four
+/// `ICC_SGI1R_EL1` writes) makes the next timer forward fail — and that used to `crate::park()`,
+/// taking the peer domain down with it. Measured before the fix: `sgis_placed=4
+/// timer_forward_refused=true`.
+///
+/// **Deferral, not retirement** (unlike the seven sites `fault_retire` handles): a guest that fills
+/// its own bank has done nothing EL2 has no rule for. It is only harming itself — it is the one that
+/// goes without a tick — and EL2's own `CNTHP` slice is untouched, so the peer keeps running either
+/// way.
+static TIMER_DEFERRED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+
+/// The vINTID the tick-deferral probe's Active filler entries carry. Never presented (Active, not
+/// Pending), so the value only has to be distinctive in a register dump.
+#[cfg(feature = "selftest")]
+const TICK_PROBE_FILL_INTID: u32 = 200;
+
+/// One-shot latch for the tick-deferral probe, so it perturbs exactly one timer interrupt.
+#[cfg(feature = "selftest")]
+static TICK_DEFER_PROBED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Per-guest **software pending set** — the real-Linux path's answer to a full list-register bank.
 ///
 /// ## ★ What this closes, and it is an ISOLATION defect rather than a robustness one
@@ -1322,17 +1354,66 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
             gic::deactivate_physical(intid);
             return;
         }
+        // **The discriminating probe, once per boot.** The shipped guest takes all 59 of its SGIs,
+        // so its bank never fills and `TIMER_DEFERRED` would read ZERO on a good boot — a counter
+        // that proves nothing, which is the "WFI traps > 0" mistake this project already made once.
+        // So the condition is MANUFACTURED: fill the bank right before the forward and let the REAL
+        // deferral path run.
+        //
+        // **Filled with ACTIVE list registers, and the first attempt at this HUNG THE GUEST.** The
+        // obvious fill is a few SGIs the guest has enabled — and on arm64 Linux **SGI 2 is
+        // `IPI_CPU_STOP`**, so the probe told the kernel to halt itself and the boot died just after
+        // reaching userspace. An Active entry occupies the slot (`lr_is_free` refuses it, so the
+        // injector skips it) while never being PRESENTED, because only a *Pending* entry is offered
+        // to the guest's CPU interface. The guest is therefore handed nothing at all.
+        //
+        // ⚠ **The fill MUST be undone before returning, and assuming otherwise cost a hung boot.**
+        // The first version left the entries in place, reasoning that the next switch poisons the
+        // bank and restores the incoming vCPU's own. True, and irrelevant — the switch **SAVES
+        // first**: `ctx[cur].save()` captured the filler entries into that vCPU's context, so they
+        // were faithfully restored on its every switch-in from then on. Its bank was permanently
+        // full, it never got another tick, and dom 2 stalled while dom 1 powered off normally. The
+        // bank is therefore snapshotted here and put back below.
+        #[cfg(feature = "selftest")]
+        let mut probe_fill: Option<[u64; gic::MAX_LIST_REGISTERS]> = None;
+        #[cfg(feature = "selftest")]
+        if !TICK_DEFER_PROBED.swap(true, Ordering::Relaxed) {
+            let mut saved = [0u64; gic::MAX_LIST_REGISTERS];
+            for (k, slot) in saved.iter_mut().enumerate().take(gic::num_list_registers()) {
+                *slot = gic::read_lr(k);
+                gic::write_lr(
+                    k,
+                    hv_vdev::vgic_cpuif::encode_active(TICK_PROBE_FILL_INTID + k as u32),
+                );
+            }
+            probe_fill = Some(saved);
+        }
         if !gic::inject_hw(gic::VTIMER_INTID, gic::VTIMER_INTID) {
-            // Unreachable with one guest forwarding one interrupt into a bank of four — and reported
-            // rather than dropped anyway, because a lost timer tick is a guest that stops scheduling,
-            // which presents as a hang with no cause on the console.
-            let mut uart = crate::uart();
-            let _ = writeln!(
-                uart,
-                "baleen: LINUX GUEST TRAP: the list-register bank is full — cannot forward the timer \
-                 interrupt (INTID {intid}); halting"
-            );
-            crate::park();
+            // ★ **DEFER, and the tick is not lost.** This used to `park()` — the last halt a guest
+            //   could reach, and it could reach it with four instructions (see [`TIMER_DEFERRED`]).
+            //
+            //   **Nothing new is needed to redeliver it, which is why there is no flag here.** The
+            //   interrupt is left **Active** with only a priority drop below, exactly as the success
+            //   path leaves it, so it cannot re-signal and storm EL2. At the next switch —
+            //   guaranteed within one `CNTHP` slice, because EL2 owns that clock and the guest
+            //   cannot mask it — `gic::release_forwarded_timer` deactivates it, and the guest's own
+            //   `CNTV_CVAL_EL0` is *still expired*, so the level re-asserts and the tick arrives
+            //   again through this same path. A level-triggered source that nobody has serviced does
+            //   not need remembering; it needs only to stop being Active.
+            //
+            //   So the guest is late by at most one scheduling round, and only the guest that filled
+            //   its own bank is affected.
+            // Put the guest's own bank back before leaving. The deferral is REAL either way:
+            // `inject_hw` genuinely failed against a genuinely full bank.
+            #[cfg(feature = "selftest")]
+            if let Some(saved) = probe_fill {
+                for (k, &lr) in saved.iter().enumerate().take(gic::num_list_registers()) {
+                    gic::write_lr(k, lr);
+                }
+            }
+            TIMER_DEFERRED[slot].fetch_add(1, Ordering::Relaxed);
+            gic::eoi_physical(intid);
+            return;
         }
         TIMER_FORWARDED[slot].fetch_add(1, Ordering::Relaxed);
         // Priority drop ONLY (`EOImode=1`): the interrupt stays Active, so its still-asserted level
@@ -1970,6 +2051,8 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     report_pending_absorption(uart);
     #[cfg(feature = "selftest")]
     report_lr_overflow(uart);
+    #[cfg(feature = "selftest")]
+    report_tick_deferral(uart);
     report_per_guest_state(uart);
     if (0..NUM_GUESTS).all(|s| retirement_of(s) == Retirement::PoweredOff) {
         let _ = writeln!(
@@ -1994,6 +2077,35 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
 /// boot where a domain was killed — which, before this rung, could not happen at all.
 fn witnesses_assertable(slot: usize) -> bool {
     retirement_of(slot) != Retirement::Faulted
+}
+
+/// **The tick-deferral witness** — a full bank defers the forwarded timer instead of halting.
+///
+/// Reports the count for every guest, and ASSERTS only that the manufactured deferral actually
+/// happened somewhere. The per-guest count itself is not assertable: which guest holds the pCPU when
+/// the one-shot fires is a scheduling accident, and a boot where the OTHER guest saw it is just as
+/// correct — a count tied to which domain got it would be a claim about the workload.
+#[cfg(feature = "selftest")]
+fn report_tick_deferral(uart: &mut Pl011) {
+    let total: u64 = (0..NUM_GUESTS)
+        .map(|s| TIMER_DEFERRED[s].load(Ordering::Relaxed))
+        .sum();
+    if total > 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: tickdefer OK: a FULL list-register bank DEFERS the forwarded timer instead of \
+             halting — {total} tick(s) could not be placed, EL2 left the PPI Active with a priority \
+             drop only, and the still-expired CNTV_CVAL_EL0 re-asserted it after the next handover. \
+             The guest that filled its own bank went one round without a tick; the peer was untouched"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: tickdefer FAIL: no forwarded tick was ever deferred — the probe never \
+             manufactured a full bank, so a full bank halting the machine would look exactly like \
+             this boot"
+        );
+    }
 }
 
 /// How each domain's run ended — the line that keeps a retirement from reading as a shutdown.
@@ -3036,14 +3148,33 @@ fn report_timer_handoff(uart: &mut Pl011) {
         // count depends on the guest's timing, not on the mechanism. Three earlier forms of this
         // witness (`== switches`, `== tick handovers`, `>= tick handovers`) each refused, or would
         // have refused, a perfectly correct boot.
-        let ok = released == deactivated && released <= handovers;
+        // ★ **`released + deferred == deactivated`, and the `+ deferred` is this rung.**
+        //
+        // The old form was `released == deactivated`, and the comment above called it "the
+        // load-bearing one, **unchanged**". It was — right up until a forwarded tick could be
+        // DEFERRED. A deferred timer is Active with **no list register**, so the next handover
+        // demotes nothing (`released += 0`) while the redistributor still confirms an
+        // Active -> Inactive transition (`deactivated += 1`), and the old equality refuses a
+        // perfectly correct boot.
+        //
+        // **That is the SIXTH time in this arc that an invariant mentioning a count turned out to be
+        // a claim about the workload** — here, the claim that every Active physical timer had been
+        // forwarded. It was true only while forwarding could not fail.
+        //
+        // The repair STRENGTHENS the cross-check rather than relaxing it: every controller-confirmed
+        // deactivation is accounted for by exactly one of the two ways EL2 can stop owning that
+        // line — it demoted a mapping it had made, or it never made one because the bank was full.
+        // Deleting either term breaks the equality, which is what the witness is for.
+        let deferred = TIMER_DEFERRED[slot].load(Ordering::Relaxed);
+        let ok = released + deferred == deactivated && released <= handovers;
         if ok {
             let _ = writeln!(
                 uart,
                 "baleen: handoff OK: dom {dom} gave the forwarded timer up every time it left the \
                  pCPU holding one — {released} hardware-mapped list registers demoted and {} \
                  controller-confirmed Active -> Inactive transitions of PPI {}, across {handovers} \
-                 handovers; then re-armed from the incoming guest's own emulated distributor",
+                 handovers ({deferred} tick(s) deferred for a full bank and redelivered); then \
+                 re-armed from the incoming guest's own emulated distributor",
                 deactivated,
                 gic::VTIMER_INTID
             );
