@@ -58,14 +58,17 @@
 //! faults are prefixed `guest FAULT:` rather than `LINUX GUEST TRAP:` so that the latter keeps that
 //! narrower meaning — and stays forbidden by the boot gate in *both* of its runs.
 //!
-//! ⚠ **ONE GUEST-REACHABLE HALT REMAINS, and it is declared rather than implied.** The sweep that
-//! drove this work reported eight sites; there are **nine**. [`handle_peer_fault`] parks when a guest
-//! exceeds `MAX_PEER_FAULTS`, and a guest reaches that with a two-instruction loop — fault on a peer
-//! address, be skipped, resume, repeat. The cap was written as a runaway backstop for a *probing*
-//! guest and is a denial of service in the hands of a looping one. Its fix is the one this file
-//! already has — retire the domain, do not halt the machine — but [`handle_peer_fault`] has no
-//! `LinuxFrame` to switch away on, so it is a rung rather than a patch. **Until it lands, the
-//! sentence "no `park()` here is guest-reachable" is FALSE; do not write it.**
+//! **All NINE guest-reachable halts this path had are now closed** — seven by [`fault_retire`], the
+//! forwarded timer by deferral, and [`handle_peer_fault`]'s loop cap by retirement. Every remaining
+//! `park()` here is EL2 declaring its own state indescribable.
+//!
+//! ⚠ **Say "all nine KNOWN", and keep saying it.** The sweep that drove this work reported EIGHT and
+//! there were nine: the ninth appeared in its own park-to-function mapping and was dropped when the
+//! summary table was written. An audit that undercounted once is not evidence of completeness the
+//! second time. **The claim this file can support is "every `park()` reachable from
+//! [`handle_linux_sync`] or [`handle_linux_irq`] has been enumerated and closed" — which is a
+//! statement about a procedure that has already failed once, not a theorem.** `hv-metal` is not a
+//! Kani target; nothing here proves the enumeration is complete.
 //!
 //! ## ③-a2: the guest's interrupts stop being its own
 //!
@@ -1824,18 +1827,44 @@ fn guest_owning(ipa: u64) -> Option<usize> {
 /// held before, which is exactly what a device that is not there would give it. The alternative —
 /// killing the guest — would make the negative test indistinguishable from a crash, and would mean
 /// the boot could never assert both that the access was refused *and* that everything else kept
-/// working. Bounded by [`MAX_PEER_FAULTS`] so a guest that loops on it cannot spin EL2 forever.
-fn handle_peer_fault(faulting: usize, owner: usize, ipa: u64, uart: &mut Pl011) {
+/// working.
+///
+/// ## The cap, its ORIGINAL reason (now obsolete), and what exceeding it does
+///
+/// [`MAX_PEER_FAULTS`] was written "so a guest that loops on it cannot spin EL2 forever". **That
+/// justification no longer stands, and re-deriving it is what changed this rung**: ③-b2b-ii-e gave
+/// EL2 its own `CNTHP` clock, which the guest can neither program nor mask, so a guest looping on
+/// peer faults cannot hold the pCPU whatever the cap says. It makes no progress and its PEER keeps
+/// running. Liveness is the slice's job now.
+///
+/// What the cap is still good for is the DIAGNOSTIC — *this guest is not probing, it is looping* —
+/// so it stays. What changed is the ACTION. **Exceeding it used to `crate::park()`, and a guest could
+/// reach that with a two-instruction loop** (fault on a peer address, be skipped by the very line
+/// below, resume, repeat), which halted the machine and killed the innocent peer with it. It now
+/// retires the looping domain and hands the pCPU on — the same answer, and the same machinery, as
+/// every other guest fault on this path.
+///
+/// ⚠ This was the **ninth** guest-reachable halt, and the sweep that found the other eight MISSED
+/// it: it appeared in that sweep's park-to-function mapping and was dropped when the summary table
+/// was written. When an audit produces both a list and a table, diff them.
+fn handle_peer_fault(
+    faulting: usize,
+    owner: usize,
+    ipa: u64,
+    frame: &mut LinuxFrame,
+    uart: &mut Pl011,
+) {
     let n = PEER_FAULTS[faulting].fetch_add(1, Ordering::Relaxed) + 1;
     if n > MAX_PEER_FAULTS {
         let _ = writeln!(
             uart,
-            "baleen: LINUX GUEST TRAP: dom {} has faulted on dom {}'s memory {n} times (cap \
-             {MAX_PEER_FAULTS}) — it is not probing, it is looping; halting",
+            "baleen: guest FAULT: dom {} has faulted on dom {}'s memory {n} times (cap \
+             {MAX_PEER_FAULTS}) — it is not probing, it is looping",
             slot_dom(faulting),
             slot_dom(owner)
         );
-        crate::park();
+        fault_retire(faulting, frame, uart, "looped on its peer's memory");
+        return;
     }
 
     // Only the first one is reported in full: the AMBA identification read produces a fixed handful
@@ -2433,7 +2462,7 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
     let faulting = current_slot();
     if let Some(owner) = guest_owning(ipa) {
         if owner != faulting {
-            handle_peer_fault(faulting, owner, ipa, uart);
+            handle_peer_fault(faulting, owner, ipa, frame, uart);
             return;
         }
     }

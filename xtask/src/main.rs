@@ -46,18 +46,23 @@ fn main() {
         //   `qemu-linux-test` the headless gate: same QEMU line, output captured, markers asserted.
         // Both go through ONE `qemu_linux` (design-lesson #14c) — the gate must not be able to
         // pass against a QEMU invocation the demo does not use.
-        "qemu-linux" => qemu_linux(false, false),
-        // TWO boots, and the second is the rung's witness. The first is the shipped configuration
-        // (both guests power off); the second inserts a fault-probe node into dom 1's device tree so
-        // its own driver core commits a fault EL2 has no rule for. Before the retire rung that
-        // parked the machine and took dom 2 down with it. ~2 s for the pair.
+        "qemu-linux" => qemu_linux(false, LinuxBoot::Shipped),
+        // THREE boots, and the last two are witnesses the shipped guest cannot produce. The first
+        // is the product: both guests power off. The other two each make dom 1's OWN driver core
+        // commit a fault — one unmapped access, one loop that crosses `MAX_PEER_FAULTS` — and each
+        // asserts that dom 2, which did nothing, runs to completion and powers off. Both used to
+        // park the machine and take dom 2 down with it. ~5 s for the set.
+        //
+        // Sequential `let`s, not `a && b && c`: `&&` short-circuits, and the boots that would be
+        // skipped are exactly the newer, less-trusted ones.
         "qemu-linux-test" => {
             // NOT `a && b`: that short-circuits, so a failing shipped boot would skip the fault
             // boot entirely and the log would say nothing about it. Both always run, and the run
             // that failed is always named.
-            let shipped = qemu_linux(true, false);
-            let faulted = qemu_linux(true, true);
-            shipped && faulted
+            let shipped = qemu_linux(true, LinuxBoot::Shipped);
+            let faulted = qemu_linux(true, LinuxBoot::UnmappedFault);
+            let looped = qemu_linux(true, LinuxBoot::PeerLoop);
+            shipped && faulted && looped
         }
         "metal-lint" => metal_lint(),
         "doc-markers" => doc_markers(),
@@ -194,6 +199,31 @@ fn guest_load_addrs(slot: u64) -> GuestLoad {
 /// would pass while testing nothing.
 const FAULT_PROBE_ADDR: u64 = 0x0C00_0000;
 
+/// Which of the three real-Linux boots the gate is running.
+///
+/// The shipped one is the product; the other two exist because **the shipped guest is cooperative and
+/// cannot demonstrate what happens when a guest is not.** Each retires dom 1 by a DIFFERENT route and
+/// asserts that dom 2 — which did nothing — runs to completion and powers off.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LinuxBoot {
+    /// The product: both guests power off cleanly.
+    Shipped,
+    /// Dom 1's device tree names a peripheral at an address in no window, so its own bus scan takes
+    /// a Stage-2 abort EL2 has no rule for.
+    UnmappedFault,
+    /// Dom 1's device tree names **many** peripherals inside its PEER's RAM, so its bus scan crosses
+    /// `MAX_PEER_FAULTS` and it is retired for LOOPING rather than for one bad access.
+    PeerLoop,
+}
+
+/// How many extra peer-probe nodes the [`LinuxBoot::PeerLoop`] device tree carries.
+///
+/// **Sized from measurement, not taste.** One peer-probe node yields exactly **48** peer faults per
+/// boot (measured: `PFPROBE dom 1 peer_faults=48`, and the driver core's re-probing is why it is 48
+/// rather than 8). `MAX_PEER_FAULTS` is 4096, so 86 nodes would just cross it; 128 crosses it with
+/// ~50% margin so the witness does not sit on the threshold it is testing.
+const PEER_LOOP_NODES: u64 = 128;
+
 /// The window belonging to guest `slot`'s peer — the address its peer-probe node names (③-b2b-ii-d).
 fn peer_of(slot: u64) -> GuestLoad {
     guest_load_addrs((slot + 1) % NUM_GUESTS)
@@ -222,7 +252,7 @@ struct GuestLoad {
 /// The `Image` and `initramfs` come from `$BALEEN_LINUX_DIR` (default `.baleen-linux`, relative to
 /// the repo root like every other path in this file, and the same location CI uses);
 /// `hv-metal/linux/fetch-guest-image.sh` builds both from checksum-pinned official Alpine downloads.
-fn qemu_linux(check: bool, fault_probe: bool) -> bool {
+fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
     use std::path::PathBuf;
 
     let task = if check {
@@ -268,7 +298,7 @@ fn qemu_linux(check: bool, fault_probe: bool) -> bool {
     let initrd_size = std::fs::metadata(&initrd).map(|m| m.len()).unwrap_or(0);
     let mut dtbs = Vec::new();
     for slot in 0..NUM_GUESTS {
-        match render_guest_dtb(task, &dir, slot, initrd_size, fault_probe) {
+        match render_guest_dtb(task, &dir, slot, initrd_size, boot) {
             Some(path) => dtbs.push(path),
             None => return false,
         }
@@ -348,7 +378,7 @@ fn qemu_linux(check: bool, fault_probe: bool) -> bool {
     if !check {
         return run("qemu-system-aarch64", &argv);
     }
-    boot_and_check_linux(&argv, fault_probe)
+    boot_and_check_linux(&argv, boot)
 }
 
 /// Render and compile guest `slot`'s device tree from `hv-metal/linux/guest.dts`, returning the
@@ -368,7 +398,7 @@ fn render_guest_dtb(
     dir: &std::path::Path,
     slot: u64,
     initrd_size: u64,
-    fault_probe: bool,
+    boot: LinuxBoot,
 ) -> Option<std::path::PathBuf> {
     let src = "hv-metal/linux/guest.dts";
     let dts = match std::fs::read_to_string(src) {
@@ -447,7 +477,7 @@ fn render_guest_dtb(
     // declaration of the twenty lines that must not differ — the defect ⑭ spent a rung removing —
     // and because the node must exist for exactly one guest in exactly one run. Dom 2 gets no node,
     // which is what lets the witness say "the PEER ran to completion".
-    if fault_probe && slot == 0 {
+    if boot == LinuxBoot::UnmappedFault && slot == 0 {
         let anchor = "\n\tapb-pclk {";
         if !rendered.contains(anchor) {
             eprintln!(
@@ -466,7 +496,42 @@ fn render_guest_dtb(
         rendered = rendered.replacen(anchor, &format!("{node}{anchor}"), 1);
     }
 
-    let suffix = if fault_probe { "-fault" } else { "" };
+    // ── the peer-LOOP probe (dom 1 only) ────────────────────────────────────────────────────────
+    //
+    // Same instrument as ③-b2b-ii-d's peer-probe node, just MANY of them. Each names an AMBA
+    // peripheral inside the peer's RAM, so dom 1's own bus scan faults on the peer 48 times per node
+    // and crosses `MAX_PEER_FAULTS` — the guest is doing the looping, not EL2 simulating it.
+    //
+    // **Dom 2 keeps its single node and its 48 faults, far under the cap**, which is what lets the
+    // witness say the peer ran to completion. Addresses start one page above the peer's base so they
+    // do not collide with the peer-probe node already there.
+    if boot == LinuxBoot::PeerLoop && slot == 0 {
+        let anchor = "\n\tapb-pclk {";
+        if !rendered.contains(anchor) {
+            eprintln!(
+                "xtask {task}: {src} has no `apb-pclk` node to anchor the peer-loop probes against \
+                 — the peer-loop boot would never cross the cap and would pass by doing nothing."
+            );
+            return None;
+        }
+        let base = peer_of(slot).ram_base;
+        let mut nodes = String::new();
+        for i in 1..=PEER_LOOP_NODES {
+            let addr = base + i * 0x1000;
+            nodes.push_str(&format!(
+                "\n\tpeer-loop@{addr:x} {{\n\t\tcompatible = \"arm,pl011\", \"arm,primecell\";\n\t\t\
+                 reg = <0x00 0x{addr:x} 0x00 0x1000>;\n\t\tclocks = <0x8000 0x8000>;\n\t\t\
+                 clock-names = \"uartclk\", \"apb_pclk\";\n\t}};\n"
+            ));
+        }
+        rendered = rendered.replacen(anchor, &format!("{nodes}{anchor}"), 1);
+    }
+
+    let suffix = match boot {
+        LinuxBoot::Shipped => "",
+        LinuxBoot::UnmappedFault => "-fault",
+        LinuxBoot::PeerLoop => "-peerloop",
+    };
     let dts_out = dir.join(format!("guest-dom{dom}{suffix}.dts"));
     let dtb_out = dir.join(format!("guest-dom{dom}{suffix}.dtb"));
     if let Err(e) = std::fs::write(&dts_out, rendered) {
@@ -821,6 +886,24 @@ const LINUX_FAULT_MARKERS: &[&str] = &[
     "baleen: dom 2 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
 ];
 
+/// What the **peer-loop** boot must show: a guest retired for LOOPING, and its peer unharmed.
+///
+/// The ninth guest-reachable halt, and the one the sweep missed. `handle_peer_fault` capped repeated
+/// peer faults at `MAX_PEER_FAULTS` and **parked the machine** on exceeding it — reachable with a
+/// two-instruction loop, killing the innocent peer. Here dom 1's device tree carries
+/// `PEER_LOOP_NODES` probe nodes so its own bus scan crosses the cap; dom 1 is retired and dom 2
+/// powers off.
+///
+/// The `guest FAULT:` prefix is asserted deliberately: the diagnostic used to say `LINUX GUEST TRAP`,
+/// which is the FORBIDDEN marker meaning "EL2 hit something fatal". A guest looping is not that.
+const LINUX_PEER_LOOP_MARKERS: &[&str] = &[
+    "baleen: guest FAULT: dom 1 has faulted on dom 2's memory",
+    "baleen: dom 1 RETIRED — looped on its peer's memory",
+    "baleen: retire dom 1: RETIRED FOR A FAULT — it was stopped and the machine kept running",
+    "baleen: retire dom 2: powered off cleanly",
+    "baleen: dom 2 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
+];
+
 /// Strings the fault-probe boot must NOT show, on top of [`LINUX_FORBIDDEN`].
 ///
 /// The summary line claims every guest powered off. One of them was KILLED, so a build that still
@@ -907,7 +990,7 @@ const LINUX_WAIT_SECS_DEFAULT: u64 = 300;
 /// Boot the real-Linux config headlessly and assert its markers. Returns whether every required
 /// marker appeared and no forbidden one did; dumps the whole serial log on failure, since a boot
 /// failure is diagnosed from the log or not at all.
-fn boot_and_check_linux(argv: &[&str], fault_probe: bool) -> bool {
+fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
@@ -987,10 +1070,10 @@ fn boot_and_check_linux(argv: &[&str], fault_probe: bool) -> bool {
     // absent. `LINUX_FORBIDDEN` is SHARED and unweakened — `LINUX GUEST TRAP` now means "EL2 hit
     // something fatal", which must not happen in either run, and the guest-fault diagnostics were
     // renamed to `guest FAULT:` precisely so that canary keeps its meaning here.
-    let markers: &[&str] = if fault_probe {
-        LINUX_FAULT_MARKERS
-    } else {
-        LINUX_MARKERS
+    let markers: &[&str] = match boot {
+        LinuxBoot::Shipped => LINUX_MARKERS,
+        LinuxBoot::UnmappedFault => LINUX_FAULT_MARKERS,
+        LinuxBoot::PeerLoop => LINUX_PEER_LOOP_MARKERS,
     };
     for m in markers {
         if serial.contains(m) {
@@ -1000,10 +1083,11 @@ fn boot_and_check_linux(argv: &[&str], fault_probe: bool) -> bool {
             failed = true;
         }
     }
-    let forbidden = LINUX_FORBIDDEN.iter().chain(if fault_probe {
-        LINUX_FAULT_FORBIDDEN.iter()
-    } else {
-        [].iter()
+    // `LINUX_FAULT_FORBIDDEN` applies to BOTH retiring boots: in each of them a domain was KILLED,
+    // so neither may claim every guest powered off, and dom 1 may not claim it shut down.
+    let forbidden = LINUX_FORBIDDEN.iter().chain(match boot {
+        LinuxBoot::Shipped => [].iter(),
+        LinuxBoot::UnmappedFault | LinuxBoot::PeerLoop => LINUX_FAULT_FORBIDDEN.iter(),
     });
     for m in forbidden {
         if serial.contains(m) {
@@ -1190,6 +1274,7 @@ fn doc_markers() -> bool {
         .iter()
         .chain(LINUX_FORBIDDEN.iter())
         .chain(LINUX_FAULT_MARKERS.iter())
+        .chain(LINUX_PEER_LOOP_MARKERS.iter())
         .chain(LINUX_FAULT_FORBIDDEN.iter())
         .map(|m| collapse(m))
         .collect();
