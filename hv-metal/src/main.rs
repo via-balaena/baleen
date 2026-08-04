@@ -66,6 +66,8 @@ mod linux;
 mod pcie;
 mod pending;
 mod pl011;
+#[cfg(feature = "real-linux")]
+mod role;
 #[cfg(feature = "smmu")]
 mod smmu;
 mod stage2;

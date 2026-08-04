@@ -242,6 +242,7 @@ use crate::console::GuestConsole;
 use crate::ctx::CtxComponent;
 use crate::gic;
 use crate::pl011::Pl011;
+use crate::role::{Incoming, Outgoing, PerGuest};
 use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
 use crate::vcpu;
 use crate::vgic::{self, DeployedGic};
@@ -980,8 +981,8 @@ const PL011_AT_RESET: DeployedPl011 = DeployedPl011::new();
 /// it turns on: if a future rung ever unmasks IRQs inside an EL2 handler, or adds an EL2 idle loop,
 /// **this borrow becomes a halt** — which is why `VCPU_PENDING` next door uses plain atomics
 /// instead. A counter would; a register file that must be read consistently would not.
-static VGIC: BootCell<[DeployedGic; NUM_GUESTS]> =
-    BootCell::new("VGIC", [GIC_AT_RESET; NUM_GUESTS]);
+static VGIC: BootCell<PerGuest<DeployedGic, NUM_GUESTS>> =
+    BootCell::new("VGIC", PerGuest::new([GIC_AT_RESET; NUM_GUESTS]));
 
 /// A distributor out of reset. Named because an array repeat expression needs a constant operand.
 const GIC_AT_RESET: DeployedGic = DeployedGic::new();
@@ -1011,12 +1012,14 @@ static CONSOLE: BootCell<GuestConsole> = BootCell::new("CONSOLE", GuestConsole::
 ///
 /// **Per guest since ③-b2b-ii-a.** A merged count would stay green with one guest's forwarding path
 /// entirely dead — the same reason ③-a1/a2/b1 each brought their own line rather than one tally.
-static TIMER_FORWARDED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static TIMER_FORWARDED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// How many guest-generated SGIs EL2 has mediated and delivered (③-a2) — the second thing `IMO=1`
 /// made EL2 responsible for. Same standing as [`TIMER_FORWARDED`]: written from a trap handler, so an
 /// atomic rather than a [`BootCell`], and per guest for the same reason.
-static SGIS_DELIVERED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static SGIS_DELIVERED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// Forwarded timer interrupts EL2 could not place, because the guest's list-register bank was full.
 ///
@@ -1030,7 +1033,8 @@ static SGIS_DELIVERED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; N
 /// its own bank has done nothing EL2 has no rule for. It is only harming itself — it is the one that
 /// goes without a tick — and EL2's own `CNTHP` slice is untouched, so the peer keeps running either
 /// way.
-static TIMER_DEFERRED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static TIMER_DEFERRED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// The vINTID the tick-deferral probe's Active filler entries carry. Never presented (Active, not
 /// Pending), so the value only has to be distinctive in a register dump.
@@ -1062,29 +1066,37 @@ static TICK_DEFER_PROBED: core::sync::atomic::AtomicBool =
 /// A **set**, not a queue, for III-1's reason: a queue's "full" is the old halt relocated, while a set
 /// over every INTID the distributor can name has no full state at all. See [`crate::pending`], which
 /// is the one type both switches now share.
-static LINUX_PENDING: [crate::pending::PendingSet; NUM_GUESTS] =
-    [const { crate::pending::PendingSet::new() }; NUM_GUESTS];
+static LINUX_PENDING: PerGuest<crate::pending::PendingSet, NUM_GUESTS> =
+    PerGuest::new([const { crate::pending::PendingSet::new() }; NUM_GUESTS]);
 
 /// vINTs that found no free list register and were recorded in the pending set instead.
-static SGIS_DEFERRED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static SGIS_DEFERRED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// vINTs later drained from the pending set into a freed list register.
-static SGIS_DRAINED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static SGIS_DRAINED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// Maintenance interrupts ([`gic::MAINT_INTID`]) EL2 took on this path.
-static MAINT_TAKEN: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static MAINT_TAKEN: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// **Deliver a guest-generated SGI, or record it as pending if the bank is full.**
 ///
 /// Total by construction: there is no failure to report, which is what removes the `park()` this
 /// replaces. The two outcomes are "in a list register now" and "in the set until one frees".
-fn deliver_or_defer_sgi(slot: usize, intid: u32) {
+fn deliver_or_defer_sgi(
+    set: &crate::pending::PendingSet,
+    delivered: &AtomicU64,
+    deferred: &AtomicU64,
+    intid: u32,
+) {
     if gic::inject(intid) {
-        SGIS_DELIVERED[slot].fetch_add(1, Ordering::Relaxed);
+        delivered.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    if LINUX_PENDING[slot].mark(intid) {
-        SGIS_DEFERRED[slot].fetch_add(1, Ordering::Relaxed);
+    if set.mark(intid) {
+        deferred.fetch_add(1, Ordering::Relaxed);
         // Level-based, and armed only because something is now waiting — see
         // `gic::set_underflow_interrupt` for why arming it over an empty set livelocks EL2.
         gic::set_underflow_interrupt(true);
@@ -1105,31 +1117,34 @@ fn deliver_or_defer_sgi(slot: usize, intid: u32) {
 ///
 /// The trailing arm is a function of what REMAINS, which is what keeps the level-based `UIE` from
 /// asserting over an empty set.
-fn flush_pending_to_lrs(slot: usize) -> usize {
+/// Takes the SET and the counter, not a slot — so **which guest** is decided at the call site by a
+/// role-typed accessor ([`crate::role`]) and cannot be got wrong here. Passing the outgoing guest's
+/// set at a switch was one of the two MEASURED silent swaps this rung closes.
+fn flush_pending_to_lrs(set: &crate::pending::PendingSet, drained: &AtomicU64) -> usize {
     let n = gic::num_list_registers();
     let mut placed = 0;
     for i in 0..n {
         if !gic::lr_is_free(gic::read_lr(i)) {
             continue;
         }
-        match LINUX_PENDING[slot].take_next() {
+        match set.take_next() {
             Some(intid) => {
                 // Back through the raw allocator rather than writing the list register here, so the
                 // set and the synchronous path place interrupts through exactly one encoder (#55).
                 if gic::inject(intid) {
                     placed += 1;
-                    SGIS_DRAINED[slot].fetch_add(1, Ordering::Relaxed);
+                    drained.fetch_add(1, Ordering::Relaxed);
                 } else {
                     // Cannot happen single-CPU with a free LR just observed — but do not lose the
                     // vINT on a surprise.
-                    let _ = LINUX_PENDING[slot].mark(intid);
+                    let _ = set.mark(intid);
                     break;
                 }
             }
             None => break,
         }
     }
-    gic::set_underflow_interrupt(!LINUX_PENDING[slot].is_empty());
+    gic::set_underflow_interrupt(!set.is_empty());
     placed
 }
 
@@ -1163,7 +1178,7 @@ static LR_OVERFLOW_FILLED: AtomicU64 = AtomicU64::new(0);
 /// (design-lesson #127). So the probe MANUFACTURES the condition instead of waiting for it.
 ///
 /// **Safe by placement, not by care.** It runs between the outgoing vCPU's `save` and the incoming
-/// one's `poison`: the bank has already been captured into `VCPU_CTX[cur]`, and every list register
+/// one's `poison`: the bank has already been captured into `VCPU_CTX.out_mut(cur)`, and every list register
 /// is about to be zeroed and then overwritten by the incoming vCPU's restore. There is no window in
 /// which a guest can observe anything this writes.
 ///
@@ -1174,12 +1189,12 @@ static LR_OVERFLOW_FILLED: AtomicU64 = AtomicU64::new(0);
 /// 4. freeing one list register drains exactly that vINT;
 /// 5. **`UIE` reads back CLEAR** — arming follows what remains, so an idle guest cannot be stormed.
 #[cfg(feature = "selftest")]
-fn probe_lr_overflow(slot: usize) {
+fn probe_lr_overflow(g: Outgoing) {
     let n = gic::num_list_registers();
     for i in 0..n {
         gic::write_lr(i, 0);
     }
-    let started_empty = LINUX_PENDING[slot].is_empty();
+    let started_empty = LINUX_PENDING.out(g).is_empty();
 
     let mut filled = 0;
     for k in 0..n {
@@ -1189,13 +1204,18 @@ fn probe_lr_overflow(slot: usize) {
     }
     let bank_refuses = !gic::inject(PROBE_FILL_BASE + n as u32);
 
-    deliver_or_defer_sgi(slot, PROBE_OVERFLOW_INTID);
-    let deferred = !LINUX_PENDING[slot].is_empty();
+    deliver_or_defer_sgi(
+        LINUX_PENDING.out(g),
+        SGIS_DELIVERED.out(g),
+        SGIS_DEFERRED.out(g),
+        PROBE_OVERFLOW_INTID,
+    );
+    let deferred = !LINUX_PENDING.out(g).is_empty();
     let armed = gic::underflow_interrupt_armed();
 
     gic::write_lr(0, 0);
-    let placed = flush_pending_to_lrs(slot);
-    let drained = LINUX_PENDING[slot].is_empty();
+    let placed = flush_pending_to_lrs(LINUX_PENDING.out(g), SGIS_DRAINED.out(g));
+    let drained = LINUX_PENDING.out(g).is_empty();
     let disarmed = !gic::underflow_interrupt_armed();
 
     for i in 0..n {
@@ -1233,9 +1253,9 @@ fn probe_lr_overflow(slot: usize) {
 /// the machine simply stopped, and the last thing on the console was a halt message.
 fn report_pending_absorption(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
-        let deferred = SGIS_DEFERRED[slot].load(Ordering::Relaxed);
-        let drained = SGIS_DRAINED[slot].load(Ordering::Relaxed);
-        let maint = MAINT_TAKEN[slot].load(Ordering::Relaxed);
+        let deferred = SGIS_DEFERRED.at(slot).load(Ordering::Relaxed);
+        let drained = SGIS_DRAINED.at(slot).load(Ordering::Relaxed);
+        let maint = MAINT_TAKEN.at(slot).load(Ordering::Relaxed);
         let _ = writeln!(
             uart,
             "baleen: pending dom {}: {deferred} vINT(s) deferred when the list-register bank was \
@@ -1346,7 +1366,7 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         // two. Now the interrupt is delivered only if the guest asked for it **in its own emulated
         // distributor**, which lives in EL2 memory the guest cannot reach. A guest that has not
         // enabled INTID 27 does not get INTID 27 — and, come ③-b, cannot enable anyone else's.
-        if !VGIC.borrow_mut()[slot].is_enabled(intid) {
+        if !VGIC.borrow_mut().at_mut(slot).is_enabled(intid) {
             // Not an error — the guest legitimately runs with its timer masked. Mask it PHYSICALLY
             // too before completing it: the timer PPI is level-triggered, so deactivating while the
             // level is high would re-signal immediately and storm EL2. `handle_vgic_access` re-enables
@@ -1373,7 +1393,7 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         // ⚠ **The fill MUST be undone before returning, and assuming otherwise cost a hung boot.**
         // The first version left the entries in place, reasoning that the next switch poisons the
         // bank and restores the incoming vCPU's own. True, and irrelevant — the switch **SAVES
-        // first**: `ctx[cur].save()` captured the filler entries into that vCPU's context, so they
+        // first**: `ctx.out_mut(cur).save()` captured the filler entries into that vCPU's context, so they
         // were faithfully restored on its every switch-in from then on. Its bank was permanently
         // full, it never got another tick, and dom 2 stalled while dom 1 powered off normally. The
         // bank is therefore snapshotted here and put back below.
@@ -1414,11 +1434,11 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
                     gic::write_lr(k, lr);
                 }
             }
-            TIMER_DEFERRED[slot].fetch_add(1, Ordering::Relaxed);
+            TIMER_DEFERRED.at(slot).fetch_add(1, Ordering::Relaxed);
             gic::eoi_physical(intid);
             return;
         }
-        TIMER_FORWARDED[slot].fetch_add(1, Ordering::Relaxed);
+        TIMER_FORWARDED.at(slot).fetch_add(1, Ordering::Relaxed);
         // Priority drop ONLY (`EOImode=1`): the interrupt stays Active, so its still-asserted level
         // cannot re-signal and storm EL2, while EL2's running priority returns to idle. The guest's
         // EOI of the virtual interrupt is what deactivates this one.
@@ -1440,10 +1460,10 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
     // to the "no forwarding rule; halting" branch below. Arming `UIE` without this branch would have
     // turned a full-bank halt into a maintenance-interrupt halt.
     if intid == gic::MAINT_INTID {
-        MAINT_TAKEN[slot].fetch_add(1, Ordering::Relaxed);
+        MAINT_TAKEN.at(slot).fetch_add(1, Ordering::Relaxed);
         // Drain FIRST: the interrupt is level-based on `UIE` + bank occupancy, and the drain is what
         // clears `UIE` when nothing is left. Deactivating before that could re-assert immediately.
-        let _ = flush_pending_to_lrs(slot);
+        let _ = flush_pending_to_lrs(LINUX_PENDING.at(slot), SGIS_DRAINED.at(slot));
         gic::eoi_physical(intid);
         gic::deactivate_physical(intid);
         return;
@@ -1611,14 +1631,17 @@ fn note_el2_entry() {
 /// **One per guest since ③-b2b-ii-a**, because a context is what a switch *between* guests moves:
 /// with one slot, a switch-to-self resumes the same registers it saved, and the array is what makes
 /// "resume the OTHER guest" expressible at all.
-static VCPU_CTX: BootCell<[vcpu::VcpuCtx; NUM_GUESTS]> =
-    BootCell::new("LINUX_VCPU_CTX", [VCPU_CTX_EMPTY; NUM_GUESTS]);
+static VCPU_CTX: BootCell<PerGuest<vcpu::VcpuCtx, NUM_GUESTS>> = BootCell::new(
+    "LINUX_VCPU_CTX",
+    PerGuest::new([VCPU_CTX_EMPTY; NUM_GUESTS]),
+);
 
 /// An empty context. Named because an array repeat expression needs a constant operand.
 const VCPU_CTX_EMPTY: vcpu::VcpuCtx = vcpu::VcpuCtx::new();
 
 /// How many times each guest's vCPU has been switched out and back through hv-core's scheduler.
-static SWITCHES: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static SWITCHES: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// How many hardware-mapped list registers each guest has handed back at a switch (③-b2b-ii-c1).
 ///
@@ -1637,7 +1660,8 @@ static SWITCHES: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUE
 /// deactivated the physical interrupt — and the equality holds on both. The lower bound does not,
 /// and carrying it over would have refused a correct boot, which in this arc is the shape of every
 /// witness that mentioned a count.
-static HW_RELEASED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static HW_RELEASED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// How many times the **interrupt controller agreed** that the forwarded timer went Active →
 /// Inactive at a switch (③-b2b-ii-c1).
@@ -1647,7 +1671,8 @@ static HW_RELEASED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_
 /// that count is unchanged, the boot stays green, and guest B hangs a rung later. This one is read
 /// back from `GICR_ISACTIVER0` — the GIC's own view, and the Active state is precisely what would
 /// stop a second guest being signalled the tick.
-static TIMER_DEACTIVATED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static TIMER_DEACTIVATED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// How many times each guest has been switched **out** (③-b2b-ii-c2).
 ///
@@ -1656,7 +1681,8 @@ static TIMER_DEACTIVATED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }
 /// the same number of times, and the timer handoff is an outgoing-side event. Comparing the two
 /// would have been comparing different quantities — which is what the first version of
 /// [`report_timer_handoff`] did, and it read `63 across 64 switches`.
-static HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static HANDOVERS: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 // ③-b2b-ii-e retired the `Handover` enum that used to sit here. It existed to condition the handoff
 // invariant — a `Tick` handover was guaranteed to have a forwarded interrupt in flight, so
@@ -1674,7 +1700,8 @@ static HANDOVERS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GU
 /// not what the mechanism guarantees. What it is worth reporting for is that it sizes the hole this
 /// rung closed, from the live boot rather than from an argument: the same quantity read ~31 per boot
 /// when it was measured with `CPTR_EL2.TFP` before the fix existed (see [`crate::fp`]).
-static FP_FOREIGN: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static FP_FOREIGN: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// How many switch-ins were followed by a **read-back** confirming the live FP register file now
 /// equals the incoming vCPU's saved one (③-b2b-ii-f).
@@ -1689,11 +1716,13 @@ static FP_FOREIGN: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_G
 /// guests happen not to use the high registers is byte-for-byte indistinguishable from a correct
 /// one. The read-back is EL2 asking the register file what it actually holds, the same discipline
 /// `TIMER_DEACTIVATED` applies to the redistributor and `verify_encoding` to the emitted image.
-static FP_RESTORE_VERIFIED: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static FP_RESTORE_VERIFIED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// How many times each guest has touched a PEER's memory and been refused by the hardware
 /// (③-b2b-ii-d).
-static PEER_FAULTS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static PEER_FAULTS: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// How many peer faults EL2 will service for one guest before treating the guest as looping.
 ///
@@ -1716,7 +1745,8 @@ const MAX_PEER_FAULTS: u64 = 4096;
 /// is the emitter's output rather than anything this file computes — `build_stage2_from_p2m` returns
 /// it, and `report_disjointness` has already walked both images to the descriptors before either
 /// guest runs. Plain atomics: written once before any guest exists, read from the IRQ handler.
-static VTTBR: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static VTTBR: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 /// **③-b2b-i — preempt the running guest through `hv-core`'s REAL scheduler.**
 ///
@@ -1789,7 +1819,7 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     sched_on(hv, slot_dom(next), scheduler_run(now), "run the next vcpu");
     drop(cell);
 
-    switch_context(slot, next, frame);
+    switch_context(Outgoing::slot(slot), Incoming::slot(next), frame);
 }
 
 /// Which guest's half of the RAM window contains `ipa`, if any (③-b2b-ii-d).
@@ -1854,7 +1884,7 @@ fn handle_peer_fault(
     frame: &mut LinuxFrame,
     uart: &mut Pl011,
 ) {
-    let n = PEER_FAULTS[faulting].fetch_add(1, Ordering::Relaxed) + 1;
+    let n = PEER_FAULTS.at(faulting).fetch_add(1, Ordering::Relaxed) + 1;
     if n > MAX_PEER_FAULTS {
         let _ = writeln!(
             uart,
@@ -1870,8 +1900,8 @@ fn handle_peer_fault(
     // Only the first one is reported in full: the AMBA identification read produces a fixed handful
     // of these, and eight identical paragraphs would bury the boot's other output.
     if n == 1 {
-        let peer_l1 = hv_s2::arm64::vttbr_table(VTTBR[owner].load(Ordering::Relaxed));
-        let mine_l1 = hv_s2::arm64::vttbr_table(VTTBR[faulting].load(Ordering::Relaxed));
+        let peer_l1 = hv_s2::arm64::vttbr_table(VTTBR.at(owner).load(Ordering::Relaxed));
+        let mine_l1 = hv_s2::arm64::vttbr_table(VTTBR.at(faulting).load(Ordering::Relaxed));
         let in_peer = stage2::walk_stage2(peer_l1, ipa);
         let in_mine = stage2::walk_stage2(mine_l1, ipa);
         let identity = in_peer.map(|r| r.pa == ipa).unwrap_or(false);
@@ -1945,10 +1975,11 @@ enum Retirement {
 }
 
 /// Per-slot retirement reason. `u8` because it is written from trap handlers.
-static RETIREMENT: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
+static RETIREMENT: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
 fn set_retirement(slot: usize, why: Retirement) {
-    RETIREMENT[slot].store(
+    RETIREMENT.at(slot).store(
         match why {
             Retirement::Live => 0,
             Retirement::PoweredOff => 1,
@@ -1959,7 +1990,7 @@ fn set_retirement(slot: usize, why: Retirement) {
 }
 
 fn retirement_of(slot: usize) -> Retirement {
-    match RETIREMENT[slot].load(Ordering::Relaxed) {
+    match RETIREMENT.at(slot).load(Ordering::Relaxed) {
         1 => Retirement::PoweredOff,
         2 => Retirement::Faulted,
         _ => Retirement::Live,
@@ -2013,7 +2044,7 @@ fn retire_and_hand_over(
         "run the surviving vcpu",
     );
     drop(cell);
-    switch_context(cur, next, frame);
+    switch_context(Outgoing::slot(cur), Incoming::slot(next), frame);
     true
 }
 
@@ -2117,7 +2148,7 @@ fn witnesses_assertable(slot: usize) -> bool {
 #[cfg(feature = "selftest")]
 fn report_tick_deferral(uart: &mut Pl011) {
     let total: u64 = (0..NUM_GUESTS)
-        .map(|s| TIMER_DEFERRED[s].load(Ordering::Relaxed))
+        .map(|s| TIMER_DEFERRED.at(s).load(Ordering::Relaxed))
         .sum();
     if total > 0 {
         let _ = writeln!(
@@ -2223,31 +2254,34 @@ fn sched_on(hv: &mut Hypervisor, dom: DomId, call: HvCall, what: &str) {
 /// vCPU's, and `VTTBR_EL2` becomes a different domain's VMID-tagged Stage-2. ③-b2b-ii-e adds an
 /// eighth step, and it is the only one about the guest that is *arriving* rather than the one
 /// leaving: its slice starts here.
-fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
+/// ⚠ **The two parameters are DIFFERENT TYPES on purpose** — see [`crate::role`]. Both were
+/// `usize`, and two of the eighteen indexed uses below could be swapped with the boot gate
+/// staying green (MEASURED). A swap is now a compile error.
+fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     let mut ctx = VCPU_CTX.borrow_mut();
     // 1. Capture the outgoing vCPU, list registers and `CNTV_CVAL_EL0` included.
-    ctx[cur].save(&frame.x);
+    ctx.out_mut(cur).save(&frame.x);
 
     // 2. Demote its forwarded interrupts, and 3. hand the physical timer back. Between them these
     //    are the whole of Probe 0's fix: the outgoing guest keeps its pending tick as a purely
     //    VIRTUAL interrupt, and the one physical PPI on this machine stops being Active so it can be
     //    signalled to whoever runs next. See `gic::release_forwarded_timer` for the measurement that
     //    forced this and for why disable must precede deactivate.
-    HANDOVERS[cur].fetch_add(1, Ordering::Relaxed);
-    let released = ctx[cur].release_hardware_mappings();
-    HW_RELEASED[cur].fetch_add(released, Ordering::Relaxed);
+    HANDOVERS.out(cur).fetch_add(1, Ordering::Relaxed);
+    let released = ctx.out_mut(cur).release_hardware_mappings();
+    HW_RELEASED.out(cur).fetch_add(released, Ordering::Relaxed);
     if gic::release_forwarded_timer() {
-        TIMER_DEACTIVATED[cur].fetch_add(1, Ordering::Relaxed);
+        TIMER_DEACTIVATED.out(cur).fetch_add(1, Ordering::Relaxed);
     }
 
-    // 3b. ③-b2b-ii-f — **whose data is in the FP register file right now?** `ctx[cur].fp()` was read
+    // 3b. ③-b2b-ii-f — **whose data is in the FP register file right now?** `ctx.out_mut(cur).fp()` was read
     //     off the hardware in step 1, so this compares the live file against what the INCOMING vCPU
     //     last owned. Different means the incoming guest was about to read its peer's `v0..v31` —
     //     which, before this rung, is exactly what it did. Taken here because step 4 is about to
     //     destroy the evidence.
-    let incoming_fp = ctx[next].fp();
-    if ctx[cur].fp() != incoming_fp {
-        FP_FOREIGN[next].fetch_add(1, Ordering::Relaxed);
+    let incoming_fp = ctx.inc_mut(next).fp();
+    if ctx.out_mut(cur).fp() != incoming_fp {
+        FP_FOREIGN.inc(next).fetch_add(1, Ordering::Relaxed);
     }
 
     // 3c. The overflow probe, once per boot. Deliberately HERE: the outgoing bank is already saved
@@ -2260,7 +2294,7 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     // 4. Poison — see `crate::vcpu`. Still the instrument that stops a switch-to-self being vacuous.
     // SAFETY: at EL2 with the context saved, and the restore below is unconditional — the guest's
     // EL1 configuration is garbage only for the handful of instructions between the two.
-    unsafe { ctx[next].poison() };
+    unsafe { ctx.inc_mut(next).poison() };
 
     // 5. Install the incoming vCPU. **Only now** does `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` describe the
     //    guest about to run, which is why step 6 cannot be folded into step 3: re-arming the PPI
@@ -2269,7 +2303,7 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     // SAFETY: at EL2, restoring the context of the vCPU about to be resumed. For guest B's FIRST
     // switch-in this is the arm64 boot protocol's entry state, seeded by `VcpuCtx::seed_boot` — so
     // B's boot and B's resume are the same instruction, not two paths that must agree.
-    unsafe { ctx[next].restore(&mut frame.x) };
+    unsafe { ctx.inc_mut(next).restore(&mut frame.x) };
     drop(ctx);
 
     // 5b. Install the incoming DOMAIN's VMID-tagged Stage-2, with **no TLB flush** — M5 Arc 2's
@@ -2282,7 +2316,7 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     //     fault: `EC=0x20 ELR=FAR=0x64000000 ESR=0x82000006` — an instruction abort, translation
     //     fault at level 2. A's map does not reach B's memory even to fetch one instruction, and a
     //     running guest is what says so, rather than a walk over the descriptors.
-    crate::guest::set_vttbr_no_flush(VTTBR[next].load(Ordering::Relaxed));
+    crate::guest::set_vttbr_no_flush(VTTBR.inc(next).load(Ordering::Relaxed));
 
     // 5c. ③-b2b-ii-f — read the FP file back off the hardware and confirm it is the incoming vCPU's.
     //     Structural: true on every switch regardless of what any guest does, which is what makes it
@@ -2291,26 +2325,32 @@ fn switch_context(cur: usize, next: usize, frame: &mut LinuxFrame) {
     let mut live = crate::fp::FpCtx::ZERO;
     live.save();
     if live == incoming_fp {
-        FP_RESTORE_VERIFIED[next].fetch_add(1, Ordering::Relaxed);
+        FP_RESTORE_VERIFIED
+            .inc(next)
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // 5d. Drain the incoming guest's pending set into its now-restored bank. It must run AFTER the
     //     restore (which overwrites the whole bank, so a pre-restore refill would be discarded), and
     //     it re-arms `UIE` for whatever is still pending — which is also what makes the arming follow
     //     the switched-IN vCPU rather than the outgoing one.
-    let _ = flush_pending_to_lrs(next);
+    let _ = flush_pending_to_lrs(LINUX_PENDING.inc(next), SGIS_DRAINED.inc(next));
 
     // 6. Re-arm the physical PPI for the INCOMING guest, according to its own emulated distributor —
     //    the same mediation seam `handle_vgic_access` mirrors, applied at the other moment the
     //    answer can change. A guest running with its timer masked stays masked; one that wants it
     //    gets it, and gets it immediately, because its restored deadline has long since passed.
-    let wants_timer = VGIC.borrow_mut()[next].is_enabled(gic::VTIMER_INTID);
+    let wants_timer = VGIC
+        .borrow_mut()
+        .inc_mut(next)
+        .is_enabled(gic::VTIMER_INTID);
     gic::set_ppi_enabled(gic::VTIMER_INTID, wants_timer);
 
     // 7. The pCPU now belongs to `next`, so every handler that asks "which guest?" must get the new
     //    answer from here on. Stored LAST: everything above still had to speak about `cur`.
-    CURRENT.store(next, Ordering::Relaxed);
-    SWITCHES[next].fetch_add(1, Ordering::Relaxed);
+    // The incoming guest becomes the running one — the ONE sanctioned role transition.
+    CURRENT.store(next.now_running().index(), Ordering::Relaxed);
+    SWITCHES.inc(next).fetch_add(1, Ordering::Relaxed);
 
     // 8. ③-b2b-ii-e — the incoming guest gets a FULL slice, whichever of the three handovers got us
     //    here. On the slice-expiry path this re-arms a deadline the handler already set moments ago,
@@ -2576,11 +2616,11 @@ fn handle_vgic_access(
     let mut dev = VGIC.borrow_mut();
     let outcome = if a.wnr {
         let value = if a.srt < 31 { frame.x[a.srt] } else { 0 } & a.value_mask();
-        dev[slot]
+        dev.at_mut(slot)
             .mmio_write(ipa, a.access_bytes(), value)
             .map(|()| 0)
     } else {
-        dev[slot]
+        dev.at_mut(slot)
             .mmio_read(ipa, a.access_bytes())
             .inspect(|&value| {
                 if a.srt < 31 {
@@ -2596,7 +2636,7 @@ fn handle_vgic_access(
     // It is the RUNNING guest's model, and a data abort can only come from the running guest — but
     // there is one physical redistributor for both, so once ③-b2b-ii-c makes `CURRENT` move, this
     // mirror has to be re-applied on every switch-in as well.
-    let timer_enabled = dev[slot].is_enabled(gic::VTIMER_INTID);
+    let timer_enabled = dev.at_mut(slot).is_enabled(gic::VTIMER_INTID);
     drop(dev);
     if a.wnr {
         gic::set_ppi_enabled(gic::VTIMER_INTID, timer_enabled);
@@ -2750,7 +2790,7 @@ fn handle_linux_wfi(frame: &mut LinuxFrame) {
     );
     drop(cell);
     WFI_YIELDS[cur].fetch_add(1, Ordering::Relaxed);
-    switch_context(cur, peer, frame);
+    switch_context(Outgoing::slot(cur), Incoming::slot(peer), frame);
 }
 
 /// The `ICC_SGI1R_EL1` system-register encoding as it appears in an `EC=0x18` ISS: `Op0=3, Op1=0,
@@ -2786,7 +2826,13 @@ fn handle_linux_sysreg_trap(
         //   peer domain with it. Delivery is now total: see `deliver_or_defer_sgi` and
         //   `LINUX_PENDING`. There is no `false` left to branch on, which is what makes the halt
         //   unwritable rather than merely unwritten.
-        deliver_or_defer_sgi(current_slot(), intid);
+        let slot = current_slot();
+        deliver_or_defer_sgi(
+            LINUX_PENDING.at(slot),
+            SGIS_DELIVERED.at(slot),
+            SGIS_DEFERRED.at(slot),
+            intid,
+        );
         // A trapped instruction's preferred return is the instruction ITSELF; resume past it or the
         // guest re-executes the `msr` forever.
         crate::guest::advance_elr_past_fault();
@@ -2896,7 +2942,7 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
             continue;
         }
         let dom = slot_dom(slot);
-        let n = TIMER_FORWARDED[slot].load(Ordering::Relaxed);
+        let n = TIMER_FORWARDED.at(slot).load(Ordering::Relaxed);
         if n > 0 {
             let _ = writeln!(
                 uart,
@@ -2914,7 +2960,7 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
             );
         }
 
-        let (gic_traps, gic_enables) = VGIC.borrow_mut()[slot].witness();
+        let (gic_traps, gic_enables) = VGIC.borrow_mut().at_mut(slot).witness();
         if gic_traps > 0 && gic_enables > 0 {
             let _ = writeln!(
                 uart,
@@ -2937,7 +2983,7 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
             );
         }
 
-        let switches = SWITCHES[slot].load(Ordering::Relaxed);
+        let switches = SWITCHES.at(slot).load(Ordering::Relaxed);
         if switches > 0 {
             let _ = writeln!(
                 uart,
@@ -2954,7 +3000,7 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
             );
         }
 
-        let sgis = SGIS_DELIVERED[slot].load(Ordering::Relaxed);
+        let sgis = SGIS_DELIVERED.at(slot).load(Ordering::Relaxed);
         if sgis > 0 {
             let _ = writeln!(
                 uart,
@@ -3151,9 +3197,9 @@ pub(crate) fn flush_consoles() {
 fn report_timer_handoff(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
         let dom = slot_dom(slot);
-        let released = HW_RELEASED[slot].load(Ordering::Relaxed);
-        let deactivated = TIMER_DEACTIVATED[slot].load(Ordering::Relaxed);
-        let handovers = HANDOVERS[slot].load(Ordering::Relaxed);
+        let released = HW_RELEASED.at(slot).load(Ordering::Relaxed);
+        let deactivated = TIMER_DEACTIVATED.at(slot).load(Ordering::Relaxed);
+        let handovers = HANDOVERS.at(slot).load(Ordering::Relaxed);
 
         // The two conjuncts that survive ③-b2b-ii-e, and what was removed:
         //
@@ -3194,7 +3240,7 @@ fn report_timer_handoff(uart: &mut Pl011) {
         // deactivation is accounted for by exactly one of the two ways EL2 can stop owning that
         // line — it demoted a mapping it had made, or it never made one because the bank was full.
         // Deleting either term breaks the equality, which is what the witness is for.
-        let deferred = TIMER_DEFERRED[slot].load(Ordering::Relaxed);
+        let deferred = TIMER_DEFERRED.at(slot).load(Ordering::Relaxed);
         let ok = released + deferred == deactivated && released <= handovers;
         if ok {
             let _ = writeln!(
@@ -3417,9 +3463,9 @@ fn report_el2_slice(uart: &mut Pl011) {
 fn report_fp_isolation(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
         let dom = slot_dom(slot);
-        let verified = FP_RESTORE_VERIFIED[slot].load(Ordering::Relaxed);
-        let switches = SWITCHES[slot].load(Ordering::Relaxed);
-        let foreign = FP_FOREIGN[slot].load(Ordering::Relaxed);
+        let verified = FP_RESTORE_VERIFIED.at(slot).load(Ordering::Relaxed);
+        let switches = SWITCHES.at(slot).load(Ordering::Relaxed);
+        let foreign = FP_FOREIGN.at(slot).load(Ordering::Relaxed);
         if verified == switches {
             let _ = writeln!(
                 uart,
@@ -3499,7 +3545,7 @@ fn report_per_guest_state(uart: &mut Pl011) {
     let console = CONSOLE.borrow_mut();
 
     let sample = |slot: usize| -> [u64; PER_GUEST_COUNTERS.len()] {
-        let (gic_traps, gic_enables) = vgic[slot].witness();
+        let (gic_traps, gic_enables) = vgic.at(slot).witness();
         let (_, pl011_traps, dr_writes) = pl011[slot].witness();
         [
             gic_traps,
@@ -3507,12 +3553,12 @@ fn report_per_guest_state(uart: &mut Pl011) {
             pl011_traps,
             dr_writes,
             console.lines(slot),
-            TIMER_FORWARDED[slot].load(Ordering::Relaxed),
-            SGIS_DELIVERED[slot].load(Ordering::Relaxed),
-            SWITCHES[slot].load(Ordering::Relaxed),
-            HANDOVERS[slot].load(Ordering::Relaxed),
+            TIMER_FORWARDED.at(slot).load(Ordering::Relaxed),
+            SGIS_DELIVERED.at(slot).load(Ordering::Relaxed),
+            SWITCHES.at(slot).load(Ordering::Relaxed),
+            HANDOVERS.at(slot).load(Ordering::Relaxed),
             MAX_HOLD[slot].load(Ordering::Relaxed),
-            PEER_FAULTS[slot].load(Ordering::Relaxed),
+            PEER_FAULTS.at(slot).load(Ordering::Relaxed),
         ]
     };
 
@@ -3702,7 +3748,7 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // after `report_disjointness` has walked both to their descriptors — an image nothing has read
     // back is not one to start dispatching guests onto.
     for (slot, v) in vttbr.iter().enumerate() {
-        VTTBR[slot].store(*v, Ordering::Relaxed);
+        VTTBR.at(slot).store(*v, Ordering::Relaxed);
     }
 
     // ③-b2b-i put guest A's vCPU under hv-core's REAL scheduler before it ever ran, so the
@@ -3780,7 +3826,7 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     {
         let mut ctx = VCPU_CTX.borrow_mut();
         for slot in (0..NUM_GUESTS).filter(|&s| s != SLOT_A) {
-            ctx[slot].seed_boot(
+            ctx.at_mut(slot).seed_boot(
                 kernel_entry(slot),
                 dtb_addr(slot),
                 SPSR_EL2_LINUX,
