@@ -3902,6 +3902,166 @@ mod device_models {
         );
     }
 
+    // ─── H4b · ⑱-5, `ICC_SGI1R_EL1`: which vCPU does a guest's IPI name? ─────────────────────────
+    //
+    // The first thing under this fence where a guest's arbitrary `u64` decides WHO RECEIVES AN
+    // INTERRUPT. Everything else here turns a guest-chosen offset into a register; this turns a
+    // guest-chosen value into a target vCPU.
+
+    // ★ THE KILL PROBES, and the matrix is orthogonal — each property is killed by ITS OWN defect
+    // and by no other. Run one harness at a time, because `-j 4` interleaves output and an
+    // attribution you cannot trust is worse than none.
+    //
+    // | probe (applied to `hv_vdev::sgi`) | intid | cluster | broadcast | list | non-vac |
+    // |---|---|---|---|---|---|
+    // | **P0** unmodified — the CONTROL | PASS | PASS | PASS | PASS | PASS |
+    // | **P1** ignore the cluster (hv-metal's pre-⑱-5 behaviour) | PASS | **RED** | PASS | PASS | PASS |
+    // | **P2** broadcast includes the sender | PASS | PASS | **RED** | PASS | PASS |
+    // | **P3** range selector ignored | PASS | PASS | PASS | **RED** | PASS |
+    // | **P4** `targets` always false | PASS | PASS | **RED** | **RED** | **RED** |
+    //
+    // ⚠ **P0 is not decoration — it caught a broken probe harness twice.** A first attempt passed the
+    // `--harness` flags through a shell variable that did not word-split, so Kani never ran and every
+    // probe was reported as "survived"; a second reported every harness RED including the unmodified
+    // baseline. **A probe rig that cannot tell "the property held" from "the check never ran" defaults
+    // to the reassuring answer**, and the only thing that exposes it is a row whose expected result
+    // you already know. (Design-lesson #164, reappearing one level out — in the rig rather than the
+    // harness.)
+    //
+    // ⚠ **`an_sgi_intid_is_always_in_the_sgi_range` is killed by NO probe**, because none of the four
+    // perturbs the four-bit extraction. It is proven, not probed. Said out loud rather than left for a
+    // reader to infer from a table of PASSes.
+    //
+    // P4's third kill was not predicted and is correct: with `targets` always false, "names exactly
+    // the bits set" fails wherever a bit IS set. `cluster` staying PASS under P4 is the discriminating
+    // detail — it asserts *not*-targets, which a decode naming nothing satisfies.
+
+    /// **The register encoder, written out HERE rather than taken from the model** (design-lesson
+    /// #36). Asking `hv_vdev::sgi` whether it agrees with itself would prove nothing; these are the
+    /// field positions read off the GICv3 spec, and the harnesses below check that the decode
+    /// inverts *this*.
+    ///
+    /// `Aff1` [23:16] · `INTID` [27:24] · `Aff2` [39:32] · `RS` [43:40] · `IRM` [47] ·
+    /// `Aff3` [63:56] · `TargetList` [15:0].
+    #[allow(clippy::too_many_arguments)]
+    fn sgi1r(intid: u64, irm: bool, aff1: u64, aff2: u64, aff3: u64, rs: u64, list: u64) -> u64 {
+        (aff3 << 56)
+            | ((irm as u64) << 47)
+            | (rs << 40)
+            | (aff2 << 32)
+            | (intid << 24)
+            | (aff1 << 16)
+            | list
+    }
+
+    /// **∀ value: the INTID is an SGI id.** It indexes nothing here, but `hv-metal` hands it to the
+    /// pending set and to the list-register allocator, both of which are bounded by the distributor's
+    /// INTID space — so a decode that could return 1000 would put a number outside the SGI range into
+    /// a path whose callers all assume otherwise.
+    #[kani::proof]
+    fn an_sgi_intid_is_always_in_the_sgi_range() {
+        let (value, sender): (u64, u64) = (kani::any(), kani::any());
+        assert!(
+            hv_vdev::sgi::decode(value, sender).intid() < 16,
+            "ICC_SGI1R_EL1 names an SGI, and SGIs are INTIDs 0..15"
+        );
+    }
+
+    /// ★ **THE ISOLATION PROPERTY: a guest that names a cluster it is not in targets NOTHING.**
+    ///
+    /// `Aff1`/`Aff2`/`Aff3` are a statement about *physical* processing elements, which is precisely
+    /// why the architecture traps this register to EL2 instead of letting EL1 have it. Every vCPU
+    /// baleen gives a guest has affinity `vcpu_affinity(v)` — `Aff0 = v`, every higher level zero — so
+    /// a write naming any non-zero higher level describes no vCPU that exists, and must select none.
+    ///
+    /// A decode that ignored the affinity fields (which is what `hv-metal` did before this rung, by
+    /// its own doc's admission) fails this: it would deliver to whatever the target list said,
+    /// regardless of the cluster asked for.
+    #[kani::proof]
+    fn a_foreign_cluster_names_no_vcpu() {
+        let (value, sender): (u64, u64) = (kani::any(), kani::any());
+        // Not a broadcast — `IRM` deliberately ignores the affinity fields, and is the next harness.
+        kani::assume(value & (1 << 47) == 0);
+        let (aff1, aff2, aff3) = (
+            (value >> 16) & 0xff,
+            (value >> 32) & 0xff,
+            (value >> 56) & 0xff,
+        );
+        kani::assume(aff1 != 0 || aff2 != 0 || aff3 != 0);
+        kani::cover!(true, "a foreign-cluster write is expressible");
+        let d = hv_vdev::sgi::decode(value, sender);
+        let v: usize = kani::any();
+        kani::assume(v < 16);
+        assert!(
+            !d.targets(vcpu_affinity(v)),
+            "a guest naming a cluster none of its vCPUs is in must target no vCPU"
+        );
+    }
+
+    /// **`IRM` means every vCPU EXCEPT the one that issued the write** — the architecture's "all but
+    /// self", and the one routing mode where the target list and affinity fields say nothing.
+    ///
+    /// The exclusion is not cosmetic: a self-targeting broadcast would make a kernel's
+    /// `smp_send_stop` stop the CPU that is running it.
+    #[kani::proof]
+    fn a_broadcast_names_every_vcpu_but_the_sender() {
+        let value: u64 = kani::any();
+        kani::assume(value & (1 << 47) != 0);
+        let sender: usize = kani::any();
+        kani::assume(sender < 16);
+        let d = hv_vdev::sgi::decode(value, vcpu_affinity(sender));
+        assert!(d.is_broadcast());
+        let v: usize = kani::any();
+        kani::assume(v < 16);
+        assert!(
+            d.targets(vcpu_affinity(v)) == (v != sender),
+            "a broadcast must name every vCPU but the sender, and must name all of them"
+        );
+    }
+
+    /// **∀ target list, ∀ range selector: the decode names EXACTLY the PEs the bits name.**
+    ///
+    /// The `RS` arithmetic is the part worth quantifying over. `TargetList` is 16 bits and `Aff0` is
+    /// 8, so `RS` selects which block of sixteen the list covers — and an off-by-one there silently
+    /// re-aims every IPI on a machine with more than 16 vCPUs.
+    #[kani::proof]
+    fn a_target_list_names_exactly_the_bits_it_sets() {
+        let (rs, list): (u64, u64) = (kani::any(), kani::any());
+        kani::assume(rs < 16 && list <= 0xffff);
+        let sender: u64 = kani::any();
+        // Cluster 0 — the one every baleen vCPU is in — and not a broadcast.
+        let d = hv_vdev::sgi::decode(sgi1r(0, false, 0, 0, 0, rs, list), sender);
+        let v: usize = kani::any();
+        kani::assume(v < 256);
+        let aff0 = v as u64;
+        let in_window = aff0 >= rs * 16 && aff0 < rs * 16 + 16;
+        let named = in_window && (list & (1 << (aff0.wrapping_sub(rs * 16)))) != 0;
+        assert!(
+            d.targets(vcpu_affinity(v)) == named,
+            "the target set must be exactly the PEs the range selector and target list name"
+        );
+    }
+
+    /// **Non-vacuity, and it is the property the rung exists for.** Everything above is of the form
+    /// "nothing wrong is named", which a decode that names NOTHING AT ALL would satisfy — and a
+    /// decode that names nothing is exactly the bug that would leave `hv-metal` delivering every IPI
+    /// to the running vCPU forever.
+    ///
+    /// So: a concrete write from vCPU 0 naming vCPU 1 must target vCPU 1 and NOT vCPU 0.
+    #[kani::proof]
+    fn a_guest_can_name_a_vcpu_that_is_not_itself() {
+        let d = hv_vdev::sgi::decode(sgi1r(3, false, 0, 0, 0, 0, 1 << 1), vcpu_affinity(0));
+        assert!(d.intid() == 3, "the SGI id must survive the decode");
+        assert!(
+            d.targets(vcpu_affinity(1)),
+            "a write whose target list names vCPU 1 must target vCPU 1"
+        );
+        assert!(
+            !d.targets(vcpu_affinity(0)),
+            "and must NOT also target the vCPU that sent it"
+        );
+    }
+
     // ─── H5 · the PL011 ──────────────────────────────────────────────────────────────────────────
 
     /// **∀ (offset, width, value): the PL011 model is total.**

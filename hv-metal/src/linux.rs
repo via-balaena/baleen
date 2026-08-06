@@ -235,6 +235,7 @@ use hv_core::hypervisor::DomId;
 use hv_core::p2m::{Mfn, PtLevel};
 use hv_core::sched::RunState;
 use hv_core::{HvCall, Hypervisor};
+use hv_vdev::gicv3::vcpu_affinity;
 
 use crate::abort::{self, DataAbort, EC_DATA_ABORT};
 use crate::cell::BootCell;
@@ -871,7 +872,7 @@ const MPIDR_HWID_BITMASK: u64 = 0xff_00ff_ffff;
 /// level with `Aff0` at bit 0, which is where `MPIDR_EL1` wants it and which `GICR_TYPER` shifts to
 /// bit 32.
 const fn guest_mpidr(vcpu: VcpuIdx) -> u64 {
-    MPIDR_RES1 | hv_vdev::gicv3::vcpu_affinity(vcpu.get())
+    MPIDR_RES1 | vcpu_affinity(vcpu.get())
 }
 
 // ⑱-3a: `BOOT_VCPU` and `VCPUS_PER_GUEST` moved to `crate::role`, which owns the vCPU axis and so
@@ -913,8 +914,7 @@ const _: () = assert!(
 // vacuous assert that reads as coverage is worse than an absent one. It belongs to ⑱-3b-ii, with
 // the rung that gives the axis a second value.
 const _: () = assert!(
-    guest_mpidr(VcpuIdx::boot()) & MPIDR_HWID_BITMASK
-        == hv_vdev::gicv3::vcpu_affinity(VcpuIdx::boot().get()),
+    guest_mpidr(VcpuIdx::boot()) & MPIDR_HWID_BITMASK == vcpu_affinity(VcpuIdx::boot().get()),
     "the affinity a guest reads in MPIDR_EL1 must be the one its redistributor reports in \
      GICR_TYPER — gic_populate_rdist matches them against each other and fails the CPU if they \
      disagree"
@@ -1297,6 +1297,30 @@ static LINUX_PENDING: PerVcpu<crate::pending::PendingSet, NUM_GUESTS, VCPUS_PER_
 static SGIS_DEFERRED: PerGuest<AtomicU64, NUM_GUESTS> =
     PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
+/// ⑱-5 — **every `(SGI, target vCPU)` pair EL2 undertook to deliver.** One guest write can name
+/// several vCPUs (a broadcast names every one but the sender), so this counts targets, not writes.
+///
+/// The witness is the identity `named == delivered + deferred + routed`: each such pair gets
+/// **exactly one** disposition — into the running vCPU's list registers, into its pending set
+/// because the bank was full, or into a *sibling's* set because that vCPU is not on the pCPU. There
+/// is no fourth, so this is a property of the mechanism rather than of what any guest sends.
+///
+/// ⚠ **It counts DISPOSITIONS, not decodes, and the distinction was forced by the witness itself.**
+/// The obvious wording — "pairs the `ICC_SGI1R_EL1` decode named" — was what this doc said first, and
+/// it was wrong in the configuration the REQUIRED gate boots: the `selftest` overflow probe calls
+/// [`deliver_or_defer_sgi`] directly to manufacture a full bank, which is a disposition no decode
+/// named. Counting at the decode left the identity one short and the marker went red on its first
+/// run. **Counted where the disposition happens, it holds for every caller** — including callers
+/// this rung did not think of, which is the point.
+static SGI_TARGETS_NAMED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-5 — SGIs marked for a vCPU that was **not the one running**, i.e. genuinely routed rather than
+/// delivered. **Zero until ⑱-4 starts a second vCPU**, and reported rather than asserted for exactly
+/// that reason: it is a claim about the workload, and the workload cannot produce one yet.
+static SGIS_ROUTED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
 /// vINTs later drained from the pending set into a freed list register.
 static SGIS_DRAINED: PerGuest<AtomicU64, NUM_GUESTS> =
     PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
@@ -1311,10 +1335,18 @@ static MAINT_TAKEN: PerGuest<AtomicU64, NUM_GUESTS> =
 /// replaces. The two outcomes are "in a list register now" and "in the set until one frees".
 fn deliver_or_defer_sgi(
     set: &crate::pending::PendingSet,
+    named: &AtomicU64,
     delivered: &AtomicU64,
     deferred: &AtomicU64,
     intid: u32,
 ) {
+    // ⑱-5: counted HERE and not at the routing loop, and the difference was found by the witness on
+    // its first run. The `selftest` overflow probe calls this function directly to manufacture a full
+    // bank — a disposition that no `ICC_SGI1R_EL1` decode named — so counting the pair at the decode
+    // left `named` one short of `delivered + deferred` in exactly the configuration the REQUIRED gate
+    // boots. Counting it where the disposition happens makes the identity hold for every caller
+    // rather than for the ones this rung happened to think of.
+    named.fetch_add(1, Ordering::Relaxed);
     if gic::inject(intid) {
         delivered.fetch_add(1, Ordering::Relaxed);
         return;
@@ -1430,6 +1462,7 @@ fn probe_lr_overflow(g: Outgoing) {
 
     deliver_or_defer_sgi(
         LINUX_PENDING.out(g),
+        SGI_TARGETS_NAMED.out(g),
         SGIS_DELIVERED.out(g),
         SGIS_DEFERRED.out(g),
         PROBE_OVERFLOW_INTID,
@@ -1487,6 +1520,75 @@ fn report_pending_absorption(uart: &mut Pl011) {
              on a boot whose guest takes its own interrupts — this is a diagnostic, not a claim)",
             slot_dom(slot)
         );
+    }
+}
+
+/// ★ **⑱-5's witness: every SGI target the decode NAMED got exactly one disposition.**
+///
+/// ## The identity, and why it is the mechanism rather than the workload
+///
+/// One `ICC_SGI1R_EL1` write can name several vCPUs — a broadcast names every one but the sender —
+/// so the quantity to conserve is `(SGI, target vCPU)` PAIRS, not writes. Each takes exactly one of
+/// three exits:
+///
+/// * **delivered** — the target is the running vCPU and a list register was free;
+/// * **deferred** — the target is the running vCPU and its bank was full, so its own set holds it;
+/// * **routed** — the target is a *sibling*, whose bank is not live, so the set is the whole
+///   delivery and `UIE` is deliberately not armed.
+///
+/// (The `selftest` overflow probe reaches the first two directly, without a decode — see
+/// [`SGI_TARGETS_NAMED`], where counting them cost this witness a red run to learn.)
+///
+/// There is no fourth exit, and none of the three can be skipped: `PendingSet::mark` refuses only an
+/// INTID outside the distributor's space, and ⑱-5's Kani harness
+/// `an_sgi_intid_is_always_in_the_sgi_range` proves an SGI id is always 0..15. **That premise used to
+/// be prose** — `pending.rs` argued it from "a guest SGI comes from a four-bit field" — and is now a
+/// theorem, which is the quiet half of moving the decode under the fence.
+///
+/// So `named == delivered + deferred + routed` holds on every boot whatever the guests do, and it is
+/// **false on `main`**, where nothing counts targets because nothing decodes them.
+///
+/// ## What is reported and NOT asserted, and why that restraint is the whole discipline
+///
+/// **`routed` reads ZERO today, and asserting anything about it would be this arc's standing
+/// mistake.** ⑱-5 lands before ⑱-4 deliberately (#163, the ⑱-2 pattern: prove at N, deploy at 1), so
+/// no sibling vCPU is `Runnable` and no guest can name one. A count of zero here is a correct boot,
+/// and a positive count becomes the point of the rung that starts a second vCPU — not of this one.
+///
+/// ## Honest ceiling
+///
+/// This says every named target was disposed of. It does **not** say the decode named the RIGHT
+/// targets — that claim is the five Kani harnesses over `hv_vdev::sgi`, which quantify over the
+/// whole 64-bit value a guest can write, and their four kill probes. A boot witness cannot make it,
+/// because the shipped Alpine kernel with one runnable vCPU only ever names itself.
+fn report_sgi_routing(uart: &mut Pl011) {
+    for slot in 0..NUM_GUESTS {
+        if !witnesses_assertable(slot) {
+            continue;
+        }
+        let dom = slot_dom(slot);
+        let named = SGI_TARGETS_NAMED.at(slot).load(Ordering::Relaxed);
+        let delivered = SGIS_DELIVERED.at(slot).load(Ordering::Relaxed);
+        let deferred = SGIS_DEFERRED.at(slot).load(Ordering::Relaxed);
+        let routed = SGIS_ROUTED.at(slot).load(Ordering::Relaxed);
+        if named == delivered + deferred + routed {
+            let _ = writeln!(
+                uart,
+                "baleen: sgiroute OK: dom {dom}'s SGIs are decoded under the fence and ROUTED BY \
+                 TARGET — {named} (write, target) pair(s) named by ICC_SGI1R_EL1, each disposed of \
+                 exactly once: {delivered} into the running vCPU's list registers, {deferred} \
+                 deferred to its own pending set, {routed} routed to a SIBLING vCPU's set (zero \
+                 until a second vCPU is startable, which is ⑱-4 — reported, not asserted)"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: sgiroute FAIL: dom {dom} undertook {named} SGI deliveries but disposed of \
+                 {delivered} + {deferred} + {routed} — a target reached no vCPU at all, or was \
+                 counted twice. An IPI a guest sent has gone missing"
+            );
+            crate::park();
+        }
     }
 }
 
@@ -2389,6 +2491,7 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     report_vcpu_census(uart);
     report_fp_isolation(uart);
     report_pending_absorption(uart);
+    report_sgi_routing(uart);
     #[cfg(feature = "selftest")]
     report_lr_overflow(uart);
     #[cfg(feature = "selftest")]
@@ -3166,40 +3269,64 @@ fn handle_linux_sysreg_trap(
         // `Rt` is ISS[9:5]; 31 is `XZR`, which reads zero.
         let rt = ((iss >> 5) & 0x1f) as usize;
         let value = if rt < 31 { frame.x[rt] } else { 0 };
-        let intid = gic::sgi1r_intid(value);
         // ★ This used to `park()` when the bank was full — a halt a guest could REACH, taking the
         //   peer domain with it. Delivery is now total: see `deliver_or_defer_sgi` and
         //   `LINUX_PENDING`. There is no `false` left to branch on, which is what makes the halt
         //   unwritable rather than merely unwritten.
         //
-        // ⑱-3b-i: the pending set is the **running vCPU's**, because the list-register bank
+        // ⑱-3b-i put the pending set on the **running vCPU**, because the list-register bank
         // `deliver_or_defer_sgi` tries first is the running vCPU's — the set is where a vINT waits
-        // for *that* bank to free a slot. Deferring into `BOOT_VCPU`'s set would hand vCPU 1's
-        // undeliverable SGI to vCPU 0, which then drains it into its own list registers on its next
-        // switch-in.
+        // for *that* bank to free a slot.
         //
-        // ⚠ This is the STORAGE axis only. **Which vCPU an SGI is aimed AT** is a different
-        // question — `ICC_SGI1R_EL1` carries a target list, which `gic::sgi1r_intid` does not decode.
-        // That decode is ⑱-5, and this site is why it is worth getting the storage right first: the
-        // target-list rung wants a per-vCPU set to deliver *into*.
+        // ★★ ⑱-5 — **AND NOW THE OTHER AXIS: WHICH vCPU AN SGI IS AIMED AT.**
         //
-        // ⚠⚠ **⑱-3b-ii CHANGED WHY THAT IS SAFE, and the old reason is now false.** This comment
-        // used to say the decode could be skipped "because with one vCPU per guest there is only one
-        // answer". `VCPUS_PER_GUEST` is 2, so there are now two answers and that sentence would be a
-        // lie. What still holds is weaker and behavioural: **only the boot vCPU is ever admitted**,
-        // so it is the only vCPU that can be running when this trap is taken and the only one that
-        // can be delivered to — a guest cannot target a sibling that never executes. That is a
-        // property of ⑱-3b-ii's boundary (`report_vcpu_census`'s `dispatched == 0`), not of the
-        // architecture, and it **expires the moment ⑱-4 starts a second vCPU**. ⑱-5 must land the
-        // target-list decode before, or together with, any rung that lets a sibling run.
+        // Two rungs of comment here said this decode did not exist and named the reason it was safe
+        // to skip. ⑱-3b-i's reason was "one vCPU per guest, so only one answer"; ⑱-3b-ii falsified
+        // that and replaced it with a weaker, behavioural one — "only the boot vCPU is ever admitted,
+        // so no sibling can be running to be targeted" — and said in as many words that it **expires
+        // the moment ⑱-4 starts a second vCPU**. This is that rung, arriving first on purpose.
+        //
+        // The decode is `hv_vdev::sgi`, under the fence where `hv-verify` quantifies over the whole
+        // 64-bit value a guest can write. What is left here is the part that needs the machine: which
+        // pending set each named target's vINT goes into, and whether its bank is the live one.
+        //
+        // ⚠ **MEASURED, on a probe that was reverted.** Without this, a started second vCPU gives
+        // `SMP: failed to stop secondary CPUs 1` on both guests and the boot gate TIMES OUT — every
+        // IPI landing on whichever vCPU happened to be running. That measurement is why ⑱-5 goes
+        // before ⑱-4 rather than after it, which is not the order the roadmap had.
         let running = current_vcpu();
         let slot = running.guest();
-        deliver_or_defer_sgi(
-            LINUX_PENDING.of(running),
-            SGIS_DELIVERED.at(slot),
-            SGIS_DEFERRED.at(slot),
-            intid,
-        );
+        let decoded = hv_vdev::sgi::decode(value, vcpu_affinity(running.vcpu().get()));
+        let intid = decoded.intid();
+        // Offer the decode every vCPU of the ISSUING guest and no others. That is what confines an
+        // SGI to its own guest: the affinity a guest names is checked against `vcpu_affinity`, but
+        // even a value that matched a peer's would never be asked about, because the peer's vCPUs are
+        // not in this iteration. Two independent reasons, and the loop is the stronger one.
+        for (_, target) in crate::role::census(NUM_GUESTS).filter(|&(g, _)| g == slot) {
+            if !decoded.targets(vcpu_affinity(target.get())) {
+                continue;
+            }
+            if target == running.vcpu() {
+                // The target is on the pCPU: its list registers are the live ones, so this is ③-a2's
+                // path unchanged — inject, or defer into its own set and arm `UIE`.
+                deliver_or_defer_sgi(
+                    LINUX_PENDING.of(running),
+                    SGI_TARGETS_NAMED.at(slot),
+                    SGIS_DELIVERED.at(slot),
+                    SGIS_DEFERRED.at(slot),
+                    intid,
+                );
+            } else if LINUX_PENDING.at(slot, target).mark(intid) {
+                SGI_TARGETS_NAMED.at(slot).fetch_add(1, Ordering::Relaxed);
+                // ★ A SIBLING vCPU, which is the whole point of the rung. Its bank is NOT live, so
+                //   there is nothing to inject into and `UIE` must NOT be armed — `UIE` is a
+                //   statement about the running vCPU's list registers, and arming it here would make
+                //   EL2 take a maintenance interrupt about a bank that is already empty (III-1's
+                //   livelock, reached from the other side). The set is the whole delivery, and
+                //   `flush_pending_to_lrs` drains it when that vCPU is switched IN.
+                SGIS_ROUTED.at(slot).fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // A trapped instruction's preferred return is the instruction ITSELF; resume past it or the
         // guest re-executes the `msr` forever.
         crate::guest::advance_elr_past_fault();

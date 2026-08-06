@@ -250,27 +250,21 @@ pub(crate) fn inject_hw(vintid: u32, pintid: u32) -> bool {
     }
 }
 
-/// The SGI id a write to `ICC_SGI1R_EL1` requests — bits [27:24], so 0..=15 (the whole SGI range).
-///
-/// **Why EL2 sees this write at all.** `HCR_EL2.IMO=1` redirects EL1's *interrupt-handling* `ICC_*`
-/// accesses to the virtual CPU interface, but `ICC_SGI1R_EL1` is not one of them: generating an SGI
-/// names its targets by **physical affinity** (`Aff1..3` + a target list, or "all but self"), which is
-/// a statement about real PEs that a guest must not be allowed to make. So the architecture traps it
-/// to EL2 instead, and the hypervisor decides what it means. That trap is unavoidable under `IMO=1` —
-/// it is not something this port opted into — and leaving it unhandled is a dead guest the moment the
-/// kernel raises its first IPI.
-///
-/// **What ③-a2 does with it, and the honest bound.** One guest, one vCPU: every SGI a guest can
-/// generate is addressed to itself, so the faithful emulation is to make that SGI pending as a purely
-/// *virtual* interrupt ([`inject`], `HW=0` — the guest invented it, so there is no physical interrupt
-/// to deactivate and a hardware mapping would be a lie). **The affinity fields are deliberately not
-/// read**, because with a single vCPU there is no other target they could name; ③-b, which has a
-/// second guest and may have a second vCPU, is where routing them becomes a real decision rather than
-/// a degenerate one.
-#[cfg(feature = "real-linux")]
-pub(crate) fn sgi1r_intid(value: u64) -> u32 {
-    ((value >> 24) & 0xf) as u32
-}
+// ─── ⑱-5: `sgi1r_intid` LIVED HERE, AND ITS REMOVAL IS THE RUNG ─────────────────────────────────
+//
+// It read **bits [27:24] only** — the INTID — and its own doc said why, honestly and at length:
+// *"The affinity fields are deliberately not read, because with a single vCPU there is no other
+// target they could name; ③-b, which has a second guest and may have a second vCPU, is where routing
+// them becomes a real decision rather than a degenerate one."*
+//
+// That rung arrived. `VCPUS_PER_GUEST` is 2, the fields name something, and reading only the INTID
+// means every IPI lands on whichever vCPU is running — **measured** on a reverted probe as
+// `SMP: failed to stop secondary CPUs 1`, with the boot gate timing out.
+//
+// The replacement is `hv_vdev::sgi`, under the `unsafe_code = "forbid"` fence where `hv-verify` can
+// reach it: a guest's arbitrary 64-bit value deciding which vCPU receives an interrupt is exactly
+// the kind of thing ⑯ built that fence for. **The decode did not move because this file was wrong —
+// it moved because a theorem about it is statable there and was not statable here.**
 
 /// **Deactivate** a physical interrupt EL2 handled itself (`ICC_DIR_EL1`).
 ///

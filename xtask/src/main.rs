@@ -816,6 +816,22 @@ const LINUX_MARKERS: &[&str] = &[
     // The guest-observable half (410 → 413 GICD/GICR traps per dom, the driver walking to the
     // redistributor that carries `Last`) is a WORKLOAD number and is reported, never asserted.
     "baleen: vcpus OK: each of the",
+    // ★ ⑱-5 — **AN SGI IS DECODED UNDER THE FENCE AND ROUTED BY TARGET.** `ICC_SGI1R_EL1` names its
+    // targets by physical affinity, which is why the architecture traps it to EL2 at all. hv-metal
+    // used to read bits [27:24] only — the INTID — and its own doc admitted the affinity fields were
+    // "deliberately not read, because with a single vCPU there is no other target they could name".
+    //
+    // MEASURED on a reverted probe once a second vCPU actually ran: every IPI landed on whichever
+    // vCPU was running, giving `SMP: failed to stop secondary CPUs 1` and a boot-gate TIMEOUT. That
+    // is why this rung lands BEFORE the one that starts a second vCPU.
+    //
+    // The marker asserts a conservation identity — every `(write, target)` pair the decode names gets
+    // exactly one disposition — which is a property of the routing loop's three exits and not of
+    // anything a guest sends. The claim that the decode names the RIGHT targets is five Kani
+    // harnesses over `hv_vdev::sgi` (∀ 64-bit value a guest can write) plus their four kill probes;
+    // no boot can make it, because one runnable vCPU only ever names itself.
+    "baleen: sgiroute OK: dom 1's SGIs are decoded under the fence and ROUTED BY TARGET",
+
     // ★ ③-b2b-ii-f — **THE FP/SIMD REGISTER FILE IS PER-GUEST.** The last enumerated member of the
     // "state the hardware does not swap" class, and the one that stayed open longest: `v0..v31`,
     // `FPCR` and `FPSR` are one physical file shared by every context on the CPU, and nothing saved

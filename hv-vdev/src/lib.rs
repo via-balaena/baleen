@@ -44,9 +44,20 @@
 //! switch applies to a saved copy of it. A guest never addresses it. It belongs here anyway because
 //! the criterion that actually earns a module a place in this crate is not "the guest touches it" but
 //! **"it is a pure function of ordinary state, so a theorem about it is statable"** — and the
-//! distributor half was only ever the first thing to satisfy that. The two halves are one device seen
-//! from its two sides: [`gicv3`] is what the guest reads, [`vgic_cpuif`] is what EL2 writes, and an
-//! interrupt is not delivered until both agree.
+//! distributor half was only ever the first thing to satisfy that.
+//!
+//! **⑱-5 added a THIRD side, and it is the one the criterion was written for.** [`sgi`] decodes
+//! `ICC_SGI1R_EL1` — the register a guest **writes** to raise an interrupt on another CPU, whose
+//! 64 bits are entirely the guest's choice and whose meaning is "which processing elements receive
+//! this". So the GICv3 is here from all three of its sides: [`gicv3`] is what the guest **reads**,
+//! [`sgi`] is what the guest **writes**, [`vgic_cpuif`] is what EL2 writes to present the result —
+//! and an interrupt is not delivered until all three agree.
+//!
+//! Worth saying which of the three is the adversarial one. A guest chooses the GIC *offset* it reads
+//! (⑯'s reason for existing) and it chooses the whole `ICC_SGI1R_EL1` *value*; but the offset only
+//! selects a register, while this value selects **a target vCPU**. It is the first thing under this
+//! fence where a guest's arbitrary `u64` decides who receives an interrupt, which is why [`sgi`] is
+//! a predicate over affinities rather than anything that indexes.
 //!
 //! **Not here: the deployment.** Three kinds of thing stay in `hv-metal`, and the split is the part
 //! worth getting right:
@@ -80,11 +91,21 @@
 //!
 //! ## Where this crate actually stands — read before believing the word "provable"
 //!
-//! ⑯ is complete: the models moved here (steps 1 and 2) and **`hv-verify::device_models` now carries
-//! fourteen harnesses over them** (step 3). Both entry points of both models are proven total over
-//! every offset, width and value a guest can name; the GIC's decode is proven a partition and its
-//! failed writes proven to change nothing; the enable state a caller mediates on is proven to move
-//! only where an enable register names it.
+//! ⑯ is complete: the models moved here (steps 1 and 2) and **`hv-verify::device_models` carries
+//! harnesses over them** (step 3) — fourteen at ⑯, ten more at ⑱-2 for the per-vCPU redistributors,
+//! and **five at ⑱-5 for [`sgi`]**. Both entry points of both MMIO models are proven total over every
+//! offset, width and value a guest can name; the GIC's decode is proven a partition and its failed
+//! writes proven to change nothing; the enable state a caller mediates on is proven to move only
+//! where an enable register names it.
+//!
+//! ⑱-5's five are a different shape and worth distinguishing. They are not about totality — [`sgi`]
+//! indexes nothing and cannot fail — but about **meaning**: which processing elements a guest's
+//! 64-bit value names. The load-bearing one is that a guest naming a cluster none of its vCPUs is in
+//! targets nothing, which is an isolation property rather than a memory-safety one. All five were
+//! kill-probed, and the probes are tabulated on the harnesses: each of the three semantic properties
+//! is killed by its own defect and by no other. ⚠ **The INTID-range harness was killed by none of
+//! them** — no probe perturbed the four-bit extraction — so it is proven, not probed, and that is
+//! recorded rather than glossed.
 //!
 //! **Keep this paragraph honest as things change.** It is the one place a reader is told what the
 //! fence does and does not buy, and it has gone stale twice already — once saying the GIC model was
@@ -111,4 +132,5 @@
 pub mod gicv3;
 pub mod pending;
 pub mod pl011;
+pub mod sgi;
 pub mod vgic_cpuif;
