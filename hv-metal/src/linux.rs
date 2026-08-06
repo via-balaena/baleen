@@ -913,11 +913,70 @@ const _: () = assert!(
 // one. It cannot be stated as anything but a vacuous truth while `VCPUS_PER_GUEST == 1`, and a
 // vacuous assert that reads as coverage is worse than an absent one. It belongs to ⑱-3b-ii, with
 // the rung that gives the axis a second value.
+//
+// ✅ **DISCHARGED BY ⑱-4b-ii — see `AFFINITIES_ARE_DISTINCT` below.** The obligation was recorded
+// here, came due when ⑱-3b-ii raised `VCPUS_PER_GUEST` to 2, and was not paid then. This rung is
+// what makes it load-bearing rather than merely non-vacuous, so it is paid here.
 const _: () = assert!(
     guest_mpidr(VcpuIdx::boot()) & MPIDR_HWID_BITMASK == vcpu_affinity(VcpuIdx::boot().get()),
     "the affinity a guest reads in MPIDR_EL1 must be the one its redistributor reports in \
      GICR_TYPER — gic_populate_rdist matches them against each other and fails the CPU if they \
      disagree"
+);
+
+// ⑱-4b-ii: `MPIDR_RES1` must lie OUTSIDE the hwid field. Everything below reasons about
+// `vcpu_affinity` where `guest_mpidr` is what the guest reads, and this is what makes the two
+// interchangeable under the mask instead of that being a sentence in a comment.
+const _: () = assert!(
+    MPIDR_RES1 & MPIDR_HWID_BITMASK == 0,
+    "MPIDR_RES1 must not fall inside MPIDR_HWID_BITMASK, or guest_mpidr's masked hwid would carry \
+     a bit that vcpu_affinity — the value GICR_TYPER and the DTS both encode — does not"
+);
+
+// ⑱-4b-ii: the pin for `cpu@1`, the twin of the `cpu@0` one above.
+//
+// It names `vcpu_affinity` rather than `guest_mpidr` because [`VcpuIdx`] has no const constructor
+// for a bare index — that is ⑱-3b-i's whole point — and the assert directly above makes the two
+// equal under the mask. So this is still ONE derivation, reached from the only end a `const` can.
+const _: () = assert!(
+    vcpu_affinity(1) & MPIDR_HWID_BITMASK == 1,
+    "guest.dts declares cpu@1 with reg = <0x01>; vcpu_affinity(1) must present that same hwid, or \
+     PSCI CPU_ON's MPIDR inversion resolves the target Linux named to the wrong vCPU"
+);
+
+/// ★ **⑱-4b-ii — DISTINCT vCPUs GET DISTINCT AFFINITIES, ∀ pairs, at compile time.**
+///
+/// The obligation recorded above, now due and now load-bearing. [`cpu_on`] inverts the vCPU→MPIDR
+/// map by **searching** — offering each of the guest's vCPUs to [`guest_mpidr`] and comparing under
+/// [`MPIDR_HWID_BITMASK`]. A search returns *the* answer only if the map is injective; if two vCPUs
+/// ever shared an affinity it would return whichever came first, and a guest asking to start CPU 1
+/// could be given CPU 0 — or `ALREADY_ON` for a CPU that is not the one it named.
+///
+/// It is also what `gic_populate_rdist` needs: a booting secondary matches its own `MPIDR_EL1`
+/// against each redistributor's `GICR_TYPER` affinity, and picks the first that matches.
+///
+/// Checked pairwise over the whole axis rather than for the two values that exist today, so raising
+/// [`VCPUS_PER_GUEST`] cannot silently outgrow it. `vcpu_affinity` is the shared derivation, so this
+/// constrains the same function the emulated GIC and the device tree are pinned against.
+const fn affinities_are_distinct() -> bool {
+    let mut i = 0;
+    while i < VCPUS_PER_GUEST {
+        let mut j = i + 1;
+        while j < VCPUS_PER_GUEST {
+            if vcpu_affinity(i) & MPIDR_HWID_BITMASK == vcpu_affinity(j) & MPIDR_HWID_BITMASK {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+const AFFINITIES_ARE_DISTINCT: bool = affinities_are_distinct();
+const _: () = assert!(
+    AFFINITIES_ARE_DISTINCT,
+    "two vCPUs of one guest present the same hwid: PSCI CPU_ON's MPIDR inversion would be \
+     ambiguous, and a booting secondary would match the wrong redistributor"
 );
 
 /// Times [`set_guest_identity`] ran, and times the registers **read back** as what it wrote.
@@ -1164,6 +1223,16 @@ const PSCI_FEATURES_FID: u64 = 0x8400_000A;
 const PSCI_SYSTEM_OFF_FID: u64 = 0x8400_0008;
 const PSCI_VERSION_1_1: u64 = 0x0001_0001;
 const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
+/// PSCI `CPU_ON`, SMC64. ⑱-4b-ii is the rung that answers it with anything but `NOT_SUPPORTED`.
+/// `guest.dts`'s `psci` node has declared `cpu_on = <0xc4000003>` since the file was written.
+const PSCI_CPU_ON_FID: u64 = 0xc400_0003;
+/// The return codes ⑱-4b-ii can produce, taken from the PSCI spec's table rather than from what the
+/// one caller we have happens to check: a guest given a wrong code makes a wrong decision about its
+/// own CPUs, and the next caller may not be Linux.
+const PSCI_SUCCESS: u64 = 0;
+const PSCI_INVALID_PARAMETERS: u64 = (-2i64) as u64;
+const PSCI_ALREADY_ON: u64 = (-4i64) as u64;
+const PSCI_INVALID_ADDRESS: u64 = (-9i64) as u64;
 
 /// The emulated PL011s the guests drive (③-a1), **one per guest since ③-b2b-ii-a** — which is the
 /// whole point of the device having become EL2 state instead of hardware. A UART is not a shareable
@@ -2002,9 +2071,57 @@ static SWITCHES: PerGuest<AtomicU64, NUM_GUESTS> =
 /// would be satisfiable by never scheduling anything at all — the shape of vacuity design-lesson
 /// #105 names.
 ///
-/// **⑱-4 RETIRES THIS ASSERTION**, and should: once `PSCI CPU_ON` seeds and admits a second vCPU,
-/// a non-zero count is the point of that rung rather than a defect. It is scoped deliberately.
+/// ✅ **⑱-4b-ii RETIRED THAT ASSERTION, as this doc said it should.** `PSCI CPU_ON` seeds and admits
+/// a second vCPU, so a non-zero count is now the point rather than a defect — **measured 344 on a
+/// shipped boot.** The counter survives as a REPORTED number; what replaced the assertion is
+/// `seeded == admitted` per guest, in [`report_vcpu_census`]. Retired, not relaxed: the statement it
+/// was standing in for ("no vCPU runs without a context") is still asserted, and is still true.
 static DISPATCHED_NONBOOT: AtomicU64 = AtomicU64::new(0);
+
+/// ⑱-4b-ii — **which vCPUs EL2 has established a context for.**
+///
+/// A vCPU with no seeded context holds a zeroed [`vcpu::VcpuCtx`]; entering it `eret`s to PC = 0,
+/// which ⑱-3b-ii measured directly (`EC=0x20 ELR=FAR=0x0` on both guests, then a boot that never
+/// finished).
+///
+/// ★ **THIS GENERALISES ⑱-3b-ii'S ASSERTION RATHER THAN RETIRING IT.** That rung asserted
+/// `DISPATCHED_NONBOOT == 0` — *no vCPU but the boot one ever reached the pCPU* — which was right
+/// while nothing could start one and is **false by design** here. What it was really protecting
+/// against was never "a non-boot vCPU" but **an unseeded one**, and that statement stays true for
+/// every rung after this: [`cpu_on`] seeds before it admits, and [`switch_context`] refuses to enter
+/// a vCPU this set does not name.
+///
+/// Written at the three — and only three — places a vCPU acquires a context: guest A's boot `eret`,
+/// the boot-time seeding of every other guest's first vCPU, and `CPU_ON`.
+static VCPU_SEEDED: PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST> =
+    PerVcpu::new([const { [const { AtomicU64::new(0) }; VCPUS_PER_GUEST] }; NUM_GUESTS]);
+
+/// ⑱-4b-ii — secondaries `CPU_ON` seeded a context for, and secondaries it admitted to the model.
+///
+/// **The witness is that they are EQUAL**, and they are counted at the two sites separately rather
+/// than one being inferred from the other, so a path that admitted without seeding shows up as a
+/// difference instead of being invisible.
+static SECONDARIES_SEEDED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+static SECONDARIES_ADMITTED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-4b-ii — `CPU_ON` requests EL2 REFUSED, by no particular reason (the console line says which).
+///
+/// Reported, never asserted: every one of these is a claim about what a guest asked for. **MEASURED
+/// on the shipped boot: zero** — Linux calls `CPU_ON` exactly once per guest, with a target it owns
+/// and an entry point in its own RAM, and never retries.
+static CPU_ON_REFUSED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// The `SCTLR_EL1` a guest's first vCPU was entered with — **MMU off**, read off the live CPU right
+/// after `init_guest_el1` cleared the enables.
+///
+/// ⑱-4b-ii needs it because a secondary must start in the state the primary did, and by the time a
+/// guest issues `CPU_ON` the live `SCTLR_EL1` is the *primary's*, with its MMU long since on.
+/// Entering a secondary with that would translate its entry point through page tables it has not
+/// built. Captured once, at the one moment the value is the boot value.
+static SCTLR_AT_BOOT: AtomicU64 = AtomicU64::new(0);
 
 /// How many hardware-mapped list registers each guest has handed back at a switch (③-b2b-ii-c1).
 ///
@@ -2501,24 +2618,50 @@ fn retire_and_hand_over(
         use hv_hal::TimeSource;
         crate::time::GenericTimer.now()
     };
-    // ⚠ **⑱-4 MUST REVISIT THIS, AND IT IS THE ONE PLACE THIS RUNG LEAVES A LOADED GUN.** A guest is
-    // being RETIRED — powered off or faulted — but only the vCPU that was running is offlined. That
-    // is exactly right today, because no other vCPU of that guest has ever been admitted, so every
-    // one of them is already `Offline`. The moment `CPU_ON` admits a second, retiring a guest here
-    // would leave a sibling `Runnable` in the model — and `next_runnable` would then dispatch a vCPU
-    // of a domain that has powered off, into a context nobody restored. `hv_core::sched` already has
-    // the right primitive (`offline_all`, "take every vCPU `dom` owns offline — the scheduler step of
-    // tearing a domain down"); what it lacks is an `HvCall` reaching it, which is ⑱-4's work, not a
-    // hazard this rung can close by guessing at the shape.
-    sched_on(
-        hv,
-        slot_dom(cur.guest()),
-        HvCall::SchedOffline {
-            vcpu: cur.vcpu().model(),
-            now,
-        },
-        "retire the vcpu",
-    );
+    // ★★ ⑱-4b-ii — **RETIRE EVERY vCPU THE GUEST HAS.** ⑱-3b-ii left this offlining only the vCPU
+    //          that was running and said, in as many words, that it was "the one place this rung
+    //          leaves a loaded gun": the moment `CPU_ON` admits a second vCPU, retiring a guest
+    //          would leave a sibling `Runnable`, and `next_runnable` would go on handing the pCPU to
+    //          a vCPU of a domain that has powered off.
+    //
+    // A domain teardown is a claim about the DOMAIN, so it has to reach every vCPU the domain owns.
+    //
+    // ⚠ **`hv_core::sched::offline_all` is exactly this and is deliberately NOT used**, because it
+    // is reachable only through `HvCall::DomainDestroy` — and destroying is a different transition
+    // from retiring, one this file argues against making (see the doc above: `SchedOffline` "is the
+    // truthful transition"; a kernel that has issued `SYSTEM_OFF` has not been destroyed, and its
+    // domain must stay `Live` for the peer-fault path to keep resolving against its image). So the
+    // metal applies the model's own per-vCPU transition to each vCPU it knows the guest has. That is
+    // ITERATION over one transition, not a second derivation of what offlining means.
+    //
+    // The `state_of` filter is not defensive: `SchedOffline` refuses an already-`Offline` vCPU with
+    // `WrongState` and [`sched_on`] halts on a refusal — correctly, since a refusal means this
+    // file's idea of who is running has come apart from the model's. Asking first is how a vCPU that
+    // never started is SKIPPED rather than treated as an inconsistency. It is the same filter
+    // `offline_all` applies internally, for the same reason.
+    for (_, v) in crate::role::census(NUM_GUESTS).filter(|&(g, _)| g == cur.guest()) {
+        let state = hv.sched().state_of(slot_dom(cur.guest()), v.model());
+        if state == Some(RunState::Offline) {
+            continue;
+        }
+        // ⑱-4b-ii — a sibling asleep in `wfi` when its domain powers off leaves `Blocked` by being
+        // RETIRED rather than woken. Counted so ⑱-4b-i's conservation law still balances; see
+        // [`VCPUS_OFFLINED_WHILE_BLOCKED`], which the first boot of this rung is what created.
+        if state == Some(RunState::Blocked) {
+            VCPUS_OFFLINED_WHILE_BLOCKED
+                .at(cur.guest(), v)
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        sched_on(
+            hv,
+            slot_dom(cur.guest()),
+            HvCall::SchedOffline {
+                vcpu: v.model(),
+                now,
+            },
+            "retire a vcpu of a domain that is going down",
+        );
+    }
     // ★★ ⑱-4b-i — **WAKE BEFORE CONCLUDING THE MACHINE IS FINISHED. This rung introduces the hazard
     //          this line closes, so the two are inseparable.**
     //
@@ -2835,6 +2978,28 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     // EL1 configuration is garbage only for the handful of instructions between the two.
     unsafe { ctx.inc_mut(next).poison() };
 
+    // ⑱-4b-ii — **THE GUARD, placed where the damage would be done rather than where it originates.**
+    //
+    // Restoring a vCPU with no seeded context loads a zeroed [`vcpu::VcpuCtx`] and `eret`s to PC = 0.
+    // ⑱-3b-ii measured exactly that (`EC=0x20 ELR=FAR=0x0`, both guests retired, the boot never
+    // finishing) by admitting every vCPU as a probe.
+    //
+    // **Nothing a GUEST can do reaches here** — [`cpu_on`] seeds before it admits, so the inversion
+    // is unreachable rather than merely caught, and only an EL2 bug could admit a vCPU it never
+    // seeded. That is precisely why this parks instead of recovering, for the same reason
+    // [`sched_on`] does: a failure here is never a guest's fault and never something to continue
+    // through. The ordering in `cpu_on` is the safety property; this is the alarm on it.
+    if VCPU_SEEDED.inc(next).load(Ordering::Relaxed) == 0 {
+        let mut uart = crate::uart();
+        let _ = writeln!(
+            uart,
+            "baleen: LINUX GUEST TRAP: about to enter a vCPU with NO SEEDED CONTEXT — its saved \
+             state is all zero, so this would eret to PC = 0. hv-core admitted a vCPU hv-metal \
+             never gave a context to; halting instead of running it"
+        );
+        crate::park();
+    }
+
     // 5. Install the incoming vCPU. **Only now** does `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` describe the
     //    guest about to run, which is why step 6 cannot be folded into step 3: re-arming the PPI
     //    while the outgoing guest's deadline was still loaded would fire the outgoing guest's timer
@@ -2921,7 +3086,8 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     CURRENT.store(next.now_running().pack(), Ordering::Relaxed);
     SWITCHES.inc(next).fetch_add(1, Ordering::Relaxed);
     // ⑱-3b-ii's boundary, counted at the ONE funnel every switch passes through. See
-    // [`DISPATCHED_NONBOOT`]: this must stay zero until ⑱-4 seeds a second vCPU.
+    // [`DISPATCHED_NONBOOT`]: it stayed zero until ⑱-4b-ii seeded a second vCPU, and is now the
+    // rung's headline — REPORTED, never asserted (measured 344 on a shipped boot).
     if !next.vcpu().is_boot() {
         DISPATCHED_NONBOOT.fetch_add(1, Ordering::Relaxed);
     }
@@ -2982,7 +3148,12 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
         match frame.x[0] {
             PSCI_VERSION_FID => frame.x[0] = PSCI_VERSION_1_1,
             PSCI_FEATURES_FID => {
-                frame.x[0] = if frame.x[1] == PSCI_SYSTEM_OFF_FID {
+                // ⑱-4b-ii adds `CPU_ON`. ⚠ **MEASURED that the shipped guest never asks:** with
+                // `cpu@1` present and `CPU_ON` still unimplemented, Linux called the FID directly
+                // and read its return code — it never queried `PSCI_FEATURES` for it. So this arm
+                // is correctness for a caller that does, not something any boot exercises, and it
+                // is written that way deliberately rather than left to be discovered.
+                frame.x[0] = if frame.x[1] == PSCI_SYSTEM_OFF_FID || frame.x[1] == PSCI_CPU_ON_FID {
                     0
                 } else {
                     PSCI_NOT_SUPPORTED
@@ -3008,6 +3179,22 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 }
                 end_of_boot(&mut uart);
             }
+            // ★★ ⑱-4b-ii — **`CPU_ON`: a guest asks for its second CPU, and EL2 gives it one.**
+            //
+            // The arc's headline arrives here. Everything before it built the machinery for a vCPU
+            // that could not be started — a per-vCPU redistributor (⑱-2), a typed vCPU axis (⑱-3a/b),
+            // a scheduler that picks `(guest, vCPU)` (⑱-3b-ii), routed SGIs (⑱-5), per-vCPU active
+            // priorities (⑱-4a), an idle vCPU that stops being a candidate (⑱-4b-i). This is the
+            // call that starts it.
+            //
+            // MEASURED before implementing: each guest issues this **exactly once**, with
+            // `x1 = 0x1`, `x2` an address in its OWN RAM, and `x3 = 0`; told `NOT_SUPPORTED` it
+            // prints `psci: failed to boot CPU1 (-95)` and settles for one CPU.
+            PSCI_CPU_ON_FID => {
+                let (target_mpidr, entry, context_id) = (frame.x[1], frame.x[2], frame.x[3]);
+                let slot = current_vcpu().guest();
+                frame.x[0] = cpu_on(slot, target_mpidr, entry, context_id, &mut uart);
+            }
             other => {
                 frame.x[0] = PSCI_NOT_SUPPORTED;
                 let _ = writeln!(
@@ -3032,6 +3219,165 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
         &mut uart,
         "took an exception EL2 has no rule for",
     );
+}
+
+/// **⑱-4b-ii — service `PSCI CPU_ON`.** Returns the PSCI status to place in the caller's `x0`.
+///
+/// ## Which vCPU did the caller name, and the inversion that keeps ONE derivation
+///
+/// `x1` is a target **MPIDR**, not a vCPU index, so EL2 has to invert the map it presents. It does
+/// that by **searching** — offering each of the caller's own vCPUs to [`guest_mpidr`] and comparing
+/// under [`MPIDR_HWID_BITMASK`], which is exactly the comparison arm64 Linux's
+/// `smp_setup_processor_id` and `gic_populate_rdist` make.
+///
+/// **A closed-form inverse would be a second derivation** of a mapping ⑱-3b-i spent a rung reducing
+/// to one (it was two, in two crates, with a doc claiming otherwise), and it would silently stop
+/// agreeing the day the affinity encoding gains structure. Searching `VCPUS_PER_GUEST` entries to
+/// avoid that is not a cost worth optimising.
+///
+/// ⚠ **The search returns THE vCPU and not merely A vCPU because affinities are provably distinct**
+/// — [`AFFINITIES_ARE_DISTINCT`], a compile-time pairwise check over the whole axis. Without it a
+/// duplicate affinity would make this silently resolve to whichever came first. That obligation was
+/// recorded by ⑱-3b-i, came due at ⑱-3b-ii, and is discharged by this rung because this is where it
+/// became load-bearing.
+///
+/// ## The three refusals, and why each is an ANSWER rather than a fallback
+///
+/// * **`INVALID_PARAMETERS`** — no vCPU *of this guest* has that MPIDR. Note the confinement: the
+///   census is filtered to the caller's own slot, so a guest naming its peer's CPU is told its
+///   parameters are invalid rather than being allowed to learn whether that CPU exists.
+/// * **`ALREADY_ON`** — the model does not say `Offline`. **The model is asked; no flag is kept
+///   here**, which is the discipline [`next_runnable`] follows for the same reason: `hv-core` owns
+///   run state and a second copy in this file would be a thing to keep in step.
+/// * **`INVALID_ADDRESS`** — the entry point is not in the caller's own RAM, decided by
+///   [`guest_owning`], the same function the peer-fault path and the emitter's split come from.
+///   ⚠ **This is FIDELITY, not enforcement, and the distinction is worth keeping straight.** Stage-2
+///   already confines the secondary: an entry point in the peer's RAM is unmapped in this guest's
+///   image and faults on the first fetch. What the check buys is that the guest is *told*, in the
+///   architected way, instead of being started and dying. MEASURED: the shipped boot never trips it
+///   — both guests pass an address in their own window, at the same offset from their own base.
+///
+/// ## ★ THE PROBES, and the first one REFUTED THE PREDICTION MADE FOR IT
+///
+/// | # | probe | predicted | measured |
+/// |---|---|---|---|
+/// | A | **invert the order** — `SchedAdmit` before seeding | kills | **did NOT kill — gate fully GREEN** |
+/// | A′ | admit and **never seed at all** | kills | **kills**, and `EC=0x20 ELR=0x0` never happens |
+/// | B | retire only the RUNNING vCPU (⑱-3b-ii's code) | kills | **kills** |
+/// | C | make two vCPUs share an affinity | `E0080` | **`E0080` ×2, before anything runs** |
+/// | D | answer `NOT_SUPPORTED` again | kills | **kills** |
+///
+/// **Probe A is the one worth reading.** "Seed before admit" is stated above as the safety property,
+/// and reversing it changes nothing observable: EL2 is not preemptible between the two statements on
+/// a single pCPU, so no dispatch can occur in the window the inversion opens. **The ordering is
+/// insurance against a concurrent EL2 — which is also why `ON_PENDING` is absent — and not against
+/// today's machine.** Keeping it is still right; claiming today's boot depends on it would not be.
+///
+/// **What actually protects the machine is [`switch_context`]'s guard,** and probe A′ is its
+/// evidence: admitting a vCPU with no context at all reddens all three configurations, and the count
+/// of `EC=0x20 ELR=FAR=0x0` — ⑱-3b-ii's measured signature for an `eret` to PC = 0 — is **zero**.
+/// The guard stops it *before* the `eret` rather than reporting it afterwards.
+///
+/// **Probe B** confirms retire-all is load-bearing exactly as ⑱-3b-ii predicted when it called this
+/// "the one place this rung leaves a loaded gun": dom 1 retires, dom 2 powers off, and then neither
+/// `retire dom 1` nor `retire dom 2` is ever printed, because the scheduler keeps handing the pCPU
+/// to the retired domain's parked sibling and `end_of_boot` is never reached.
+///
+/// ## Honest ceiling
+///
+/// `ON_PENDING` is not modelled and cannot arise here: this hypervisor is single-pCPU and services
+/// the `HVC` to completion before the caller resumes, so there is no window in which a vCPU is
+/// "coming up". A concurrent EL2 would need it. And `CPU_OFF`/`CPU_SUSPEND` remain unimplemented —
+/// `guest.dts` advertises `cpu_off`, and a guest calling it still gets `NOT_SUPPORTED`, so a guest
+/// can start its second CPU but cannot stop it. Nothing in the shipped boot does.
+fn cpu_on(slot: usize, target_mpidr: u64, entry: u64, context_id: u64, uart: &mut Pl011) -> u64 {
+    let refuse = |why: &str, code: u64, uart: &mut Pl011| -> u64 {
+        CPU_ON_REFUSED.at(slot).fetch_add(1, Ordering::Relaxed);
+        let _ = writeln!(
+            uart,
+            "baleen: cpu_on: dom {} REFUSED (mpidr=0x{target_mpidr:x} entry=0x{entry:x}): {why}",
+            slot_dom(slot)
+        );
+        code
+    };
+
+    let want = target_mpidr & MPIDR_HWID_BITMASK;
+    let Some((_, target)) = crate::role::census(NUM_GUESTS)
+        .filter(|&(g, _)| g == slot)
+        .find(|&(_, v)| guest_mpidr(v) & MPIDR_HWID_BITMASK == want)
+    else {
+        return refuse(
+            "no vCPU of this guest has that MPIDR",
+            PSCI_INVALID_PARAMETERS,
+            uart,
+        );
+    };
+
+    if guest_owning(entry) != Some(slot) {
+        return refuse(
+            "the entry point is not in this guest's own RAM",
+            PSCI_INVALID_ADDRESS,
+            uart,
+        );
+    }
+
+    let Some(mut cell) = crate::guest::GUEST_HV.try_borrow_mut() else {
+        let _ = writeln!(
+            uart,
+            "baleen: LINUX GUEST TRAP: CPU_ON arrived while the model was borrowed; halting"
+        );
+        crate::park();
+    };
+    let Some(hv) = cell.as_mut() else {
+        crate::park();
+    };
+    if hv.sched().state_of(slot_dom(slot), target.model()) != Some(RunState::Offline) {
+        drop(cell);
+        return refuse("that vCPU is not Offline", PSCI_ALREADY_ON, uart);
+    }
+
+    // ★ **SEED FIRST.** `SchedAdmit` is what makes a vCPU eligible for [`next_runnable`]; a vCPU
+    //   that becomes eligible before it has a context is one the scheduler may dispatch into a
+    //   zeroed `VcpuCtx` and `eret` to PC = 0, which ⑱-3b-ii measured directly.
+    //
+    //   ⚠ **This used to claim the ORDER was the safety property. PROBE A REFUTED THAT** — inverting
+    //   these two statements leaves the gate fully green, because EL2 is not preemptible between
+    //   them on a single pCPU and nothing can dispatch in the window. The order is kept as insurance
+    //   against a concurrent EL2 (the same reason `ON_PENDING` is absent), and what actually
+    //   protects the machine is [`switch_context`]'s guard — probe A′, which reddens all three
+    //   configurations and never reaches the `eret`. See the probe table on [`cpu_on`].
+    VCPU_CTX.borrow_mut().at_mut(slot, target).seed_boot(
+        entry,
+        context_id,
+        SPSR_EL2_LINUX,
+        SCTLR_AT_BOOT.load(Ordering::Relaxed),
+    );
+    VCPU_SEEDED.at(slot, target).store(1, Ordering::Relaxed);
+    SECONDARIES_SEEDED.at(slot).fetch_add(1, Ordering::Relaxed);
+
+    sched_on(
+        hv,
+        slot_dom(slot),
+        HvCall::SchedAdmit {
+            vcpu: target.model(),
+        },
+        "admit a secondary vcpu started by PSCI CPU_ON",
+    );
+    drop(cell);
+    SECONDARIES_ADMITTED
+        .at(slot)
+        .fetch_add(1, Ordering::Relaxed);
+
+    let _ = writeln!(
+        uart,
+        "baleen: cpu_on OK: dom {} started vCPU {} at 0x{entry:08x} (x0 = context_id \
+         0x{context_id:x}, SPSR 0x{SPSR_EL2_LINUX:x}, SCTLR_EL1 0x{:x} — MMU off, as its boot vCPU \
+         was) — SEEDED BEFORE ADMITTED, and it becomes Runnable only in hv-core",
+        slot_dom(slot),
+        target.get(),
+        SCTLR_AT_BOOT.load(Ordering::Relaxed)
+    );
+    PSCI_SUCCESS
 }
 
 /// Route a guest **Stage-2 data abort** (`EC=0x24`) to one of four outcomes:
@@ -3344,6 +3690,21 @@ static BLOCKED_READBACK_OK: PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST> =
     PerVcpu::new([const { [const { AtomicU64::new(0) }; VCPUS_PER_GUEST] }; NUM_GUESTS]);
 /// ⑱-4b-i — how many blocked vCPUs [`wake_blocked_vcpus`] returned to `Runnable`.
 static VCPUS_WOKEN: PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST> =
+    PerVcpu::new([const { [const { AtomicU64::new(0) }; VCPUS_PER_GUEST] }; NUM_GUESTS]);
+/// ⑱-4b-ii — blocked vCPUs that were taken `Offline` by their domain retiring, rather than woken.
+///
+/// ★ **THIS COUNTER EXISTS BECAUSE ⑱-4b-i'S IDENTITY CAUGHT THIS RUNG.** That rung asserted
+/// `woken == blocked` and was right to: with one vCPU per guest the retiring vCPU is always the
+/// `Running` one, so no `Blocked` vCPU could ever be offlined and the third term was provably zero.
+/// It was considered and left out as dead weight.
+///
+/// `CPU_ON` plus retire-all makes it reachable — a guest can power off while its *sibling* is asleep
+/// in `wfi`, and [`retire_and_hand_over`] then offlines that sibling straight out of `Blocked`. The
+/// first boot of this rung failed exactly there: **290 blocked, 289 woken.** One vCPU, off by one.
+///
+/// So the conservation law widens rather than weakens: every block is still accounted for, and the
+/// two ways out of `Blocked` are now *woken* and *retired with its domain*.
+static VCPUS_OFFLINED_WHILE_BLOCKED: PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST> =
     PerVcpu::new([const { [const { AtomicU64::new(0) }; VCPUS_PER_GUEST] }; NUM_GUESTS]);
 /// ⑱-4b-i — how many times [`wake_blocked_vcpus`] ran a sweep, counted INSIDE the function.
 ///
@@ -3981,13 +4342,24 @@ fn report_timer_handoff(uart: &mut Pl011) {
         // handoff is entirely dead contributes `released = 0, deactivated = 0` to each of its own
         // handovers — which balances — so this witness stays GREEN with half the new tenant broken.
         //
-        // ⚠ **DECLARED FOR ⑱-4, NOT CLOSED HERE, and the reason is that it is not yet checkable.**
+        // ⚠ **DECLARED FOR ⑱-4, NOT CLOSED HERE, and the reason WAS that it is not yet checkable.**
         // At `VCPUS_PER_GUEST == 1` a `PerVcpu<AtomicU64, G, 1>` is `[[T; 1]; G]` — isomorphic to
         // the `[T; G]` it would replace, so moving the fifteen counters is behaviour-nil AND
         // witness-nil, and produces no build error either, because `AtomicU64` implements both
         // marker traits by `crate::role`'s declared convention. It becomes a real check the moment a
         // second vCPU produces counts, together with the kill probe that makes it one: kill vCPU 1's
         // release path alone, and the per-vCPU report must redden while the per-guest sum does not.
+        //
+        // ★ **THE PRECONDITION IS NOW MET AND THE ITEM IS STILL OPEN — say so rather than let the
+        // paragraph above keep reading as "not yet".** ⑱-4b-ii starts a real second vCPU: this
+        // guest's handovers are now shared between two of them, so these per-guest counters ARE the
+        // merged count the paragraph warns about, and the kill probe it describes is finally
+        // runnable. It is deliberately NOT done in this rung — moving fifteen counters is its own
+        // change with its own probe — but it is now a deferral by choice rather than by
+        // impossibility, which is a different claim and the honest one.
+        //
+        // ⚠ Note what ⑱-4b-ii DID move, because it is the same hazard: `seeded == admitted` in
+        // [`report_vcpu_census`] is asserted PER GUEST, not on the sum, for exactly this reason.
         let deferred = TIMER_DEFERRED.at(slot).load(Ordering::Relaxed);
         let ok = released + deferred == deactivated && released <= handovers;
         if ok {
@@ -4015,73 +4387,67 @@ fn report_timer_handoff(uart: &mut Pl011) {
     }
 }
 
-/// ★ **⑱-3b-ii's witness: every vCPU the metal can name is one the MODEL knows, and the model is
-/// what keeps the unseeded one off the pCPU.**
+/// ★ **⑱-4b-ii's witness: every vCPU the metal can name is one the MODEL knows, every secondary was
+/// SEEDED before it was ADMITTED, and every one of them went down with its domain.**
 ///
-/// ## What the boot cannot tell you without this
+/// ## What changed from ⑱-3b-ii, and it is a STRENGTHENING rather than a relaxation
 ///
-/// This rung is behaviour-nil where it matters: the second vCPU never runs, so a boot with it and a
-/// boot without it reach userspace identically. The one thing a guest *does* notice — the emulated
-/// GIC presenting two redistributor frames instead of one, measured as **410 → 413 register traps
-/// per dom** — is a WORKLOAD number and is reported below, never asserted. A different kernel walks
-/// the redistributors differently, and this arc has already made that mistake six times.
+/// That rung asserted `dispatched == 0` — *no vCPU but the boot one ever reached the pCPU* — which
+/// was the correct claim while nothing could start one, and is **false by design** here. It is not
+/// relaxed away; it is replaced by the two statements it was really standing in for, both of which
+/// stay true for every rung after this:
 ///
-/// ## The conjuncts, and which of them is load-bearing
+/// * **`seeded == admitted`, PER GUEST** — EL2 never made a vCPU eligible to run that it had not
+///   first given a context to. The dangerous thing was never "a non-boot vCPU"; it was an
+///   **unseeded** one, which ⑱-3b-ii measured as `EC=0x20 ELR=FAR=0x0` and a boot that never
+///   finished. The ordering inside [`cpu_on`] makes that inversion unreachable and
+///   [`switch_context`]'s guard makes it loud if it ever became reachable again. Counted at the two
+///   sites independently, so a path that admitted without seeding is a difference rather than
+///   silence.
 ///
-/// * **`known == TOTAL`** — `hv-core` answered `Some(_)` for every `(guest, vCPU)` the metal can
-///   name. This is metal and model agreeing about the size of the axis. It is what `main.rs`'s
-///   `VCPUS_PER_DOMAIN >= VCPUS_PER_GUEST` assert pins at compile time, checked here against the
-///   model that was actually built.
-/// * **`dispatched == 0`** — **the load-bearing one.** No vCPU other than a guest's boot vCPU was
-///   ever handed the pCPU, counted at [`switch_context`], the single funnel every switch passes.
-///   Dispatching one would `eret` into a zeroed [`vcpu::VcpuCtx`] at PC = 0.
-/// * **`NONBOOT > 0`** — non-vacuity, and it is honest to say what it is: a **compile-time**
-///   quantity, `NUM_GUESTS * (VCPUS_PER_GUEST - 1)`, not anything a guest produced. It reads 0 on
-///   `main`, which is what makes this marker false there rather than green — design-lesson #99's
-///   test. It is a build-time fact wearing a runtime check's clothes, and that is deliberate: it
-///   costs nothing and it stops the marker being satisfiable by a build that never raised the count.
+///   ⚠ **Asserted per guest and NOT on the sum**, which is the reason the counters are indexed at
+///   all. `TIMER_FORWARDED`'s doc names the hazard: *"A merged count would stay green with one
+///   guest's forwarding path entirely dead."* Here a global equality balances when dom 1 seeds one
+///   and admits none while dom 2 admits one it never seeded — the two errors cancelling to hide
+///   exactly the inversion the conjunct is for. The sums are still printed, because a reader wants
+///   the total; the *assertion* is over each guest.
+/// * **`nonboot_offline == nonboot`** — ⚠ **this conjunct was DELIBERATELY WEAK in ⑱-3b-ii, which
+///   said so, and it is now the load-bearing one.** There it read "every non-boot vCPU is Offline"
+///   at a point where nothing had ever started one, so it would have passed on a model in almost any
+///   state. Here secondaries really run, and a domain that retires must take *all* of them down —
+///   otherwise `next_runnable` keeps handing the pCPU to a retired domain's parked sibling while its
+///   peer starves. This is the assertion that catches that, and it is FALSE on the code ⑱-3b-ii
+///   shipped.
+/// * **`known == TOTAL`** — unchanged: `hv-core` answered `Some(_)` for every `(guest, vCPU)` the
+///   metal can name, i.e. metal and model agree about the size of the axis. What `main.rs`'s
+///   `VCPUS_PER_DOMAIN >= VCPUS_PER_GUEST` assert pins at compile time, checked against the model
+///   that was actually built.
+/// * **`NONBOOT > 0`** — non-vacuity, and still honestly a **compile-time** quantity rather than
+///   anything a guest produced. Kept because it costs nothing and stops the marker being satisfied
+///   by a build that never raised the count.
 ///
-/// ⚠ **`nonboot_offline == nonboot` is DELIBERATELY WEAK HERE, and pretending otherwise would be
-/// the dishonest move.** By the time this runs both guests have powered off, so *every* vCPU is
-/// `Offline` and the check would also pass if a non-boot vCPU had run and then been retired. It is
-/// kept because it costs nothing and would catch a model in a state nothing can explain — but the
-/// claim "the second vCPU never ran" rests on `dispatched == 0`, not on this.
+/// ## What is REPORTED and never asserted
 ///
-/// ## ★ THE PROBES, and the first one is the whole non-vacuity argument
+/// **The dispatch count is this rung's headline and is deliberately not asserted**, along with the
+/// per-guest seeded/admitted/refused lines. They are claims about the workload: a guest that never
+/// issues `CPU_ON` produces zero and that is a correct boot, and a guest may legitimately ask for a
+/// CPU it already has. The mechanism's own statements are the four above. Design-lesson #127.
 ///
-/// | # | probe | result |
-/// |---|---|---|
-/// | A | **admit EVERY vCPU** (`SchedAdmit` over `role::census` instead of the boot vCPU alone) | **the machine dies, and this marker is what says so** |
-/// | B | `VCPUS_PER_DOMAIN = 1` — the model smaller than the metal's count | `E0080` ×2 from `main.rs`'s asserts |
+/// ## ★ THE GUEST-OBSERVED HALF LIVES IN THE MARKER LIST, and it is the stronger evidence
 ///
-/// **Probe A was predicted before it was run, and the prediction is what makes it evidence.** The
-/// claim is that vCPU 1 has no seeded context and that only the model's `Offline` keeps it off the
-/// pCPU; so admitting it — changing *nothing else* — should dispatch it into a zeroed
-/// [`vcpu::VcpuCtx`] and fault at PC = 0. Observed, on both guests:
-///
-/// ```text
-/// baleen: guest FAULT: EC=0x20 ELR=0x0000000000000000 FAR=0x0000000000000000 ESR=0x82000005
-/// baleen: dom 1 RETIRED — took an exception EL2 has no rule for.
-/// baleen: vcpus FAIL: 4 of 4 (guest, vCPU) pairs are known to the model, 2 of 2 are non-boot,
-///         2 of those are Offline, and 2 non-boot dispatches occurred
-/// ```
-///
-/// `EC=0x20` is an instruction abort from a lower EL and `ELR = FAR = 0` is the `eret` landing on an
-/// address no Stage-2 maps — exactly the predicted failure, at exactly the predicted address. **The
-/// boot then did not finish within 300 s.** Three things follow, and the third is the one worth
-/// keeping: the second vCPU really is unrunnable; `SchedAdmit` really is the only thing standing
-/// between here and that; and **this marker reddens precisely when the property is violated**, which
-/// is the difference between a witness and a decoration.
-///
-/// Worth noting what did *not* happen: EL2 survived. The faulting domains were retired and the
-/// hypervisor kept running and kept reporting — the halt-closing work (#127–#135) paying for itself
-/// in a rung that had nothing to do with it.
+/// This function is EL2's account of itself. The kernels' account is
+/// `SMP: Total of 2 processors activated.` — a required marker — and its twin
+/// `SMP: Total of 1 processors activated.`, which is FORBIDDEN. The twin is what does the work:
+/// `seeded == admitted` reads `0 == 0` on a build where `CPU_ON` silently never fires, and this
+/// marker would stay green; the forbidden string appears the moment *either* guest fails to bring
+/// its second CPU up. MEASURED as the exact baseline output before this rung existed.
 ///
 /// ## Honest ceiling
 ///
-/// `hv-metal` is not a Kani target. This is a boot witness over the live model, not a theorem, and
-/// it says nothing about what happens once ⑱-4 seeds vCPU 1 — at which point `dispatched == 0`
-/// stops being the property and must be retired rather than relaxed.
+/// `hv-metal` is not a Kani target. This is a boot witness over the live model, not a theorem. It
+/// says a secondary was seeded, admitted and retired correctly; it does **not** say the secondary
+/// executed the guest's code correctly — that is what the kernel's own SMP line and its clean
+/// shutdown say instead.
 fn report_vcpu_census(uart: &mut Pl011) {
     const TOTAL: usize = NUM_GUESTS * VCPUS_PER_GUEST;
     const NONBOOT: usize = NUM_GUESTS * (VCPUS_PER_GUEST - 1);
@@ -4115,30 +4481,60 @@ fn report_vcpu_census(uart: &mut Pl011) {
     drop(cell);
 
     let dispatched = DISPATCHED_NONBOOT.load(Ordering::Relaxed);
+    let sum = |c: &PerGuest<AtomicU64, NUM_GUESTS>| -> u64 {
+        (0..NUM_GUESTS)
+            .map(|s| c.at(s).load(Ordering::Relaxed))
+            .sum()
+    };
+    let seeded = sum(&SECONDARIES_SEEDED);
+    let admitted = sum(&SECONDARIES_ADMITTED);
+    let refused = sum(&CPU_ON_REFUSED);
+    // ⚠ **PER GUEST, not on the sum, and the difference is the whole point of the counters being
+    // indexed.** `TIMER_FORWARDED`'s doc states the hazard exactly: *"A merged count would stay
+    // green with one guest's forwarding path entirely dead."* A global `seeded == admitted` balances
+    // when dom 1 seeds one and admits none while dom 2 admits one it never seeded — which is
+    // precisely the inversion this conjunct exists to catch, cancelling itself out across guests.
+    let seed_before_admit_everywhere = (0..NUM_GUESTS).all(|s| {
+        SECONDARIES_SEEDED.at(s).load(Ordering::Relaxed)
+            == SECONDARIES_ADMITTED.at(s).load(Ordering::Relaxed)
+    });
+
     let ok = known == TOTAL
         && nonboot == NONBOOT
         && NONBOOT > 0
         && nonboot_offline == nonboot
-        && dispatched == 0;
+        && seed_before_admit_everywhere;
     if ok {
         let _ = writeln!(
             uart,
             "baleen: vcpus OK: each of the {NUM_GUESTS} guests has {VCPUS_PER_GUEST} vCPUs and \
-             hv-core knows all {known} of them — {nonboot} non-boot vCPU(s) exist, were offered to \
-             the scheduler on every rotation, and were refused every time by the model's own run \
-             state; {dispatched} of them were ever dispatched. A vCPU with no seeded context cannot \
-             reach the pCPU because a proven state machine says Offline, not because this file \
-             checks a range"
+             hv-core knows all {known} of them — {admitted} secondary vCPU(s) started by PSCI \
+             CPU_ON, every one of them SEEDED BEFORE IT WAS ADMITTED ({seeded} of {admitted}), \
+             dispatched onto the pCPU {dispatched} time(s), and all {nonboot_offline} of the \
+             {nonboot} non-boot vCPUs Offline again once their domain retired ({refused} CPU_ON \
+             request(s) refused — reported, not asserted)"
         );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: vcpus FAIL: {known} of {TOTAL} (guest, vCPU) pairs are known to the model, \
-             {nonboot} of {NONBOOT} are non-boot, {nonboot_offline} of those are Offline, and \
-             {dispatched} non-boot dispatches occurred — either the metal can name a vCPU hv-core \
-             cannot, or a vCPU with no seeded context was handed the pCPU"
+            "baleen: vcpus FAIL: {known} of {TOTAL} (guest, vCPU) pairs known to the model, \
+             {nonboot} of {NONBOOT} non-boot, {nonboot_offline} of those Offline at the end, and \
+             {seeded} seeded against {admitted} admitted — either a vCPU was admitted without a \
+             context, or a retired domain left one Runnable for the scheduler to keep picking"
         );
         crate::park();
+    }
+    for slot in 0..NUM_GUESTS {
+        let _ = writeln!(
+            uart,
+            "baleen: vcpus: dom {} — {} secondary seeded, {} admitted, {} CPU_ON request(s) \
+             refused (reported, never asserted: a guest that never calls CPU_ON produces zero, and \
+             that is a correct boot)",
+            slot_dom(slot),
+            SECONDARIES_SEEDED.at(slot).load(Ordering::Relaxed),
+            SECONDARIES_ADMITTED.at(slot).load(Ordering::Relaxed),
+            CPU_ON_REFUSED.at(slot).load(Ordering::Relaxed)
+        );
     }
 }
 
@@ -4264,11 +4660,18 @@ fn report_wfi_yield(uart: &mut Pl011) {
 ///   this is not error handling: it is the gap between "EL2 asked" and "the model agrees", which is
 ///   the gap `HCR_EL2`'s read-back in [`report_wfi_yield`] closes for a register.
 ///
-/// * **`woken == blocked` — conservation, and it is the LIVENESS half.** Every vCPU this file put to
-///   sleep was later woken. A vCPU blocked and never woken is starved: its guest stops making
-///   progress, never reaches `poweroff`, and — before this conjunct existed — the most likely
-///   symptom was the boot timing out with no explanation. Reaching zero here is what the kill probe
-///   induces (see below).
+/// * **`woken + retired_asleep == blocked` — conservation, and it is the LIVENESS half.** Every vCPU
+///   this file put to sleep left `Blocked` by one of exactly two routes: it was woken, or its domain
+///   retired and took it down asleep. A vCPU that left by neither is starved — its guest stops making
+///   progress, never reaches `poweroff`, and before this conjunct existed the likeliest symptom was
+///   a boot timing out with no explanation.
+///
+///   ⚠ **⑱-4b-i asserted the narrower `woken == blocked`, and was RIGHT TO — then this rung broke
+///   it, and that is the identity working rather than failing.** At one vCPU per guest the retiring
+///   vCPU is always the `Running` one, so no `Blocked` vCPU could be offlined and the second term was
+///   provably zero; it was considered and deliberately left out. `CPU_ON` plus retire-all makes it
+///   reachable, and the very first boot of this rung reported **290 blocked, 289 woken**. A witness
+///   that survives a change to the machine unchanged has usually not been told anything.
 ///
 /// * **`sweeps >= preempts` — the FAIRNESS one, and it exists because a probe FAILED to kill.**
 ///   Every preemption gave the blocked vCPUs a chance before choosing who runs next. `>=` and not
@@ -4344,20 +4747,21 @@ fn report_idle(uart: &mut Pl011) {
     let blocked = sum(&VCPUS_BLOCKED);
     let readback = sum(&BLOCKED_READBACK_OK);
     let woken = sum(&VCPUS_WOKEN);
+    let retired_asleep = sum(&VCPUS_OFFLINED_WHILE_BLOCKED);
     let sweeps = WAKE_SWEEPS.load(Ordering::Relaxed);
     let preempts = PREEMPTS.load(Ordering::Relaxed);
 
     // ★ THE IDENTITIES ARE THE PARK CONDITION; NON-VACUITY IS NOT. Both are vacuously true at
     //   `blocked == 0`, and that is the correct answer for a boot in which no vCPU ever had a peer
     //   to yield to — see the doc above for the fault-configuration measurement that taught this.
-    if readback != blocked || woken != blocked || sweeps < preempts {
+    if readback != blocked || woken + retired_asleep != blocked || sweeps < preempts {
         let _ = writeln!(
             uart,
             "baleen: idle FAIL: {blocked} vCPU block(s), {readback} of them read back as Blocked, \
-             {woken} woken again, and {sweeps} wake sweep(s) against {preempts} preemption(s) — \
-             either a vCPU EL2 blocked is NOT Blocked in the model, or one was put to sleep and \
-             never woken (a starved guest), or a preemption chose a vCPU without first giving the \
-             blocked ones a chance"
+             {woken} woken again and {retired_asleep} retired while still asleep, and {sweeps} wake \
+             sweep(s) against {preempts} preemption(s) — either a vCPU EL2 blocked is NOT Blocked \
+             in the model, or one left Blocked by neither route (a starved guest), or a preemption \
+             chose a vCPU without first giving the blocked ones a chance"
         );
         crate::park();
     }
@@ -4366,8 +4770,8 @@ fn report_idle(uart: &mut Pl011) {
             uart,
             "baleen: idle OK: a vCPU that executed WFI left the scheduler's candidate set and came \
              back — {blocked} block(s), all {readback} of them read back as Blocked from the model \
-             itself, and all {woken} woken again. An idle peer is no longer handed the pCPU it just \
-             gave up"
+             itself, and every one accounted for on the way out ({woken} woken, {retired_asleep} \
+             retired with their domain). An idle peer is no longer handed the pCPU it just gave up"
         );
     } else {
         // Neither OK nor FAIL, and deliberately neither: the identities above hold, but nothing
@@ -5009,6 +5413,14 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // `VcpuIdx::boot()` is the honest answer on this path rather than the constant that was there
     // because there was only one.
     set_guest_identity(Incoming::at(SLOT_A, VcpuIdx::boot()));
+    // ⑱-4b-ii — **guest A's boot vCPU IS seeded, and it is the one that never calls `seed_boot`.**
+    // Its context is established by the `eret` below — `ELR_EL2`/`SPSR_EL2` written directly — so it
+    // is entered rather than restored-from-zero, and [`switch_context`]'s guard has to know that.
+    // Marking it here rather than exempting the boot vCPU from the check is the difference between a
+    // guard with one hole in it and a guard with none.
+    VCPU_SEEDED
+        .at(SLOT_A, VcpuIdx::boot())
+        .store(1, Ordering::Relaxed);
 
     // ③-b2b-ii-c2 — **seed every guest that is not the one this `eret` enters.**
     //
@@ -5027,12 +5439,18 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     unsafe {
         asm!("mrs {v}, sctlr_el1", v = out(reg) sctlr_at_boot, options(nomem, nostack, preserves_flags));
     }
+    // ⑱-4b-ii — the one moment `SCTLR_EL1` holds the value a guest BOOTS with, so this is where a
+    // secondary's copy has to be taken from. See [`SCTLR_AT_BOOT`].
+    SCTLR_AT_BOOT.store(sctlr_at_boot, Ordering::Relaxed);
     {
         let mut ctx = VCPU_CTX.borrow_mut();
         for slot in (0..NUM_GUESTS).filter(|&s| s != SLOT_A) {
             // ⑱-3b-i: `VcpuIdx::boot()` and not "the running vCPU" — a guest's FIRST switch-in is
-            // by definition onto the vCPU it boots on. ⑱-4 adds the second seeding site, for a vCPU
-            // a guest asks for by `PSCI CPU_ON`, and that one is not this answer.
+            // by definition onto the vCPU it boots on. ⑱-4b-ii adds the third seeding site, for a
+            // vCPU a guest asks for by `PSCI CPU_ON`, and that one is not this answer.
+            VCPU_SEEDED
+                .at(slot, VcpuIdx::boot())
+                .store(1, Ordering::Relaxed);
             ctx.at_mut(slot, VcpuIdx::boot()).seed_boot(
                 kernel_entry(slot),
                 dtb_addr(slot),

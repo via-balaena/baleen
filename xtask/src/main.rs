@@ -843,23 +843,38 @@ const LINUX_MARKERS: &[&str] = &[
     // is deleting the waker, which starves a sleeping guest — and that probe only became usable
     // because of the sleep, since it cannot fire on a boot that never idles.
     "baleen: idle OK: a vCPU that executed WFI left the scheduler's candidate set and came back",
-    // ★ ⑱-3b-ii — **THE vCPU AXIS IS PLURAL, AND THE MODEL IS WHAT KEEPS THE SECOND ONE OFF THE
-    // pCPU.** `VCPUS_PER_GUEST` is 2, so every guest now has a second vCPU: hv-core allocated it, the
-    // emulated GIC gives it its own redistributor (⑱-2, proved at two and until now deployed at one),
-    // and the scheduler offers it as a candidate on every rotation. It has no seeded context —
-    // dispatching it would `eret` to PC = 0 — and `PSCI CPU_ON` is ⑱-4.
+    // ★★ ⑱-4b-ii — **THE SECOND vCPU EXECUTES.** `PSCI CPU_ON` seeds a secondary's context, admits
+    // it to hv-core, and the guest's own kernel reports two processors activated.
     //
-    // ⚠ **Nothing in hv-metal forbids that dispatch.** hv-core boots every vCPU `Offline`,
-    // `SchedAdmit` is the only exit from that state, and the metal admits only the boot vCPU; what
-    // refuses the second one is `next_runnable`'s `state_of(..) == Some(Runnable)` — a proven state
-    // machine's answer, not a range check this port keeps. That is the claim, and the marker's
-    // load-bearing conjunct is the dispatch count being zero.
+    // ⑱-3b-ii's version of this marker asserted `DISPATCHED_NONBOOT == 0` — no vCPU but the boot one
+    // ever reached the pCPU — which was right while nothing could start one and is false BY DESIGN
+    // now. It is REPLACED, not relaxed, by the two statements it stood in for:
     //
-    // The non-vacuity conjunct is `NUM_GUESTS * (VCPUS_PER_GUEST - 1) > 0`, which is COMPILE-TIME and
-    // reads zero on `main` — so this marker is false there rather than green (design-lesson #99).
-    // The guest-observable half (410 → 413 GICD/GICR traps per dom, the driver walking to the
-    // redistributor that carries `Last`) is a WORKLOAD number and is reported, never asserted.
+    //   * `seeded == admitted` — EL2 never made a vCPU eligible to run without first giving it a
+    //     context. The hazard was never "a non-boot vCPU", it was an UNSEEDED one, measured at
+    //     ⑱-3b-ii as `EC=0x20 ELR=FAR=0x0` and a boot that never finished.
+    //   * `nonboot_offline == nonboot` — every secondary is Offline once its domain retires. ⚠ This
+    //     conjunct was DELIBERATELY WEAK in ⑱-3b-ii, which said so, and is now LOAD-BEARING: with a
+    //     secondary actually running, a domain that retires only its running vCPU leaves a sibling
+    //     Runnable, and the scheduler keeps handing the pCPU to a retired guest's parked vCPU while
+    //     the peer starves.
+    //
+    // The dispatch count is the rung's headline and is REPORTED, never asserted — a guest that never
+    // calls CPU_ON produces zero, and that is a correct boot (design-lesson #127).
     "baleen: vcpus OK: each of the",
+    // ★★ ⑱-4b-ii — **THE KERNEL'S OWN ACCOUNT, and it is stronger evidence than EL2's.**
+    //
+    // `baleen: vcpus OK` is EL2 saying it seeded and admitted a secondary. This is a real Linux
+    // kernel saying the secondary CAME UP AND RAN — it brought it online, ran a task on it, and
+    // counted it. EL2 can be wrong about the first in a way that leaves this absent.
+    //
+    // ⚠ **The FORBIDDEN twin below is what makes the pair complete, and it is why this one can be
+    // an unprefixed substring.** `serial.contains` matches anywhere, so this string proves only that
+    // AT LEAST ONE guest activated two CPUs — a per-dom form is unwritable because the console
+    // prefix and the message are separated by a variable `[    N.NNNNNN]` timestamp. The twin closes
+    // that gap from the other side: `SMP: Total of 1 processors activated.` appears the moment
+    // EITHER guest fails, so requiring one and forbidding the other pins both.
+    "SMP: Total of 2 processors activated.",
     // ★ ⑱-5 — **AN SGI IS DECODED UNDER THE FENCE AND ROUTED BY TARGET.** `ICC_SGI1R_EL1` names its
     // targets by physical affinity, which is why the architecture traps it to EL2 at all. hv-metal
     // used to read bits [27:24] only — the INTID — and its own doc admitted the affinity fields were
@@ -1048,6 +1063,17 @@ const LINUX_FORBIDDEN: &[&str] = &[
     "baleen: LINUX GUEST TRAP",
     "baleen: lroverflow FAIL",
     "baleen: tickdefer FAIL",
+    // ★★ ⑱-4b-ii's negative half, and the load-bearing half of that rung's guest-observed witness.
+    //
+    // MEASURED as the EXACT baseline output: with `cpu@1` in the device tree and `CPU_ON` still
+    // answering NOT_SUPPORTED, both kernels print `psci: failed to boot CPU1 (-95)` and then this
+    // line, and the boot otherwise succeeds. So it is precisely the string a regression produces.
+    //
+    // It is forbidden in EVERY configuration, and that is deliberate: it fires for whichever guest
+    // failed, which is the "both guests" coverage the required `SMP: Total of 2` substring cannot
+    // give on its own. It also catches the case `baleen: vcpus OK` cannot see at all — a build where
+    // CPU_ON silently never fires leaves `seeded == admitted` reading `0 == 0` and that marker green.
+    "SMP: Total of 1 processors activated.",
     // ⑱-4b-i's negative half. It fires for three distinguishable reasons and the message says which:
     // a vCPU EL2 blocked that the model does not report as `Blocked`; a vCPU blocked and never woken
     // (a STARVED guest — what the kill probe induces); or no guest idling at all, which would mean
