@@ -3251,8 +3251,9 @@ const ISS_ICC_SGI1R_EL1_WRITE: u64 = (3 << 20) | (5 << 17) | (12 << 10) | (11 <<
 /// on this path before ③-a2, because `IMO=0` left the guest's GIC CPU interface untrapped.
 ///
 /// The only member of the class this port has a rule for is a write to `ICC_SGI1R_EL1`: the guest
-/// raising a software-generated interrupt. See [`gic::sgi1r_intid`] for why the architecture routes it
-/// here and what the single-vCPU emulation is. Everything else is reported with the decoded register
+/// raising a software-generated interrupt. See [`hv_vdev::sgi`] for why the architecture routes it
+/// here — an SGI names its targets by *physical* affinity, which a guest must not be allowed to
+/// state — and for the decode of what it names. Everything else is reported with the decoded register
 /// encoding and parked — the same discipline as an abort outside every emulated device, and for the
 /// same reason: a silently-ignored system-register write leaves the guest believing something took
 /// effect that did not.

@@ -102,7 +102,7 @@
 //! indexes nothing and cannot fail — but about **meaning**: which processing elements a guest's
 //! 64-bit value names. The load-bearing one is that a guest naming a cluster none of its vCPUs is in
 //! targets nothing, which is an isolation property rather than a memory-safety one. All five were
-//! kill-probed, and the probes are tabulated on the harnesses: each of the three semantic properties
+//! RUN AGAINST four kill probes, tabulated on the harnesses: each of the three semantic properties
 //! is killed by its own defect and by no other. ⚠ **The INTID-range harness was killed by none of
 //! them** — no probe perturbed the four-bit extraction — so it is proven, not probed, and that is
 //! recorded rather than glossed.
