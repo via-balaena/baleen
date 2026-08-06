@@ -2158,6 +2158,49 @@ const MAX_PEER_FAULTS: u64 = 4096;
 static VTTBR: PerGuest<AtomicU64, NUM_GUESTS> =
     PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
+/// **⑱-4b-i — return every `Blocked` vCPU to `Runnable`.** Called from EL2's own slice expiry, and
+/// once more before EL2 concludes the machine is finished.
+///
+/// ## Why this exists, and the residual it openly stands in for
+///
+/// [`handle_linux_wfi`] makes an idle vCPU `Blocked`, which is what stops the ping-pong. Something
+/// then has to make it a candidate again, and the architecturally right answer is *the interrupt it
+/// is waiting for* — for an idle Linux CPU, almost always its own arch-timer deadline.
+///
+/// ⚠ **EL2 cannot do that today, and this function is the honest substitute rather than the answer.**
+/// There is one physical timer for the guests (`CNTV`, forwarded to whoever holds the pCPU) and one
+/// for EL2 (`CNTHP`, its slice). A *blocked* vCPU's deadline sits in its saved `CNTV_CVAL_EL0` and
+/// nothing compares it against the clock, because nothing is running it. Waking a vCPU on its own
+/// deadline means EL2 keeping every vCPU's deadline and programming the earliest — a per-vCPU timer
+/// subsystem, which is honest-ledger item 9's deeper form and is not this rung.
+///
+/// So EL2 wakes **everything, every slice**. Stated plainly, that is:
+///
+/// * **sound** — `WFI` is architecturally permitted to wake spuriously, so a vCPU woken early simply
+///   re-executes it and blocks again. Nothing observes the difference except the counters;
+/// * **bounded** — idle latency becomes at most one [`EL2_SLICE_HZ`] period rather than unbounded;
+/// * **and still an enormous improvement on what it replaces** — a wake per slice per idle vCPU
+///   (~100/s) against the **8,735 yields per guest per second** measured on `main`.
+///
+/// **What it costs:** an idle guest is woken ~100 times a second to discover it is still idle. That
+/// is power and efficiency on real hardware, not correctness, and it is the price of not having
+/// per-vCPU timers. It is a declared residue, not a hidden one.
+fn wake_blocked_vcpus(hv: &mut Hypervisor) {
+    WAKE_SWEEPS.fetch_add(1, Ordering::Relaxed);
+    for (slot, v) in crate::role::census(NUM_GUESTS) {
+        if hv.sched().state_of(slot_dom(slot), v.model()) != Some(RunState::Blocked) {
+            continue;
+        }
+        sched_on(
+            hv,
+            slot_dom(slot),
+            HvCall::SchedWake { vcpu: v.model() },
+            "wake a blocked vcpu",
+        );
+        VCPUS_WOKEN.at(slot, v).fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// **③-b2b-i — preempt the running guest through `hv-core`'s REAL scheduler.**
 ///
 /// **③-b2b-ii-e changed who calls this and why.** It used to be reached from the guest's own timer
@@ -2201,6 +2244,8 @@ fn preempt_through_the_scheduler(cur: Running, frame: &mut LinuxFrame) {
         use hv_hal::TimeSource;
         crate::time::GenericTimer.now()
     };
+    // ⑱-4b-i: the denominator for [`WAKE_SWEEPS`]. Deliberately NOT on the sweep's call line below.
+    PREEMPTS.fetch_add(1, Ordering::Relaxed);
     // `SchedPreempt`, not `SchedOffline`. The model already had the right transition and its doc
     // names this exact situation — *"the involuntary counterpart of a guest yield"*: `Running` →
     // `Runnable`, freeing the pCPU without retiring the vCPU. `guest.rs` uses `SchedOffline` because
@@ -2216,6 +2261,19 @@ fn preempt_through_the_scheduler(cur: Running, frame: &mut LinuxFrame) {
         },
         "preempt the running vcpu",
     );
+
+    // ⑱-4b-i — EL2's slice is the clock a blocked vCPU is woken by, because EL2 has no other. See
+    // [`wake_blocked_vcpus`]: this is the substitute for per-vCPU deadlines, and it is what makes
+    // `Blocked` a state a vCPU comes back from rather than one it disappears into.
+    // ⑱-4b-i — EL2's slice is the clock a blocked vCPU is woken by, because EL2 has no other. See
+    // [`wake_blocked_vcpus`]: this is the substitute for per-vCPU deadlines, and it is what makes
+    // `Blocked` a state a vCPU comes back from rather than one it disappears into.
+    //
+    // ⚠ **[`PREEMPTS`] above is counted so that DELETING THIS LINE IS CAUGHT**, and it is counted
+    // there rather than here for exactly that reason. Removing this call originally left the gate
+    // fully GREEN: the retire path's own sweep still rescued the blocked vCPU at teardown, after
+    // starving it for the whole boot. Measured red now at `2 wake sweeps against 218 preemptions`.
+    wake_blocked_vcpus(hv);
 
     let next = match next_runnable(hv, cur) {
         Some(n) => n,
@@ -2461,6 +2519,23 @@ fn retire_and_hand_over(
         },
         "retire the vcpu",
     );
+    // ★★ ⑱-4b-i — **WAKE BEFORE CONCLUDING THE MACHINE IS FINISHED. This rung introduces the hazard
+    //          this line closes, so the two are inseparable.**
+    //
+    // `next_runnable` returning `None` used to mean exactly one thing — every vCPU is `Offline`, so
+    // the boot is over — because `Offline` was the only state that made a vCPU un-runnable. Making
+    // `wfi` produce `Blocked` adds a second, and it is emphatically **not** "finished": it is
+    // "asleep, and nobody has rung the bell yet".
+    //
+    // Left alone, the failure is EL2 ending the boot out from under a guest that was merely idle:
+    // dom 1 blocks, dom 2 powers off, `None` comes back, and `end_of_boot` runs while dom 1's kernel
+    // is still mid-`sleep` and has never issued `SYSTEM_OFF`. The `retire dom N: never retired`
+    // conjunct is what would catch it, but catching it is not the same as it not happening.
+    //
+    // So the question "is anyone left?" has to be asked of vCPUs that COULD run, not of ones that
+    // happen to want the pCPU this instant. Waking first turns the second question into the first,
+    // and a `None` after it is once again the honest "everything is `Offline`".
+    wake_blocked_vcpus(hv);
     let Some(next) = next_runnable(hv, cur) else {
         return false;
     };
@@ -2534,6 +2609,7 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     report_timer_handoff(uart);
     report_el2_slice(uart);
     report_wfi_yield(uart);
+    report_idle(uart);
     report_guest_identity(uart);
     report_vcpu_census(uart);
     report_fp_isolation(uart);
@@ -3250,15 +3326,65 @@ static WFI_TRAPS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GU
 /// How many of those handed the pCPU to a peer that had work to do.
 static WFI_YIELDS: [AtomicU64; NUM_GUESTS] = [const { AtomicU64::new(0) }; NUM_GUESTS];
 
+/// ⑱-4b-i — how many times [`handle_linux_wfi`] moved a vCPU to `Blocked`.
+///
+/// **On the vCPU axis, not the guest axis, and that is not anticipation.** "Which vCPU said it had
+/// nothing to do" is a per-vCPU fact in the most literal sense: the whole defect this rung closes is
+/// two vCPUs of one guest being indistinguishable to a per-guest counter. Storing it per guest would
+/// be the merged-count shape `TIMER_FORWARDED`'s own doc warns about, written fresh.
+static VCPUS_BLOCKED: PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST> =
+    PerVcpu::new([const { [const { AtomicU64::new(0) }; VCPUS_PER_GUEST] }; NUM_GUESTS]);
+/// ⑱-4b-i — of those, how many the MODEL then reported as `Blocked` when asked.
+///
+/// The read-back, not the request. `sched_on` already halts if the model *refuses* the transition,
+/// so this is not checking for an error — it is checking that the state the model is now in is the
+/// one this file believes it put it in. Same discipline as `HCR_EL2`'s read-back in
+/// [`trap_guest_wfi`]: ask the register what happened rather than assume the write took.
+static BLOCKED_READBACK_OK: PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST> =
+    PerVcpu::new([const { [const { AtomicU64::new(0) }; VCPUS_PER_GUEST] }; NUM_GUESTS]);
+/// ⑱-4b-i — how many blocked vCPUs [`wake_blocked_vcpus`] returned to `Runnable`.
+static VCPUS_WOKEN: PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST> =
+    PerVcpu::new([const { [const { AtomicU64::new(0) }; VCPUS_PER_GUEST] }; NUM_GUESTS]);
+/// ⑱-4b-i — how many times [`wake_blocked_vcpus`] ran a sweep, counted INSIDE the function.
+///
+/// ★ **Counted inside, and [`PREEMPTS`] outside, so that the two come apart when the CALL is
+/// deleted.** A counter on the call site would vanish with the call and the identity would still
+/// balance — which is the difference between a witness and a comment.
+static WAKE_SWEEPS: AtomicU64 = AtomicU64::new(0);
+/// ⑱-4b-i — how many times [`preempt_through_the_scheduler`] got far enough to preempt anything.
+///
+/// Incremented after the model borrow succeeds and independently of the sweep call, because it is
+/// the *denominator* the sweep is checked against: every preemption must have swept first.
+static PREEMPTS: AtomicU64 = AtomicU64::new(0);
+
 /// **A guest went idle — give the pCPU to someone who can use it.**
 ///
 /// The whole point of trapping `wfi`: see [`trap_guest_wfi`] for what happens without this.
 ///
-/// [`next_runnable`] is consulted **before** `SchedPreempt`, and that is deliberate — while this
-/// guest is still `Running` the model reports it as such, so the only slot that can come back is a
-/// genuine *peer*. (The preemption path calls it after, where falling back to self is what it
-/// wants.) `None` therefore means "nobody else can use the CPU", and the honest answer to that is to
-/// wait, not to hand it back to a guest that has just said it has nothing to do.
+/// [`next_runnable`] is consulted **before** the vCPU's own transition, and that is deliberate —
+/// while this guest is still `Running` the model reports it as such, so the only slot that can come
+/// back is a genuine *peer*. (The preemption path calls it after, where falling back to self is what
+/// it wants.) `None` therefore means "nobody else can use the CPU", and the honest answer to that is
+/// to wait, not to hand it back to a guest that has just said it has nothing to do.
+///
+/// ## ★ ⑱-4b-i KEPT THAT ORDER, and the alternative was written and rejected
+///
+/// The obvious way to add `Blocked` is to block first and then ask. **Don't** — asking first is what
+/// keeps the no-peer case honest, and inverting it costs code that cannot run:
+///
+/// * **Ask first (this code).** No peer ⇒ the vCPU is still `Running`, so the existing
+///   [`wait_at_el2`] path applies unchanged, down to the instruction. EL2 waits on its own `CNTHP`
+///   slice, erets, and the guest re-executes its `wfi`. That path has ~100 runs of evidence behind
+///   it from ③-b2b-ii-e and this rung does not disturb it.
+/// * **Block first.** The model has already moved, so returning would `eret` into a vCPU the
+///   scheduler says is `Blocked` — hv-metal's idea of who is running come apart from the model's,
+///   which is the one thing [`sched_on`] exists to prevent. The no-peer case then needs its own
+///   re-borrow, `SchedWake` and `SchedRun`-of-self. **That block is unreachable at one vCPU per
+///   guest** — a guest going idle always leaves a peer guest `Runnable`, which is why every one of
+///   the 8,735 traps measured below yielded — so it would ship unexecuted.
+///
+/// The livelock is broken identically either way, because what breaks it is a blocked *sibling*
+/// ceasing to be returned by [`next_runnable`], not the order of the two calls here.
 fn handle_linux_wfi(frame: &mut LinuxFrame) {
     // ⑱-3b-ii: the whole role. `WFI_TRAPS`/`WFI_YIELDS` are per-guest tallies and keep the slot; the
     // scheduler half below now names a `(guest, vCPU)` pair on both sides of the yield.
@@ -3288,15 +3414,47 @@ fn handle_linux_wfi(frame: &mut LinuxFrame) {
         use hv_hal::TimeSource;
         crate::time::GenericTimer.now()
     };
+    // ★★ ⑱-4b-i — **`SchedBlock`, NOT `SchedPreempt`, and the difference is MEASURED.**
+    //
+    // `SchedPreempt` is `Running -> Runnable`: the vCPU gives up the pCPU and stays a candidate. For
+    // a vCPU that has just executed `wfi` that is a lie of exactly one word — it does not want a
+    // CPU, and `Runnable` says it does. The model has the right word (`Blocked`, *"waiting on an
+    // event ... will not run until `System::wake` returns it to Runnable"*) and this file was not
+    // using it.
+    //
+    // ⚠ **The cost of the lie, measured on `main` with both guests idle for one second:** dom 1 and
+    // dom 2 trapped **8,735 `wfi`s each, and yielded on every single one** — the counts identical to
+    // the unit, which is the signature of perfect alternation. Each guest went idle, `next_runnable`
+    // handed the pCPU to the peer *because `SchedPreempt` had left the peer `Runnable`*, the peer was
+    // also idle and handed it straight back. **17,613 full context switches** — 25 registers, the
+    // vGIC bank and the FP file each — to accomplish two guests sleeping. Against **72** switches per
+    // guest on a boot that never idles.
+    //
+    // It is a pathology and not a hang, which is exactly why it survived: the guests' own timer ticks
+    // keep breaking the cycle, so `main` completes in the right wall-clock time while doing 122× the
+    // work. **Safe by workload, not by construction** — the seventh instance in this arc.
+    //
+    // `Blocked` removes the candidacy rather than the symptom: `next_runnable` already filters on
+    // `== Some(Runnable)`, so an idle peer stops being offered **for free**, with no flag this file
+    // keeps and no second notion of idleness to drift from the model's.
     sched_on(
         hv,
         slot_dom(cur),
-        HvCall::SchedPreempt {
+        HvCall::SchedBlock {
             vcpu: running.vcpu().model(),
             now,
         },
-        "preempt an idle vcpu",
+        "block a vcpu that executed WFI",
     );
+    VCPUS_BLOCKED.of(running).fetch_add(1, Ordering::Relaxed);
+    // The READ-BACK. `sched_on` has already halted if the model refused, so this is not error
+    // handling — it is the difference between "EL2 asked for `Blocked`" and "the vCPU is `Blocked`",
+    // which is the statement [`report_idle`] actually asserts.
+    if hv.sched().state_of(slot_dom(cur), running.vcpu().model()) == Some(RunState::Blocked) {
+        BLOCKED_READBACK_OK
+            .of(running)
+            .fetch_add(1, Ordering::Relaxed);
+    }
     sched_on(
         hv,
         slot_dom(peer.guest()),
@@ -4028,6 +4186,14 @@ fn report_guest_identity(uart: &mut Pl011) {
 /// idle is a perfectly good boot with a count of zero. Measured — a run of this gate produced
 /// exactly that, and an earlier version of this function refused it.
 ///
+/// ⚠ **⑱-4b-i CHANGED THE WORKLOAD BUT NOT THIS DECISION, and the distinction matters.**
+/// `guest-init.sh` now sleeps for a second, so both guests DO reliably idle and these counts are no
+/// longer the coin flip described above (six boots of the previous init: two trapped zero). That
+/// makes a non-vacuity assertion defensible — and [`report_idle`] makes exactly one, over the
+/// mechanism ⑱-4b-i added. It is deliberately NOT made here: this marker is about `HCR_EL2.TWI`
+/// being in force, which is true whether or not any guest ever idles, and widening it to depend on
+/// the init's sleep would couple a `③-b2b-ii-e`-era structural claim to a later rung's harness.
+///
 /// So the assertion is the STRUCTURAL half: `HCR_EL2` read back after the write, showing `TWI`
 /// really took effect. That is true on every boot and cannot be satisfied by luck. The counts are
 /// reported beside it as the behavioural half, and deliberately NOT asserted.
@@ -4064,6 +4230,169 @@ fn report_wfi_yield(uart: &mut Pl011) {
             slot_dom(slot),
             WFI_TRAPS[slot].load(Ordering::Relaxed),
             WFI_YIELDS[slot].load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// ★ **⑱-4b-i's witness: a vCPU that says it has nothing to do STOPS BEING A SCHEDULER CANDIDATE,
+/// and comes back.**
+///
+/// ## The three conjuncts, and what each would catch
+///
+/// * **`blocked > 0` — non-vacuity, and it is enforced by the MARKER LIST, not by this function.**
+///   `idle OK` is printed only when something was actually blocked, and it is a required marker of
+///   the **shipped** configuration alone. A boot that exercises nothing prints `idle: NOT EXERCISED`
+///   instead, which is not the required string, so the gate reddens on absence.
+///
+///   ⚠ **THIS WAS FIRST WRITTEN AS A PARK CONDITION HERE, AND THAT WAS WRONG — the fault
+///   configuration MEASURED it wrong within the hour.** The reasoning was: idling used to be
+///   incidental guest behaviour (six boots of the previous init gave (1,0) (0,0) (0,0) (1,1) (0,1)
+///   (1,1) `wfi` traps, **two of them zero**), `guest-init.sh` now sleeps on purpose, therefore
+///   idling is the HARNESS's behaviour and may be asserted. **The premise was true and the
+///   conclusion did not follow.** Blocking needs a *peer*, not merely an idle vCPU — and the harness
+///   also KILLS a guest in two of its three configurations. In the fault boot dom 2 idled 97 times,
+///   found dom 1 already retired, took the [`wait_at_el2`] path every time and blocked **zero**
+///   times. Perfectly correct, and the assertion parked EL2 and hung the boot to a 300 s timeout.
+///
+///   The lesson is the arc's most-repeated one arriving in a new disguise: *a count is a claim about
+///   the workload*, and calling the workload "ours" does not change what the count depends on. What
+///   is safely assertable here is the two identities below, which are vacuously true at zero.
+///
+/// * **`readback == blocked` — the structural one, and the one that cannot be satisfied by luck.**
+///   Every `SchedBlock` this file issued was followed by asking the model what state that vCPU is
+///   actually in, and getting `Blocked`. [`sched_on`] already halts on a *refused* transition, so
+///   this is not error handling: it is the gap between "EL2 asked" and "the model agrees", which is
+///   the gap `HCR_EL2`'s read-back in [`report_wfi_yield`] closes for a register.
+///
+/// * **`woken == blocked` — conservation, and it is the LIVENESS half.** Every vCPU this file put to
+///   sleep was later woken. A vCPU blocked and never woken is starved: its guest stops making
+///   progress, never reaches `poweroff`, and — before this conjunct existed — the most likely
+///   symptom was the boot timing out with no explanation. Reaching zero here is what the kill probe
+///   induces (see below).
+///
+/// * **`sweeps >= preempts` — the FAIRNESS one, and it exists because a probe FAILED to kill.**
+///   Every preemption gave the blocked vCPUs a chance before choosing who runs next. `>=` and not
+///   `==` because [`retire_and_hand_over`] sweeps too, at most once per guest per boot; the
+///   inequality is the honest form and the excess is bounded by `NUM_GUESTS`.
+///
+///   [`WAKE_SWEEPS`] is counted INSIDE [`wake_blocked_vcpus`] and [`PREEMPTS`] outside it, on
+///   purpose: a counter on the call site would be deleted along with the call, and the identity
+///   would still balance. See probe A below for why that mattered.
+///
+/// ## What is REPORTED and never asserted
+///
+/// **The yield counts.** They are the rung's headline and they are the guests' behaviour, not the
+/// mechanism's: `main` measured **8,735 per guest** for one second of idleness, every trap yielding,
+/// the two counts identical to the unit. That is the ping-pong. What this rung leaves is bounded by
+/// EL2's slice instead, so the number should collapse — but the *specific* number it collapses to is
+/// a function of tick rates and scheduling luck, and asserting it would be refusing a correct boot
+/// for being fast. Design-lesson #127.
+///
+/// ## ★ THE PROBES — there are two wake sites, and they FAIL DIFFERENTLY
+///
+/// | # | probe | predicted | measured |
+/// |---|---|---|---|
+/// | A | delete the sweep in [`preempt_through_the_scheduler`] | does not kill | **did not kill — gate fully GREEN.** Re-run after `sweeps >= preempts` was added: **kills**, at `2 sweeps against 218 preemptions` |
+/// | B | delete the sweep in [`retire_and_hand_over`] | kills | **killed: `82 blocked, 81 woken`** |
+///
+/// **Probe B**, the easy one: dom 1's last block is never woken, `end_of_boot` runs while its kernel
+/// is still asleep, and the boot reddens. Worth noting *how* it was caught — **both**
+/// `BALEEN-IDLE-END` markers still printed, because dom 1 had finished its sleep long before the
+/// lost wake. The guest-observed marker saw nothing. The conservation identity caught it on a
+/// difference of **one out of eighty-two**, which is the whole argument for having it.
+///
+/// **Probe A is the interesting one, and it is why `sweeps >= preempts` exists.** Deleting the
+/// slice sweep left the gate GREEN. The retire path's own sweep still rescued the blocked vCPU at
+/// teardown, so `woken == blocked` balanced — at **1 == 1**, because dom 1 blocked ONCE and then sat
+/// `Blocked` for the entire boot (69 dispatches against dom 2's 151) instead of blocking 82 times
+/// and being woken 82 times. A guest starved for a second, reported as a clean pass.
+///
+/// That is a latency and fairness defect rather than a correctness one, which is exactly why the
+/// identity missed it: *the counts still balance when the mechanism barely runs*. `sweeps >=
+/// preempts` is structural instead — it is about what EL2 did on every preemption, not about how
+/// often the guests happened to idle — and it turns probe A from green into red.
+///
+/// ⚠ **Two further honesty notes.** First, every one of these probes was USELESS before
+/// `guest-init.sh` gained its sleep: on a boot that traps zero `wfi`s, removing a waker changes
+/// nothing, and a probe that fires on two boots in three is not a probe. That is why the sleep is
+/// part of this rung rather than a convenience. Second, **the reverse probe — restoring
+/// `SchedPreempt` — does NOT kill and cannot be made to**: the machine still works, just 122×
+/// harder. It is caught by the *reported* counts and a human reading them, not by the gate, and
+/// pretending otherwise would overstate this marker.
+///
+/// ## Honest ceiling
+///
+/// `hv-metal` is not a Kani target. This is a boot witness over the live model, not a theorem. It
+/// says every vCPU that went idle was descheduled and re-offered; it says **nothing** about the wake
+/// arriving when the guest's own deadline expires, which is honest-ledger item 9's open form and
+/// which [`wake_blocked_vcpus`] openly substitutes a whole-slice sweep for.
+///
+/// ⚠ **AND THE CONJUNCTS ARE SUMS THAT ONE GUEST LARGELY CARRIES.** Two boots of this rung split
+/// 81 blocks as **81/0** and **80/1** between dom 1 and dom 2. The imbalance is not a fault; it is
+/// [`handle_linux_wfi`]'s ask-first order meeting the rotation — by the time dom 2 goes idle dom 1
+/// is usually already `Blocked`, so dom 2 has no peer to hand to and takes the untouched
+/// [`wait_at_el2`] path instead. The mechanism is per-vCPU-generic code, so no code path goes
+/// uncovered; but a reader should not take `81 == 81 == 81` for evidence about **both** guests in
+/// equal measure, because it is very largely evidence about one. The per-vCPU lines below the marker
+/// are printed precisely so the split is visible rather than hidden inside the sum.
+fn report_idle(uart: &mut Pl011) {
+    let sum = |c: &PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST>| -> u64 {
+        crate::role::census(NUM_GUESTS)
+            .map(|(g, v)| c.at(g, v).load(Ordering::Relaxed))
+            .sum()
+    };
+    let blocked = sum(&VCPUS_BLOCKED);
+    let readback = sum(&BLOCKED_READBACK_OK);
+    let woken = sum(&VCPUS_WOKEN);
+    let sweeps = WAKE_SWEEPS.load(Ordering::Relaxed);
+    let preempts = PREEMPTS.load(Ordering::Relaxed);
+
+    // ★ THE IDENTITIES ARE THE PARK CONDITION; NON-VACUITY IS NOT. Both are vacuously true at
+    //   `blocked == 0`, and that is the correct answer for a boot in which no vCPU ever had a peer
+    //   to yield to — see the doc above for the fault-configuration measurement that taught this.
+    if readback != blocked || woken != blocked || sweeps < preempts {
+        let _ = writeln!(
+            uart,
+            "baleen: idle FAIL: {blocked} vCPU block(s), {readback} of them read back as Blocked, \
+             {woken} woken again, and {sweeps} wake sweep(s) against {preempts} preemption(s) — \
+             either a vCPU EL2 blocked is NOT Blocked in the model, or one was put to sleep and \
+             never woken (a starved guest), or a preemption chose a vCPU without first giving the \
+             blocked ones a chance"
+        );
+        crate::park();
+    }
+    if blocked > 0 {
+        let _ = writeln!(
+            uart,
+            "baleen: idle OK: a vCPU that executed WFI left the scheduler's candidate set and came \
+             back — {blocked} block(s), all {readback} of them read back as Blocked from the model \
+             itself, and all {woken} woken again. An idle peer is no longer handed the pCPU it just \
+             gave up"
+        );
+    } else {
+        // Neither OK nor FAIL, and deliberately neither: the identities above hold, but nothing
+        // exercised them. Saying so in its own words is what stops a reader — or a marker list —
+        // reading a vacuous pass as a witness.
+        let _ = writeln!(
+            uart,
+            "baleen: idle: NOT EXERCISED — no vCPU ever executed WFI with a peer available to take \
+             the pCPU, so none was blocked and this boot witnesses nothing about the mechanism. \
+             Expected whenever a guest has been retired and the survivor idles alone. The shipped \
+             configuration requires 'idle OK', so seeing THIS line there would redden the gate"
+        );
+    }
+    for (slot, v) in crate::role::census(NUM_GUESTS) {
+        let b = VCPUS_BLOCKED.at(slot, v).load(Ordering::Relaxed);
+        if b == 0 {
+            continue;
+        }
+        let _ = writeln!(
+            uart,
+            "baleen: idle: dom {} vcpu {} — blocked {b} time(s), woken {} (reported, never \
+             asserted — a workload number; see report_idle's docs for what it replaced)",
+            slot_dom(slot),
+            v.get(),
+            VCPUS_WOKEN.at(slot, v).load(Ordering::Relaxed)
         );
     }
 }

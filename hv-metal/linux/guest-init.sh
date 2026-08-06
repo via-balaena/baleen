@@ -21,6 +21,13 @@
 #                            `LINUX_RAM_BASE..LINUX_RAM_END` in linux.rs until ③-b2b-ii-b; ③-b2a had
 #                            already halved the window and moved the constants, and this outlived
 #                            both — which is why the marker itself carries the values.)
+#   * BALEEN-IDLE-START/END  ⑱-4b-i, and the ODD ONE OUT: this pair brackets a second of deliberate
+#                            idleness, so what it witnesses is not the printing but what happens
+#                            BETWEEN the two lines — the kernel running out of work and executing
+#                            `wfi`. See the block above it for the measurement that made it
+#                            necessary. A boot that prints START and never END is a guest that went
+#                            idle and was never given the pCPU again, which is exactly the
+#                            starvation `report_idle`'s kill probe induces.
 #   * poweroff               busybox `poweroff -f` -> the kernel's PSCI SYSTEM_OFF -> HVC -> hv-metal's
 #                            EL2 handler. The end-to-end round trip, and how the boot terminates.
 #
@@ -36,6 +43,31 @@ echo "########## BALEEN-STEP0-OK ##########"
 /bin/busybox uname -a
 echo "baleen-guest-ram: $(/bin/busybox grep -m1 'System RAM' /proc/iomem | /bin/busybox tr -d ' ')"
 echo "cmdline: $(/bin/busybox cat /proc/cmdline)"
+
+# ★★ ⑱-4b-i — **GO IDLE ON PURPOSE, and this line is a WITNESS-ENABLING MECHANISM, not padding.**
+#
+# Every other line here prints a marker. This one produces a *scheduler state* instead: with PID 1
+# asleep and nothing else runnable, the kernel has no work, so it idles into `wfi` — the trap
+# `HCR_EL2.TWI` routes to EL2 and the whole reason `handle_linux_wfi` exists.
+#
+# ⚠ **Without it that path is very nearly untested, which was MEASURED before this line was added.**
+# Six boots of the previous init on `main`: dom 1 / dom 2 trapped (1,0) (0,0) (0,0) (1,1) (0,1)
+# (1,1) `wfi`s — **two of the six trapped ZERO across both guests**, and the most any boot managed
+# was two. A witness over that is vacuous a third of the time and a kill probe over it cannot kill.
+#
+# With one second of sleep the guests idle **hundreds of times each**, reliably, every boot. That is
+# what makes the ⑱-4b-i witness an assertion rather than a coin flip, and it is what let the
+# ping-pong that rung fixes be measured on `main` instead of argued about — with this sleep and
+# `SchedPreempt` still in place, the same boot produced **8,735 yields per guest**; with `SchedBlock`
+# it produces 81. See `report_idle` in hv-metal/src/linux.rs for both numbers and what they mean.
+#
+# One second, not more. The trap count scales roughly linearly with the sleep — the guests idle at
+# their own tick rate — so a longer sleep buys proportionally more of a signal that is already large
+# enough, at ~1 s of gate time per boot configuration.
+echo "########## BALEEN-IDLE-START ##########"
+/bin/busybox sleep 1
+echo "########## BALEEN-IDLE-END ##########"
+
 echo "########## poweroff ##########"
 
 /bin/busybox poweroff -f
