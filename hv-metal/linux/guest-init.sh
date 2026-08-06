@@ -59,7 +59,10 @@ echo "cmdline: $(/bin/busybox cat /proc/cmdline)"
 # what makes the ⑱-4b-i witness an assertion rather than a coin flip, and it is what let the
 # ping-pong that rung fixes be measured on `main` instead of argued about — with this sleep and
 # `SchedPreempt` still in place, the same boot produced **8,735 yields per guest**; with `SchedBlock`
-# it produces 81. See `report_idle` in hv-metal/src/linux.rs for both numbers and what they mean.
+# it produced 81. ⚠ That "after" figure is ⑱-4b-i's, at one vCPU per guest; once ⑱-4b-ii started a
+# second one the same boot blocks ~465 times across four vCPUs, because there is far more idling to
+# do. The 8,735 is the number that matters and it is a statement about `main`.
+# See `report_idle` in hv-metal/src/linux.rs for the current split and what it means.
 #
 # One second, not more. The trap count scales roughly linearly with the sleep — the guests idle at
 # their own tick rate — so a longer sleep buys proportionally more of a signal that is already large

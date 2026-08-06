@@ -2072,8 +2072,9 @@ static SWITCHES: PerGuest<AtomicU64, NUM_GUESTS> =
 /// #105 names.
 ///
 /// ✅ **⑱-4b-ii RETIRED THAT ASSERTION, as this doc said it should.** `PSCI CPU_ON` seeds and admits
-/// a second vCPU, so a non-zero count is now the point rather than a defect — **measured 344 on a
-/// shipped boot.** The counter survives as a REPORTED number; what replaced the assertion is
+/// a second vCPU, so a non-zero count is now the point rather than a defect — **measured in the low
+/// hundreds per boot (344 and 378 on two runs).** It is a WORKLOAD number and varies run to run,
+/// which is why it is reported and never asserted. The counter survives as a REPORTED number; what replaced the assertion is
 /// `seeded == admitted` per guest, in [`report_vcpu_census`]. Retired, not relaxed: the statement it
 /// was standing in for ("no vCPU runs without a context") is still asserted, and is still true.
 static DISPATCHED_NONBOOT: AtomicU64 = AtomicU64::new(0);
@@ -3087,7 +3088,7 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     SWITCHES.inc(next).fetch_add(1, Ordering::Relaxed);
     // ⑱-3b-ii's boundary, counted at the ONE funnel every switch passes through. See
     // [`DISPATCHED_NONBOOT`]: it stayed zero until ⑱-4b-ii seeded a second vCPU, and is now the
-    // rung's headline — REPORTED, never asserted (measured 344 on a shipped boot).
+    // rung's headline — REPORTED, never asserted (low hundreds per boot; 344 and 378 on two runs).
     if !next.vcpu().is_boot() {
         DISPATCHED_NONBOOT.fetch_add(1, Ordering::Relaxed);
     }
@@ -4696,7 +4697,7 @@ fn report_wfi_yield(uart: &mut Pl011) {
 /// | # | probe | predicted | measured |
 /// |---|---|---|---|
 /// | A | delete the sweep in [`preempt_through_the_scheduler`] | does not kill | **did not kill — gate fully GREEN.** Re-run after `sweeps >= preempts` was added: **kills**, at `2 sweeps against 218 preemptions` |
-/// | B | delete the sweep in [`retire_and_hand_over`] | kills | **killed: `82 blocked, 81 woken`** |
+/// | B | delete the sweep in [`retire_and_hand_over`] | kills | **killed: `82 blocked, 81 woken`** (⑱-4b-i era, one vCPU per guest; the counts are larger now, the verdict is not) |
 ///
 /// **Probe B**, the easy one: dom 1's last block is never woken, `end_of_boot` runs while its kernel
 /// is still asleep, and the boot reddens. Worth noting *how* it was caught — **both**
@@ -4730,14 +4731,20 @@ fn report_wfi_yield(uart: &mut Pl011) {
 /// arriving when the guest's own deadline expires, which is honest-ledger item 9's open form and
 /// which [`wake_blocked_vcpus`] openly substitutes a whole-slice sweep for.
 ///
-/// ⚠ **AND THE CONJUNCTS ARE SUMS THAT ONE GUEST LARGELY CARRIES.** Two boots of this rung split
-/// 81 blocks as **81/0** and **80/1** between dom 1 and dom 2. The imbalance is not a fault; it is
-/// [`handle_linux_wfi`]'s ask-first order meeting the rotation — by the time dom 2 goes idle dom 1
-/// is usually already `Blocked`, so dom 2 has no peer to hand to and takes the untouched
-/// [`wait_at_el2`] path instead. The mechanism is per-vCPU-generic code, so no code path goes
-/// uncovered; but a reader should not take `81 == 81 == 81` for evidence about **both** guests in
-/// equal measure, because it is very largely evidence about one. The per-vCPU lines below the marker
-/// are printed precisely so the split is visible rather than hidden inside the sum.
+/// ✅ **A CAVEAT THIS DOC DECLARED AND ⑱-4b-ii RETIRED — recorded because the retirement is the
+/// interesting part.** At one vCPU per guest the conjuncts were sums that ONE GUEST LARGELY CARRIED:
+/// two boots split 81 blocks as **81/0** and **80/1** between dom 1 and dom 2, because
+/// [`handle_linux_wfi`]'s ask-first order meets the rotation — by the time dom 2 went idle dom 1 was
+/// usually already `Blocked`, leaving dom 2 no peer to hand to and sending it down the untouched
+/// [`wait_at_el2`] path. So `81 == 81 == 81` was evidence about one guest wearing the shape of
+/// evidence about two.
+///
+/// **With a second vCPU per guest actually running it is gone, measured:** 465 blocks split
+/// **117 / 194 / 109 / 45** across dom 1 vcpu 0/1 and dom 2 vcpu 0/1 — every vCPU carrying a real
+/// share. What fixed it was not this rung: more runnable vCPUs mean a yielding one usually *does*
+/// find a peer, so the ask-first path stops funnelling into `wait_at_el2`. The per-vCPU lines below
+/// the marker are printed precisely so a split like the old one stays visible instead of hiding
+/// inside the sum.
 fn report_idle(uart: &mut Pl011) {
     let sum = |c: &PerVcpu<AtomicU64, NUM_GUESTS, VCPUS_PER_GUEST>| -> u64 {
         crate::role::census(NUM_GUESTS)
