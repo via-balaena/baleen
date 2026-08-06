@@ -4,11 +4,18 @@
 //! # M5 Arc 5e — the real-Linux capstone (feature `real-linux`)
 //!
 //! The documented drop-in from `docs/ARC-5-M5-GUEST-INTERFACE.md`: boot a **real** aarch64 Linux
-//! kernel as a single EL1 guest that "owns the machine", on the interfaces the synthetic Arc 0–5
-//! guests already proved sound. **No isolation content** — the thesis (Arcs 0–4) is proven on the
-//! un-forgeable synthetic guests; this arc only demonstrates the already-proven hardware interface
-//! carries an unmodified kernel. `hv-core`/`hv-hal` are untouched; this whole module is behind the
-//! `real-linux` feature, so the default build (the CI boot-test) is byte-for-byte unchanged.
+//! kernel as an EL1 guest, on the interfaces the synthetic Arc 0–5 guests already proved sound.
+//! **No isolation content** — the thesis (Arcs 0–4) is proven on the un-forgeable synthetic guests;
+//! this arc only demonstrates the already-proven hardware interface carries an unmodified kernel.
+//! `hv-core`/`hv-hal` are untouched; this whole module is behind the `real-linux` feature, so the
+//! default build (the CI boot-test) is byte-for-byte unchanged.
+//!
+//! ⚠ **THIS PARAGRAPH SAID "a SINGLE EL1 guest that owns the machine" UNTIL ⑱-4b, AND HAD BEEN
+//! FALSE SINCE ③-b2b-ii.** What actually boots today is **two** unmodified kernels, each with
+//! **two vCPUs** (⑱-4b-ii's `PSCI CPU_ON`), time-slicing one physical CPU — four vCPUs in total,
+//! each guest reporting `SMP: Total of 2 processors activated.` and owning half the RAM window
+//! behind its own proven-emitted Stage-2 image. "Owns the machine" is the one phrase of the original
+//! framing that has to go: a guest owns its RAM and nothing else, and now not even a CPU to itself.
 //!
 //! ## The model — the guest owns its RAM, and NOTHING else
 //!
@@ -29,11 +36,17 @@
 //! on QEMU `virt`, and ③-b1 because the emulated distributor reports a `GICD_TYPER` covering the
 //! INTIDs the existing DTB already names.
 //!
-//! **③-b2b-ii-d added the first node that tree has ever gained, and the distinction is worth
-//! keeping sharp.** The property earned above is that *taking a device away from a guest never
-//! required editing its description*; that is untouched. The peer-probe node is not an
-//! accommodation of our emulation — it is the negative test's instrument, the one node in the tree
-//! that exists in order to FAIL. Say "the DTS gained a probe", not "the DTS is untouched".
+//! **The tree has now gained TWO nodes, and the distinction is worth keeping sharp.** The property
+//! earned above is that *taking a device away from a guest never required editing its description*;
+//! that is untouched, because neither addition takes anything away.
+//!
+//! * **③-b2b-ii-d — the peer probe.** Not an accommodation of our emulation: it is the negative
+//!   test's instrument, the one node in the tree that exists in order to FAIL.
+//! * **⑱-4b-ii — `cpu@1`.** The other direction of the same property, and the honest exception to
+//!   it: a guest cannot USE a CPU its machine description does not mention, so GIVING it one has to
+//!   be said in the tree. Taking away needs no edit; handing over does.
+//!
+//! Say "the DTS gained a probe, and then a second CPU" — not "the DTS is untouched".
 //!
 //! So **four** things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` Stage-2
 //! **data abort**, which [`handle_linux_sync`] routes to the emulated GIC or the emulated PL011 and
