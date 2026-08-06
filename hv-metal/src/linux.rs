@@ -853,8 +853,10 @@ const MPIDR_HWID_BITMASK: u64 = 0xff_00ff_ffff;
 /// derived … so `hv-metal` calls this rather than repeating it — design-lesson #74."*
 ///
 /// **`hv-metal` did not call it.** There were two derivations of the mapping, in two crates, one of
-/// which asserted in the crate `hv-verify` can reach that there was one. They agreed — because the
-/// only vCPU index in existence is `0`, and every encoding of the identity agrees at a single point.
+/// which asserted in the crate `hv-verify` can reach that there was one. They agreed — because at
+/// the time the only vCPU index in existence **was** `0`, and every encoding of the identity agrees
+/// at a single point. ⑱-3b-ii raised `VCPUS_PER_GUEST` to 2, so that coincidence is gone and the
+/// single derivation below is now doing real work rather than being tidy.
 ///
 /// **This is not a tidy-up, and the guest is what makes it load-bearing.** arm64 Linux's
 /// `gic_populate_rdist` walks the redistributors looking for the frame whose affinity equals its own
@@ -3177,10 +3179,19 @@ fn handle_linux_sysreg_trap(
         // switch-in.
         //
         // ⚠ This is the STORAGE axis only. **Which vCPU an SGI is aimed AT** is a different
-        // question — `ICC_SGI1R_EL1` carries a target list, which `gic::sgi1r_intid` currently does
-        // not decode because with one vCPU per guest there is only one answer. That decode is ⑱-5,
-        // and it is the reason this site is worth getting right first: the target-list rung wants a
-        // per-vCPU set to deliver *into*.
+        // question — `ICC_SGI1R_EL1` carries a target list, which `gic::sgi1r_intid` does not decode.
+        // That decode is ⑱-5, and this site is why it is worth getting the storage right first: the
+        // target-list rung wants a per-vCPU set to deliver *into*.
+        //
+        // ⚠⚠ **⑱-3b-ii CHANGED WHY THAT IS SAFE, and the old reason is now false.** This comment
+        // used to say the decode could be skipped "because with one vCPU per guest there is only one
+        // answer". `VCPUS_PER_GUEST` is 2, so there are now two answers and that sentence would be a
+        // lie. What still holds is weaker and behavioural: **only the boot vCPU is ever admitted**,
+        // so it is the only vCPU that can be running when this trap is taken and the only one that
+        // can be delivered to — a guest cannot target a sibling that never executes. That is a
+        // property of ⑱-3b-ii's boundary (`report_vcpu_census`'s `dispatched == 0`), not of the
+        // architecture, and it **expires the moment ⑱-4 starts a second vCPU**. ⑱-5 must land the
+        // target-list decode before, or together with, any rung that lets a sibling run.
         let running = current_vcpu();
         let slot = running.guest();
         deliver_or_defer_sgi(
