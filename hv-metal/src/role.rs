@@ -148,11 +148,26 @@
 /// `vgic.rs` reads it, and its `const assert!` that the redistributor region can hold that many
 /// frames is what keeps this constant honest.
 ///
-/// **Still 1.** Raising it is ⑱-3b, which needs a scheduler that can pick a vCPU and a `PSCI CPU_ON`
-/// that can start one; raising it alone would give every guest a vCPU nothing ever runs.
-pub(crate) const VCPUS_PER_GUEST: usize = 1;
+/// ## ★ ⑱-3b-ii RAISED IT TO 2, and what that actually deployed
+///
+/// Raising this is not a flag flip: it is what finally **deploys** ⑱-2, which built
+/// `VirtGic<VCPUS>`, proved it at two and shipped it at one (design-lesson #163). At 2 a guest's
+/// redistributor region presents **two frames**, with `GICR_TYPER.Last` on the second — and the
+/// guest notices. **MEASURED: 410 → 413 GICD/GICR register traps per dom**, which is arm64 Linux's
+/// `gic_populate_rdist` walking to the frame that carries `Last` looking for the one whose affinity
+/// matches its own `MPIDR_EL1`. That walk is why ⑱-3b-i's single-derivation fix to `guest_mpidr` had
+/// to land first: it is the comparison the guest performs, and it now has two frames to perform it
+/// against.
+///
+/// ⚠ **The second vCPU is NOT RUNNABLE, and that is the rung's boundary.** `hv-core` boots every
+/// vCPU `Offline`, the metal admits only the boot one, and `next_runnable` reads run state from the
+/// model rather than from bookkeeping — so vCPU 1 exists, is nameable, is offered to the scheduler
+/// on every rotation, and is refused every time. **Seeding it is ⑱-4's `PSCI CPU_ON`.** Dispatching
+/// it before then would `eret` into a zeroed [`crate::vcpu::VcpuCtx`] — PC = 0 — and take a Stage-2
+/// translation fault at the guest's first instruction.
+pub(crate) const VCPUS_PER_GUEST: usize = 2;
 
-/// The vCPU a guest boots on, and — until ⑱-3b-ii — the only one that runs.
+/// The vCPU a guest boots on, and — until ⑱-4 seeds a second — the only one that ever runs.
 ///
 /// ⚠ **PRIVATE since ⑱-3b-i, and the privacy is the rung.** This constant used to be `pub(crate)`,
 /// and `linux.rs` reached for it at six sites where the vCPU that mattered was the *running* one —
@@ -211,9 +226,22 @@ const _: () = assert!(
 ///
 /// What it changes is *where an index can come from*. The defect above is not two roles confused in
 /// one function — it is an axis **projected away and then re-supplied from a constant**. A type
-/// closes exactly that: outside this module the only constructors are [`Running::vcpu`],
-/// [`Incoming::vcpu`] and [`VcpuIdx::boot`], and `BOOT_VCPU` itself is no longer in scope to be
-/// passed by mistake.
+/// closes exactly that: outside this module the only ways to obtain one are [`Running::vcpu`],
+/// [`Incoming::vcpu`], [`VcpuIdx::boot`] and — since ⑱-3b-ii — the two **enumerations**,
+/// [`Running::rotation`] and [`census`]. `BOOT_VCPU` itself is no longer in scope to be passed by
+/// mistake.
+///
+/// ⚠ **⑱-3b-ii WIDENED that list, and the honest reading is that it is a weakening — a small,
+/// visible one.** The scheduler must be able to *name* a vCPU no role currently holds (that is what
+/// selecting one means), and the census must be able to speak about vCPUs nothing is running. Both
+/// therefore hand out indices, and a determined caller could pull an arbitrary `VcpuIdx` out of
+/// `census(..)` and pass it to a per-vCPU seam.
+///
+/// What the type still buys is the thing that was actually measured: the ⑱-3b-i defect was a
+/// **constant that looked correct at every site**, arriving silently. An enumeration is not that —
+/// `census(NUM_GUESTS).nth(1)` at a mediation seam is a sentence a reviewer stops on, where
+/// `BOOT_VCPU` was one they read past six times. **Narrowed, not sealed**, and the rung's ceiling
+/// section below says the same thing about the wrong-role case.
 ///
 /// (There is no `Outgoing::vcpu`. It would be the obvious fourth, and **no site wants it** — every
 /// per-vCPU decision here is about the vCPU that is *arriving* or the one that is *running*, never
@@ -274,6 +302,37 @@ impl VcpuIdx {
     pub(crate) const fn get(self) -> usize {
         self.0
     }
+
+    /// The same index as `hv_core::sched::Vcpu`, for the four calls that cross into the model
+    /// (`SchedAdmit`, `SchedRun`, `SchedPreempt`, `state_of`).
+    ///
+    /// A named accessor rather than four `as u32` casts, because this is a **fence crossing** and
+    /// worth seeing: on this side a vCPU index is a role-derived `VcpuIdx`, on the other it is a
+    /// plain integer scoped to its domain. ⚠ **A vCPU id is scoped to its DOMAIN in `hv_core::sched`**
+    /// — every guest's vCPU 0 is `0` — so this must always travel beside the domain it belongs to.
+    pub(crate) const fn model(self) -> u32 {
+        self.0 as u32
+    }
+
+    /// Whether this is the vCPU a guest boots on. Read by the ⑱-3b-ii census, which asserts that
+    /// every **non**-boot vCPU is one the model knows about and refuses to run.
+    pub(crate) const fn is_boot(self) -> bool {
+        self.0 == BOOT_VCPU
+    }
+}
+
+/// **Every `(guest, vCPU)` the machine has**, in packed order — the ⑱-3b-ii census.
+///
+/// Exists because [`VcpuIdx`] cannot be built from an integer outside this module, which is the
+/// point of ⑱-3b-i and is exactly the constraint a *report* runs into: it needs to speak about
+/// vCPUs no role currently names. So the enumeration lives here, where constructing an index is
+/// legal, rather than by handing out a constructor that would reopen the hole.
+///
+/// Yields bare `(slot, VcpuIdx)` pairs and **not** roles: a census subject is not arriving, leaving
+/// or running, and dressing it as a role would be exactly the laundering [`Incoming::now_running`]
+/// exists to prevent.
+pub(crate) fn census(num_guests: usize) -> impl Iterator<Item = (usize, VcpuIdx)> {
+    (0..num_guests).flat_map(|g| (0..VCPUS_PER_GUEST).map(move |v| (g, VcpuIdx(v))))
 }
 
 /// The vCPU that is leaving the pCPU.
@@ -300,13 +359,19 @@ pub(crate) struct Running {
     vcpu: VcpuIdx,
 }
 
-impl Outgoing {
-    /// Name a guest's vCPU as the outgoing one. **The one place raw indices become this role** —
-    /// keeping it explicit is what makes the seam reviewable.
-    pub(crate) const fn at(guest: usize, vcpu: VcpuIdx) -> Self {
-        Self { guest, vcpu }
-    }
-}
+// ★ ⑱-3b-ii — **`Outgoing::at` IS GONE, and its absence is stronger than it was.**
+//
+// It used to be "the one place raw indices become this role". There is no such place now: every
+// switch's outgoing side comes from [`Running::now_leaving`], so an `Outgoing` is *provably the vCPU
+// that was running* rather than a pair someone assembled. The three call sites that built it from a
+// slot were the same three that read `VcpuIdx::boot()` for the vCPU half — correct only while a
+// guest had one vCPU, which is the defect ⑱-3b-i spent a rung on.
+//
+// ⚠ This also retires, for the outgoing side only, the caveat recorded on [`VcpuIdx`]'s probe 6:
+// a wrong-role slip there was a build error by ACCIDENT (`Outgoing::vcpu` happened not to exist).
+// Now `Outgoing` has exactly one constructor and it is a transition, so "the outgoing vCPU is the
+// one that was running" is enforced rather than merely true. **The incoming side keeps the old
+// ceiling** — `Incoming::at` still takes parts, because the scheduler genuinely selects them.
 
 impl Incoming {
     /// Name a guest's vCPU as the incoming one.
@@ -319,6 +384,17 @@ impl Incoming {
     /// name vCPU 0.
     pub(crate) const fn vcpu(self) -> VcpuIdx {
         self.vcpu
+    }
+
+    /// The guest this vCPU belongs to — for the two calls that must name the incoming **domain** to
+    /// `hv-core` while this role names the incoming **vCPU**, so the pair travels together.
+    ///
+    /// ⑱-3b-ii: the scheduler now selects a `(guest, vCPU)` pair rather than a slot, so the guest
+    /// half has to be projectable out of the selection instead of being carried alongside it. Only
+    /// [`Running`] had this before, for the same reason and with the same caveat: it is a projection
+    /// for code that must index something this module does not own.
+    pub(crate) const fn guest(self) -> usize {
+        self.guest
     }
 
     /// Becomes the running vCPU once the switch has completed — the ONLY transition between roles,
@@ -354,6 +430,48 @@ impl Running {
         self.vcpu
     }
 
+    /// **The running vCPU becomes the outgoing one** — the SECOND sanctioned transition between
+    /// roles, and the counterpart of [`Incoming::now_running`].
+    ///
+    /// ⑱-3b-ii needs it because a switch's outgoing side stops being derivable from a bare slot. The
+    /// three scheduler paths used to build `Outgoing::at(slot, VcpuIdx::boot())` from a `usize` they
+    /// had projected out of `CURRENT`; with two vCPUs the outgoing side is *whichever vCPU was
+    /// running*, and that is a fact only [`Running`] holds. Naming it as a transition — rather than
+    /// letting `linux.rs` reassemble an `Outgoing` from parts — is what keeps the module's rule
+    /// intact: **a role is either constructed at a seam or transitioned from another role, never
+    /// rebuilt out of arithmetic.**
+    pub(crate) const fn now_leaving(self) -> Outgoing {
+        Outgoing {
+            guest: self.guest,
+            vcpu: self.vcpu,
+        }
+    }
+
+    /// **The scheduler's candidates**, in round-robin order starting at the vCPU *after* this one
+    /// and ending at this one.
+    ///
+    /// Stepping `1..=n` rather than `0..n` is what makes a peer preferred and the caller the
+    /// fallback — the property ③-b2b-ii-c2 relied on, now over `(guest, vCPU)` pairs instead of
+    /// guest slots, so that with one vCPU left alive the last candidate is still self and the switch
+    /// degrades to a switch-to-self rather than having nowhere to go.
+    ///
+    /// ⚠ **The ORDER is policy, and deliberately the simplest one.** `hv_core::sched`'s module doc
+    /// draws that line — *"it does not decide which runnable vCPU should get a CPU next. Fairness is
+    /// policy, not a safety property"* — so what is here is a rotation over the packed index, which
+    /// visits a guest's **sibling vCPU before its peer guest**. At ⑱-3b-ii that choice is
+    /// unobservable, because no vCPU but the boot one is ever `Runnable`. **It becomes a real policy
+    /// question at ⑱-4**, when a second vCPU can actually be picked, and it should be revisited
+    /// there rather than inherited silently: sibling-first is a defensible default and so is
+    /// peer-guest-first, and this comment exists so the choice is made rather than found.
+    pub(crate) fn rotation(self, num_guests: usize) -> impl Iterator<Item = (usize, VcpuIdx)> {
+        let n = num_guests * VCPUS_PER_GUEST;
+        let from = self.pack();
+        (1..=n).map(move |step| {
+            let packed = (from + step) % n;
+            (packed / VCPUS_PER_GUEST, VcpuIdx(packed % VCPUS_PER_GUEST))
+        })
+    }
+
     /// The guest this vCPU belongs to, for the handful of callers that must index something this
     /// module does not own (the console's per-guest line buffers, `slot_dom`). Only [`Running`] has
     /// this, because a handler has ONE subject and so cannot confuse two roles.
@@ -371,15 +489,16 @@ impl Running {
 
     /// Inverse of [`Running::pack`].
     ///
-    /// **The `expect` is a tripwire, not a suppression.** With `VCPUS_PER_GUEST == 1` the modulo is
-    /// trivially zero and clippy is right to say so — but the expression is the correct general
-    /// formula, and `expect` (unlike `allow`) FAILS THE BUILD once the lint stops firing. So the day
-    /// ⑱-3b raises the count, this line reports itself as no longer needing the exemption rather
-    /// than sitting there as a stale annotation nobody re-reads.
-    #[expect(
-        clippy::modulo_one,
-        reason = "degenerate only while VCPUS_PER_GUEST == 1"
-    )]
+    /// ✅ **THE TRIPWIRE FIRED, AND THIS IS THE RECORD OF IT.** ⑱-3a annotated this line
+    /// `#[expect(clippy::modulo_one, reason = "degenerate only while VCPUS_PER_GUEST == 1")]` —
+    /// `expect` rather than `allow` precisely so that raising the count would **fail the build**
+    /// instead of leaving a stale annotation nobody re-reads (design-lesson #167). Raising it to 2
+    /// produced exactly one error across the whole crate, and it was this one:
+    /// `error: this lint expectation is unfulfilled`. The annotation is gone because the modulo is
+    /// no longer degenerate — the count did the removing, not a human remembering to.
+    ///
+    /// Worth keeping the story: it is the only evidence that #167 pays for itself, and the reason
+    /// the ⑱-3b-ii diff is small enough to read is that nothing else silently absorbed the change.
     pub(crate) const fn unpack(packed: usize) -> Self {
         Self {
             guest: packed / VCPUS_PER_GUEST,

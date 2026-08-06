@@ -799,6 +799,23 @@ const LINUX_MARKERS: &[&str] = &[
     // `Aff0 = slot` instead of `Aff0 = vCPU` gives dom 2 an MPIDR its own `cpu@0 { reg = <0x00>; }`
     // does not describe, and dom 2 must then fail to boot.
     "baleen: identity OK: every entry to EL1 carries an identity EL2 CHOSE",
+    // ★ ⑱-3b-ii — **THE vCPU AXIS IS PLURAL, AND THE MODEL IS WHAT KEEPS THE SECOND ONE OFF THE
+    // pCPU.** `VCPUS_PER_GUEST` is 2, so every guest now has a second vCPU: hv-core allocated it, the
+    // emulated GIC gives it its own redistributor (⑱-2, proved at two and until now deployed at one),
+    // and the scheduler offers it as a candidate on every rotation. It has no seeded context —
+    // dispatching it would `eret` to PC = 0 — and `PSCI CPU_ON` is ⑱-4.
+    //
+    // ⚠ **Nothing in hv-metal forbids that dispatch.** hv-core boots every vCPU `Offline`,
+    // `SchedAdmit` is the only exit from that state, and the metal admits only the boot vCPU; what
+    // refuses the second one is `next_runnable`'s `state_of(..) == Some(Runnable)` — a proven state
+    // machine's answer, not a range check this port keeps. That is the claim, and the marker's
+    // load-bearing conjunct is the dispatch count being zero.
+    //
+    // The non-vacuity conjunct is `NUM_GUESTS * (VCPUS_PER_GUEST - 1) > 0`, which is COMPILE-TIME and
+    // reads zero on `main` — so this marker is false there rather than green (design-lesson #99).
+    // The guest-observable half (410 → 413 GICD/GICR traps per dom, the driver walking to the
+    // redistributor that carries `Last`) is a WORKLOAD number and is reported, never asserted.
+    "baleen: vcpus OK: each of the",
     // ★ ③-b2b-ii-f — **THE FP/SIMD REGISTER FILE IS PER-GUEST.** The last enumerated member of the
     // "state the hardware does not swap" class, and the one that stayed open longest: `v0..v31`,
     // `FPCR` and `FPSR` are one physical file shared by every context on the CPU, and nothing saved
