@@ -2079,6 +2079,53 @@ static FP_FOREIGN: PerGuest<AtomicU64, NUM_GUESTS> =
 /// guests happen not to use the high registers is byte-for-byte indistinguishable from a correct
 /// one. The read-back is EL2 asking the register file what it actually holds, the same discipline
 /// `TIMER_DEACTIVATED` applies to the redistributor and `verify_encoding` to the emitted image.
+/// ★ **⑱-4a — switch-ins at which the virtual ACTIVE PRIORITIES on the interface were not the
+/// incoming vCPU's** (`ICH_AP0R<n>_EL2`/`ICH_AP1R<n>_EL2`).
+///
+/// The [`FP_FOREIGN`] of this rung, and **reported, never asserted**, for the same reason: it is a
+/// claim about the workload — whether a switch happens to land between a vCPU's `ICC_IAR1_EL1` and
+/// its EOI.
+///
+/// ⚠ **MEASURED on the shipped two-guest boot, and the number is why it can never be a gate: it is
+/// 0, 0, 1, 1 per guest across four consecutive local boots** (~62 switch-ins each). The leak
+/// really does happen on the configuration this rung lands on — so the rung is not speculative —
+/// but *whether* it happens on any given boot is scheduling luck. Asserting a positive count would
+/// redden half the runs; asserting zero would redden exactly when the rung starts earning its keep.
+/// Design-lesson #127, for the seventh time in this arc.
+///
+/// ⚠ **A weaker version of this question answers ZERO, and the difference matters more than the
+/// number.** The scoping probe first asked *"is the live bank non-zero at a switch?"* and measured
+/// **0 of 125** — from which the leak looks absent. It is the wrong question: the bank being zero
+/// is fine when the *incoming* vCPU's saved bank is also zero, and the fault is a MISMATCH, not a
+/// non-zero. Comparing against the incoming context is what makes the count real.
+///
+/// ★ **What made it fatal, and it is why this rung exists.** With a guest's SECOND vCPU running
+/// (⑱-4b's `PSCI CPU_ON`) the switch points start correlating with interrupt handling — an idle
+/// Linux CPU executes `wfi` immediately after taking its tick, and `HCR_EL2.TWI` turns that into a
+/// switch. `ICH_AP1R0_EL2` was then measured **stuck at `0x10000`** — bit 16, priority `0x80`,
+/// which is every interrupt this port injects — inherited by the sibling vCPU, whose interface then
+/// refused to signal anything at or below that priority. Both siblings wedged: the guest was
+/// offered its tick forever (`TIMER_DEFERRED` 3887, four Pending vINTID 27 filling the bank) and
+/// could never acknowledge one.
+///
+/// ⚠ **Do not read the stalled boot's switch count as the cost of a second vCPU.** That boot shows
+/// ~2000 switch-ins per vCPU, but the stall is what produces them: two wedged siblings handing an
+/// idle pCPU back and forth. **With this rung in place the same two-vCPU configuration settles at
+/// 143 and 158** — a little above the one-vCPU boot's ~125, which is what a second tenant should
+/// cost. Quoting 2000 as the healthy figure would be reading a symptom as a property.
+static AP_FOREIGN: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ★ **⑱-4a — switch-ins after which the interface's active priorities were READ BACK equal to the
+/// incoming vCPU's saved ones.** The assertable half, in [`FP_RESTORE_VERIFIED`]'s shape.
+///
+/// Structural rather than a claim about the workload: every switch-in verifies, so this equals
+/// [`SWITCHES`] on every boot regardless of what any guest does, and no arrangement of guest
+/// behaviour can satisfy it by luck (design-lesson #127). It is also the conjunct that cannot be
+/// satisfied by writing the registers and hoping — it asks the machine what it holds.
+static AP_RESTORE_VERIFIED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
 static FP_RESTORE_VERIFIED: PerGuest<AtomicU64, NUM_GUESTS> =
     PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
@@ -2490,6 +2537,7 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     report_guest_identity(uart);
     report_vcpu_census(uart);
     report_fp_isolation(uart);
+    report_active_priorities(uart);
     report_pending_absorption(uart);
     report_sgi_routing(uart);
     #[cfg(feature = "selftest")]
@@ -2689,6 +2737,16 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
         FP_FOREIGN.inc(next).fetch_add(1, Ordering::Relaxed);
     }
 
+    // 3b′. ⑱-4a — **and whose ACTIVE PRIORITIES is the virtual interface carrying?** Read off the
+    //      hardware rather than out of the outgoing context, because unlike the FP file this state
+    //      is not merely *stale* when it is wrong: a priority the outgoing vCPU acknowledged and has
+    //      not ended is a live veto on everything the incoming one could be signalled. Taken here
+    //      for the same reason the FP read is — step 4 is about to destroy the evidence.
+    let incoming_apr = ctx.inc_mut(next).active_priorities();
+    if gic::live_active_priorities() != incoming_apr {
+        AP_FOREIGN.inc(next).fetch_add(1, Ordering::Relaxed);
+    }
+
     // 3c. The overflow probe, once per boot. Deliberately HERE: the outgoing bank is already saved
     //     and step 4 is about to zero every list register, so nothing it writes can be observed.
     #[cfg(feature = "selftest")]
@@ -2745,6 +2803,15 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     live.save();
     if live == incoming_fp {
         FP_RESTORE_VERIFIED
+            .inc(next)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // 5c′. ⑱-4a — the same question of the active priorities, and the same answer: ask the
+    //      interface, do not trust the write. "EL2 wrote it" and "the machine holds it" are the two
+    //      facts `gic::release_forwarded_timer` already taught this file to keep apart.
+    if gic::live_active_priorities() == incoming_apr {
+        AP_RESTORE_VERIFIED
             .inc(next)
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -4146,6 +4213,104 @@ fn report_el2_slice(uart: &mut Pl011) {
 /// *observed* the peer's data before the fix — that claim is the `CPTR_EL2.TFP` measurement recorded
 /// in [`crate::fp`], which found ~31 first-FP-uses-after-a-switch per boot with the guest's own
 /// `CPACR_EL1` permitting each one — nor is it a theorem: `hv-metal` is not a Kani target.
+/// ★ **⑱-4a's witness: a vCPU resumes on its OWN virtual active priorities.**
+///
+/// ## What this closes, and it was found by measurement rather than by reading the ARM ARM
+///
+/// `ICH_AP0R<n>_EL2`/`ICH_AP1R<n>_EL2` hold the priorities a vCPU has acknowledged and not yet
+/// ended. While a bit is set the virtual CPU interface signals nothing at or below that priority —
+/// so they are per-vCPU state in exactly the sense the list registers and `ICH_VMCR_EL2` are, and
+/// they were the one member of that class [`gic::VgicCtx`] did not carry. A vCPU preempted between
+/// `ICC_IAR1_EL1` and its EOI left its bit behind for whoever was restored next, **across vCPUs and
+/// across DOMAINS**, since one physical interface serves both guests.
+///
+/// The measurement is on [`AP_FOREIGN`]. In one line: with a second vCPU per guest the boot
+/// deadlocks permanently, `ICH_AP1R0_EL2` stuck at `0x10000`.
+///
+/// ## The conjunct that is asserted, and the one that is not
+///
+/// * **`verified == switches`** — asserted. Every switch-in reads the interface back and finds the
+///   incoming vCPU's own priorities. Structural: true on every boot, unsatisfiable by a lucky
+///   workload, and false the moment a restore is dropped.
+/// * **`foreign`** — reported. Whether a switch lands inside a handler is the workload's business:
+///   measured **0, 0, 1, 1 per guest across four consecutive boots** of the shipped configuration.
+///   The condition is real here and it is also a coin toss, which is exactly the shape of thing
+///   that must not be a gate in either direction (design-lesson #127).
+///
+/// ## What the assertion cannot see, and the poison that can
+///
+/// A read-back proves the restore is faithful; on the two boots in four where nothing is left
+/// behind it cannot by itself prove the guest *depends* on it. That half is the **poison**
+/// ([`gic::VgicCtx::poison_live`]): every priority is set active between save and restore, so a
+/// dropped restore is fatal rather than invisible. The pair is the point — the read-back watches
+/// the mechanism, the poison makes it load-bearing.
+///
+/// ## ★ THE PROBES, and the rig's own control row
+///
+/// | # | probe | observed |
+/// |---|---|---|
+/// | **CONTROL** | restore the two groups in the opposite order — behaviour-nil | **clean boot, witness green.** The rig discriminates rather than defaulting to "survived" (design-lesson #180) |
+/// | **P1** | delete the RESTORE; keep save and poison | ★ **KILLED, reproduced twice.** Both kernels reach userspace and print `poweroff`; neither ever issues `PSCI SYSTEM_OFF`; the gate reddens on the missing markers |
+/// | **P2** | delete the SAVE; keep restore and poison | **SURVIVED, witness green** — the declared ceiling above, stated because it was measured and not because it was predicted |
+/// | **P3** | delete the `apr` field | **KILLED AT BUILD: three `E0026`s, one per destructuring** (save, restore, poison), plus one `E0609` from the accessor. This is the class fix working |
+/// | **P4** | delete the AP poison; keep save and restore | **SURVIVED** — behaviour-nil on this workload, which is exactly why the poison is there for the workload where it is not |
+/// | **P5** | write `u64::MAX` to `ICH_AP0R0_EL2` and read it straight back | **`0xffffffff`** — QEMU honours the write, so P4's poison is real and P1's kill is not an artefact of an ignored register |
+/// | **P6** | ★ the payoff. On ⑱-4b's configuration (`cpu@1`, two vCPUs per guest), remove save, restore and poison — i.e. put `VgicCtx` back to exactly what `main` carries | **KILLED: the original stall, reproduced.** One guest boots and powers off, the survivor never finishes. With the pair present the whole `qemu-linux-test` — three boot configurations — is GREEN on that branch |
+///
+/// P6 is the row that matters and it is deliberately last: it is the only one measured against the
+/// workload this rung exists for, and it was run against the SHIPPED code rather than the scoping
+/// prototype, because "the prototype fixed it" and "this diff fixes it" are two different claims.
+///
+/// ⚠ **P3's FIRST version was a build error for the WRONG REASON** — it deleted the field and left
+/// its doc comment, so `E0585` (a doc comment documenting nothing) fired before any destructuring
+/// could. Design-lesson #172, caught only by reading the compiler output instead of the exit code.
+/// The row above is the corrected probe.
+///
+/// ⚠ **And the rig ate the rung once.** Its revert step was `git checkout -- hv-metal/src` while the
+/// work was still uncommitted, which restored `main`. Commit before running a destructive rig; the
+/// revert target must be the rung, not its parent.
+///
+/// ## Honest ceiling
+///
+/// `hv-metal` is not a Kani target, so this is a boot witness, not a theorem. The read-back compares
+/// the interface against the **stored** context, so it witnesses the restore and not the save —
+/// deleting the save alone leaves it green (probe P2). And the register list is an **enumeration**
+/// of the writable per-vCPU `ICH_*` state (`LR`, `VMCR`, `AP0R`, `AP1R`; `HCR` is EL2's and
+/// recomputed per switch-in; `VTR`/`EISR`/`ELRSR`/`MISR` are read-only) — the same kind of audit
+/// that undercounted once before (design-lesson #155). Say "enumerated", not "complete".
+fn report_active_priorities(uart: &mut Pl011) {
+    for slot in 0..NUM_GUESTS {
+        // No `witnesses_assertable` guard, deliberately, and matching [`report_fp_isolation`]
+        // beside it: `verified == switches` is not a count that a retired domain leaves
+        // legitimately short — both sides increment in the same statement of `switch_context`, so
+        // a domain that made three switches and died has three of three. The guard exists for
+        // reports whose zero is honest on a faulted boot; this one has no such zero.
+        let dom = slot_dom(slot);
+        let verified = AP_RESTORE_VERIFIED.at(slot).load(Ordering::Relaxed);
+        let switches = SWITCHES.at(slot).load(Ordering::Relaxed);
+        let foreign = AP_FOREIGN.at(slot).load(Ordering::Relaxed);
+        if verified == switches {
+            let _ = writeln!(
+                uart,
+                "baleen: vapr OK: dom {dom} resumed on its OWN virtual active priorities every \
+                 time — {verified} of {switches} switch-ins read ICH_AP0R/ICH_AP1R back off the \
+                 interface equal to the context restored, and on {foreign} of them the interface \
+                 had been left holding a priority the PREVIOUS vCPU had acknowledged and not ended \
+                 (that count is the workload's, not the mechanism's)"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: vapr FAIL: dom {dom} verified {verified} active-priority restores across \
+                 {switches} switch-ins — the interface does not hold what EL2 restored, so a vCPU \
+                 is running under a priority its peer acknowledged and its own interrupts are being \
+                 vetoed"
+            );
+            crate::park();
+        }
+    }
+}
+
 fn report_fp_isolation(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
         let dom = slot_dom(slot);

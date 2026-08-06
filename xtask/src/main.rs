@@ -856,6 +856,34 @@ const LINUX_MARKERS: &[&str] = &[
     // this read-back is the ONLY thing between a broken restore and a silent green boot.
     "baleen: fp OK: dom 1 resumed on its OWN FP register file every time —",
     "baleen: fp OK: dom 2 resumed on its OWN FP register file every time —",
+    // ★★ ⑱-4a — **THE VIRTUAL ACTIVE PRIORITIES ARE PER-vCPU.** `ICH_AP0R<n>_EL2`/`ICH_AP1R<n>_EL2`
+    // hold the priorities a vCPU has acknowledged and not yet ended; while a bit is set the virtual
+    // CPU interface signals nothing at or below that level. They are the same class of state as the
+    // list registers and `ICH_VMCR_EL2` — one physical interface, no hardware swap — and they were
+    // the one member of that class `gic::VgicCtx` did not carry, across every arc since 7c.
+    //
+    // ⚠ **FOUND BY MEASUREMENT, NOT BY READING THE REGISTER LIST**, and the diagnosis it replaced
+    // was confidently wrong. The recorded blocker for a guest's second vCPU was "EL2 presents CNTV
+    // only to whoever holds the pCPU, so a deadline that expires while descheduled is never
+    // delivered". Six instrumented boots refuted it: the tick ARRIVES once per slice per vCPU
+    // forever, `TIMER_FORWARDED` is frozen only because `inject_hw` fails against a bank holding
+    // FOUR Pending vINTID 27, and the guest cannot acknowledge any of them because
+    // `ICH_AP1R0_EL2` is stuck at 0x10000 — bit 16, priority 0x80, which is every interrupt this
+    // port injects — inherited from its sibling. Saving and restoring these two registers is the
+    // entire fix; a competing theory (refuse DUPLICATE ticks) was implemented and REFUTED in one
+    // boot, the bank stopped filling and the guest stayed wedged.
+    //
+    // The assertion is the READ-BACK — `verified == switches`, structural on every boot — and NOT
+    // the leak count, which measured 0, 0, 1, 1 per guest across four consecutive boots of this
+    // configuration. The condition is real here and it is also a coin toss; a gate on it would be
+    // red half the time (design-lesson #127).
+    //
+    // ⚠ **THE KILL PROBE DOES KILL, and loudly.** Unlike ③-b2b-ii-f's, dropping the restore is not
+    // silently survivable: see the rung's probe table. The poison is what makes that true on THIS
+    // configuration — all priorities set active between save and restore, so an unrestored bank is
+    // a guest that can take no interrupt at all.
+    "baleen: vapr OK: dom 1 resumed on its OWN virtual active priorities every time —",
+    "baleen: vapr OK: dom 2 resumed on its OWN virtual active priorities every time —",
     // ⑰-a — the boot transcript records what THIS BUILD believes a vCPU context is made of, so a
     // component silently added or removed changes a line the gate asserts. The real obligation is
     // the compiler's: `save`, `restore` and `poison` each destructure the context with no `..`, so
@@ -1013,6 +1041,7 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // `v0..v31`/`FPCR`/`FPSR` is being dropped and a guest resumes on its peer's floating-point
     // state. The only detector — the poison alone does not kill this boot.
     "baleen: fp FAIL",
+    "baleen: vapr FAIL",
     // ③-b2b-ii-d: a guest reached the peer's memory and the refusal proved nothing — the address is
     // mapped in its own image too, or it does not resolve in the peer's, or the peer's kernel is not
     // there. Any of those makes the negative test an anecdote.
