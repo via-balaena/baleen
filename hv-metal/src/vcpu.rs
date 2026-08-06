@@ -47,7 +47,7 @@
 //! This module holds the state a guest **owns and mutates**, which is why save/restore/poison is the
 //! right shape for it. Some per-vCPU state is EL2's instead — the guest cannot write it, so there is
 //! nothing to save, and poisoning it would only break the guest. It is *installed* by
-//! [`crate::linux::switch_context`] from the incoming vCPU's identity rather than carried here:
+//! `crate::linux::switch_context` from the incoming vCPU's identity rather than carried here:
 //! `VTTBR_EL2` (the domain's Stage-2, since ③-b2b-ii-c2) and, since ⑱-1, `VMPIDR_EL2`/`VPIDR_EL2`
 //! (the `MPIDR_EL1`/`MIDR_EL1` the guest reads).
 //!
@@ -75,7 +75,7 @@
 //!
 //! ## One derivation
 //!
-//! The table is declared **once**, by [`ctx_regs!`], which generates the enum, the `ALL` slice, the
+//! The table is declared **once**, by `ctx_regs!`, which generates the enum, the `ALL` slice, the
 //! names and both accessors together. There is no second list to drift from the first — adding a
 //! register is one line, and the exhaustive wildcard-free matches mean the compiler, not a reviewer,
 //! is what notices if an accessor forgets it (the Phase I-1 `Transition` shape, one layer out).

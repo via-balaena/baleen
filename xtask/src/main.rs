@@ -102,7 +102,7 @@ fn main() {
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
-                 metal-lint fmt --check + clippy -D warnings for hv-metal ({} feature configs)",
+                 metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)",
                 METAL_LINT_CONFIGS.len()
             );
             exit(2);
@@ -1331,6 +1331,45 @@ fn metal_lint() -> bool {
             "--check",
         ],
     ) && METAL_LINT_CONFIGS.iter().all(|cfg| metal_clippy(cfg))
+        && METAL_LINT_CONFIGS.iter().all(|cfg| metal_doc(cfg))
+}
+
+/// **Build `hv-metal`'s rustdoc for one feature config, denying every rustdoc warning.**
+///
+/// ## Why this exists: an EXCLUDED crate loses every `--workspace` gate, not just the one
+///
+/// `cargo xtask doc` runs `cargo doc --workspace`, and `hv-metal` is workspace-**excluded** — so
+/// until this rung its rustdoc was built by **nothing at all**, in any job, ever. `metal-lint`
+/// covered `fmt` and `clippy` for it and stopped there. Design-lesson #173 is the general form:
+/// excluding a crate to escape one gate silently excuses it from all of them.
+///
+/// **MEASURED when the gate was added: 33 distinct broken intra-doc links**, across every module and
+/// every feature config — 24 in the default build, 23 under `selftest`, **30 under `smmu`**, 18
+/// under `real-linux`, 17 under `real-linux,selftest`. Given how much of this project's argument
+/// lives in doc comments, links that rot silently are a real cost.
+///
+/// ⚠ **PER CONFIG, and that is load-bearing rather than thorough-for-its-own-sake.** The count above
+/// is not uniform: `smmu` was the worst and `real-linux` — the only config anyone had ever measured
+/// — was among the best. A single-config gate would have reported 18, "fixed" those, and left 15
+/// live in configurations it never built. That is design-lesson #155's shape (an audit that measures
+/// one case and generalises), and it is why this iterates [`METAL_LINT_CONFIGS`] exactly as clippy
+/// does: the invariant that list already states is *every configuration that is BUILT AND BOOTED is
+/// linted*, and "linted" now includes its docs.
+///
+/// `-D warnings` rather than `-D rustdoc::broken_intra_doc_links`, matching [`doc`]'s bar for the
+/// workspace: all five configs meet it today, so the stricter form costs nothing and catches the
+/// next class too.
+fn metal_doc(extra: &[&str]) -> bool {
+    let mut args = vec![
+        "doc",
+        "--manifest-path",
+        "hv-metal/Cargo.toml",
+        "--target",
+        METAL_TARGET,
+        "--no-deps",
+    ];
+    args.extend_from_slice(extra);
+    run_env("cargo", &args, &[("RUSTDOCFLAGS", "-D warnings")])
 }
 
 /// Run clippy over `hv-metal` for the bare-metal target with `extra` cargo args, denying warnings.

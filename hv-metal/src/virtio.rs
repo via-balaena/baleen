@@ -29,8 +29,8 @@
 //! **unmapped** in the guest's Stage-2, so a guest load/store to a device register faults to EL2 (a
 //! Stage-2 data abort, `EC=0x24`). The metal decodes the abort syndrome — `FAR_EL2` gives the full
 //! faulting address (Stage-1 is off, so guest VA == IPA), `ESR_EL2.ISS` gives the access size (`SAS`),
-//! the target GP register (`SRT`), and direction (`WnR`) — services the register in [`mmio_read`] /
-//! [`mmio_write`], writes any read result back into the guest's saved register frame, advances `ELR`
+//! the target GP register (`SRT`), and direction (`WnR`) — services the register in `mmio_read` /
+//! `mmio_write`, writes any read result back into the guest's saved register frame, advances `ELR`
 //! past the faulting instruction, and resumes. This is genuine trap-and-emulate of a device register
 //! file, distinct from the pure isolation-fault probes of Arcs 5/0/2.
 

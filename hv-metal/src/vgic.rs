@@ -110,7 +110,7 @@ pub(crate) struct DeployedGic {
 /// **A guest's distributor is per-GUEST, and ⑱-2 is why that stays true with more than one vCPU:**
 /// the per-vCPU part of a GICv3 — the redistributors, with their banked INTIDs 0..31 — lives INSIDE
 /// [`VirtGic`] as `VirtGic<VCPUS_PER_GUEST>`, not as a second axis out here. Declaring only
-/// [`PerGuestState`] makes a `PerVcpu<DeployedGic, ..>` a build error, which is the right answer: it
+/// `PerGuestState` makes a `PerVcpu<DeployedGic, ..>` a build error, which is the right answer: it
 /// would give each vCPU its own copy of the SPIs the guest shares.
 impl crate::role::PerGuestState for DeployedGic {}
 

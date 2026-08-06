@@ -40,10 +40,10 @@
 //! ## Rung 2: the same idea, one boot, five phases
 //!
 //! Rung 1's control differs from its deny in the **machine** (SMMU or no SMMU), which leaves a lot
-//! unexplained between the two runs. [`rung2`] tightens that to the smallest possible difference: one
+//! unexplained between the two runs. `rung2` tightens that to the smallest possible difference: one
 //! boot, one machine, one device, and phases that differ only in the contents of a single 64-byte
 //! Stream Table Entry — or, in the last phase, only in the table *size* announced to the SMMU. See
-//! [`rung2`] for the phase table and what each one rules out.
+//! `rung2` for the phase table and what each one rules out.
 //!
 //! **What the phases are for** is the whole design. Every one of them exists because some *other*
 //! explanation of "the DMA was aborted" had to be excluded, and each was confirmed able to fail by
@@ -54,14 +54,14 @@
 //! * bind the device's own StreamID instead of the neighbour, and phase 3 lands — so the permit is
 //!   per-StreamID;
 //! * bind the **wrong** StreamID throughout, and *every* phase loses its outcome — so the whole
-//!   result rests on [`pcie::stream_id`] being the RequesterID the hardware really presents;
+//!   result rests on `pcie::stream_id` being the RequesterID the hardware really presents;
 //! * never write `CR0.SMMUEN`, and every phase reports "aborted" — which is exactly the vacuous deny
 //!   this rung is built to exclude, and exactly what phase 1 catches.
 //!
 //! ## Rung 3: the same idea again, and the sentinel that must NOT change
 //!
 //! Rung 2 could only show the device reaches its STE — everything it permits, it permits unconfined.
-//! [`rung3`] binds the device to a **domain's own Stage-2 tables** and asks the sharper question: not
+//! `rung3` binds the device to a **domain's own Stage-2 tables** and asks the sharper question: not
 //! "did something land?" but "did it land where the **table** says, rather than where the **device**
 //! asked?" Two sentinels at two different addresses, both seeded and read back, and the
 //! discriminator is which one moved. Probed: swap the stage-2 STE for a bypass STE and the two

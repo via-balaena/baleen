@@ -78,7 +78,7 @@ const SMMU_BASE: u64 = 0x0905_0000;
 /// whole arc depends on, since baleen's plan is to point the SMMU at the *same* `p2m`-derived Stage-2
 /// tables the CPU walks — and bit 1 `S1P` (stage-1).
 const SMMU_IDR0: u64 = 0x0000;
-/// `SMMU_IDR1` — queue/table size parameters. `SIDSIZE` in bits [5:0] bounds the stream table;
+/// `SMMU_IDR1` — queue/table size parameters. `SIDSIZE` in bits `[5:0]` bounds the stream table;
 /// `CMDQS`/`EVTQS` bound the queues; `REL` (bit 28) says where page 1 sits.
 const SMMU_IDR1: u64 = 0x0004;
 /// `SMMU_CR0` — global control; bit 0 is `SMMUEN`.
@@ -101,11 +101,11 @@ const SMMU_GBPA: u64 = 0x0044;
 /// both look like a `CMD_SYNC` that never completes.
 const SMMU_GERROR: u64 = 0x0060;
 const SMMU_GERRORN: u64 = 0x0064;
-/// `SMMU_STRTAB_BASE` (64-bit) — physical base of the stream table, bits [51:6].
+/// `SMMU_STRTAB_BASE` (64-bit) — physical base of the stream table, bits `[51:6]`.
 const SMMU_STRTAB_BASE: u64 = 0x0080;
-/// `SMMU_STRTAB_BASE_CFG` — `LOG2SIZE` [5:0], `SPLIT` [10:6], `FMT` [17:16].
+/// `SMMU_STRTAB_BASE_CFG` — `LOG2SIZE` `[5:0]`, `SPLIT` `[10:6]`, `FMT` `[17:16]`.
 const SMMU_STRTAB_BASE_CFG: u64 = 0x0088;
-/// `SMMU_CMDQ_BASE` (64-bit) — `ADDR` [51:5], `LOG2SIZE` [4:0].
+/// `SMMU_CMDQ_BASE` (64-bit) — `ADDR` `[51:5]`, `LOG2SIZE` `[4:0]`.
 const SMMU_CMDQ_BASE: u64 = 0x0090;
 const SMMU_CMDQ_PROD: u64 = 0x0098;
 const SMMU_CMDQ_CONS: u64 = 0x009c;
@@ -132,7 +132,7 @@ const IDR0_S2P: u32 = 1 << 0;
 /// discriminate between them. Corrected here, and worth recording as the shape rather than the
 /// instance.
 const IDR0_S1P: u32 = 1 << 1;
-/// `SMMU_IDR1.SIDSIZE` — bits [5:0]; the SMMU supports StreamIDs below `2^SIDSIZE`.
+/// `SMMU_IDR1.SIDSIZE` — bits `[5:0]`; the SMMU supports StreamIDs below `2^SIDSIZE`.
 const IDR1_SIDSIZE_MASK: u32 = 0x3f;
 /// `SMMU_IDR1.REL` — bit 28; clear means page 1 is at `base + 64 KiB` (the layout
 /// [`SMMU_EVENTQ_PROD`] assumes).
@@ -299,7 +299,7 @@ const EVENTQ_LOG2SIZE: u32 = 4;
 const EVENTQ_ENTRIES: usize = 1 << EVENTQ_LOG2SIZE;
 
 /// The linear stream table. Alignment is **the larger of the table size and 64 bytes** — an
-/// architectural requirement, and a silent one: `STRTAB_BASE` carries only bits [51:6], so an
+/// architectural requirement, and a silent one: `STRTAB_BASE` carries only bits `[51:6]`, so an
 /// under-aligned base is *truncated* to a different address, the SMMU walks whatever is there, and
 /// every StreamID denies for a reason that has nothing to do with the property under test. That is
 /// the vacuity failure in its purest form, so the requirement is bound to the type by a `const _`
@@ -329,7 +329,7 @@ const STRTAB_CFG: u32 = match st::strtab_base_cfg(STRTAB_LOG2SIZE) {
     None => panic!("STRTAB_LOG2SIZE exceeds what STRTAB_BASE_CFG.LOG2SIZE can encode"),
 };
 
-/// The command queue. Aligned to its size (`CMDQ_BASE.ADDR` is bits [51:5], and the architecture
+/// The command queue. Aligned to its size (`CMDQ_BASE.ADDR` is bits `[51:5]`, and the architecture
 /// requires queue-size alignment).
 #[repr(C, align(256))]
 struct CmdQueue([u64; CMDQ_ENTRIES * 2]);

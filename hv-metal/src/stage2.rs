@@ -329,7 +329,7 @@ fn sup_ram_start() -> u64 {
 
 /// Number of independent per-domain Stage-2 table sets the metal can hold live at once. Two, for the
 /// M5 Arc-2 concurrent-inter-domain-isolation test (two domains, each its own set + VMID); the
-/// single-domain phases (Arc 0/5 isolation + lifecycle, Arc 1 scheduler) all use [`set`] `0`.
+/// single-domain phases (Arc 0/5 isolation + lifecycle, Arc 1 scheduler) all use `set` `0`.
 pub const NUM_STAGE2_SETS: usize = 2;
 
 /// The `VMID` a Stage-2 set is tagged with — **`set + 1`**, stamped into `VTTBR_EL2[55:48]`. Distinct
@@ -422,7 +422,7 @@ static STAGE2_SETS: BootCell<[Stage2Set; NUM_STAGE2_SETS]> = BootCell::new(
 ///
 /// The guest-image region is mapped as infrastructure (identity 2 MiB RO+X block). The data region is
 /// the refinement: for every **leaf** page-table edge whose parent `guest_dom` owns, the leaf's
-/// child frame is mapped at [`frame_ipa`] → [`frame_pa`] with the leaf's permission (`writable` →
+/// child frame is mapped at [`frame_ipa`] → `frame_pa` with the leaf's permission (`writable` →
 /// `S2AP=RW`, else `S2AP=RO`, always execute-never). A foreign child appears here only because
 /// `p2m_link` already required a grant, so the grant dimension is covered transitively; a frame
 /// `guest_dom` may not reach has no leaf edge and so no descriptor — the hardware faults it.

@@ -7,7 +7,7 @@
 //! unmapped, a guest load/store to a device register faults to EL2, and the handler reads what the
 //! access *was* out of `ESR_EL2.ISS` (which register, which direction, how wide) and where it was
 //! aimed (`HPFAR_EL2` + `FAR_EL2`). Two handlers now need that: the synthetic guest's virtio-mmio
-//! path ([`crate::guest`], M5 Arc 3) and the real-Linux guest's emulated PL011 ([`crate::vpl011`],
+//! path ([`crate::guest`], M5 Arc 3) and the real-Linux guest's emulated PL011 (`crate::vpl011`,
 //! ③-a1).
 //!
 //! **This module exists so there is one decode, not two.** ⑭ found `VTCR_EL2` written out as a

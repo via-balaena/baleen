@@ -10,7 +10,7 @@
 //!
 //! ## Why this was a real leak and not a theoretical one — MEASURED, not argued
 //!
-//! `CPACR_EL1` *is* in [`crate::vcpu::CtxReg`], so each guest's FP **trap** state is its own. That
+//! `CPACR_EL1` *is* in `crate::vcpu::CtxReg`, so each guest's FP **trap** state is its own. That
 //! is what makes the leak reachable rather than latent: a guest resumes with its own `CPACR_EL1`
 //! permitting FP, and its kernel's lazy-FP bookkeeping still believes the live registers hold the
 //! current task's state, so it does **not** reload them. It reads whatever the peer left.
@@ -51,7 +51,7 @@
 //!
 //! ## One type, both switches
 //!
-//! This module exists rather than a field in [`crate::vcpu::VcpuCtx`] because **both** switch paths
+//! This module exists rather than a field in `crate::vcpu::VcpuCtx` because **both** switch paths
 //! need it: the real-Linux one and `guest.rs`'s synthetic one, which has carried its own context
 //! struct since M5 Arc 1. Two hand-rolled answers to "what is an FP context" is precisely the
 //! second-derivation defect ⑭ spent a rung removing for the vGIC, and [`crate::gic::VgicCtx`] is the
@@ -84,7 +84,7 @@ const CPTR_EL2_TFP: u64 = 1 << 10;
 ///
 /// `CPTR_EL2`'s reset value is architecturally **UNKNOWN**, exactly like `HCR_EL2`'s — which is why
 /// [`crate::el2::configure`] writes that register explicitly rather than trusting reset. Nothing in
-/// hv-metal had ever written `CPTR_EL2`, so [`FpCtx::save`]'s very first `stp q0, q1` was relying on
+/// hv-metal had ever written `CPTR_EL2`, so `FpCtx::save`'s very first `stp q0, q1` was relying on
 /// an UNKNOWN field happening to be 0. It is on this emulator. On silicon that came up with `TFP=1`,
 /// EL2 would take a trap **inside its own context switch**, which is about the worst place to
 /// discover a reset assumption.
@@ -186,7 +186,7 @@ const POISON: FpCtx = FpCtx {
 
 /// Clobber the live FP register file, so a restore that misses part of it cannot go unnoticed.
 ///
-/// **The instrument, not a debugging aid** — the same standing as [`crate::vcpu::poison`], but be
+/// **The instrument, not a debugging aid** — the same standing as `crate::vcpu::poison`, but be
 /// precise about what it buys, because the read-back witness overlaps it. A broken restore is caught
 /// *without* poison on any switch between two different guests: the live file still holds the
 /// outgoing guest's data, which differs from the incoming one's saved copy. What poison adds is the
@@ -286,7 +286,7 @@ impl crate::ctx::CtxComponent for FpCtx {
     /// Write this context back onto the live CPU.
     ///
     /// # Safety
-    /// The caller must be at EL2 with the outgoing context already saved; between a [`poison`] and
+    /// The caller must be at EL2 with the outgoing context already saved; between a `poison` and
     /// this call the register file belongs to nobody.
     unsafe fn restore(&self) {
         let p = core::ptr::addr_of!(self.v) as *const u64;

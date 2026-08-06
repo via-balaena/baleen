@@ -44,7 +44,7 @@
 //!   `&mut T` it derefs to is genuinely exclusive. The claim is taken with a
 //!   `compare_exchange` on a per-cell [`AtomicBool`] and released in [`BootRef`]'s `Drop`; a second
 //!   claim **halts loudly** rather than aliasing.
-//! - **Check:** the `selftest` boot runs [`selftest_exclusion`] — a live guard, a refused
+//! - **Check:** the `selftest` boot runs `selftest_exclusion` — a live guard, a refused
 //!   `try_borrow_mut`, the guard dropped, an accepted `try_borrow_mut` — so the flag is witnessed
 //!   *by the mechanism under test* on every CI boot (design-lesson #24(f)), not merely asserted.
 //! - **Scope:** this **does not make anything SMP-safe**. A second CPU still cannot run hypervisor
