@@ -247,7 +247,11 @@ const SCHED_YIELDS: u64 = 4;
 const SCHED_BASE_A: u64 = 0x100;
 const SCHED_BASE_B: u64 = 0x200;
 /// Metal-side vCPU context slots (one per scheduler vCPU).
-const NUM_VCPUS_METAL: usize = 2;
+///
+/// `pub(crate)` since ⑱-3b-ii so `main.rs` can `const assert!` that the model it builds has room for
+/// every vCPU this path names — a relationship that was unpinned, and that had already drifted on
+/// the real-Linux side. See the asserts beside `VCPUS_PER_DOMAIN`.
+pub(crate) const NUM_VCPUS_METAL: usize = 2;
 
 /// The single Stage-2 table set (of [`stage2::NUM_STAGE2_SETS`]) every single-domain phase uses —
 /// Arc 0/5 isolation + lifecycle and Arc 1's scheduler (both vCPUs share one address space). VMID 1.

@@ -359,6 +359,32 @@ const PORTS_PER_DOMAIN: usize = 4;
 const GRANTS_PER_DOMAIN: usize = 4;
 const VCPUS_PER_DOMAIN: usize = 2;
 const NUM_PCPUS: usize = 2;
+
+// ─── ⑱-3b-ii: the MODEL must have room for every vCPU the METAL can name ─────────────────────────
+//
+// **This was an unpinned relationship, and it had already drifted.** Three constants say how many
+// vCPUs exist — `VCPUS_PER_DOMAIN` here (what the model allocates), `guest::NUM_VCPUS_METAL` (what
+// the synthetic path time-slices) and `role::VCPUS_PER_GUEST` (what a real-Linux guest has) — and
+// until this rung *nothing checked any of them against another*. `VCPUS_PER_DOMAIN` appeared in
+// exactly two places: its definition and its single use.
+//
+// ⚠ **An INEQUALITY, not an equality, and the distinction is the honest part.** These are not three
+// derivations of one fact (which #74 would say to collapse into one): the model's array is shared by
+// both paths and must be big enough for whichever is compiled, while each metal path's count is its
+// own statement about its own workload. What *is* a defect is the metal naming a vCPU the model does
+// not have — `state_of` would answer `None`, `next_runnable` would silently never pick it, and a
+// dispatch would be refused by a model that is right. So the checkable relationship is "big enough".
+const _: () = assert!(
+    VCPUS_PER_DOMAIN >= guest::NUM_VCPUS_METAL,
+    "the model must have room for every vCPU the synthetic path time-slices"
+);
+#[cfg(feature = "real-linux")]
+const _: () = assert!(
+    VCPUS_PER_DOMAIN >= role::VCPUS_PER_GUEST,
+    "the model must have room for every vCPU a real-Linux guest has — raising role::VCPUS_PER_GUEST \
+     past VCPUS_PER_DOMAIN would make hv-core answer None for a vCPU the metal can name"
+);
+
 /// DMA-capable devices in the model — the SMMU arc's rung-4 assignment axis.
 ///
 /// One, because this machine has exactly one bus master baleen drives (QEMU's `edu`, at PCIe
