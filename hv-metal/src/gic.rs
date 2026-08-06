@@ -467,6 +467,127 @@ pub(crate) fn num_list_registers() -> usize {
     (((vtr & 0x1f) as usize) + 1).min(MAX_LIST_REGISTERS)
 }
 
+/// The most `ICH_AP0R<n>_EL2`/`ICH_AP1R<n>_EL2` registers any GICv3 implements — four each, at
+/// `ICH_VTR_EL2.PRIbits == 7`.
+///
+/// Sized to the architectural maximum for the same reason [`MAX_LIST_REGISTERS`] is: the saved
+/// context is a compile-time array and the machine's real count is a run-time question
+/// ([`num_ap_registers`]). On this platform that means carrying 2 × 4 slots and using 2 × 1 — 48
+/// bytes per vCPU unused — which buys a board-dependent constant out of a type.
+pub(crate) const MAX_AP_REGISTERS: usize = 4;
+
+/// The number of implemented **active-priority** registers per group, from `ICH_VTR_EL2.PRIbits`
+/// (bits [31:29], holding *PRIbits − 1*) — **1 on QEMU `virt`, which reports PRIbits = 5**.
+///
+/// The architecture ties the count to the number of priority bits the virtual interface implements:
+/// `PRIbits == 5` ⇒ `ICH_AP<x>R0_EL2` only; `6` ⇒ `R0..R1`; `7` ⇒ `R0..R3`. **An access to a
+/// register the implementation does not provide is UNDEFINED**, not merely UNPREDICTABLE, so this
+/// bound is harder than [`num_list_registers`]'s and every loop over the bank takes it.
+///
+/// Asked of the machine rather than written down, exactly as the list-register count is. A constant
+/// `1` would be correct on this QEMU and silently wrong — reading a register that does not exist —
+/// on any core with more priority bits.
+pub(crate) fn num_ap_registers() -> usize {
+    let vtr: u64;
+    // SAFETY: `ICH_VTR_EL2` is a RO EL2 identification register for the virtual interface; no effect.
+    unsafe {
+        asm!("mrs {v}, ICH_VTR_EL2", v = out(reg) vtr, options(nomem, nostack, preserves_flags));
+    }
+    match ((vtr >> 29) & 0x7) + 1 {
+        7 => 4,
+        6 => 2,
+        // PRIbits is architecturally at least 5, so this arm is the 5 case and the floor together.
+        _ => 1,
+    }
+    .min(MAX_AP_REGISTERS)
+}
+
+// `ICH_AP<g>R<n>_EL2` has the same problem the list registers do — the encoding must be a string
+// literal — so a runtime index dispatches through the matches below.
+macro_rules! read_one_apr {
+    ($g:literal, $n:literal) => {{
+        let v: u64;
+        // SAFETY: `ICH_AP<g>R<n>_EL2` for `n < num_ap_registers()` is a RW EL2 virtual-interface
+        // register; read-only here, no memory effect.
+        unsafe {
+            asm!(concat!("mrs {v}, ICH_AP", stringify!($g), "R", stringify!($n), "_EL2"),
+                 v = out(reg) v, options(nomem, nostack, preserves_flags));
+        }
+        v
+    }};
+}
+macro_rules! write_one_apr {
+    ($g:literal, $n:literal, $v:expr) => {{
+        // SAFETY: `ICH_AP<g>R<n>_EL2` for `n < num_ap_registers()` is a RW EL2 virtual-interface
+        // register. `isb` so the write is in effect before a following `eret` lets the virtual
+        // interface decide what to present.
+        unsafe {
+            asm!(concat!("msr ICH_AP", stringify!($g), "R", stringify!($n), "_EL2, {v}"), "isb",
+                 v = in(reg) $v, options(nomem, nostack, preserves_flags));
+        }
+    }};
+}
+
+/// Read active-priority register `n` of group `group` (0 or 1), `n < num_ap_registers()`.
+///
+/// **What these hold, and why a context that omits them is broken.** `ICH_AP<g>R<n>_EL2` is the
+/// **virtual active priorities** bitmap: one bit per priority level, set when the vCPU acknowledges a
+/// virtual interrupt through `ICC_IAR<g>_EL1` and cleared by its EOI. While a bit is set the virtual
+/// CPU interface will not signal any interrupt at or below that priority — that is what makes
+/// interrupt priorities mean anything to a guest.
+///
+/// They are per-vCPU state the hardware does not swap, in exactly the sense [`VgicCtx`]'s other two
+/// members are. ⑱-4a measured what their absence costs; see that type's docs.
+///
+/// ⚠ **`n` must be below [`num_ap_registers`]** — an access to a register the implementation does
+/// not provide is UNDEFINED. The `_` arm below catches only a nonsense *group* or an `n` past the
+/// architectural maximum; it cannot know this machine's count. Same contract as [`read_lr`]'s, and
+/// stated rather than inherited because the consequence is harder here (UNDEFINED, not merely
+/// UNPREDICTABLE).
+pub(crate) fn read_apr(group: usize, n: usize) -> u64 {
+    match (group, n) {
+        (0, 0) => read_one_apr!(0, 0),
+        (0, 1) => read_one_apr!(0, 1),
+        (0, 2) => read_one_apr!(0, 2),
+        (0, 3) => read_one_apr!(0, 3),
+        (1, 0) => read_one_apr!(1, 0),
+        (1, 1) => read_one_apr!(1, 1),
+        (1, 2) => read_one_apr!(1, 2),
+        (1, 3) => read_one_apr!(1, 3),
+        _ => 0,
+    }
+}
+
+/// Write active-priority register `n` of group `group` — the inverse of [`read_apr`].
+///
+/// ⚠ **`unsafe` where [`write_lr`] is safe, and the asymmetry is deliberate rather than an
+/// oversight.** Both carry the same architectural precondition, but this one also decides whether a
+/// vCPU can be signalled *at all*: a bitmap that is not the resuming vCPU's silently vetoes its
+/// interrupts, which is a failure with no console output and no trap — ⑱-4a spent six instrumented
+/// boots finding exactly that. Requiring a `SAFETY:` line at every call site is cheap insurance on a
+/// register whose misuse is invisible. `write_lr`'s convention is left alone; changing it is a
+/// separate edit and not this rung's.
+///
+/// # Safety
+/// Two obligations. `n` must be below [`num_ap_registers`] — an access to a register the
+/// implementation does not provide is UNDEFINED. And the caller must be at EL2 writing a value that
+/// belongs to the vCPU about to run: an active-priority bitmap that is not this vCPU's either lets
+/// it take an interrupt it should have been masked from, or — the ⑱-4a failure — silently prevents
+/// it from taking any.
+pub(crate) unsafe fn write_apr(group: usize, n: usize, v: u64) {
+    match (group, n) {
+        (0, 0) => write_one_apr!(0, 0, v),
+        (0, 1) => write_one_apr!(0, 1, v),
+        (0, 2) => write_one_apr!(0, 2, v),
+        (0, 3) => write_one_apr!(0, 3, v),
+        (1, 0) => write_one_apr!(1, 0, v),
+        (1, 1) => write_one_apr!(1, 1, v),
+        (1, 2) => write_one_apr!(1, 2, v),
+        (1, 3) => write_one_apr!(1, 3, v),
+        _ => {}
+    }
+}
+
 // The `ICH_LR<n>_EL2` register encoding must be a string literal in `asm!`, so a runtime index `n`
 // dispatches through the 16-arm matches below. `concat!` builds the register name at compile time.
 macro_rules! read_one_lr {
@@ -579,11 +700,36 @@ unsafe fn write_vmcr(v: u64) {
 /// context is" is the second-derivation defect ⑭ spent a rung removing (#74). Adding a register here
 /// is a single edit both paths inherit, which is how `vmcr` reached the synthetic path at all.
 ///
-/// **What is here and what is deliberately not.** The list registers and `ICH_VMCR_EL2` are
-/// *hardware* per-vCPU state: leave them behind on a switch and the incoming vCPU inherits the
-/// outgoing one's pending interrupts and its priority mask. The III-1 software pending SET is not
-/// here — it is `guest.rs`'s own per-slot state, already carried by being indexed per vCPU rather
-/// than by living in a register.
+/// **What is here and what is deliberately not.** The list registers, `ICH_VMCR_EL2` and — since
+/// ⑱-4a — `ICH_AP0R<n>_EL2`/`ICH_AP1R<n>_EL2` are *hardware* per-vCPU state: leave them behind on a
+/// switch and the incoming vCPU inherits the outgoing one's pending interrupts, its priority mask,
+/// and its record of what it has acknowledged. The III-1 software pending SET is not here — it is
+/// `guest.rs`'s own per-slot state, already carried by being indexed per vCPU rather than by living
+/// in a register.
+///
+/// ## ★ ⑱-4a — the active priorities, and the measurement that put them here
+///
+/// `ICH_AP<g>R<n>_EL2` is the **virtual active priorities** bitmap: a bit per priority level, set
+/// when the vCPU acknowledges a virtual interrupt through `ICC_IAR<g>_EL1` and cleared by its EOI.
+/// While a bit is set the virtual CPU interface signals **nothing** at or below that level. It was
+/// missing from this type since Arc 7c, so a vCPU preempted between its `IAR` and its EOI left the
+/// bit behind for whoever was restored next — across vCPUs, and across DOMAINS, since one physical
+/// interface serves both guests.
+///
+/// **Measured, on a boot with two vCPUs per guest** (⑱-4b's configuration): `ICH_AP1R0_EL2` stuck at
+/// `0x10000` — bit 16, priority `0x80`, which is every interrupt this port injects — inherited by
+/// the sibling, whose interface then refused to signal anything at or below it. Both siblings
+/// wedged: the guest was offered its tick forever (four Pending vINTID 27 filling the bank,
+/// `TIMER_DEFERRED` past 3800) and could never acknowledge one. Removing this member again
+/// reproduces that stall; see [`crate::linux`]'s `report_active_priorities` for the probe table.
+///
+/// ⚠ **It refuted the diagnosis on record**, which was that a descheduled vCPU's timer deadline is
+/// never delivered. The tick arrives about once per slice per vCPU, forever; what fails is the
+/// acknowledgement, not the delivery.
+///
+/// **On the one-vCPU-per-guest configuration this file ships today the leak is real but rare** —
+/// 0, 0, 1, 1 per guest across four consecutive boots. That is why the rung lands here before its
+/// consumer, in the ⑱-2 shape, rather than waiting for the boot that makes it constant.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct VgicCtx {
@@ -591,13 +737,24 @@ pub(crate) struct VgicCtx {
     lr: [u64; MAX_LIST_REGISTERS],
     /// `ICH_VMCR_EL2` — the guest's priority mask, binary point, group enables and EOI mode.
     vmcr: u64,
+    /// ★ **⑱-4a — `ICH_AP0R<n>_EL2` and `ICH_AP1R<n>_EL2`, the VIRTUAL ACTIVE PRIORITIES.** Group 0
+    /// first, then group 1; only [`num_ap_registers`] of each are live. See this type's docs for the
+    /// measurement that put them here.
+    ///
+    /// Both groups, though this port injects only Group 1 today. A vCPU's active-priority state is
+    /// not something EL2 gets to have an opinion about: it is whatever the guest's own
+    /// acknowledgements made it, and a guest that starts using Group 0 must not discover that half
+    /// of its interface stopped being per-vCPU. The count is asked of the machine
+    /// ([`num_ap_registers`]), so this costs nothing where the registers do not exist.
+    apr: [[u64; MAX_AP_REGISTERS]; 2],
 }
 
 impl VgicCtx {
-    /// An empty context: every list register Invalid, `VMCR` zero.
+    /// An empty context: every list register Invalid, `VMCR` zero, no priority active.
     pub(crate) const ZERO: Self = Self {
         lr: [0; MAX_LIST_REGISTERS],
         vmcr: 0,
+        apr: [[0; MAX_AP_REGISTERS]; 2],
     };
 
     /// **Strip the hardware mapping from every saved list register**, returning how many were
@@ -639,6 +796,16 @@ impl VgicCtx {
         hv_vdev::vgic_cpuif::release_hardware_mappings(&mut self.lr[..n])
     }
 
+    /// This context's saved **virtual active priorities**, for the ⑱-4a witness in [`crate::linux`].
+    ///
+    /// Entries beyond [`num_ap_registers`] are never written by save and stay zero, so two of these
+    /// compare equal exactly when the live bank matches the saved one on the registers this machine
+    /// actually has.
+    #[cfg(feature = "real-linux")]
+    pub(crate) fn active_priorities(&self) -> [[u64; MAX_AP_REGISTERS]; 2] {
+        self.apr
+    }
+
     /// Clobber the live vGIC state, so a restore that misses part of it cannot go unnoticed.
     ///
     /// **The poison is DESIGNED, not borrowed.** `vcpu.rs`'s blanket `0xDEAD_BEEF…` is wrong for this
@@ -651,15 +818,44 @@ impl VgicCtx {
     ///   If it is not restored the guest can take no virtual interrupt at all, so its timer stops and
     ///   the boot stalls — loud, and unambiguous about which half failed.
     ///
+    /// * ★ **⑱-4a — the ACTIVE PRIORITIES are poisoned to ALL ONES**, i.e. every priority level
+    ///   already active. Like `VMCR`'s, this is valid-but-hostile rather than garbage: while a
+    ///   priority bit is set the virtual CPU interface signals nothing at or below that level. Zero
+    ///   would have been the wrong poison for the reason zero is wrong for `SysRegs` — "no priority
+    ///   active" is the normal resting value, so a missing restore would look like a healthy
+    ///   interface.
+    ///
+    ///   ⚠ **The write is real and the kill is late, and both halves were MEASURED rather than
+    ///   assumed.** QEMU honours it: writing `u64::MAX` to `ICH_AP0R0_EL2` reads back `0xffffffff`
+    ///   (probe P5), so this is not theatre. But deleting the restore does **not** stop the guest
+    ///   at once, which is what the first draft of this comment claimed: both kernels still reach
+    ///   userspace and print `poweroff`, and the machine then stops with neither ever issuing
+    ///   `PSCI SYSTEM_OFF` (probe P1, reproduced twice). Fatal, and the gate reddens on the missing
+    ///   markers — the same terminal signature ③-b2b-ii-c1's kill probe leaves. *Why* the failure
+    ///   is late rather than immediate is not established here, and is not claimed.
+    ///
     /// Gated to `real-linux` because that is the only switch that poisons: the synthetic path's
     /// cross-vCPU witness (Phase III-3) is guest-OBSERVED — a peer vCPU checking it took none of the
     /// owner's vINTs — and needs no destructive step to discriminate.
+    ///
+    /// ## ⑱-4a — why this takes a `&self` it does not read
+    ///
+    /// The same reason [`crate::vcpu::VcpuCtx::poison`] does, one level in: `&self` lets the body
+    /// destructure `Self` exhaustively, which puts poisoning under the same E0027 obligation as
+    /// [`crate::ctx::CtxComponent::save`] and [`crate::ctx::CtxComponent::restore`]. Every binding
+    /// is `_` — the poison writes hardware, never this struct — and naming them anyway is what makes
+    /// a new member impossible to add without deciding what poisons it.
     ///
     /// # Safety
     /// The caller must be at EL2 with a saved context in hand, and must restore before returning to
     /// EL1. Between this call and that restore the guest has no interrupt state.
     #[cfg(feature = "real-linux")]
-    pub(crate) unsafe fn poison() {
+    pub(crate) unsafe fn poison_live(&self) {
+        let Self {
+            lr: _,
+            vmcr: _,
+            apr: _,
+        } = self;
         let n = num_list_registers();
         for i in 0..n {
             write_lr(i, 0);
@@ -667,41 +863,101 @@ impl VgicCtx {
         // SAFETY: forwarded from this function's contract. `VMCR` affects only the VIRTUAL interface,
         // so EL2's own interrupt handling is untouched while the poison stands.
         unsafe { write_vmcr(0) };
+        // ⑱-4a. The active priorities are virtual-interface state too: EL2 takes its own interrupts
+        // through the PHYSICAL interface, whose running priority is `ICC_AP<x>R<n>_EL1` and is
+        // untouched by this.
+        let a = num_ap_registers();
+        for group in 0..2 {
+            for i in 0..a {
+                // SAFETY: forwarded from this function's contract. Writing a bitmap that belongs to
+                // no vCPU is sound only because the caller promises an unconditional restore before
+                // any guest runs — which is this function's whole contract.
+                unsafe { write_apr(group, i, u64::MAX) };
+            }
+        }
     }
+}
+
+/// The **live** virtual active priorities, read off the hardware in the shape a saved [`VgicCtx`]
+/// stores them — the other half of the ⑱-4a witness.
+///
+/// Reading the interface rather than trusting EL2's own bookkeeping is the discipline
+/// [`release_forwarded_timer`] follows for the redistributor and ③-b2b-ii-f follows for the FP
+/// file: what a restore *wrote* and what the machine *holds* are two different facts, and only the
+/// second is what a guest resumes on.
+#[cfg(feature = "real-linux")]
+pub(crate) fn live_active_priorities() -> [[u64; MAX_AP_REGISTERS]; 2] {
+    let a = num_ap_registers();
+    let mut out = [[0u64; MAX_AP_REGISTERS]; 2];
+    for (group, bank) in out.iter_mut().enumerate() {
+        for (i, slot) in bank.iter_mut().enumerate().take(a) {
+            *slot = read_apr(group, i);
+        }
+    }
+    out
 }
 
 /// ⑰-a: the vGIC bank as a declared context component, so a switch that forgets it cannot compile.
 /// Same bodies as the inherent `save`/`restore` this replaced — the move is what puts them under the
 /// obligation, not a rewrite.
 impl crate::ctx::CtxComponent for VgicCtx {
+    /// ★ **⑱-4a: the destructuring is the mechanism, and it is here because a member WAS missed.**
+    ///
+    /// ⑰-a put `VcpuCtx`'s three *components* under an E0027 obligation — add a component and the
+    /// traversals stop compiling. It stopped one level short: inside this type the members were
+    /// still reached by name, so `ICH_AP0R<n>_EL2`/`ICH_AP1R<n>_EL2` could be absent from all three
+    /// traversals since Arc 7c with nothing able to notice. ⑱-4a measured what that cost (see this
+    /// type's docs). The fix for the register is one field; the fix for the *class* is this
+    /// `let Self { .. }` with no `..`, in save, restore and poison alike.
     fn save(&mut self) {
+        let Self { lr, vmcr, apr } = self;
         let n = num_list_registers();
-        for (i, slot) in self.lr.iter_mut().enumerate().take(n) {
+        for (i, slot) in lr.iter_mut().enumerate().take(n) {
             *slot = read_lr(i);
         }
-        self.vmcr = read_vmcr();
+        *vmcr = read_vmcr();
+        // ⑱-4a. Bounded by `num_ap_registers()` and not by the array's length: an access to an
+        // active-priority register the implementation does not provide is UNDEFINED.
+        let a = num_ap_registers();
+        for (group, bank) in apr.iter_mut().enumerate() {
+            for (i, slot) in bank.iter_mut().enumerate().take(a) {
+                *slot = read_apr(group, i);
+            }
+        }
     }
 
     /// # Safety
     /// The caller must be at EL2 and this context must belong to the vCPU about to be resumed.
     unsafe fn restore(&self) {
+        let Self { lr, vmcr, apr } = self;
         let n = num_list_registers();
-        for (i, &lr) in self.lr.iter().enumerate().take(n) {
-            write_lr(i, lr);
+        for (i, &v) in lr.iter().enumerate().take(n) {
+            write_lr(i, v);
         }
         // SAFETY: forwarded from this function's contract.
-        unsafe { write_vmcr(self.vmcr) };
+        unsafe { write_vmcr(*vmcr) };
+        // ⑱-4a — the active priorities. The order against `VMCR` is not load-bearing (nothing is
+        // presented to a guest until the `eret`) and matches the save above so the two read as one
+        // list rather than two.
+        let a = num_ap_registers();
+        for (group, bank) in apr.iter().enumerate() {
+            for (i, &v) in bank.iter().enumerate().take(a) {
+                // SAFETY: forwarded from this function's contract — this context belongs to the vCPU
+                // about to be resumed, which is exactly `write_apr`'s requirement.
+                unsafe { write_apr(group, i, v) };
+            }
+        }
     }
 }
 
 #[cfg(feature = "real-linux")]
 impl crate::ctx::CtxPoison for VgicCtx {
     /// # Safety
-    /// Forwarded to [`VgicCtx::poison`], whose contract this is.
+    /// Forwarded to [`VgicCtx::poison_live`], whose contract this is.
     unsafe fn poison(&self) {
         // SAFETY: forwarded from this function's contract. `&self` is the type witness only — see
         // `crate::ctx`.
-        unsafe { Self::poison() };
+        unsafe { self.poison_live() };
     }
 }
 

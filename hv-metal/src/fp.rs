@@ -219,7 +219,7 @@ const POISON: FpCtx = FpCtx {
 /// saved into its own context, so the next comparison matches. The ~10 that fail are exactly the
 /// switches where a guest really used floating point in between.
 ///
-/// Gated to `real-linux` for the same reason [`crate::gic::VgicCtx::poison`] is: that is the only
+/// Gated to `real-linux` for the same reason [`crate::gic::VgicCtx::poison_live`] is: that is the only
 /// switch which poisons. The synthetic path's cross-vCPU witness is guest-OBSERVED (Phase III-3) and
 /// needs no destructive step to discriminate.
 ///

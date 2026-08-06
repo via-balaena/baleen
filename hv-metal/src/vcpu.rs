@@ -57,6 +57,22 @@
 //! table would be saved off the hardware and restored — harmless while its value is constant, and
 //! wrong the moment it is not.
 //!
+//! ## ⚠ ⑱-4a — the class had one more member than anybody had counted, and it was found by boot
+//!
+//! The enumeration above is of registers this *file* holds. The [`gic::VgicCtx`] beside it holds the
+//! virtual-interface half, and until ⑱-4a it was missing `ICH_AP0R<n>_EL2`/`ICH_AP1R<n>_EL2` — the
+//! **virtual active priorities**, a vCPU's record of what it has acknowledged and not yet ended. It
+//! had been absent since Arc 7c and nothing could notice, because the type's own save, restore and
+//! poison reached their members by name rather than through a destructuring; the ⑰-a obligation
+//! stopped one level short of the inside of a component. It is a destructuring now, in all three.
+//!
+//! **Worth reading as a pattern rather than a bug.** Three members of "per-vCPU state the hardware
+//! does not swap" have now been found *after* the switch was believed complete — `ICH_VMCR_EL2`
+//! (③-b2b-i), the FP register file (③-b2b-ii-f), and these. Every one was invisible until a second
+//! tenant made it observable, and every one was found by a boot rather than by re-reading the
+//! architecture. The honest reading is that this list is an ENUMERATION, not a proof of
+//! completeness (design-lesson #155).
+//!
 //! ## One derivation
 //!
 //! The table is declared **once**, by [`ctx_regs!`], which generates the enum, the `ALL` slice, the
@@ -395,6 +411,12 @@ impl VcpuCtx {
     /// This context's FP state, for the leak witness in [`crate::linux`].
     pub(crate) fn fp(&self) -> crate::fp::FpCtx {
         self.fp
+    }
+
+    /// This context's saved virtual active priorities, for the ⑱-4a witness in [`crate::linux`].
+    #[cfg(feature = "real-linux")]
+    pub(crate) fn active_priorities(&self) -> [[u64; gic::MAX_AP_REGISTERS]; 2] {
+        self.vgic.active_priorities()
     }
 
     /// **Demote this saved context's forwarded interrupts to purely virtual ones**, returning how
