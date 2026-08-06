@@ -85,9 +85,11 @@
 //! ## ★ ⑱-3b-i — AND A CALL SITE CAN DROP AN AXIS THE DECLARATION GOT RIGHT
 //!
 //! ⑱-3a closed the vCPU axis on **declarations**. Six call sites projected it away and re-supplied a
-//! constant, which no container type can see. That is [`VcpuIdx`], and the six sites — two of them
-//! hangs, three of them interrupts delivered to the wrong vCPU of the same guest — are tabulated
-//! there rather than repeated here.
+//! constant, which no container type can see. That is [`VcpuIdx`], where all six are tabulated with
+//! what each does at two vCPUs — a guest that stops ticking, an EL2 livelock, interrupts delivered
+//! to the wrong vCPU of the same guest, and a kernel panic on an MPIDR its device tree does not
+//! describe. **Not one of them is loud**, which is the whole reason the rung is a type and not a
+//! patch.
 //!
 //! ## ★ THE CEILING, and it was found by running the probe rather than by reasoning
 //!
