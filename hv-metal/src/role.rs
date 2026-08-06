@@ -598,6 +598,21 @@ impl<T: PerVcpuState, const G: usize, const V: usize> PerVcpu<T, G, V> {
         &self.0[r.guest][r.vcpu.get()]
     }
 
+    /// An arbitrary vCPU — for code with a single subject and no role to confuse.
+    ///
+    /// ✅ **DELETED BY ⑱-3b-i, BACK IN ⑱-5, AND THAT ROUND TRIP IS #148 WORKING.** It went because
+    /// its only two callers were `at(current_slot(), BOOT_VCPU)` — the defect that rung closed — and
+    /// it returns because ⑱-5 has a genuine one: an SGI names a target vCPU that is **not the one
+    /// running**, so its pending set is reachable through no role at all. That is exactly the case
+    /// [`PerVcpu::of`] cannot serve, and exactly what a plain-index accessor is for.
+    ///
+    /// ⚠ Note what the type still costs an attacker of this code: the `VcpuIdx` has to come from
+    /// somewhere, and the only somewhere is [`census`] or a role. `at(slot, BOOT_VCPU)` remains
+    /// unwritable because `BOOT_VCPU` is not in `linux.rs`'s scope.
+    pub(crate) fn at(&self, guest: usize, vcpu: VcpuIdx) -> &T {
+        &self.0[guest][vcpu.get()]
+    }
+
     /// The **outgoing** vCPU's element, mutably.
     pub(crate) fn out_mut(&mut self, g: Outgoing) -> &mut T {
         &mut self.0[g.guest][g.vcpu.get()]
