@@ -67,6 +67,30 @@
 //! where a mistake is a wrong number in a report, not an isolation defect. **Structural where a
 //! mistake is silent and isolation-relevant; documented where it is loud and cosmetic.**
 //!
+//! ⚠ **⑱-3b-i re-examined that call. It stands, but the reasoning has a SECOND half that was
+//! missing — and that half is not cosmetic.** `linux.rs`'s `TIMER_FORWARDED` says of itself: *"Per
+//! guest since ③-b2b-ii-a. A merged count would stay green with one guest's forwarding path entirely
+//! dead."* **At two vCPUs the per-guest counter IS the merged count**, one axis down: a guest whose
+//! vCPU 1 handoff is entirely dead contributes `released = 0, deactivated = 0` to each of its own
+//! handovers, which balances, so `report_timer_handoff` stays green with half the new tenant broken.
+//!
+//! So the counters' *storage axis* is wrong for ⑱ even though the invariants stored in them survive
+//! (that derivation is on `report_timer_handoff`). **DECLARED, NOT CLOSED HERE, deliberately:** at
+//! `VCPUS_PER_GUEST == 1` a `PerVcpu<AtomicU64, G, 1>` is `[[T; 1]; G]`, isomorphic to the `[T; G]`
+//! it would replace — behaviour-nil *and* witness-nil, with no build error either, precisely because
+//! `AtomicU64` implements both traits by the convention above. Moving fifteen counters for zero
+//! evidence is not a change this project makes. It becomes checkable the moment a second vCPU
+//! produces counts, which is ⑱-4.
+//!
+//! ## ★ ⑱-3b-i — AND A CALL SITE CAN DROP AN AXIS THE DECLARATION GOT RIGHT
+//!
+//! ⑱-3a closed the vCPU axis on **declarations**. Six call sites projected it away and re-supplied a
+//! constant, which no container type can see. That is [`VcpuIdx`], where all six are tabulated with
+//! what each does at two vCPUs — a guest that stops ticking, an EL2 livelock, interrupts delivered
+//! to the wrong vCPU of the same guest, and a kernel panic on an MPIDR its device tree does not
+//! describe. **Not one of them is loud**, which is the whole reason the rung is a type and not a
+//! patch.
+//!
 //! ## ★ THE CEILING, and it was found by running the probe rather than by reasoning
 //!
 //! **What is closed: changing the VARIABLE.** `X.inc(next)` → `X.inc(cur)` is
@@ -88,11 +112,24 @@
 //! roles in one function*, and code with a single subject cannot have it. **A future switch-like
 //! function must take roles, not slots** — the type is the reminder.
 //!
-//! **Two accessors this rung would naturally have are ABSENT on purpose** — `Running::vcpu` and
-//! `PerGuest::out_mut`. Nothing calls them, and shipping API on the strength of "⑱-3b will want it"
-//! is design-lesson #148, which this module already applied once. Each is a one-line addition when a
-//! caller exists. (The `vcpu` field is still read — by [`Running::pack`] — so the axis is carried,
-//! just not yet projected out of a `Running`.)
+//! **Two accessors this module would naturally have are ABSENT on purpose** — `PerGuest::out_mut`
+//! and `Outgoing::vcpu`. Nothing calls either, and shipping API on the strength of "a later rung
+//! will want it" is design-lesson #148. Each is a one-line addition when a caller exists.
+//!
+//! ⚠ **⑱-3b-i also DELETED one — `PerVcpu::at` — and the deletion is worth a line.** It was the
+//! plain-index accessor for "report and setup code", and its only two callers were
+//! `at(current_slot(), BOOT_VCPU)`: precisely the defect below, wearing the escape hatch's clothes.
+//! Replacing them with [`PerVcpu::of`] left it with no callers at all, in any of the five
+//! `metal-lint` configurations — checked across all five rather than trimmed on the warning from
+//! one, which is the mistake ⑱-3a made here and design-lesson #168 records.
+//!
+//! ⚠ **[`Running::vcpu`] was on that list and is now PRESENT — ⑱-3b-i found its callers, and there
+//! were six.** Worth recording, because #148 is easy to read as "withhold and forget": the accessor
+//! was withheld correctly (nothing called it), and the rung that needed it was the very next one.
+//! What #148 buys is that the API arrives with its callers, so the shape is decided by them rather
+//! than guessed a rung early — and the shape did change. The natural guess was `Running::vcpu`
+//! alone; what the call sites actually wanted was [`PerVcpu::of`], which takes the *whole* role, so
+//! that projecting the guest axis out and forgetting the vCPU axis is not expressible.
 //!
 //! ⚠ **A third, `PerVcpu::out`, was trimmed and had to be PUT BACK — read why.** It looked dead in a
 //! `--features real-linux` build, and it is: its four callers are all in the tick-deferral
@@ -115,26 +152,142 @@
 /// that can start one; raising it alone would give every guest a vCPU nothing ever runs.
 pub(crate) const VCPUS_PER_GUEST: usize = 1;
 
-/// The vCPU a guest boots on, and — until ⑱-3b — the only one that runs.
-pub(crate) const BOOT_VCPU: usize = 0;
+/// The vCPU a guest boots on, and — until ⑱-3b-ii — the only one that runs.
+///
+/// ⚠ **PRIVATE since ⑱-3b-i, and the privacy is the rung.** This constant used to be `pub(crate)`,
+/// and `linux.rs` reached for it at six sites where the vCPU that mattered was the *running* one —
+/// see [`VcpuIdx`] for the measurement. A per-vCPU decision made from a constant is not a defect a
+/// reviewer can see, because the constant is correct at every site while there is only one vCPU. So
+/// the constant stopped being nameable from there: [`VcpuIdx::boot`] is the only way out of this
+/// module, and it says "the vCPU a guest boots on" at a call site rather than "0".
+const BOOT_VCPU: usize = 0;
 
 const _: () = assert!(
     BOOT_VCPU < VCPUS_PER_GUEST,
     "the boot vCPU must be one the guest actually has"
 );
 
+/// **A vCPU index that came from somewhere** — a role, or an explicit statement that boot is meant.
+///
+/// ## The defect, MEASURED at six sites rather than imagined
+///
+/// ⑱-3a made the vCPU axis a *type* on the state: `PendingSet` is `PerVcpu`, `DeployedGic` is
+/// `PerGuest`, and putting either in the other container stops compiling. That closed the axis on
+/// **declarations**. It did nothing for **call sites**, and the two are different defects:
+///
+/// ```ignore
+/// VGIC.borrow_mut().at_mut(slot).is_enabled(BOOT_VCPU, intid)   // linux.rs:1519, before this rung
+/// ```
+///
+/// The container is per-guest and correct; the *state* it indexes is per-vCPU and banked
+/// (`GICR_ISENABLER0`, INTIDs 0..31 — ⑱-2's whole rung). `slot` is the running guest, and the vCPU is
+/// a constant. At one vCPU per guest that constant is right at every site, so nothing — not the
+/// compiler, not the boot gate, not a reviewer — can tell the six sites that mean "the running vCPU"
+/// from the three that really mean "the boot vCPU".
+///
+/// **What each of the six does at two vCPUs**, and none of them is loud:
+///
+/// | site | consequence |
+/// |---|---|
+/// | timer mediation seam (`handle_linux_irq`) | decides the *running* vCPU's tick from vCPU 0's bank — vCPU 1 never ticks, or takes one it masked |
+/// | the switch's re-arm of the physical PPI | the same read at the other moment the answer can change |
+/// | the vGIC → physical redistributor mirror | the same read again, from the trap that changes it |
+/// | the maintenance-interrupt drain | drains vCPU 0's pending set into vCPU 1's **live** list registers, and never drains vCPU 1's — so `UIE` stays armed over a set nothing empties |
+/// | SGI deliver-or-defer | a full-bank SGI raised by vCPU 1 lands in vCPU 0's pending set |
+/// | `set_guest_identity` on switch-in | every vCPU reads vCPU 0's `MPIDR_EL1` |
+///
+/// Two are **hangs**, three are **interrupts delivered to the wrong vCPU of the same guest** — the
+/// exact class ⑱-3a's `LINUX_PENDING` finding was about, arriving one rung later through the other
+/// door. The last one already has a measured death certificate: ⑱-1's kill probe gave a guest an
+/// MPIDR its own device tree does not describe and it printed `missing boot CPU MPIDR, not enabling
+/// secondaries` before panicking.
+///
+/// ## Why a type, when the module already says a bare index is right
+///
+/// [`PerGuest::at`] takes a plain slot, and `linux.rs`'s `guest_mpidr` argues at length that a
+/// bare vCPU index is correct because there is exactly one subject. **Both of those stay true**, and
+/// this type does not contradict them: it carries a vCPU and nothing else, so it cannot smuggle in
+/// the "which guest" axis those arguments were about.
+///
+/// What it changes is *where an index can come from*. The defect above is not two roles confused in
+/// one function — it is an axis **projected away and then re-supplied from a constant**. A type
+/// closes exactly that: outside this module the only constructors are [`Running::vcpu`],
+/// [`Incoming::vcpu`] and [`VcpuIdx::boot`], and `BOOT_VCPU` itself is no longer in scope to be
+/// passed by mistake.
+///
+/// (There is no `Outgoing::vcpu`. It would be the obvious fourth, and **no site wants it** — every
+/// per-vCPU decision here is about the vCPU that is *arriving* or the one that is *running*, never
+/// the one leaving, whose per-vCPU state is reached through [`PerVcpu::out_mut`] with the whole
+/// role. Adding it for symmetry is design-lesson #148, which this module has now applied three
+/// times.)
+///
+/// ## ★ THE CEILING, stated before anyone reads more into this than it does
+///
+/// **Closed: supplying a CONSTANT where a role's vCPU was meant.** `is_enabled(BOOT_VCPU, ..)` does
+/// not compile from `linux.rs` — the name does not resolve — and `is_enabled(0, ..)` does not
+/// typecheck. Both were probed.
+///
+/// **NOT closed: supplying the WRONG ROLE's vCPU**, when the role is one you can name. That is the
+/// same ceiling the module docs record for the guest axis, and ⑰-a's before it: **forgotten →
+/// impossible, wrong → still compiles.** Nor is [`VcpuIdx::boot`] fenced off — it is a real
+/// constructor, and writing it inside a switch compiles. What it cannot do is arrive there
+/// *silently*, which is what a bare `0` spelled as a shared constant did.
+///
+/// ### The probes, all eight run, and two of them are the controls
+///
+/// | # | probe | result |
+/// |---|---|---|
+/// | 1 | `set_guest_identity(VcpuIdx::boot())` inside `switch_context` | `E0308` mismatched types |
+/// | 2 | `is_enabled(0, intid)` at the mediation seam | `E0308` mismatched types |
+/// | 3 | maintenance drain back to `LINUX_PENDING.at(slot, ..)` | `E0599` no method `at` |
+/// | 4 | `use crate::role::BOOT_VCPU;` in `linux.rs` | `E0603` constant is private |
+/// | 5 | `guest_mpidr(0)` — a bare integer | `E0308` mismatched types |
+/// | 6 | `cur.vcpu()` where `next.vcpu()` was meant | `E0599` no method `vcpu` — **read the note** |
+/// | 7 | **control:** a role fabricated on the spot, internally consistent | **builds clean** |
+/// | 8 | **control:** `VcpuIdx::boot()` spelled out at the drain | **builds clean** |
+///
+/// ⚠ **Probe 6 is a build error FOR THE WRONG REASON, and saying so is the point of running it.**
+/// The wrong-role slip does not compile inside `switch_context` today — not because roles are
+/// enforced on this axis, but because `Outgoing::vcpu` **does not exist**, having had no caller (see
+/// the module docs, #148). That is an accidental narrowing, not a designed fence, and it ends
+/// quietly the day some rung adds that accessor for a legitimate reason. Probes 7 and 8 are what the
+/// ceiling actually looks like, and they are here so nobody reads the five kills above as "a wrong
+/// vCPU cannot compile". It can.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VcpuIdx(usize);
+
+impl VcpuIdx {
+    /// **The vCPU a guest boots on**, for the three sites that genuinely mean it: the `const assert!`
+    /// pinning `guest_mpidr` against `guest.dts`'s `cpu@0`, the `eret` that first enters guest A, and
+    /// the context seeded for a guest's first entry.
+    ///
+    /// Deliberately a named constructor rather than an exported constant. The point of the rung is
+    /// that "the boot vCPU" and "the running vCPU" stop being the same token; spelling one of them
+    /// out at a call site is how a reader tells which was meant.
+    pub(crate) const fn boot() -> Self {
+        Self(BOOT_VCPU)
+    }
+
+    /// The index itself, for the arithmetic that has to happen somewhere — `MPIDR` derivation and
+    /// array indexing. Reading the number out is not the hazard; **constructing** one from a bare
+    /// integer is, and that is what this module keeps to itself.
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
 /// The vCPU that is leaving the pCPU.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Outgoing {
     guest: usize,
-    vcpu: usize,
+    vcpu: VcpuIdx,
 }
 
 /// The vCPU that is arriving on the pCPU.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Incoming {
     guest: usize,
-    vcpu: usize,
+    vcpu: VcpuIdx,
 }
 
 /// The vCPU that holds the pCPU once a switch has completed.
@@ -144,22 +297,30 @@ pub(crate) struct Incoming {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Running {
     guest: usize,
-    vcpu: usize,
+    vcpu: VcpuIdx,
 }
 
 impl Outgoing {
     /// Name a guest's vCPU as the outgoing one. **The one place raw indices become this role** —
     /// keeping it explicit is what makes the seam reviewable.
-    pub(crate) const fn at(guest: usize, vcpu: usize) -> Self {
+    pub(crate) const fn at(guest: usize, vcpu: VcpuIdx) -> Self {
         Self { guest, vcpu }
     }
 }
 
 impl Incoming {
     /// Name a guest's vCPU as the incoming one.
-    pub(crate) const fn at(guest: usize, vcpu: usize) -> Self {
+    pub(crate) const fn at(guest: usize, vcpu: VcpuIdx) -> Self {
         Self { guest, vcpu }
     }
+
+    /// Which of its guest's vCPUs this is. Read by the switch's identity write and its re-arm of the
+    /// physical timer PPI — two decisions that are about the vCPU *arriving*, and that both used to
+    /// name vCPU 0.
+    pub(crate) const fn vcpu(self) -> VcpuIdx {
+        self.vcpu
+    }
+
     /// Becomes the running vCPU once the switch has completed — the ONLY transition between roles,
     /// and it exists because the last step of a switch is exactly "the incoming vCPU is now the
     /// running one". Anything else would be a role laundering itself.
@@ -178,8 +339,19 @@ impl Running {
     pub(crate) const fn at_boot(guest: usize) -> Self {
         Self {
             guest,
-            vcpu: BOOT_VCPU,
+            vcpu: VcpuIdx::boot(),
         }
+    }
+
+    /// **Which vCPU of that guest is executing** — the accessor ⑱-3b-i exists to supply.
+    ///
+    /// The module docs used to record this as deliberately absent, on design-lesson #148's grounds
+    /// that "⑱-3b will want it" is not a reason to ship API. It has a caller now, and in fact six:
+    /// every handler that asks "which guest is running" and then makes a decision about state that
+    /// is banked **per vCPU** — the timer mediation seam, the maintenance drain, the SGI defer. Each
+    /// of those read a constant instead. See [`VcpuIdx`].
+    pub(crate) const fn vcpu(self) -> VcpuIdx {
+        self.vcpu
     }
 
     /// The guest this vCPU belongs to, for the handful of callers that must index something this
@@ -194,7 +366,7 @@ impl Running {
     /// and because keeping it inside the module is what stops `linux.rs` reconstructing a role from
     /// arithmetic of its own.
     pub(crate) const fn pack(self) -> usize {
-        self.guest * VCPUS_PER_GUEST + self.vcpu
+        self.guest * VCPUS_PER_GUEST + self.vcpu.get()
     }
 
     /// Inverse of [`Running::pack`].
@@ -211,7 +383,7 @@ impl Running {
     pub(crate) const fn unpack(packed: usize) -> Self {
         Self {
             guest: packed / VCPUS_PER_GUEST,
-            vcpu: packed % VCPUS_PER_GUEST,
+            vcpu: VcpuIdx(packed % VCPUS_PER_GUEST),
         }
     }
 }
@@ -287,31 +459,38 @@ impl<T: PerVcpuState, const G: usize, const V: usize> PerVcpu<T, G, V> {
     /// to, rather than `allow(dead_code)` over every configuration at once.
     #[cfg(feature = "selftest")]
     pub(crate) fn out(&self, g: Outgoing) -> &T {
-        &self.0[g.guest][g.vcpu]
+        &self.0[g.guest][g.vcpu.get()]
     }
 
     /// The **incoming** vCPU's element.
     pub(crate) fn inc(&self, g: Incoming) -> &T {
-        &self.0[g.guest][g.vcpu]
+        &self.0[g.guest][g.vcpu.get()]
     }
 
-    /// An arbitrary vCPU — for report and setup code, where there is no role to confuse.
-    pub(crate) fn at(&self, guest: usize, vcpu: usize) -> &T {
-        &self.0[guest][vcpu]
+    /// **The RUNNING vCPU's element** — one accessor for both axes, because a handler that asks
+    /// "which guest" and "which vCPU" separately is exactly how ⑱-3b-i's defect was written.
+    ///
+    /// The two sites this replaces read `at(current_slot(), BOOT_VCPU)`: the guest axis projected
+    /// out of [`Running`] and the vCPU axis supplied as a constant. Taking the whole role means the
+    /// second half cannot be forgotten, which a plain-index accessor — correctly, for setup code —
+    /// cannot promise. (That accessor, `PerVcpu::at`, had no callers left afterwards and was
+    /// removed; see the module docs.)
+    pub(crate) fn of(&self, r: Running) -> &T {
+        &self.0[r.guest][r.vcpu.get()]
     }
 
     /// The **outgoing** vCPU's element, mutably.
     pub(crate) fn out_mut(&mut self, g: Outgoing) -> &mut T {
-        &mut self.0[g.guest][g.vcpu]
+        &mut self.0[g.guest][g.vcpu.get()]
     }
 
     /// The **incoming** vCPU's element, mutably.
     pub(crate) fn inc_mut(&mut self, g: Incoming) -> &mut T {
-        &mut self.0[g.guest][g.vcpu]
+        &mut self.0[g.guest][g.vcpu.get()]
     }
 
     /// An arbitrary vCPU, mutably — setup code only.
-    pub(crate) fn at_mut(&mut self, guest: usize, vcpu: usize) -> &mut T {
-        &mut self.0[guest][vcpu]
+    pub(crate) fn at_mut(&mut self, guest: usize, vcpu: VcpuIdx) -> &mut T {
+        &mut self.0[guest][vcpu.get()]
     }
 }

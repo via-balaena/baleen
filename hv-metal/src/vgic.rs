@@ -131,8 +131,20 @@ impl DeployedGic {
     /// ⑱-2 added `vcpu` because INTIDs 0..31 — which include the timer PPI this seam is mostly asked
     /// about — are banked per redistributor. Call sites name the vCPU explicitly so ⑱-3 changes an
     /// argument rather than having to find them.
-    pub(crate) fn is_enabled(&self, vcpu: usize, intid: u32) -> bool {
-        self.dev.is_enabled(vcpu, intid)
+    ///
+    /// ⚠ **⑱-3b-i: that plan was right about the mechanics and wrong about the risk.** All three
+    /// call sites did name the vCPU explicitly — and all three named the *boot* vCPU, because at one
+    /// vCPU per guest that is the only correct answer and nothing distinguishes "the vCPU that is
+    /// running" from "vCPU 0". Finding them was never the hard part; noticing that finding them was
+    /// not enough was. So the parameter is a [`VcpuIdx`](crate::role::VcpuIdx), which can only come
+    /// from a role or from an explicit [`VcpuIdx::boot`](crate::role::VcpuIdx::boot) — and
+    /// `BOOT_VCPU` is no longer a name `linux.rs` can resolve at all.
+    ///
+    /// [`VirtGic`]'s own parameter stays a `usize`: it is under the fence, it is a Kani target, and
+    /// its harnesses quantify over the index. The narrowing belongs to the *deployment*, which is
+    /// where the role types live.
+    pub(crate) fn is_enabled(&self, vcpu: crate::role::VcpuIdx, intid: u32) -> bool {
+        self.dev.is_enabled(vcpu.get(), intid)
     }
 
     /// `(register traps, INTIDs ever newly enabled)` — the ③-b1 witness.
