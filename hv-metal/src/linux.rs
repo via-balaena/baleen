@@ -242,7 +242,7 @@ use crate::console::GuestConsole;
 use crate::ctx::CtxComponent;
 use crate::gic;
 use crate::pl011::Pl011;
-use crate::role::{Incoming, Outgoing, PerGuest, PerVcpu, Running, BOOT_VCPU, VCPUS_PER_GUEST};
+use crate::role::{Incoming, Outgoing, PerGuest, PerVcpu, Running, VcpuIdx, VCPUS_PER_GUEST};
 use crate::stage2::{self, HCR_EL2_VM, VTCR_EL2};
 use crate::vcpu;
 use crate::vgic::{self, DeployedGic};
@@ -848,20 +848,78 @@ const MPIDR_HWID_BITMASK: u64 = 0xff_00ff_ffff;
 /// **`U` (bit 30, "uniprocessor system") is deliberately left clear**, matching the value the guests
 /// already read. Setting it would be defensible at one vCPU and wrong at two, and it would make this
 /// rung change what a guest sees — which would cost the structural witness below its meaning.
-const fn guest_mpidr(vcpu: usize) -> u64 {
-    MPIDR_RES1 | (vcpu as u64)
+///
+/// ## ★ ⑱-3b-i — THE AFFINITY WAS DERIVED TWICE, AND A DOC SAID IT WAS DERIVED ONCE
+///
+/// This function used to compute `MPIDR_RES1 | (vcpu as u64)` itself. Meanwhile
+/// [`hv_vdev::gicv3::vcpu_affinity`] — which the emulated `GICR_TYPER` reports — carries this in
+/// **bold** at the top of its own doc: *"The affinity a vCPU has, and the ONE place that answer is
+/// derived … so `hv-metal` calls this rather than repeating it — design-lesson #74."*
+///
+/// **`hv-metal` did not call it.** There were two derivations of the mapping, in two crates, one of
+/// which asserted in the crate `hv-verify` can reach that there was one. They agreed — because the
+/// only vCPU index in existence is `0`, and every encoding of the identity agrees at a single point.
+///
+/// **This is not a tidy-up, and the guest is what makes it load-bearing.** arm64 Linux's
+/// `gic_populate_rdist` walks the redistributors looking for the frame whose affinity equals its own
+/// `MPIDR_EL1`, and **fails the CPU if none does** — so the guest matches the two artifacts against
+/// each other on every boot. Two encodings diverge the first time anyone gives the affinity levels
+/// structure (`Aff1 = vcpu / 4`, say, for a cluster topology), and the failure is ⑱-1's already
+/// measured one: `missing boot CPU MPIDR, not enabling secondaries` → `Kernel panic`. Design-lesson
+/// #74 exactly, with a doc pointing the wrong way.
+///
+/// The two placements compose rather than coincide, which is what makes one derivation *correct*
+/// here and not merely shorter: `vcpu_affinity` returns `Aff3:Aff2:Aff1:Aff0` packed one byte per
+/// level with `Aff0` at bit 0, which is where `MPIDR_EL1` wants it and which `GICR_TYPER` shifts to
+/// bit 32.
+const fn guest_mpidr(vcpu: VcpuIdx) -> u64 {
+    MPIDR_RES1 | hv_vdev::gicv3::vcpu_affinity(vcpu.get())
 }
 
 // ⑱-3a: `BOOT_VCPU` and `VCPUS_PER_GUEST` moved to `crate::role`, which owns the vCPU axis and so
 // should own its count. Every use below is imported from there; the pairing assert moved with them.
+//
+// ⑱-3b-i: **`BOOT_VCPU` then stopped being importable at all.** Moving it was right and was not
+// enough — this file went on naming it at six sites where the vCPU that mattered was the *running*
+// one, and at one vCPU per guest no build, gate or reviewer can tell those from the three that
+// really mean the boot vCPU. It is private to `crate::role` now, reachable only as
+// `VcpuIdx::boot()`, and every other site takes its index from a role. See `crate::role::VcpuIdx`.
 
 // `guest.dts` gives `cpu@0` `reg = <0x00>`, and arm64 Linux matches its boot CPU by comparing
 // `MPIDR_EL1 & MPIDR_HWID_BITMASK` against that. Two derivations of one fact (⑭'s defect), pinned:
 // if `guest_mpidr` ever stops agreeing with the device tree the build stops, instead of the guest
 // booting to `Bad CPU number`.
 const _: () = assert!(
-    guest_mpidr(BOOT_VCPU) & MPIDR_HWID_BITMASK == 0,
+    guest_mpidr(VcpuIdx::boot()) & MPIDR_HWID_BITMASK == 0,
     "guest.dts declares cpu@0 with reg = <0x00>; guest_mpidr(0) must present that same hwid"
+);
+
+// **⑱-3b-i — the hwid a guest reads IS the affinity its redistributor reports.**
+//
+// The assert above pins `guest_mpidr` against the *device tree*. This one pins it against the
+// *emulated GIC*, which is the other artifact `gic_populate_rdist` compares it to — and the two
+// comparisons are what a booting CPU actually performs. `MPIDR_EL1` places `Aff0` at bit 0 and
+// `GICR_TYPER` at bit 32, so a single shared derivation is not by itself enough: the *placement*
+// has to be right at both ends, and this is the end `hv-metal` owns.
+//
+// **Non-vacuous at one vCPU**, deliberately, because it is a statement about where the bits sit
+// rather than about how many there are: it fails if `MPIDR_RES1` ever moves into the hwid field, if
+// the mask clips the affinity, or if the two derivations are split apart again. The model's half —
+// that `GICR_TYPER` really reports `vcpu_affinity` — is ⑱-2's Kani harness
+// `the_typer_reports_the_vcpu_affinity`, so `vcpu_affinity` is the shared term and neither side
+// restates the other.
+//
+// ⚠ **What is NOT asserted here: that DISTINCT vCPUs get distinct affinities**, which is what
+// `gic_populate_rdist` needs to match the *right* redistributor rather than merely a well-formed
+// one. It cannot be stated as anything but a vacuous truth while `VCPUS_PER_GUEST == 1`, and a
+// vacuous assert that reads as coverage is worse than an absent one. It belongs to ⑱-3b-ii, with
+// the rung that gives the axis a second value.
+const _: () = assert!(
+    guest_mpidr(VcpuIdx::boot()) & MPIDR_HWID_BITMASK
+        == hv_vdev::gicv3::vcpu_affinity(VcpuIdx::boot().get()),
+    "the affinity a guest reads in MPIDR_EL1 must be the one its redistributor reports in \
+     GICR_TYPER — gic_populate_rdist matches them against each other and fails the CPU if they \
+     disagree"
 );
 
 /// Times [`set_guest_identity`] ran, and times the registers **read back** as what it wrote.
@@ -885,8 +943,26 @@ static IDENTITY_VPIDR: AtomicU64 = AtomicU64::new(0);
 ///
 /// No `isb` is needed: every path out of here reaches EL1 through an `eret`, which is a
 /// context-synchronising event.
-fn set_guest_identity(vcpu: usize) {
-    let mpidr = guest_mpidr(vcpu);
+///
+/// ## ★ ⑱-3b-i — it takes an [`Incoming`], and it used to take a constant
+///
+/// The parameter was a `usize` and **both** call sites passed `BOOT_VCPU`. On the boot `eret` that
+/// is right. In [`switch_context`] it is right only while a guest has one vCPU, and the comment at
+/// that call site had already said so — *"at ⑱-3 the answer stops being constant"* — which is the
+/// interesting part: the hazard was **written down, in the right place, a rung in advance, and the
+/// code still could not enforce it.** A note is not a mechanism.
+///
+/// So the parameter is the role. "The vCPU that is arriving on the pCPU" is exactly whose identity
+/// this writes, at both call sites, including the boot one — guest A's first entry *is* an arrival,
+/// which is why this is a narrowing rather than a special case. `set_guest_identity(VcpuIdx::boot())`
+/// no longer typechecks, and `BOOT_VCPU` is no longer a name this file can resolve.
+///
+/// ⚠ It takes the [`Incoming`] for its **vCPU**, not its guest, and [`guest_mpidr`] still takes a
+/// bare index for the reason its own doc gives: every guest's first vCPU reads the *same* MPIDR,
+/// because every guest is its own machine. The role narrows where the index may come from without
+/// making the value depend on the guest.
+fn set_guest_identity(next: Incoming) {
+    let mpidr = guest_mpidr(next.vcpu());
     let (midr, vmpidr_back, vpidr_back): (u64, u64, u64);
     // SAFETY: `VMPIDR_EL2`/`VPIDR_EL2` are RW at EL2 and `MIDR_EL1` is readable there; these are the
     // registers whose whole purpose is for a hypervisor to write. No memory effect.
@@ -1480,7 +1556,13 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
     let intid = gic::ack_physical();
     // The interrupt belongs to whichever guest is executing: the physical timer's `CNTV_CVAL_EL0` is
     // part of the vCPU context, so the deadline that just expired is the running guest's own.
-    let slot = current_slot();
+    //
+    // ⑱-3b-i: the whole ROLE, not just its guest. That sentence above is about a **vCPU** context —
+    // and two of the decisions below are about state the GICv3 banks per vCPU (the timer PPI's
+    // enable, the pending set), which this handler used to take from `BOOT_VCPU`. `slot` stays
+    // beside it for the genuinely per-guest state (the console, the domain id).
+    let running = current_vcpu();
+    let slot = running.guest();
 
     // ③-b2b-ii-e — **EL2's OWN clock, and the only interrupt here that no guest can influence.**
     // Checked before the guest's timer and before the mediation seam, because this one is not
@@ -1516,7 +1598,11 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         // two. Now the interrupt is delivered only if the guest asked for it **in its own emulated
         // distributor**, which lives in EL2 memory the guest cannot reach. A guest that has not
         // enabled INTID 27 does not get INTID 27 — and, come ③-b, cannot enable anyone else's.
-        if !VGIC.borrow_mut().at_mut(slot).is_enabled(BOOT_VCPU, intid) {
+        if !VGIC
+            .borrow_mut()
+            .at_mut(slot)
+            .is_enabled(running.vcpu(), intid)
+        {
             // Not an error — the guest legitimately runs with its timer masked. Mask it PHYSICALLY
             // too before completing it: the timer PPI is level-triggered, so deactivating while the
             // level is high would re-signal immediately and storm EL2. `handle_vgic_access` re-enables
@@ -1613,7 +1699,15 @@ extern "C" fn handle_linux_irq(frame: *mut LinuxFrame) {
         MAINT_TAKEN.at(slot).fetch_add(1, Ordering::Relaxed);
         // Drain FIRST: the interrupt is level-based on `UIE` + bank occupancy, and the drain is what
         // clears `UIE` when nothing is left. Deactivating before that could re-assert immediately.
-        let _ = flush_pending_to_lrs(LINUX_PENDING.at(slot, BOOT_VCPU), SGIS_DRAINED.at(slot));
+        //
+        // ⑱-3b-i: **the RUNNING vCPU's set**, and this is the site where the constant was worst.
+        // The signal is "the list-register bank is running dry", and the bank is the hardware's —
+        // i.e. the running vCPU's. Draining `BOOT_VCPU`'s set here would put vCPU 0's deferred vINTs
+        // into vCPU 1's live list registers (an interrupt delivered to the wrong vCPU of the same
+        // guest, which is III-1's leak reopened inside a guest), *and* leave vCPU 1's own set
+        // undrained with `UIE` level-asserted over it — EL2 re-entering on a maintenance interrupt
+        // that its own drain can never clear.
+        let _ = flush_pending_to_lrs(LINUX_PENDING.of(running), SGIS_DRAINED.at(slot));
         gic::eoi_physical(intid);
         gic::deactivate_physical(intid);
         return;
@@ -1972,8 +2066,8 @@ fn preempt_through_the_scheduler(slot: usize, frame: &mut LinuxFrame) {
     drop(cell);
 
     switch_context(
-        Outgoing::at(slot, BOOT_VCPU),
-        Incoming::at(next, BOOT_VCPU),
+        Outgoing::at(slot, VcpuIdx::boot()),
+        Incoming::at(next, VcpuIdx::boot()),
         frame,
     );
 }
@@ -2201,8 +2295,8 @@ fn retire_and_hand_over(
     );
     drop(cell);
     switch_context(
-        Outgoing::at(cur, BOOT_VCPU),
-        Incoming::at(next, BOOT_VCPU),
+        Outgoing::at(cur, VcpuIdx::boot()),
+        Incoming::at(next, VcpuIdx::boot()),
         frame,
     );
     true
@@ -2486,7 +2580,14 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     //      than state the guest owns. Written on every switch-in and not once at boot, because at
     //      ⑱-3 the answer stops being constant — a boot-time write would then be silently stale for
     //      every vCPU but the first.
-    set_guest_identity(BOOT_VCPU);
+    //
+    //      ⚠ **⑱-3b-i: and it was constant ANYWAY.** The line above is ⑱-1's, and it is correct
+    //      about the hazard, in the right place, a rung early. The call underneath it still read
+    //      `set_guest_identity(BOOT_VCPU)` — a write on every switch-in, of vCPU 0's identity, to
+    //      whichever vCPU was arriving. The comment described the fix and the code did not implement
+    //      it, and nothing in the build, the gate or five metal-lint configs could tell. That is the
+    //      argument for the parameter now being an `Incoming`.
+    set_guest_identity(next);
 
     // 5c. ③-b2b-ii-f — read the FP file back off the hardware and confirm it is the incoming vCPU's.
     //     Structural: true on every switch regardless of what any guest does, which is what makes it
@@ -2510,10 +2611,16 @@ fn switch_context(cur: Outgoing, next: Incoming, frame: &mut LinuxFrame) {
     //    the same mediation seam `handle_vgic_access` mirrors, applied at the other moment the
     //    answer can change. A guest running with its timer masked stays masked; one that wants it
     //    gets it, and gets it immediately, because its restored deadline has long since passed.
+    //
+    //    ⑱-3b-i: `next.vcpu()`, because INTID 27 is a PPI and the GICv3 banks 0..31 **per
+    //    redistributor** (⑱-2). Both halves of this read have to name the arriving vCPU: reading the
+    //    incoming guest's distributor with vCPU 0's bank would re-arm the physical timer according
+    //    to a sibling's mask, which is silent in both directions — a masked vCPU kept ticking, or an
+    //    unmasked one that never does.
     let wants_timer = VGIC
         .borrow_mut()
         .inc_mut(next)
-        .is_enabled(BOOT_VCPU, gic::VTIMER_INTID);
+        .is_enabled(next.vcpu(), gic::VTIMER_INTID);
     gic::set_ppi_enabled(gic::VTIMER_INTID, wants_timer);
 
     // 7. The pCPU now belongs to `next`, so every handler that asks "which guest?" must get the new
@@ -2782,7 +2889,11 @@ fn handle_vgic_access(
         return;
     }
 
-    let slot = current_slot();
+    // ⑱-3b-i: the whole role. The MMIO decode below is per-GUEST (one distributor, whichever vCPU
+    // is driving it), but the timer mirror at the end of this function is per-VCPU, and it used to
+    // read `BOOT_VCPU` — see [`crate::role::VcpuIdx`].
+    let running = current_vcpu();
+    let slot = running.guest();
     let mut dev = VGIC.borrow_mut();
     let outcome = if a.wnr {
         let value = if a.srt < 31 { frame.x[a.srt] } else { 0 } & a.value_mask();
@@ -2806,7 +2917,13 @@ fn handle_vgic_access(
     // It is the RUNNING guest's model, and a data abort can only come from the running guest — but
     // there is one physical redistributor for both, so once ③-b2b-ii-c makes `CURRENT` move, this
     // mirror has to be re-applied on every switch-in as well.
-    let timer_enabled = dev.at_mut(slot).is_enabled(BOOT_VCPU, gic::VTIMER_INTID);
+    //
+    // ⑱-3b-i: the running **vCPU's** bank, for the same reason. There is one physical redistributor
+    // for all of them, so what gets mirrored onto it must be the mask of the vCPU that is actually
+    // going to run against it — not vCPU 0's, which is what this read named before.
+    let timer_enabled = dev
+        .at_mut(slot)
+        .is_enabled(running.vcpu(), gic::VTIMER_INTID);
     drop(dev);
     if a.wnr {
         gic::set_ppi_enabled(gic::VTIMER_INTID, timer_enabled);
@@ -2961,8 +3078,8 @@ fn handle_linux_wfi(frame: &mut LinuxFrame) {
     drop(cell);
     WFI_YIELDS[cur].fetch_add(1, Ordering::Relaxed);
     switch_context(
-        Outgoing::at(cur, BOOT_VCPU),
-        Incoming::at(peer, BOOT_VCPU),
+        Outgoing::at(cur, VcpuIdx::boot()),
+        Incoming::at(peer, VcpuIdx::boot()),
         frame,
     );
 }
@@ -3000,9 +3117,22 @@ fn handle_linux_sysreg_trap(
         //   peer domain with it. Delivery is now total: see `deliver_or_defer_sgi` and
         //   `LINUX_PENDING`. There is no `false` left to branch on, which is what makes the halt
         //   unwritable rather than merely unwritten.
-        let slot = current_slot();
+        //
+        // ⑱-3b-i: the pending set is the **running vCPU's**, because the list-register bank
+        // `deliver_or_defer_sgi` tries first is the running vCPU's — the set is where a vINT waits
+        // for *that* bank to free a slot. Deferring into `BOOT_VCPU`'s set would hand vCPU 1's
+        // undeliverable SGI to vCPU 0, which then drains it into its own list registers on its next
+        // switch-in.
+        //
+        // ⚠ This is the STORAGE axis only. **Which vCPU an SGI is aimed AT** is a different
+        // question — `ICC_SGI1R_EL1` carries a target list, which `gic::sgi1r_intid` currently does
+        // not decode because with one vCPU per guest there is only one answer. That decode is ⑱-5,
+        // and it is the reason this site is worth getting right first: the target-list rung wants a
+        // per-vCPU set to deliver *into*.
+        let running = current_vcpu();
+        let slot = running.guest();
         deliver_or_defer_sgi(
-            LINUX_PENDING.at(slot, BOOT_VCPU),
+            LINUX_PENDING.of(running),
             SGIS_DELIVERED.at(slot),
             SGIS_DEFERRED.at(slot),
             intid,
@@ -3414,6 +3544,34 @@ fn report_timer_handoff(uart: &mut Pl011) {
         // deactivation is accounted for by exactly one of the two ways EL2 can stop owning that
         // line — it demoted a mapping it had made, or it never made one because the bank was full.
         // Deleting either term breaks the equality, which is what the witness is for.
+        //
+        // ─── ⑱-3b-i: RE-DERIVED FOR TWO vCPUs, AND THE ANSWER IS NOT THE ONE THE ARC EXPECTED ───
+        //
+        // ⑱-3a declared these two conjuncts unre-derived and made re-deriving them the FIRST task of
+        // the next rung, on the grounds that an invariant naming a count had turned out to be a claim
+        // about the workload six times already. Done, and **both survive** — for a reason worth
+        // stating, because it is not the reason they were doubted:
+        //
+        //   `released` and `deactivated` are attributed by the SAME `cur`, in the same statement of
+        //   `switch_context`; `deferred` is attributed at forward time to the vCPU that will be `cur`
+        //   at the very next handover, because nothing else runs in between. So this is a
+        //   **per-handover local identity**, and the per-guest counter is merely where the sum is
+        //   kept. Summing a local identity over a guest's vCPUs preserves it.
+        //
+        // The seventh candidate was not a workload claim. **The defect is one level down, and it is
+        // the argument `TIMER_FORWARDED` already makes about itself:** *"Per guest since
+        // ③-b2b-ii-a. A merged count would stay green with one guest's forwarding path entirely
+        // dead."* At two vCPUs **the per-guest counter IS the merged count**. A guest whose vCPU 1
+        // handoff is entirely dead contributes `released = 0, deactivated = 0` to each of its own
+        // handovers — which balances — so this witness stays GREEN with half the new tenant broken.
+        //
+        // ⚠ **DECLARED FOR ⑱-4, NOT CLOSED HERE, and the reason is that it is not yet checkable.**
+        // At `VCPUS_PER_GUEST == 1` a `PerVcpu<AtomicU64, G, 1>` is `[[T; 1]; G]` — isomorphic to
+        // the `[T; G]` it would replace, so moving the fifteen counters is behaviour-nil AND
+        // witness-nil, and produces no build error either, because `AtomicU64` implements both
+        // marker traits by `crate::role`'s declared convention. It becomes a real check the moment a
+        // second vCPU produces counts, together with the kill probe that makes it one: kill vCPU 1's
+        // release path alone, and the per-vCPU report must redden while the per-guest sum does not.
         let deferred = TIMER_DEFERRED.at(slot).load(Ordering::Relaxed);
         let ok = released + deferred == deactivated && released <= handovers;
         if ok {
@@ -4017,7 +4175,12 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     init_guest_el1();
     // ⑱-1 — guest A is the one vCPU that reaches EL1 by an `eret` rather than by a context restore,
     // so it needs the identity installed here too. Same function, not a second answer.
-    set_guest_identity(BOOT_VCPU);
+    //
+    // ⑱-3b-i: spelled as an ARRIVAL, because that is what it is — guest A's boot vCPU is about to
+    // come onto the pCPU, and `set_guest_identity` now says so in its type. This is the one place
+    // `VcpuIdx::boot()` is the honest answer on this path rather than the constant that was there
+    // because there was only one.
+    set_guest_identity(Incoming::at(SLOT_A, VcpuIdx::boot()));
 
     // ③-b2b-ii-c2 — **seed every guest that is not the one this `eret` enters.**
     //
@@ -4039,7 +4202,10 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     {
         let mut ctx = VCPU_CTX.borrow_mut();
         for slot in (0..NUM_GUESTS).filter(|&s| s != SLOT_A) {
-            ctx.at_mut(slot, BOOT_VCPU).seed_boot(
+            // ⑱-3b-i: `VcpuIdx::boot()` and not "the running vCPU" — a guest's FIRST switch-in is
+            // by definition onto the vCPU it boots on. ⑱-4 adds the second seeding site, for a vCPU
+            // a guest asks for by `PSCI CPU_ON`, and that one is not this answer.
+            ctx.at_mut(slot, VcpuIdx::boot()).seed_boot(
                 kernel_entry(slot),
                 dtb_addr(slot),
                 SPSR_EL2_LINUX,
