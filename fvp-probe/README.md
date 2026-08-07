@@ -78,6 +78,10 @@ SMMU. Measured:
 
 2 572 instructions, 0.761 GB model highwater, exit status 0.
 
+**Milestone 2a — in progress: PCIe enumeration done.** Bus 0 is walked and every function reported
+with its BAR sizes (below). This had to come first: milestone 2 needs a bus master it can actually
+drive, and whether one existed was in dispute between two sources.
+
 **Milestone 2 — not written.** Stream table + command/event queues, an STE for an
 `SMMUv3TestEngine`, a DMA, then: mutate the STE with **no** invalidation and DMA again (stale ⇒
 caching is real), then `CMD_CFGI_STE` / `CMD_TLBI_*` and DMA again (changed ⇒ invalidation matters).
@@ -91,7 +95,35 @@ Run the whole thing twice, with `size_of_tlb`/`size_of_ste_cache` at `0` and at 
 | PL011 UART0 | `0x1c09_0000` | TF-A `V2M_IOFPGA_UART0_BASE`; model's `bp.uart_base` |
 | SMMUv3 | `0x2b40_0000` | TF-A `PLAT_FVP_SMMUV3_BASE`; FVP guide table; **and `IDR0` read back here** |
 | GICD / GICR | `0x2f00_0000` / `0x2f10_0000` | TF-A `BASE_GIC*_BASE`; Linux `fvp-base-revc.dts` |
-| **PCIe ECAM** | **`0x4000_0000`** (256 MiB, bus 0–0xff) | Linux `fvp-base-revc.dts`; its PCI MEM window `0x5000_0000` matches TF-A `PLAT_ARM_PCI_MEM_1_BASE` |
+| **PCIe ECAM** | **`0x4000_0000`** (256 MiB, bus 0–0xff) | Linux `fvp-base-revc.dts`; its PCI MEM window `0x5000_0000` matches TF-A `PLAT_ARM_PCI_MEM_1_BASE`; **and enumerated here** |
+| **`SMMU_IDR1`** | **`0x0e739d20`, `SIDSIZE = 32`** | read from the device (QEMU `virt` reports `0x02730010`, `SIDSIZE = 16`) |
+| **bus masters present** | **two `SMMUv3TestEngine`s at `00:1e.0` and `00:1e.1`** | enumerated here; vendor `0x13b5` device `0xff80`, matching FVP guide §12.5 |
+
+### What bus 0 actually holds — enumerated, not assumed
+
+```
+00:00.0  vendor=0x13b5 device=0x00ba class=0x060001   host bridge
+00:01.0 … 00:04.0                    class=0x060400   four root ports
+00:1e.0  vendor=0x13b5 device=0xff80 class=0xff0000   SMMUv3TestEngine
+         BAR0(64) 256 KiB   BAR2(64) 32 KiB   BAR4(64) 4 KiB
+00:1e.1  vendor=0x13b5 device=0xff80 class=0xff0000   SMMUv3TestEngine  (same BARs)
+00:1f.0  vendor=0x0abc device=0xaced class=0x010601   AHCI
+```
+
+★ **Two engines on two functions is `㉑`'s "two bus masters" story natively** — two distinct
+RequesterIDs (`0x00f0`, `0x00f1`) with no device-stacking trick, where QEMU needed two `-device edu`s.
+Every BAR reads back base `0x0`, so addresses must be assigned by hand.
+
+⚠ **`SIDSIZE = 32` against QEMU's 16**: a linear stream table covering StreamID `0xf0`/`0xf1` still
+only needs 256 entries, but nothing here may assume the QEMU value.
+
+⚠ **This table corrects a reading taken from `--list-params`.** That listing reports
+`pci.pcie_rc.smmuv3testengine0.endpoint.bar0_log2_size=0`, whose own description says *"zero is
+reserved means bar is not used"* — from which I concluded the engines had no register window and
+could not be driven. **Wrong**: those parameter names are available *slots*, not the two devices the
+platform instantiates, and the live ones carry exactly the BARs §12.5 documents. Reading a parameter
+namespace and inferring a hardware fact is the same move that produced the `arm-smmuv3.stage` error
+(design-lesson #196). One enumeration run settled what two documents could not.
 
 ## The three assumptions this platform has already falsified
 

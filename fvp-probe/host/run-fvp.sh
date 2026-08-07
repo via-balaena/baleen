@@ -118,12 +118,18 @@ mkdir -p "$PAYLOAD_STAGE"
 cp "$(dirname "${BASH_SOURCE[0]}")/init" "$PAYLOAD_STAGE/init"
 chmod +x "$PAYLOAD_STAGE/init"
 printf '%s\n' "${FVP_ARGS[*]}" > "$PAYLOAD_STAGE/fvp-args"
-[[ "$MODE" == "probe" ]] && cp "$PROBE" "$PAYLOAD_STAGE/probe.elf"
+# ⚠ An `if`, NOT `[[ cond ]] && cp`. Under `set -e` an AND-list whose test fails returns non-zero at
+# top level and kills the script — so the one-liner form would have made `--list-params` exit
+# silently right here, in the mode whose entire purpose is to tell us whether the caching parameter
+# names are real. A witness-mode that cannot run is worse than no witness mode.
+if [[ "$MODE" == "probe" ]]; then
+    cp "$PROBE" "$PAYLOAD_STAGE/probe.elf"
+fi
 
 ( cd "$PAYLOAD_STAGE" && find . -print0 | cpio --null -o -H newc --quiet ) | gzip -1 > "$FVP_DIR/payload.cpio.gz"
 
 # Concatenated gzip streams, unpacked in order by the kernel with later entries winning. A plain
-# file concatenation, so this is a ~200 MB copy rather than a ~200 MB re-archive.
+# file concatenation, so this is a 96 MB copy rather than a 300 MB re-archive.
 cat "$BASE_CPIO" "$FVP_DIR/payload.cpio.gz" > "$FVP_DIR/combined.cpio.gz"
 
 # ─── run ─────────────────────────────────────────────────────────────────────────────────────────

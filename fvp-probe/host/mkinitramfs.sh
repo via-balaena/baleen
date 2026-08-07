@@ -19,14 +19,15 @@
 #
 # ── WHY THE ARCHIVE IS SPLIT IN TWO ──────────────────────────────────────────────────────────────
 #
-# This script builds only `base.cpio.gz` (~200 MB of model and userspace, slow, and identical from
-# run to run). `run-fvp.sh` builds a few-kilobyte `payload.cpio.gz` holding the probe binary and
-# `/init`, and simply CONCATENATES the two: Linux unpacks concatenated gzipped cpio archives in
-# order, later entries winning, which is the same mechanism early-microcode initramfs images use.
+# This script builds only `base.cpio.gz` — MEASURED at 300 MB staged, 96 MB packed: the model and
+# userspace, slow to archive, and identical from run to run. `run-fvp.sh` builds a few-kilobyte
+# `payload.cpio.gz` holding the probe binary and `/init`, and simply CONCATENATES the two: Linux
+# unpacks concatenated gzipped cpio archives in order, later entries winning, which is the same
+# mechanism early-microcode initramfs images use.
 #
-# The point is the iteration loop. Re-cpio-ing 200 MB to change ten lines of a bare-metal probe
-# would dominate every cycle; concatenating a 4 KB archive onto a cached one does not. `/init` lives
-# in the PAYLOAD for exactly this reason — it is a file we expect to keep editing.
+# The point is the iteration loop. Re-archiving 300 MB to change ten lines of a bare-metal probe
+# would dominate every cycle; `cat`-ing a 4 KB archive onto a cached 96 MB one does not. `/init`
+# lives in the PAYLOAD for exactly this reason — it is a file we expect to keep editing.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
