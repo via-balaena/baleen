@@ -1484,7 +1484,16 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
              emitter, ran isolated on one pCPU, and powered off"
         );
     }
-    let _ = std::fs::remove_file(&out);
+    // ⑲-3b: keep the serial on a GREEN boot when asked. A passing gate prints only its marker
+    // verdicts, so every measurement taken from a boot that works — which is most of them, since a
+    // probe's whole point is to succeed and report a number — needed the log resurrecting by some
+    // temporary edit. `BALEEN_KEEP_LOG=1 cargo xtask qemu-linux-smmu` leaves it in place and says
+    // where. A failing boot still dumps it inline, unchanged.
+    if std::env::var("BALEEN_KEEP_LOG").is_ok() {
+        println!("qemu-linux-test: serial log kept at {}", out.display());
+    } else {
+        let _ = std::fs::remove_file(&out);
+    }
     !failed
 }
 
