@@ -1,6 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
+// ⑳ — **`forbid`, not `deny`, and this crate has never needed `unsafe`.**
+//
+// The project's shape is "a verified core with a thin fenced `unsafe` layer in `hv-metal`". That
+// was TRUE of every workspace crate and enforced by NOTHING: a `grep` said zero, and a convention
+// is not a gate. `forbid` makes it a build error that no inner `allow` can override — which is the
+// point, since the failure mode is somebody reaching for `unsafe` locally and silencing the lint
+// beside it.
+//
+// ⚠ `hv-metal` is deliberately NOT given this: it is the fenced layer, it needs `unsafe` for MMIO
+// and `asm!`, and its job is to keep that surface small and documented rather than absent.
+#![forbid(unsafe_code)]
+
 //! # hv-sim — the deterministic twin
 //!
 //! The host-side implementation of the [`hv_hal`] fence, and the [`scenario`]
