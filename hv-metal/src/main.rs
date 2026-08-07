@@ -235,6 +235,23 @@ pub extern "C" fn rust_main() -> ! {
         park();
     }
 
+    // (3a) Report `SCTLR_EL2` — the MMU-off baseline the EL2-MMU arc (ledger item 5) must preserve.
+    //
+    // ⚠ Reported, not asserted, and deliberately so. This crate cites "EL2 runs MMU-off" as a
+    // premise in ~50 places, but MMU-off is not one behaviour: `M == 0` fixes DATA accesses at
+    // Device-nGnRnE, while INSTRUCTION accesses follow `SCTLR_EL2.I`. An identity mapping that
+    // changes "nothing but permissions" therefore has to match whatever `I` actually is here — and
+    // nobody had read it. Every other platform fact this project checked this week turned out to
+    // differ from the assumption it carried, so this one gets measured before code depends on it.
+    let sctlr = el2::sctlr_el2();
+    let _ = writeln!(
+        uart,
+        "baleen: SCTLR_EL2=0x{sctlr:016x} M={} C={} I={}",
+        u8::from(sctlr & el2::SCTLR_EL2_M != 0),
+        u8::from(sctlr & el2::SCTLR_EL2_C != 0),
+        u8::from(sctlr & el2::SCTLR_EL2_I != 0),
+    );
+
     // (4) Realize hv_hal::TimeSource on the ARM generic timer and witness that the count is
     //     monotonic and live (advances, is not frozen at zero) — the fence honored on the metal.
     let timer = GenericTimer;
