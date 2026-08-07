@@ -1,0 +1,77 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+#
+# PID 1 inside the throwaway Linux VM whose only job is to run Arm's model. Packed into the PAYLOAD
+# archive (not the base) so editing it costs a 4 KB repack rather than a 200 MB one.
+#
+# There is no init system here and there does not need to be: mount three filesystems, run one
+# program, print what it produced, power off.
+
+# ⚠ MOUNT devtmpfs BEFORE PRINTING ANYTHING. Ubuntu Base ships an EMPTY /dev — no `console`, no
+# `null`. Depending on the kernel's CONFIG_DEVTMPFS_MOUNT, /dev may or may not already be populated
+# when init is exec'd, and if it is not then every write to stdout goes nowhere and the symptom is
+# total silence with no error. That is the same failure mode the probe itself hit on the UART, one
+# layer up, and it is worth defending against rather than diagnosing twice.
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+exec >/dev/console 2>&1
+
+mount -t proc  proc  /proc
+mount -t sysfs sysfs /sys
+
+echo "=== VM up: $(uname -srm) ==="
+
+FVP_HOME=/opt/fvp
+MODEL_DIR="$FVP_HOME/models/Linux64_armv8l_GCC-9.3"
+MODEL="$MODEL_DIR/FVP_Base_RevC-2xAEMvA"
+
+# The model dlopen()s siblings that are not in its own DT_NEEDED, so the search path has to name
+# both its own directory and the bundled GCC 9.3 runtime.
+LD_LIBRARY_PATH="$MODEL_DIR:$FVP_HOME/fmtplib"
+export LD_LIBRARY_PATH
+
+if [ ! -x "$MODEL" ]; then
+    echo "!! model not found or not executable at $MODEL"
+    echo "=== FVP-TRANSCRIPT-BEGIN ==="
+    echo "=== FVP-TRANSCRIPT-END ==="
+    sync
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+    echo o > /proc/sysrq-trigger 2>/dev/null
+    sleep 5
+    exit 1
+fi
+
+# `/fvp-args` is written by run-fvp.sh: one shell-quoted argument per line is fragile, so it is a
+# single line evaluated as-is. The file is generated on the host from this repo, not user input.
+FVP_ARGS=""
+[ -f /fvp-args ] && FVP_ARGS="$(cat /fvp-args)"
+
+echo "=== FVP-STDERR-BEGIN ==="
+# ⚠ Three `libdbus-1.so.3: cannot open shared object file` warnings appear here even with
+# visualisation disabled. They are HARMLESS and the run completes — do not chase them, and do not
+# add the GUI libraries to the image to silence them.
+# shellcheck disable=SC2086
+eval "\"$MODEL\"" $FVP_ARGS
+FVP_STATUS=$?
+echo "=== FVP-STDERR-END ==="
+echo "@@ FVP exit status = $FVP_STATUS"
+
+# The probe's own output went to a file rather than to this console, because the model interleaves
+# its own progress and warning lines with the simulated UART otherwise, and a transcript you have to
+# untangle by eye is one you will misread.
+echo "=== FVP-TRANSCRIPT-BEGIN ==="
+if [ -f /tmp/uart0.log ]; then
+    cat /tmp/uart0.log
+else
+    echo "!! no /tmp/uart0.log — the model produced no UART output at all"
+fi
+echo "=== FVP-TRANSCRIPT-END ==="
+
+sync
+# Power off via sysrq. Ubuntu Base's `poweroff` is a systemd symlink and there is no systemd here;
+# sysrq needs nothing but /proc and cannot be confused by a missing init system.
+echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+echo o > /proc/sysrq-trigger 2>/dev/null
+# If sysrq is compiled out, fall through and let the host-side timeout end the run.
+sleep 10
+exit 0

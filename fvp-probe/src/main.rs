@@ -198,8 +198,29 @@ extern "C" fn probe_main() -> ! {
     puts("@@ SMMU_IDR0   = ");
     puthex(u64::from(idr0));
     puts("\n");
-    // S2P is IDR0[1] — "stage-2 translation supported". The whole instrument depends on it.
+    // `S2P` is IDR0 **bit 0** — "stage-2 translation supported". The whole instrument depends on it.
+    //
+    // ⚠ **THIS WAS WRONG AT MILESTONE 1 AND THE MEASUREMENT STILL LOOKED RIGHT.** The first version
+    // read `(idr0 >> 1) & 1`, which is `S1P` (stage *one*), and reported it as `S2P`. It printed
+    // `0x1` and was recorded as "stage-2 supported" — true, but not because this line established
+    // it: `IDR0 = 0x080fe6bf` has bit 0 AND bit 1 set, so the two candidate readings are
+    // indistinguishable on this machine.
+    //
+    // ★ **The same defect, with the same cause, was already found and fixed once** — SMMU rung 1
+    // had `IDR0_S1P`/`IDR0_S2P` swapped, it changed no result because QEMU also sets both, and
+    // `hv-metal/src/smmu.rs` carries the correction plus a note. It recurred here because this crate
+    // deliberately shares no code with `hv-metal`, so the fix could not travel: **isolation from the
+    // hypervisor's code is also isolation from its corrections.** That is a real cost of this
+    // crate's design, and it is the right trade, but it has to be paid with attention rather than
+    // assumed away. Design-lesson #71's shape: a check whose two inputs are both set cannot
+    // discriminate between them.
     puts("@@ SMMU_S2P    = ");
+    puthex(u64::from(idr0 & 1));
+    puts("\n");
+    // Reported alongside it, so the transcript records which bit is which rather than leaving a
+    // reader to trust the label. On this platform both are set; on one where they differ, the pair
+    // is what makes the reading falsifiable.
+    puts("@@ SMMU_S1P    = ");
     puthex(u64::from((idr0 >> 1) & 1));
     puts("\n");
 

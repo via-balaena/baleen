@@ -14,6 +14,12 @@ Cargo.lock
 /hv-metal/target
 /hv-metal/Cargo.lock
 
+# Arm's AEM FVP and the Linux VM image that carries it, where $BALEEN_FVP_DIR points. Built by
+# fvp-probe/host/fetch-fvp.sh; ~400 MB, and NEVER committed for a stronger reason than size — Arm's
+# Ecosystem Models licence grants no right to redistribute the model. The recipe is the artifact,
+# exactly as for .baleen-linux below.
+/.fvp
+
 # The real-Linux guest artifacts (kernel Image + initramfs), where CI's `real-linux boot (QEMU)` job
 # points $BALEEN_LINUX_DIR. Built by hv-metal/linux/fetch-guest-image.sh; ~40 MB, never committed —
 # the recipe is the artifact (see docs/ARC-5-M5-GUEST-INTERFACE.md §5f).
