@@ -587,7 +587,16 @@ fn report_dma_inflight(uart: &mut Pl011) {
         && r1g > 0
         && r2g > 0
         && peer_intact
-        && ev_sid == sid;
+        && ev_sid == sid
+        // MEASURED, and both are sharper than "an event happened". `F_TRANSLATION` is the
+        // *translation* fault class — the walk of this guest's own table refused the address —
+        // rather than a configuration fault such as `C_BAD_STE`, which would mean the stream was
+        // never properly bound and would make the whole arm a statement about broken setup. And the
+        // recorded address is the one the device put on the bus, which is the sharpest attribution
+        // the SMMU can give (design-lesson #70(d)): "the peer's site is unchanged" becomes "the SMMU
+        // refused exactly this address".
+        && ev_kind == u64::from(crate::smmu::EVT_F_TRANSLATION)
+        && ev_addr == flight::PEER_IPA.load(Ordering::Relaxed);
 
     if ok {
         let _ = writeln!(
