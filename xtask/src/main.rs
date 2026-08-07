@@ -1165,6 +1165,18 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
     "baleen: smmu rung2 STREAM-TABLE",
     "baleen: smmu rung2 STREAMID-SPECIFIC",
     "baleen: smmu rung2 OUT-OF-RANGE",
+    // ★★ ⑲-2 — the arc's point: a bus master confined by a REAL guest's own proven map.
+    //
+    // Rungs 1/2 above are about the SMMU itself and rung 3 (synthetic-config only) proves
+    // confinement to a domain built for the test. THIS one binds the device to `S2TTB` = the very
+    // table `VTTBR_EL2` carries for a domain running an unmodified Alpine kernel, under that
+    // domain's VMID, and shows the device reaches that guest's memory and is ABORTED on its peer's.
+    //
+    // ⚠ Two things it does NOT claim, both stated on `dmawitness::witness_real_guest`: the positive
+    // arm is a CONTROL only (real guests are identity-mapped, so it cannot separate "translated"
+    // from "passed through" — that is rung 3's, on a non-identity map); and this is CONFINEMENT,
+    // not SIMULTANEITY — ledger item 2(b) stays open, no vCPU runs while this device DMAs.
+    "baleen: smmu realguest OK",
 ];
 
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.

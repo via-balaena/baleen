@@ -1346,3 +1346,160 @@ fn rung4(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
 fn fault_at(e: &Option<smmu::SmmuEvent>, kind: u8, sid: u32, asked: u64) -> bool {
     matches!(e, Some(e) if e.kind == kind && e.sid == sid && e.addr == asked)
 }
+
+// ─── ⑲-2 — CONFINEMENT TO A **REAL GUEST'S** `p2m` ───────────────────────────────────────────────
+
+/// ★★ **⑲-2 — a bus master bound to a REAL Linux guest's own Stage-2 image: it reaches that guest's
+/// memory and is REFUSED its peer's.**
+///
+/// ## What this adds over rung 3, which already proved confinement
+///
+/// Rung 3 bound the device to a **synthetic** domain built for the purpose. This binds it to
+/// `S2TTB` = the very table `VTTBR_EL2` carries for a domain running an **unmodified Alpine
+/// kernel**, under that domain's own VMID — the same image the CPU walks, emitted by
+/// `build_stage2_from_p2m` from the same proven `p2m`. *"One proven `p2m`, two consumers"* stops
+/// being a statement about apparatus and becomes one about the machine that boots.
+///
+/// ⚠ **Rung 3's apparatus could not be reused, and that is measured, not asserted** — see the
+/// scoping note on [`witness`]. Its model frames land inside the 448-frame super partition under
+/// `real-linux`, and its `DOM_A`/`DOM_B` **are** the real guests' domain ids. This is a separate
+/// path for that reason.
+///
+/// ## Where the expectation comes from, and the CEILING identity mapping imposes
+///
+/// **From a walk of the emitted descriptors, never from layout arithmetic.** `walk_stage2` reads the
+/// table the device is about to walk, and the addresses below come from it.
+///
+/// ⚠ **But a real guest's RAM is IDENTITY-mapped, and that costs this rung one of rung 3's
+/// discriminators — MEASURED, not foreseen.** Rung 3's headline verdict is *"it landed where the
+/// TABLE says and NOT where the DEVICE asked"*, which is only a distinction when IPA ≠ PA. Its
+/// synthetic domains were built that way; a real guest's are not, so for these arms the two
+/// addresses are the same one and [`Landing::translated`] is structurally inapplicable — its two
+/// halves contradict each other at identity. The first boot of this rung reported
+/// `seeds1=false … seeds2=false` for exactly that reason: [`attempt_stage2`] seeds `issued` and then
+/// `landing` over the top of it.
+///
+/// **So this rung claims less on the positive arm and exactly as much on the negative one:**
+///
+/// | arm | claim | strength here |
+/// |---|---|---|
+/// | positive | the device bound to this guest **reaches** the guest's own memory | a CONTROL — it rules out a wedged SMMU refusing everything, but at identity it cannot separate "translated" from "passed through". **That separation is rung 3's, on a non-identity map, and is not re-proved here.** |
+/// | confinement | the same device asking for the PEER's IPA is **ABORTED**, peer's landing site intact | full — identity changes nothing about it, and it is the isolation content |
+///
+/// ## Timing: after emission, BEFORE the guests are entered — and this is a scope boundary
+///
+/// Called once `VTTBR` holds both images and before the `eret` into guest A. The tables are real and
+/// final; nothing is executing yet.
+///
+/// ⚠ **So this is CONFINEMENT, not SIMULTANEITY.** Honest-ledger item 2(b) — *"the two consumers are
+/// not simultaneous; no vCPU runs while the device DMAs"* — is **NOT** closed by this rung and must
+/// not be read as closed. What is closed is that the device is confined by a *real guest's* proven
+/// map rather than a synthetic one.
+///
+/// ## Why the targets are where they are, and the hazard that chose them
+///
+/// Both land **above every blob loaded into the guest's window**: dom 1's Image/DTB/initramfs end
+/// around `0x4c3d_6000` and dom 2's around `0x683d_6000`, so `0x5000_0000` and `0x6c00_0000` are
+/// untouched RAM at this point in the boot.
+///
+/// ⚠ **The peer target had to move, and the reason is easy to miss:** [`attempt_stage2`] SEEDS the
+/// `forbidden` address before the transfer, so aiming the refusal arm at dom 2's window *base* would
+/// have written eight bytes over **dom 2's kernel image** — the control would have corrupted the
+/// thing it was protecting. Caught by reading what the helper does rather than what it is called.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn witness_real_guest(
+    uart: &mut Pl011,
+    vttbr_own: u64,
+    vttbr_peer: u64,
+    ipa_own: u64,
+    ipa_peer: u64,
+) {
+    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS};
+    use hv_s2::smmu::Stage2Binding;
+
+    let Some(bdf) = pcie::find(EDU_VENDOR, EDU_DEVICE) else {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu realguest FAIL: no edu bus master on this machine, so the confinement arms would be vacuous; halting"
+        );
+        crate::park();
+    };
+    let bar0 = pcie::enable_with_bar0(bdf);
+    let sid = pcie::stream_id(bdf);
+
+    // The binding is DERIVED FROM THE VTTBR, exactly as rung 3 does it: `vttbr_table`/`vttbr_vmid`
+    // read back the value the CPU is given, so "the device walks the same table as this guest's
+    // vCPUs, under the same VMID" holds by construction rather than by two derivations agreeing.
+    let bind_own = Stage2Binding {
+        s2ttb: vttbr_table(vttbr_own),
+        vmid: vttbr_vmid(vttbr_own, BALEEN_VMID_BITS),
+        regime: BALEEN_STAGE2,
+    };
+    let l1_own = bind_own.s2ttb;
+    let l1_peer = vttbr_table(vttbr_peer);
+
+    // Where the TABLES say these addresses live. The peer's is the address that must stay intact:
+    // "the device bound to this guest did not reach where the PEER's table puts that IPA".
+    let Some(landing_own) = crate::stage2::walk_stage2(l1_own, ipa_own).map(|r| r.pa) else {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu realguest FAIL: this guest's own image maps nothing at {ipa_own:#x}, so the positive control would be vacuous; halting"
+        );
+        crate::park();
+    };
+    let Some(forbidden_peer) = crate::stage2::walk_stage2(l1_peer, ipa_peer).map(|r| r.pa) else {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu realguest FAIL: the PEER's image maps nothing at {ipa_peer:#x}, so 'did not reach the peer' would be vacuous; halting"
+        );
+        crate::park();
+    };
+    // The refusal arm's premise: this guest's own image maps NOTHING at the peer's IPA.
+    let own_maps_peer = crate::stage2::walk_stage2(l1_own, ipa_peer).is_some();
+
+    // One transfer, seeded and read back at a SINGLE address — the shape `Attempt` uses, applied to
+    // a guest address instead of EL2's own static. Deliberately NOT `attempt_stage2`: its
+    // three-address discipline collides with itself at identity (see the ceiling note above).
+    let probe = |issued: u64, watch_pa: u64| -> (u64, u64, bool) {
+        poke(watch_pa, SENTINEL_MAGIC);
+        let before = peek(watch_pa);
+        let retired = trigger_dma(bar0, issued);
+        (before, peek(watch_pa), retired)
+    };
+
+    if !smmu::bind_stream_stage2(sid, &bind_own) {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu realguest FAIL: could not bind StreamID {sid} to the guest's own Stage-2 image; halting"
+        );
+        crate::park();
+    }
+
+    // ── Arm 1 — the POSITIVE control. Without it the refusal below is vacuous: a wedged SMMU
+    //    refuses everything and looks like flawless isolation.
+    let (own_before, own_after, own_retired) = probe(ipa_own, landing_own);
+    let reached_own = own_before == SENTINEL_MAGIC && own_retired && own_after != own_before;
+
+    // ── Arm 2 — CONFINEMENT, and the isolation content. Same device, same binding, an IPA in the
+    //    PEER's window: this guest's image maps it nowhere, so the walk must fault and the peer's
+    //    landing site must be untouched.
+    let (peer_before, peer_after, peer_retired) = probe(ipa_peer, forbidden_peer);
+    let refused_peer = peer_before == SENTINEL_MAGIC && peer_retired && peer_after == peer_before;
+
+    let restored = smmu::unbind_stream(sid);
+
+    let ok = reached_own && refused_peer && !own_maps_peer && restored;
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu realguest OK: a bus master bound to a REAL guest's own Stage-2 image (S2TTB={l1_own:#x}, VMID={}) reached that guest's memory at IPA {ipa_own:#x} (table says {landing_own:#x}), and the SAME device asking for {ipa_peer:#x} in the PEER's window was ABORTED with the peer's landing site {forbidden_peer:#x} intact — one proven p2m, two consumers, on the image an unmodified Linux kernel is about to run under (positive arm is a control only: these guests are identity-mapped)",
+            bind_own.vmid
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: smmu realguest FAIL: reached_own={reached_own} (before={own_before:#x} after={own_after:#x} retired={own_retired}) refused_peer={refused_peer} (before={peer_before:#x} after={peer_after:#x} retired={peer_retired}) own_maps_peer={own_maps_peer} restored={restored}; halting"
+        );
+        crate::park();
+    }
+}

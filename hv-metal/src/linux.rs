@@ -5355,6 +5355,29 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
         VTTBR.at(slot).store(*v, Ordering::Relaxed);
     }
 
+    // ★★ ⑲-2 — **BIND A REAL BUS MASTER TO A REAL GUEST'S OWN Stage-2 IMAGE.**
+    //
+    // Here and not earlier: the images must EXIST, and `VTTBR` must hold them, before a device can
+    // be pointed at one. Here and not later: nothing is executing yet, so writing the positive
+    // control's sentinel into dom 1's RAM cannot disturb a running kernel — the targets sit above
+    // every blob loaded into each window (see `dmawitness::witness_real_guest`).
+    //
+    // ⚠ **This is CONFINEMENT, not SIMULTANEITY.** Honest-ledger item 2(b) stays open: no vCPU runs
+    // while this device DMAs. What changes is WHOSE map confines it — a real guest's proven image
+    // rather than apparatus built for the test.
+    #[cfg(feature = "smmu")]
+    crate::dmawitness::witness_real_guest(
+        uart,
+        vttbr[SLOT_A],
+        vttbr[1],
+        // Above dom 1's Image/DTB/initramfs, which end around 0x4c3d_6000.
+        guest_ram_base(SLOT_A) + 0x0800_0000,
+        // Above dom 2's, which end around 0x683d_6000. ⚠ NOT its window base: the helper seeds the
+        // forbidden address before the transfer, so aiming at 0x6400_0000 would write over dom 2's
+        // kernel image.
+        guest_ram_base(1) + 0x0800_0000,
+    );
+
     // ③-b2b-i put guest A's vCPU under hv-core's REAL scheduler before it ever ran, so the
     // preemption at each timer tick is a pair of transitions against a model that already has it
     // Running rather than a pair of calls the model would refuse. **③-b2b-ii-c2 admits EVERY
