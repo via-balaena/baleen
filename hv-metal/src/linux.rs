@@ -2248,6 +2248,7 @@ fn report_probe_inflight(uart: &mut Pl011) {
     let kick = PROBE_KICK_AT.load(Ordering::Relaxed);
     let land = PROBE_LAND_AT.load(Ordering::Relaxed);
     let retired = crate::dmawitness::probe_retired(PROBE_BAR0.load(Ordering::Relaxed));
+    crate::dmawitness::probe_dump(uart, PROBE_BAR0.load(Ordering::Relaxed), PROBE_WATCH.load(Ordering::Relaxed));
     let _ = writeln!(
         uart,
         "baleen: 19-3b PROBE: armed={armed} kicked_at_exit={kick} landed_at_exit={land} \

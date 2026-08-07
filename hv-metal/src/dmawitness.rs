@@ -1566,3 +1566,22 @@ pub(crate) fn probe_landed(watch_pa: u64) -> bool {
 pub(crate) fn probe_retired(bar0: u64) -> bool {
     mmio_read64(bar0, EDU_REG_DMA_CMD) & EDU_DMA_RUN == 0
 }
+
+/// ⑲-3b PROBE — dump the device's own view plus the SMMU's, to tell "aborted" from "never issued".
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn probe_dump(uart: &mut Pl011, bar0: u64, watch_pa: u64) {
+    let cmd = mmio_read64(bar0, EDU_REG_DMA_CMD);
+    let src = mmio_read64(bar0, EDU_REG_DMA_SRC);
+    let dst = mmio_read64(bar0, EDU_REG_DMA_DST);
+    let cnt = mmio_read64(bar0, EDU_REG_DMA_CNT);
+    let held = peek(watch_pa);
+    let ev = smmu::take_event();
+    let _ = writeln!(
+        uart,
+        "baleen: 19-3b PROBE dump: bar0={bar0:#x} watch_pa={watch_pa:#x} held={held:#x} \
+         cmd={cmd:#x} src={src:#x} dst={dst:#x} cnt={cnt} present={} translating={} event={:?}",
+        smmu::present(),
+        smmu::translating(),
+        ev
+    );
+}
