@@ -1246,6 +1246,17 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
     // from "passed through" — that is rung 3's, on a non-identity map); and this is CONFINEMENT,
     // not SIMULTANEITY — ledger item 2(b) stays open, no vCPU runs while this device DMAs.
     "baleen: smmu realguest OK",
+    // ★★ ⑲-3b — the same confinement, IN FLIGHT ACROSS GUEST EXECUTION, which closes honest-ledger
+    // item 2(b). Every DMA result before this one was taken with the machine quiesced around the
+    // device; this one is kicked 200 exits into a running pair of kernels and observed from the exit
+    // path. ⚠ It claims "in flight across guest execution", NOT wall-clock concurrency — one pCPU
+    // under TCG cannot support the stronger sentence, and `report_dma_inflight`'s docs say so.
+    //
+    // ★ The binding is DERIVED, not written: one `DeviceAssign` through the proven dispatch, then
+    // re-derived from the model by `teardown::dispatch` on every dispatch for the whole flight. A
+    // hand-poked STE measurably does NOT survive this — which is what makes it rung 4b's thesis
+    // doing work rather than a property nothing depended on.
+    "baleen: dmaflight OK",
 ];
 
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
@@ -1334,6 +1345,9 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // being mapped/writable at all. Either way the DMA landing pad is not the undisturbed page the
     // simultaneity rung is about to aim a live bus master at.
     "baleen: dmapad FAIL",
+    // ⑲-3b: the in-flight observation did not complete, or one of its arms did not behave. The
+    // message names every counter, so the failing conjunct is readable without a rebuild.
+    "baleen: dmaflight FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
