@@ -2197,7 +2197,72 @@ const CNTHP_CTL_EL2_IMASK: u64 = 1 << 1;
 /// Record that EL2 has just been entered from a guest, and charge the interval to whoever held the
 /// pCPU (③-b2b-ii-e). Called first thing in both Linux-mode handlers, which between them are every
 /// entry to EL2 on this path.
+// ⑲-3b BASELINE PROBE — TEMPORARY. How many exits to EL2 happen while one transfer is in flight?
+#[cfg(feature = "smmu")]
+static PROBE_EXITS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "smmu")]
+static PROBE_ARMED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "smmu")]
+static PROBE_BAR0: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "smmu")]
+static PROBE_WATCH: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "smmu")]
+static PROBE_KICK_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "smmu")]
+static PROBE_LAND_AT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "smmu")]
+static PROBE_FLIGHT_EXITS: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+#[cfg(feature = "smmu")]
+static PROBE_FLIGHT_ELRS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "smmu")]
+static PROBE_LAST_ELR: AtomicU64 = AtomicU64::new(0);
+
+/// Called on every exit to EL2 while a transfer is in flight (⑲-3b probe).
+#[cfg(feature = "smmu")]
+fn probe_tick() {
+    let n = PROBE_EXITS.fetch_add(1, Ordering::Relaxed) + 1;
+    if PROBE_ARMED.load(Ordering::Relaxed) != 1 {
+        return;
+    }
+    let slot = current_slot();
+    PROBE_FLIGHT_EXITS.at(slot).fetch_add(1, Ordering::Relaxed);
+    let elr: u64;
+    // SAFETY: `ELR_EL2` is readable at EL2 and holds the address the exiting guest will resume at.
+    unsafe {
+        asm!("mrs {e}, ELR_EL2", e = out(reg) elr, options(nomem, nostack, preserves_flags));
+    }
+    if PROBE_LAST_ELR.swap(elr, Ordering::Relaxed) != elr {
+        PROBE_FLIGHT_ELRS.fetch_add(1, Ordering::Relaxed);
+    }
+    if crate::dmawitness::probe_landed(PROBE_WATCH.load(Ordering::Relaxed)) {
+        PROBE_LAND_AT.store(n, Ordering::Relaxed);
+        PROBE_ARMED.store(2, Ordering::Relaxed);
+    }
+}
+
+/// ⑲-3b probe report.
+#[cfg(feature = "smmu")]
+fn report_probe_inflight(uart: &mut Pl011) {
+    let armed = PROBE_ARMED.load(Ordering::Relaxed);
+    let kick = PROBE_KICK_AT.load(Ordering::Relaxed);
+    let land = PROBE_LAND_AT.load(Ordering::Relaxed);
+    let retired = crate::dmawitness::probe_retired(PROBE_BAR0.load(Ordering::Relaxed));
+    let _ = writeln!(
+        uart,
+        "baleen: 19-3b PROBE: armed={armed} kicked_at_exit={kick} landed_at_exit={land} \
+         exits_in_flight={} dom1={} dom2={} distinct_elrs={} retired={retired} total_exits={}",
+        land.saturating_sub(kick),
+        PROBE_FLIGHT_EXITS.at(SLOT_A).load(Ordering::Relaxed),
+        PROBE_FLIGHT_EXITS.at(1).load(Ordering::Relaxed),
+        PROBE_FLIGHT_ELRS.load(Ordering::Relaxed),
+        PROBE_EXITS.load(Ordering::Relaxed),
+    );
+}
+
 fn note_el2_entry() {
+    #[cfg(feature = "smmu")]
+    probe_tick();
     let now = {
         use hv_hal::TimeSource;
         crate::time::GenericTimer.now()
@@ -2943,6 +3008,8 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     report_tick_deferral(uart);
     report_per_guest_state(uart);
     report_dma_pad(uart);
+    #[cfg(feature = "smmu")]
+    report_probe_inflight(uart);
     if (0..NUM_GUESTS).all(|s| retirement_of(s) == Retirement::PoweredOff) {
         let _ = writeln!(
             uart,
@@ -5553,6 +5620,18 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // what EL2 put there. Any EL2 write to a pad added below this line silently turns the power-off
     // check into a check of that write instead.
     seed_dma_pads(uart);
+
+    // ⑲-3b BASELINE PROBE — TEMPORARY. Kick a transfer at the pad's SECOND page (the base holds
+    // ⑲-3a's sentinel, which `report_dma_pad` still checks) and leave it in flight across the `eret`.
+    #[cfg(feature = "smmu")]
+    if let Some((bar0, watch)) =
+        crate::dmawitness::probe_kick_inflight(uart, vttbr[SLOT_A], dma_pad_ipa(SLOT_A) + 0x1000)
+    {
+        PROBE_BAR0.store(bar0, Ordering::Relaxed);
+        PROBE_WATCH.store(watch, Ordering::Relaxed);
+        PROBE_KICK_AT.store(PROBE_EXITS.load(Ordering::Relaxed), Ordering::Relaxed);
+        PROBE_ARMED.store(1, Ordering::Relaxed);
+    }
 
     // ③-b2b-i put guest A's vCPU under hv-core's REAL scheduler before it ever ran, so the
     // preemption at each timer tick is a pair of transitions against a model that already has it

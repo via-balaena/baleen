@@ -1512,3 +1512,57 @@ pub(crate) fn witness_real_guest(
         crate::park();
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ⑲-3b BASELINE PROBE — TEMPORARY, reverted once the number is recorded.
+//
+// The question: how many EXITS TO EL2 happen while one transfer is in flight? The flight is ~29.5M
+// EL2 spins (⑲-3a's measurement) against a 10 ms slice quantum, so it should be many — but "should
+// be" is what this project measures instead of asserting. If it is two, ⑲-3b's progress evidence is
+// thin and the rung needs a different shape.
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Bind the bus master to `vttbr_own`'s image, seed the watch address, and KICK a transfer at
+/// `target_ipa` **without waiting for it**. The binding is deliberately left in place across the
+/// `eret`. Returns `(bar0, watch_pa)` for the caller to poll from its exit path.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn probe_kick_inflight(
+    uart: &mut Pl011,
+    vttbr_own: u64,
+    target_ipa: u64,
+) -> Option<(u64, u64)> {
+    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS};
+    use hv_s2::smmu::Stage2Binding;
+
+    let bdf = pcie::find(EDU_VENDOR, EDU_DEVICE)?;
+    let bar0 = pcie::enable_with_bar0(bdf);
+    let sid = pcie::stream_id(bdf);
+    let bind = Stage2Binding {
+        s2ttb: vttbr_table(vttbr_own),
+        vmid: vttbr_vmid(vttbr_own, BALEEN_VMID_BITS),
+        regime: BALEEN_STAGE2,
+    };
+    let watch_pa = crate::stage2::walk_stage2(bind.s2ttb, target_ipa).map(|r| r.pa)?;
+    if !smmu::bind_stream_stage2(sid, &bind) {
+        let _ = writeln!(uart, "baleen: 19-3b PROBE: bind failed");
+        return None;
+    }
+    poke(watch_pa, SENTINEL_MAGIC);
+    mmio_write64(bar0, EDU_REG_DMA_SRC, EDU_DMA_BUF);
+    mmio_write64(bar0, EDU_REG_DMA_DST, target_ipa);
+    mmio_write64(bar0, EDU_REG_DMA_CNT, 8);
+    mmio_write64(bar0, EDU_REG_DMA_CMD, EDU_DMA_RUN | EDU_DMA_TO_RAM);
+    Some((bar0, watch_pa))
+}
+
+/// Whether the in-flight transfer has reached memory — a plain read, no exit to QEMU.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn probe_landed(watch_pa: u64) -> bool {
+    peek(watch_pa) != SENTINEL_MAGIC
+}
+
+/// Whether the engine has retired the command — one MMIO read, so only for the report.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn probe_retired(bar0: u64) -> bool {
+    mmio_read64(bar0, EDU_REG_DMA_CMD) & EDU_DMA_RUN == 0
+}

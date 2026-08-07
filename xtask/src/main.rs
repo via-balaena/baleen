@@ -68,7 +68,8 @@ fn main() {
         // ⑲-1b — the same boot `qemu-linux-test` now runs as its fourth configuration, kept as a
         // named task for running it alone during SMMU work. It is NOT a local-only escape hatch:
         // see `LINUX_SMMU_MARKERS` for why that is no longer needed.
-        "qemu-linux-smmu" => qemu_linux(true, LinuxBoot::Smmu),
+        // ⑲-3b PROBE, TEMPORARY: stream the serial so the probe line is visible.
+        "qemu-linux-smmu" => qemu_linux(false, LinuxBoot::Smmu),
         "metal-lint" => metal_lint(),
         "doc-markers" => doc_markers(),
         "ci" => {
