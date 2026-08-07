@@ -11,7 +11,8 @@
 //! default build (the CI boot-test) is byte-for-byte unchanged.
 //!
 //! ⚠ **"No isolation content" STOPPED BEING TRUE AT ⑲-2, and is now decisively false.** This file
-//! carries the device half of the isolation claim: [`report_dma_inflight`] observes a bus master
+//! carries the device half of the isolation claim: `report_dma_inflight` (feature `smmu`, so it is
+//! not linkable from every configuration's docs) observes a bus master
 //! confined by a real guest's own DERIVED Stage-2 binding while both kernels execute, and
 //! [`report_dma_pad`] is what makes a landing site available to aim it at. The sentence above is
 //! kept because it is true of the arc's ORIGINAL scope and explains why the file is shaped the way
