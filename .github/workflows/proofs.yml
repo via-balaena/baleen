@@ -93,7 +93,13 @@ jobs:
           # alternative — adding the path in the same commit as the dependency — risks the one
           # failure mode this filter must never have, a device-model change that green-skips the
           # gate that exists to check it.
-          PROOF_PATHS='^(hv-hal|hv-core|hv-s2|hv-vdev|hv-verify)/|^Cargo\.toml$|^\.github/workflows/proofs\.yml$'
+          #
+          # `hv-part` (Tier A) is added in the SAME commit as its harnesses, which is the direction
+          # the note above warns about — so state why it is safe here: the crate is created by that
+          # commit, so there is no window in which a `hv-part` change could have green-skipped a
+          # gate that already existed. The hazard that note describes is a path added LATER than the
+          # code it guards; this is the opposite order.
+          PROOF_PATHS='^(hv-hal|hv-core|hv-part|hv-s2|hv-vdev|hv-verify)/|^Cargo\.toml$|^\.github/workflows/proofs\.yml$'
           ZERO='0000000000000000000000000000000000000000'
 
           if [ "$EVENT" = "pull_request" ]; then

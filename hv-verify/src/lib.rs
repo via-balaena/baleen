@@ -4734,3 +4734,234 @@ mod gic_declared_residues {
         );
     }
 }
+
+/// **The machine's partition among guest slots, proven for a SYMBOLIC partition.**
+///
+/// Every property here was previously a `const assert!` in `hv-metal`, evaluated at the sizes the
+/// board deploys — two guests, two vCPUs. That is a check of two cases, and `hv-metal` is
+/// workspace-EXCLUDED so nothing in it is reachable from here. Moving the arithmetic into `hv-part`
+/// is what makes "no two guests' windows overlap" a statement about **all** partitions of this shape
+/// rather than about the one this board happens to have.
+///
+/// ## What is symbolic, what is concrete, and why — MEASURED
+///
+/// The slot COUNT is concrete (one harness per size, 2/3/4); everything else — `ram_base`,
+/// `ram_end`, `window_len`, the frame and table counts — is a **fully symbolic `u64`**, constrained
+/// only by [`is_well_formed`](hv_part::Partition::is_well_formed).
+///
+/// ⚠ **That split was forced by measurement, and my first diagnosis of it was wrong.** With
+/// `num_guests` symbolic, every harness that loops over slots failed to finish in 120 s while
+/// `domain_ids_are_injective_and_never_dom0` — the only one with no loop — completed in **0.1 s**. I
+/// first blamed the 64x64 multiply in the window arithmetic and restructured `hv-part` to remove it
+/// (a change worth keeping on its own merits); the harnesses still timed out. The cost is the
+/// **symbolic loop bound**: Kani must unwind `while slot < num_guests` against an unknown limit.
+/// Concrete sizes make the unwinding exact, which is the same reason the `DOMS`/`FRAMES` harnesses
+/// elsewhere in this file are sized rather than symbolic.
+///
+/// Three sizes rather than one, and not 2 alone: with two slots there is exactly one pair, so
+/// "pairwise disjoint" cannot distinguish a correct stride from one that merely works for adjacent
+/// slots. Three is the first size where a non-adjacent pair exists.
+#[cfg(kani)]
+mod partition {
+    use hv_part::{Partition, DOM0};
+
+    /// A symbolic partition with a CONCRETE slot count. Everything else is unconstrained beyond
+    /// well-formedness — in particular the deployed 448 frames of 2 MiB at `0x4800_0000` is inside
+    /// what these harnesses prove, which is NOT true of the `DOMS=3/FRAMES=4` harnesses above.
+    fn symbolic(num_guests: u64) -> Partition {
+        let p = Partition {
+            num_guests,
+            frames_per_guest: kani::any(),
+            window_len: kani::any(),
+            ram_base: kani::any(),
+            ram_end: kani::any(),
+            num_sup_frames: kani::any(),
+            tables_per_guest: kani::any(),
+            vcpus_per_guest: kani::any(),
+        };
+        kani::assume(p.is_well_formed());
+        p
+    }
+
+    /// ★ **The arithmetic half of the isolation thesis: no two slots' windows overlap.**
+    fn windows_disjoint_at(n: u64) {
+        assert!(
+            symbolic(n).windows_disjoint(),
+            "a well-formed partition put two slots' windows on top of each other"
+        );
+    }
+
+    /// No slot's window escapes the backed RAM — the half a wrong `ram_end` would break silently.
+    fn windows_in_range_at(n: u64) {
+        assert!(
+            symbolic(n).windows_in_range(),
+            "a slot's window ran past ram_end"
+        );
+    }
+
+    /// No two slots share a model frame or table, and no table lands in the super partition.
+    fn frames_disjoint_at(n: u64) {
+        assert!(
+            symbolic(n).frames_disjoint(),
+            "two slots overlapped in the model's frame index space"
+        );
+    }
+
+    /// ★ **`owner_of` really is the inverse of the window map**, in both directions — which makes
+    /// "that address belongs to the peer" decidable rather than a comparison written out by hand at
+    /// each fault site, which is how `hv-metal` asked the question before this crate existed.
+    fn owner_of_inverts_at(n: u64) {
+        let p = symbolic(n);
+        let ipa: u64 = kani::any();
+        match p.owner_of(ipa) {
+            // Sound: whoever it names really does contain it.
+            Some(s) => {
+                assert!(p.has_slot(s), "owner_of named a slot that does not exist");
+                assert!(
+                    p.window_contains(s, ipa),
+                    "owner_of named a slot whose window does not contain the address"
+                );
+            }
+            // Complete: if it names nobody, nobody contains it. Without this arm the function could
+            // return `None` always and still pass the one above.
+            None => {
+                let mut s = 0;
+                while s < p.num_guests {
+                    assert!(
+                        !p.window_contains(s, ipa),
+                        "owner_of returned None for an address a slot owns"
+                    );
+                    s += 1;
+                }
+            }
+        }
+    }
+
+    /// ★ **Anything placed by offset lands in its OWN slot's window** — the generic form of the
+    /// per-blob `const assert!`s (`kernel_entry`, `dtb_addr`, `initrd_addr`, the DMA pad) that
+    /// `hv-metal` writes one at a time for the offsets this board happens to use.
+    fn in_window_belongs_to_that_slot_at(n: u64) {
+        let p = symbolic(n);
+        let (slot, offset): (u64, u64) = (kani::any(), kani::any());
+        if let Some(addr) = p.in_window(slot, offset) {
+            assert!(
+                p.window_contains(slot, addr),
+                "in_window produced an address outside the slot's own window"
+            );
+            assert_eq!(
+                p.owner_of(addr),
+                Some(slot),
+                "an address placed in one slot's window is owned by another"
+            );
+        }
+    }
+
+    /// A reservation at the top of a window (⑲-3a's DMA landing pad) lies wholly inside it, so a
+    /// device pointed at it cannot spill into the peer.
+    fn window_top_fits_at(n: u64) {
+        let p = symbolic(n);
+        let (slot, len): (u64, u64) = (kani::any(), kani::any());
+        if let Some(base) = p.window_top(slot, len) {
+            assert!(
+                p.window_contains(slot, base),
+                "the reservation starts outside"
+            );
+            assert_eq!(
+                base + len,
+                p.window_end(slot),
+                "the reservation does not end at the window's end"
+            );
+            assert_eq!(
+                p.owner_of(base),
+                Some(slot),
+                "the reservation is owned by another slot"
+            );
+        }
+    }
+
+    /// Domain ids are injective in the slot and never `DOM0`, so a slot index and a domain id cannot
+    /// be confused by being accidentally equal and no guest can be mistaken for the privileged
+    /// domain. Loop-free, hence sized once.
+    #[kani::proof]
+    fn domain_ids_are_injective_and_never_dom0() {
+        let p = symbolic(4);
+        let (a, b): (u64, u64) = (kani::any(), kani::any());
+        kani::assume(p.has_slot(a) && p.has_slot(b));
+        assert!(p.dom_of(a) != DOM0, "a guest slot was given DOM0");
+        assert!(
+            (a == b) == (p.dom_of(a) == p.dom_of(b)),
+            "two distinct slots share a domain id"
+        );
+    }
+
+    // ── The sizes, and why each property gets the ones it does ───────────────────────────────────
+    //
+    // MEASURED on this laptop (CI is ~2.9x): `windows_disjoint` 0.5 s · `frames_disjoint` 2.2 s ·
+    // `in_window` 10.4 s · `owner_of` 19.1 s, each at 4 slots. So the cheap, purely pairwise
+    // properties are run at 2/3/4 and the two that also quantify over a symbolic ADDRESS are run at
+    // 2 and 4. **2 is the size the board deploys; 3 is the first with a non-adjacent pair; 4 is the
+    // most demanding instance affordable.** Whole module ~60 s locally, which is the price recorded
+    // for the next person deciding whether to add a size.
+
+    #[kani::proof]
+    fn windows_are_pairwise_disjoint_2_slots() {
+        windows_disjoint_at(2)
+    }
+    #[kani::proof]
+    fn windows_are_pairwise_disjoint_3_slots() {
+        windows_disjoint_at(3)
+    }
+    #[kani::proof]
+    fn windows_are_pairwise_disjoint_4_slots() {
+        windows_disjoint_at(4)
+    }
+
+    #[kani::proof]
+    fn windows_stay_inside_the_backed_ram_2_slots() {
+        windows_in_range_at(2)
+    }
+    #[kani::proof]
+    fn windows_stay_inside_the_backed_ram_3_slots() {
+        windows_in_range_at(3)
+    }
+    #[kani::proof]
+    fn windows_stay_inside_the_backed_ram_4_slots() {
+        windows_in_range_at(4)
+    }
+
+    #[kani::proof]
+    fn frame_and_table_runs_are_disjoint_2_slots() {
+        frames_disjoint_at(2)
+    }
+    #[kani::proof]
+    fn frame_and_table_runs_are_disjoint_3_slots() {
+        frames_disjoint_at(3)
+    }
+    #[kani::proof]
+    fn frame_and_table_runs_are_disjoint_4_slots() {
+        frames_disjoint_at(4)
+    }
+
+    #[kani::proof]
+    fn owner_of_is_exactly_the_containing_window_2_slots() {
+        owner_of_inverts_at(2)
+    }
+    #[kani::proof]
+    fn owner_of_is_exactly_the_containing_window_4_slots() {
+        owner_of_inverts_at(4)
+    }
+
+    #[kani::proof]
+    fn an_in_window_address_belongs_to_that_slot_2_slots() {
+        in_window_belongs_to_that_slot_at(2)
+    }
+    #[kani::proof]
+    fn an_in_window_address_belongs_to_that_slot_4_slots() {
+        in_window_belongs_to_that_slot_at(4)
+    }
+
+    #[kani::proof]
+    fn a_window_top_reservation_fits_4_slots() {
+        window_top_fits_at(4)
+    }
+}

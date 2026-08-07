@@ -51,6 +51,11 @@ hv-hal = { path = "../hv-hal" }
 # which frames a domain reaches and encodes the descriptors, as pure zero-`unsafe` code under the
 # workspace fence; hv-metal keeps only the publish (barriers + TLB maintenance + VTTBR).
 hv-s2 = { path = "../hv-s2" }
+# How this machine is PARTITIONED among guest slots (Tier A). The slot-indexed arithmetic used to
+# live here, guarded by `const assert!`s at the two slots the board deploys; under the fence the same
+# `const fn`s are proven for a symbolic partition. This crate keeps the DEPLOYMENT — which numbers go
+# in — and asserts the shipped instance against the very predicates `hv-verify` proved total.
+hv-part = { path = "../hv-part" }
 # The emulated device models the guest drives, factored OUT of this crate for the same reason
 # `hv-s2` was (⑯): `hv-metal` is workspace-EXCLUDED, so nothing here can be reached by `hv-verify`.
 # Under the fence the register files are pure, provable code; what stays here is the deployment —

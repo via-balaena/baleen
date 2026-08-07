@@ -62,8 +62,8 @@ Most of the value here is in **not** letting these blur into one word.
 ### What it is not
 
 - **Not seL4-tier.** seL4 proves full functional correctness, at a proof-to-code ratio widely
-  reported around 20:1. Here it is **0.53:1** — 6 347 non-comment lines of Kani + Verus against
-  the 12 069 of `hv-core` + `hv-s2` + `hv-vdev` — property-directed verification rather than
+  reported around 20:1. Here it is **0.53:1** — 6 457 non-comment lines of Kani + Verus against
+  the 12 256 of `hv-core` + `hv-s2` + `hv-vdev` + `hv-part` — property-directed verification rather than
   functional correctness. A deliberately different bargain: a weaker guarantee, far more
   cheaply, with the remainder enforced at runtime instead. If you need seL4's guarantee, the
   gap *is* the point. (Both sides of that ratio are non-comment lines; comparing
@@ -89,8 +89,9 @@ and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot
 | `hv-core`   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, **zero external crates** (one path dep on `hv-hal`), and zero `unsafe` — measured, though not yet `#![forbid(unsafe_code)]`-enforced | 7 615 |
 | `hv-s2`     | the Stage-2 page-table **emitter**, and the ∀-address refinement theorems over it        | 3 594  |
 | `hv-vdev`   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets | 860 |
+| `hv-part`   | how the machine is **partitioned among guest slots** — windows, frame runs, domain ids — as `const fn` arithmetic proven ∀-partition rather than `const assert!`-ed at the two slots this board deploys | 187 |
 | `hv-sim`    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps | 5 653 |
-| `hv-verify` | the **Kani harnesses** (113) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) | 2 787 + 3 560 |
+| `hv-verify` | the **Kani harnesses** (128) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) | 2 897 + 3 560 |
 | `hv-metal`  | the bare-metal AArch64/EL2 binary: boot, Stage-2, vGIC, the real-Linux path              | 10 946 |
 | `hv-fuzz`   | `cargo-fuzz` targets against the hypercall dispatcher                                    | —      |
 | `xtask`     | build/test automation and the gate corpora (`cargo xtask <task>`)                        | 828    |
@@ -249,7 +250,7 @@ The decision, repo/CI shape, what is proven, and that finding live in
 [`docs/TIER-C-SPIKE.md`](docs/TIER-C-SPIKE.md). ⚠ **This paragraph used to end "the proofs run in the scheduled `Deep verification`
 workflow, not the per-PR gate". That is no longer true and has not been for some time.**
 `kani proofs (PR)` and `verus proofs (PR)` are **required checks on `main`**, run on any PR
-touching `hv-hal` / `hv-core` / `hv-s2` / `hv-vdev` / `hv-verify`; a PR that touches none of
+touching `hv-hal` / `hv-core` / `hv-part` / `hv-s2` / `hv-vdev` / `hv-verify`; a PR that touches none of
 them green-skips in seconds. `Deep verification` still exists for what does *not* belong in a
 PR gate — the ∀-size enumerator sweeps, fuzzing, and a weekly backstop re-run of the proofs.
 

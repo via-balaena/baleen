@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+[package]
+name = "hv-part"
+description = "How the machine is PARTITIONED among guest slots — which model frames, which tables, which IPA window and which domain id each slot owns — as pure no_std arithmetic with zero unsafe, so the disjointness the isolation story rests on is proven for all slots rather than const-asserted at the two the board happens to deploy."
+# Internal workspace crate — not for crates.io. Guards against an accidental publish.
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# No dependencies, for `hv-vdev`'s reason: a partition is a function from a slot index to the
+# resources that slot owns. It needs no model of domains, grants or descriptors, and taking one
+# would give Kani a larger world to reason about for nothing.
+[dependencies]
+
+[lints]
+workspace = true

@@ -299,7 +299,7 @@ const SLOT_B: usize = 1;
 /// nothing else. (`pub(crate)` for [`crate::console`], which tags each guest's console lines and
 /// must name the same domain this file dispatches to.)
 pub(crate) const fn slot_dom(slot: usize) -> DomId {
-    slot as DomId + 1
+    PARTITION.dom_of(slot as u64)
 }
 
 /// The domain the first real Linux kernel boots as.
@@ -329,14 +329,14 @@ const _: () = assert!(
 /// The first super-span model frame guest `slot` owns. **This is the isolation mechanism** — the two
 /// guests are disjoint because neither ever names the other's frames (see [`build_model_and_stage2`]).
 const fn first_frame(slot: usize) -> Mfn {
-    (slot as u64 * stage2::LINUX_SUP_FRAMES_PER_GUEST) as Mfn
+    PARTITION.first_frame(slot as u64) as Mfn
 }
 
 /// The first model frame holding an `L2` page table for guest `slot` — just above the super
 /// partition, in the base partition, and never mapped (a page table is model state, not a leaf).
 /// Each domain gets its own contiguous run of `LINUX_TABLES_PER_GUEST`.
 const fn first_table(slot: usize) -> Mfn {
-    stage2::NUM_SUP_FRAMES as Mfn + (slot as u64 * stage2::LINUX_TABLES_PER_GUEST) as Mfn
+    PARTITION.first_table(slot as u64) as Mfn
 }
 
 const PCPU0: u32 = 0;
@@ -405,11 +405,52 @@ const DTB_ADDR: u64 = 0x4b00_0000;
 /// address on faith would be checking a place instead of a thing.
 const INITRD_ADDR: u64 = 0x4c00_0000;
 
+/// **How this machine is divided among guest slots — the deployment, and the ONE instance.**
+///
+/// The arithmetic moved to `hv-part` (Tier A): it used to be four `const fn`s here, guarded by
+/// `const assert!`s evaluated at the two slots this board deploys, and `hv-metal` is
+/// workspace-EXCLUDED so no proof could reach them. What stays here is which numbers go in.
+///
+/// ★ **The link that makes the proofs load-bearing rather than decorative is the `const assert!`
+/// below**: the shipped partition is checked against the very predicates `hv-verify` proves total
+/// for a symbolic partition. Without it this crate could deploy a partition the proofs say nothing
+/// about, and the proofs would be true of a shape nothing uses.
+pub(crate) const PARTITION: hv_part::Partition = hv_part::Partition::from_frames(
+    NUM_GUESTS as u64,
+    stage2::LINUX_SUP_FRAMES_PER_GUEST,
+    stage2::SUP_FRAME_BYTES,
+    stage2::LINUX_RAM_BASE,
+    stage2::LINUX_RAM_END,
+    stage2::NUM_SUP_FRAMES,
+    stage2::LINUX_TABLES_PER_GUEST,
+    VCPUS_PER_GUEST as u64,
+);
+
+/// The deployed partition satisfies the predicates proven ∀-partition in `hv-verify::partition`.
+const _: () = {
+    assert!(
+        PARTITION.is_well_formed(),
+        "the deployed partition is outside the shape hv-part's proofs are stated for"
+    );
+    assert!(
+        PARTITION.windows_disjoint(),
+        "two guest slots' RAM windows overlap"
+    );
+    assert!(
+        PARTITION.windows_in_range(),
+        "a guest slot's RAM window runs past the backed window"
+    );
+    assert!(
+        PARTITION.frames_disjoint(),
+        "two guest slots overlap in the model's frame index space"
+    );
+};
+
 /// The base of guest `slot`'s RAM window — the address its `Image` loads at and the base its DTB's
 /// `/memory` node advertises. Derived from which model frames the guest owns, so it cannot disagree
 /// with what the emitter maps for it.
 const fn guest_ram_base(slot: usize) -> u64 {
-    stage2::LINUX_RAM_BASE + first_frame(slot) as u64 * stage2::SUP_FRAME_BYTES
+    PARTITION.window_base(slot as u64)
 }
 
 /// How far guest `slot`'s window sits above guest A's. **This is the whole of ③-b2b-ii-b's address
@@ -2865,10 +2906,10 @@ fn preempt_through_the_scheduler(cur: Running, frame: &mut LinuxFrame) {
 /// the emitted images come from, so "whose memory is this" has one answer on this path and it is the
 /// one the emitter used.
 fn guest_owning(ipa: u64) -> Option<usize> {
-    (0..NUM_GUESTS).find(|&slot| {
-        let base = guest_ram_base(slot);
-        (base..base + stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES).contains(&ipa)
-    })
+    // ⑯-Tier-A: the containment test is `hv-part`'s, and `owner_of` is PROVEN to be exactly the
+    // inverse of the window map (both directions — a version that always answered "nobody" would
+    // pass a soundness-only harness, and the completeness arm was probe-confirmed to catch it).
+    PARTITION.owner_of(ipa).map(|slot| slot as usize)
 }
 
 /// **③-b2b-ii-d — a guest reached into its peer's memory, and the hardware said no.**
