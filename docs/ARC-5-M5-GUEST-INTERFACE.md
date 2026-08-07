@@ -97,7 +97,7 @@ same script a developer with an empty `$BALEEN_LINUX_DIR` runs.
 output captured, requiring every marker in `LINUX_MARKERS` and none in `LINUX_FORBIDDEN`. The per-marker
 reasoning lives on those constants. Two are worth repeating here:
 
-- **`node   0: [mem 0x0000000048000000-0x0000000063ffffff]`** is the memory contract in one string.
+- **`  DMA      [mem 0x0000000048000000-0x0000000063ffffff]`** is the memory contract in one string.
   It is the kernel reporting the window it read from *our* DTB, and it must equal what the emitter
   maps for this domain and xtask's `-device loader` addresses (where the blobs land). Four places
   that have to agree, previously kept in agreement by hand.
@@ -106,6 +106,17 @@ reasoning lives on those constants. Two are worth repeating here:
   dom 1 and owns `LINUX_RAM_BASE..LINUX_RAM_SPLIT`, while dom 2 owns the upper half and has its own
   emitted Stage-2 image. The `baleen: peer OK` marker is the statement that the two images are
   disjoint, walked from the descriptors.
+
+  **This was `node   0: [mem …]` until ⑲-3a**, which reserved the top 2 MiB of each window `no-map`
+  as a DMA landing pad. Linux answers a `no-map` range by splitting its node-0 range in two, so the
+  single string that carried the whole window stopped existing; the zone span says the same thing and
+  is not perturbed by a hole inside it. The pad has its own marker, `OF: reserved mem: …nomap…`.
+- **`OF: reserved mem: 0x0000000063e00000..0x0000000063ffffff (2048 KiB) nomap non-reusable
+  dma-pad@63e00000`** is the guest's own acknowledgement of the landing pad (⑲-3a). Paired with
+  `baleen: dmapad OK`, which is EL2 reading its pre-boot sentinel back out of that range after both
+  kernels have run and powered off: the kernel says it mapped nothing there, and the memory says
+  nothing wrote there. Neither half is sufficient — a sentinel can survive by luck in a 448 MiB
+  window, and a parsed reservation is not proof of a quiet page.
 - **`baleen: LINUX GUEST TRAP`** is forbidden. `handle_linux_sync` prints it for any lower-EL
   synchronous exception that is not an `HVC` — i.e. for every Stage-2 abort — so an emitter
   mis-mapping lands there. It is what makes this an assertion about the emitter rather than about

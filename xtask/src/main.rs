@@ -663,7 +663,7 @@ fn render_guest_dtb(
 ///   **emulated in EL2**, not in the pass-through window, so the bytes additionally have to survive
 ///   `vpl011`'s relay to the real UART. Un-forgeable in the same way `ro=0x5eed` is on the synthetic
 ///   path.
-/// * **`node   0: [mem 0x0000000048000000-0x0000000063ffffff]`** — THE MEMORY CONTRACT, in one
+/// * **`DMA      [mem 0x0000000048000000-0x0000000063ffffff]`** — THE MEMORY CONTRACT, in one
 ///   string. It is the kernel reporting the window it got from our DTB, and it must equal what the
 ///   emitter maps for **this domain** and the `-device loader` addresses above (where the blobs
 ///   land). Four places that must agree; this is the assertion that goes red when they stop.
@@ -673,6 +673,14 @@ fn render_guest_dtb(
 ///   `xtask doc-markers` does NOT scan `.rs` files, only `docs/*.md`, so a stale marker quote in
 ///   THIS doc comment is caught by a human reading the diff or not at all — which is how the
 ///   `0x7fffffff` above survived one rung too long.
+///
+///   ⚠ **It was `node   0: [mem …]` until ⑲-3a, and the swap is not cosmetic.** That rung reserved
+///   the top 2 MiB of each window `no-map`, and Linux responds by SPLITTING its node-0 range in two
+///   (`…48000000-63dfffff` and `…63e00000-63ffffff`) — so the single string that used to carry the
+///   whole window stopped existing. The zone span is the same four-way agreement in a form the
+///   reservation does not perturb: zone ranges include their holes. **Do not read the swap as a
+///   weakening — read it as the one line here that still names both ends of the window.** The pad
+///   itself is asserted separately, by the `OF: reserved mem: …` marker.
 /// * **`Linux version 6.18.`** — an unmodified upstream Alpine kernel, not a stub that prints
 ///   markers.
 /// * **`linux PSCI FID 0x84000006 -> NOT_SUPPORTED`** — the kernel's `MIGRATE_INFO_TYPE` probe
@@ -729,12 +737,21 @@ const LINUX_MARKERS: &[&str] = &[
     // The kernel, behind the proven emitter.
     "Linux version 6.18.",
     "Machine model: baleen-metal-guest",
-    "node   0: [mem 0x0000000048000000-0x0000000063ffffff]",
+    "  DMA      [mem 0x0000000048000000-0x0000000063ffffff]",
+    // ⑲-3a — the kernel-side half of the landing-pad claim, and the half that makes the EL2-side
+    // `dmapad OK` mean something. Linux read the `reserved-memory` child out of OUR device tree,
+    // agreed the range, and says `nomap`: it mapped nothing there. It then drops the range from
+    // `System RAM` entirely, which is what moved the two `baleen-guest-ram` markers below.
+    "OF: reserved mem: 0x0000000063e00000..0x0000000063ffffff (2048 KiB) nomap non-reusable dma-pad@63e00000",
     "baleen: linux PSCI FID 0x84000006 -> NOT_SUPPORTED",
     "Run /init as init process",
     // Userspace, out of our initramfs.
     "########## BALEEN-STEP0-OK ##########",
-    "baleen-guest-ram: 48000000-63ffffff:SystemRAM",
+    // ⑲-3a: ends at `63dfffff`, not `63ffffff` — the top 2 MiB is the `no-map` landing pad, and the
+    // kernel does not count it as System RAM at all. Userspace reporting the SHORTENED range is the
+    // reservation observed from the far end of the guest: not just parsed at boot, but reflected in
+    // what `/proc/iomem` tells a process the machine has.
+    "baleen-guest-ram: 48000000-63dfffff:SystemRAM",
     // ③-a1: the console every marker above travelled over is EMULATED.
     "baleen: vpl011 OK: dom 1's console is EMULATED — its own userspace's 'BALEEN-STEP0-OK' was \
      written to dom 1's emulated PL011 DR register in EL2",
@@ -799,18 +816,24 @@ const LINUX_MARKERS: &[&str] = &[
     // string. Both guests run the SAME initramfs and the same `Image`, so no guest-supplied content
     // alone can say which kernel printed it, and no EL2 tag alone says a kernel ran at all.
     //
-    // `[dom 2] baleen-guest-ram: 64000000-7fffffff` is the strongest single assertion in this file:
+    // `[dom 2] baleen-guest-ram: 64000000-7fdfffff` is the strongest single assertion in this file:
     // it is dom 2's userspace reading dom 2's `/proc/iomem`, which requires dom 2's kernel to have
     // parsed dom 2's DTB and reached that RAM through dom 2's OWN Stage-2 image. Guest A cannot
-    // produce that string — its window ends at 0x63ffffff, and the peer's half is unmapped in its
+    // produce that string — its window ends at 0x63dfffff, and the peer's half is unmapped in its
     // image (`peer OK`, walked from the descriptors before either guest ran).
+    // ⑲-3a moved the top end from `7fffffff` to `7fdfffff`: the last 2 MiB is the `no-map` landing
+    // pad, which Linux excludes from System RAM. The string got STRONGER — it now names dom 2's
+    // window and dom 2's reservation at once, and neither guest can print the other's.
     // Dom 2's KERNEL lines cannot be asserted tag-plus-content: `printk` puts its own timestamp
     // between the two (`[dom 2] [    0.000000] Linux version …`), and the timestamp varies. So the
     // kernel-side claim is made by CONTENT that only dom 2 can print — its `/memory` window — and
     // the tag-plus-content claims are the two userspace lines, which carry no timestamp.
-    "  node   0: [mem 0x0000000064000000-0x000000007fffffff]",
+    "  DMA      [mem 0x0000000064000000-0x000000007fffffff]",
+    // ⑲-3a — dom 2's own reservation, at ITS window's top. Two guests, two device trees, two
+    // kernels each honouring the range its own DTB named.
+    "OF: reserved mem: 0x000000007fe00000..0x000000007fffffff (2048 KiB) nomap non-reusable dma-pad@7fe00000",
     "[dom 2] ########## BALEEN-STEP0-OK ##########",
-    "[dom 2] baleen-guest-ram: 64000000-7fffffff:SystemRAM",
+    "[dom 2] baleen-guest-ram: 64000000-7fdfffff:SystemRAM",
     // ★ ⑱-4b-i, and these two are the GUEST-OBSERVED half of that rung — the only assertion in this
     // list that a guest which went idle was given the pCPU back.
     //
