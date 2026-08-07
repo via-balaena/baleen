@@ -1,0 +1,7 @@
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+# rust-lld is the default linker for this target and does not take -nostartfiles (it links
+# no startup files anyway). Just point it at the script.
+rustflags = ["-C", "link-arg=-Tlink.ld"]
