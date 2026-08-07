@@ -1244,8 +1244,20 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
     // ⚠ Two things it does NOT claim, both stated on `dmawitness::witness_real_guest`: the positive
     // arm is a CONTROL only (real guests are identity-mapped, so it cannot separate "translated"
     // from "passed through" — that is rung 3's, on a non-identity map); and this is CONFINEMENT,
-    // not SIMULTANEITY — ledger item 2(b) stays open, no vCPU runs while this device DMAs.
+    // not SIMULTANEITY — nothing runs while THIS device DMAs. Ledger item 2(b) is closed by the
+    // `dmaflight OK` marker below, not by this one.
     "baleen: smmu realguest OK",
+    // ★★ ⑲-3b — the same confinement, IN FLIGHT ACROSS GUEST EXECUTION, which closes honest-ledger
+    // item 2(b). Every DMA result before this one was taken with the machine quiesced around the
+    // device; this one is kicked 200 exits into a running pair of kernels and observed from the exit
+    // path. ⚠ It claims "in flight across guest execution", NOT wall-clock concurrency — one pCPU
+    // under TCG cannot support the stronger sentence, and `report_dma_inflight`'s docs say so.
+    //
+    // ★ The binding is DERIVED, not written: one `DeviceAssign` through the proven dispatch, then
+    // re-derived from the model by `teardown::dispatch` on every dispatch for the whole flight. A
+    // hand-poked STE measurably does NOT survive this — which is what makes it rung 4b's thesis
+    // doing work rather than a property nothing depended on.
+    "baleen: dmaflight OK",
 ];
 
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
@@ -1331,9 +1343,12 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // wrong slot. The message names which counter leaked.
     "baleen: perguest FAIL",
     // ⑲-3a: a guest wrote inside the range its own device tree reserves `no-map`, or the pad stopped
-    // being mapped/writable at all. Either way the DMA landing pad is not the undisturbed page the
-    // simultaneity rung is about to aim a live bus master at.
+    // being mapped/writable at all. Either way the DMA landing pad is not the undisturbed page
+    // ⑲-3b aims a live bus master at while both kernels are running.
     "baleen: dmapad FAIL",
+    // ⑲-3b: the in-flight observation did not complete, or one of its arms did not behave. The
+    // message names every counter, so the failing conjunct is readable without a rebuild.
+    "baleen: dmaflight FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
@@ -1470,7 +1485,16 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
              emitter, ran isolated on one pCPU, and powered off"
         );
     }
-    let _ = std::fs::remove_file(&out);
+    // ⑲-3b: keep the serial on a GREEN boot when asked. A passing gate prints only its marker
+    // verdicts, so every measurement taken from a boot that works — which is most of them, since a
+    // probe's whole point is to succeed and report a number — needed the log resurrecting by some
+    // temporary edit. `BALEEN_KEEP_LOG=1 cargo xtask qemu-linux-smmu` leaves it in place and says
+    // where. A failing boot still dumps it inline, unchanged.
+    if std::env::var("BALEEN_KEEP_LOG").is_ok() {
+        println!("qemu-linux-test: serial log kept at {}", out.display());
+    } else {
+        let _ = std::fs::remove_file(&out);
+    }
     !failed
 }
 

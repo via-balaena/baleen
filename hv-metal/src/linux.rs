@@ -10,6 +10,14 @@
 //! `hv-core`/`hv-hal` are untouched; this whole module is behind the `real-linux` feature, so the
 //! default build (the CI boot-test) is byte-for-byte unchanged.
 //!
+//! ⚠ **"No isolation content" STOPPED BEING TRUE AT ⑲-2, and is now decisively false.** This file
+//! carries the device half of the isolation claim: `report_dma_inflight` (feature `smmu`, so it is
+//! not linkable from every configuration's docs) observes a bus master
+//! confined by a real guest's own DERIVED Stage-2 binding while both kernels execute, and
+//! [`report_dma_pad`] is what makes a landing site available to aim it at. The sentence above is
+//! kept because it is true of the arc's ORIGINAL scope and explains why the file is shaped the way
+//! it is — but read it as history, not as a description of what is asserted here today.
+//!
 //! ⚠ **THIS PARAGRAPH SAID "a SINGLE EL1 guest that owns the machine" UNTIL ⑱-4b, AND HAD BEEN
 //! FALSE SINCE ③-b2b-ii.** What actually boots today is **two** unmodified kernels, each with
 //! **two vCPUs** (⑱-4b-ii's `PSCI CPU_ON`), time-slicing one physical CPU — four vCPUs in total,
@@ -523,6 +531,108 @@ fn seed_dma_pads(uart: &mut Pl011) {
             crate::park();
         }
         DMA_PAD_SEEDED.at(slot).store(1, Ordering::Relaxed);
+    }
+}
+
+/// **⑲-3b's witness — a bus master confined by a real guest's proven map, ACROSS GUEST EXECUTION.**
+///
+/// Closes honest-ledger item 2(b). Every DMA result before this one — SMMU rungs 1–4, ⑲-2, and
+/// ⑲-3a's own seeding — was taken with the machine quiesced around the device.
+///
+/// ⚠ **The claim is "in flight across guest execution", NOT wall-clock concurrency**, and the
+/// difference is real on this machine: one pCPU, TCG, and an engine that completes on a virtual-clock
+/// timer between translation blocks. No guest instruction is mid-execution at the instant the copy
+/// happens. What is established is that the machine was not stopped around the transfer.
+///
+/// Each arm asserts the same three-part progress conjunction, because a count alone is weak:
+/// * **exits** — entries to EL2 from a guest while the transfer was outstanding;
+/// * **ELR moved** — the exiting PC differed from the previous exit's, so instructions ran between
+///   them. A guest wedged retaking one trap would produce exits without this;
+/// * **both guests** — "no vCPU runs while the device DMAs" is refuted hardest by two having run.
+///
+/// ★ **And the binding is DERIVED, not written.** ⑲-2 pokes an STE; that cannot survive here, because
+/// SMMU rung 4b re-derives the whole stream table from the model's device→domain relation after every
+/// dispatch. The probe that found this measured the transfer aborting with its sentinel untouched.
+/// So the confinement is established by one `DeviceAssign` and then **re-established from the model
+/// tens of thousands of times while the guests ran** — rung 4b's thesis, finally load-bearing.
+#[cfg(feature = "smmu")]
+fn report_dma_inflight(uart: &mut Pl011) {
+    let phase = flight::PHASE.load(Ordering::Relaxed);
+    let (k1, l1) = (
+        flight::KICK1.load(Ordering::Relaxed),
+        flight::LAND1.load(Ordering::Relaxed),
+    );
+    let (k2, r2) = (
+        flight::KICK2.load(Ordering::Relaxed),
+        flight::RETIRE2.load(Ordering::Relaxed),
+    );
+    let permitted_span = l1.saturating_sub(k1);
+    let refused_span = r2.saturating_sub(k2);
+    let p1 = flight::EXITS_PERMITTED.at(SLOT_A).load(Ordering::Relaxed);
+    let p2 = flight::EXITS_PERMITTED.at(1).load(Ordering::Relaxed);
+    let r1g = flight::EXITS_REFUSED.at(SLOT_A).load(Ordering::Relaxed);
+    let r2g = flight::EXITS_REFUSED.at(1).load(Ordering::Relaxed);
+    let mp = flight::ELR_MOVES_PERMITTED.load(Ordering::Relaxed);
+    let mr = flight::ELR_MOVES_REFUSED.load(Ordering::Relaxed);
+    let peer_intact = flight::PEER_INTACT.load(Ordering::Relaxed) == 1;
+    let (ev_kind, ev_sid, ev_addr) = (
+        flight::EV_KIND.load(Ordering::Relaxed),
+        flight::EV_SID.load(Ordering::Relaxed),
+        flight::EV_ADDR.load(Ordering::Relaxed),
+    );
+    let sid = flight::SID.load(Ordering::Relaxed);
+    let vacuous = flight::LANDED_AT_KICK.load(Ordering::Relaxed) != 0;
+
+    let ok = phase == 5
+        && !vacuous
+        && l1 > k1
+        && permitted_span >= FLIGHT_EXIT_FLOOR
+        && refused_span >= FLIGHT_EXIT_FLOOR
+        && mp >= 2
+        && mr >= 2
+        && p1 > 0
+        && p2 > 0
+        && r1g > 0
+        && r2g > 0
+        && peer_intact
+        && ev_sid == sid
+        // MEASURED, and both are sharper than "an event happened". `F_TRANSLATION` is the
+        // *translation* fault class — the walk of this guest's own table refused the address —
+        // rather than a configuration fault such as `C_BAD_STE`, which would mean the stream was
+        // never properly bound and would make the whole arm a statement about broken setup. And the
+        // recorded address is the one the device put on the bus, which is the sharpest attribution
+        // the SMMU can give (design-lesson #70(d)): "the peer's site is unchanged" becomes "the SMMU
+        // refused exactly this address".
+        && ev_kind == u64::from(crate::smmu::EVT_F_TRANSLATION)
+        && ev_addr == flight::PEER_IPA.load(Ordering::Relaxed);
+
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: dmaflight OK: a bus master confined by a REAL guest's own DERIVED Stage-2 \
+             binding, IN FLIGHT ACROSS GUEST EXECUTION — the permitted transfer to {:#x} was kicked \
+             at exit {k1} with its target untouched and landed by exit {l1}, {permitted_span} \
+             entries to EL2 later, {p1} of them from dom {} and {p2} from dom {} with the guest PC \
+             moving on {mp} of them; the SAME device then asked for {:#x} in the PEER's window and \
+             was REFUSED across a further {refused_span} entries ({r1g}/{r2g} per guest, {mr} PC \
+             moves), the SMMU logging kind {ev_kind:#x} for StreamID {ev_sid} at {ev_addr:#x} and \
+             the peer's landing site intact. The stream table was never written by this code: one \
+             DeviceAssign, then re-derived from the model on every one of those dispatches \
+             (in flight across guest execution — NOT wall-clock concurrency; see this function's docs)",
+            flight::OWN_IPA.load(Ordering::Relaxed),
+            slot_dom(SLOT_A),
+            slot_dom(1),
+            flight::PEER_IPA.load(Ordering::Relaxed),
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: dmaflight FAIL: phase={phase} landed_at_kick={vacuous} kick1={k1} land1={l1} \
+             permitted_span={permitted_span} kick2={k2} retire2={r2} refused_span={refused_span} \
+             exits_permitted={p1}/{p2} exits_refused={r1g}/{r2g} elr_moves={mp}/{mr} \
+             peer_intact={peer_intact} event=(kind {ev_kind:#x}, sid {ev_sid}, addr {ev_addr:#x}) \
+             expected_sid={sid} floor={FLIGHT_EXIT_FLOOR}"
+        );
     }
 }
 
@@ -2194,10 +2304,166 @@ const CNTHP_CTL_EL2_ENABLE: u64 = 1 << 0;
 /// read-back witness is looking for.
 const CNTHP_CTL_EL2_IMASK: u64 = 1 << 1;
 
+// ── ⑲-3b — a transfer in flight ACROSS guest execution ──────────────────────────────────────────
+//
+// ⚠ **THE HONEST CLAIM, and it is narrower than the words "simultaneous DMA" suggest.** One pCPU,
+// TCG, and an `edu` engine that completes on a virtual-clock timer *between* translation blocks: at
+// the instant the copy happens, no guest instruction is mid-execution. What is true, and what
+// honest-ledger item 2(b) actually asks for, is that **the transfer was in flight across an interval
+// in which guest instructions executed** — the machine was NOT quiesced around the device, which is
+// the caveat every DMA result before this one carried. Say "in flight across guest execution", never
+// "concurrent with it".
+//
+// The state machine below lives on the exit path because that is the only place EL2 exists while a
+// guest runs. It is deliberately branch-light: one relaxed load rejects it in the steady state.
+
+/// Entries to EL2 before the first transfer is kicked. Non-zero on purpose — the guests must already
+/// be running when the device is pointed at them, so the rung is not "a device aimed at a machine
+/// that then started" but "a device aimed at a machine that was already going".
+#[cfg(feature = "smmu")]
+const FLIGHT_KICK_AFTER: u64 = 200;
+
+/// The floor each arm's progress must clear. Measured headroom is ~68,000 exits per flight, so this
+/// is four orders of magnitude clear of the real number — it is a non-vacuity floor, not a claim
+/// about the workload.
+#[cfg(feature = "smmu")]
+const FLIGHT_EXIT_FLOOR: u64 = 100;
+
+/// How often the exit path may spend an MMIO read asking whether the engine retired. Every entry
+/// would be an exit to QEMU per exit to EL2; the resolution this costs is ±64 against ~68,000.
+#[cfg(feature = "smmu")]
+const FLIGHT_RETIRE_POLL: u64 = 64;
+
+#[cfg(feature = "smmu")]
+mod flight {
+    use super::{AtomicU64, PerGuest, NUM_GUESTS};
+    /// 0 not armed · 1 armed, waiting · 2 permitted arm in flight · 3 refused arm in flight · 5 done.
+    pub(super) static PHASE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static EXITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static KICK1: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LAND1: AtomicU64 = AtomicU64::new(0);
+    pub(super) static KICK2: AtomicU64 = AtomicU64::new(0);
+    pub(super) static RETIRE2: AtomicU64 = AtomicU64::new(0);
+    /// Whether the permitted target had ALREADY changed when the transfer was kicked. Must be 0, or
+    /// "it landed" says nothing.
+    pub(super) static LANDED_AT_KICK: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PEER_INTACT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static EV_KIND: AtomicU64 = AtomicU64::new(0xff);
+    pub(super) static EV_SID: AtomicU64 = AtomicU64::new(0);
+    pub(super) static EV_ADDR: AtomicU64 = AtomicU64::new(0);
+    /// Per-guest exits taken while each arm was in flight — the plural form of "a vCPU ran".
+    pub(super) static EXITS_PERMITTED: PerGuest<AtomicU64, NUM_GUESTS> =
+        PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+    pub(super) static EXITS_REFUSED: PerGuest<AtomicU64, NUM_GUESTS> =
+        PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+    /// How often the exiting guest's `ELR_EL2` differed from the previous exit's — the PC moved, so
+    /// instructions ran. A count of exits alone would also be produced by a guest taking the same
+    /// trap forever.
+    pub(super) static ELR_MOVES_PERMITTED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static ELR_MOVES_REFUSED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LAST_ELR: AtomicU64 = AtomicU64::new(0);
+    // The handle, flattened so the exit path needs no borrow.
+    pub(super) static BAR0: AtomicU64 = AtomicU64::new(0);
+    pub(super) static SID: AtomicU64 = AtomicU64::new(0);
+    pub(super) static OWN_IPA: AtomicU64 = AtomicU64::new(0);
+    pub(super) static OWN_PA: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PEER_IPA: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PEER_PA: AtomicU64 = AtomicU64::new(0);
+}
+
+#[cfg(feature = "smmu")]
+fn flight_handle() -> crate::dmawitness::InFlight {
+    crate::dmawitness::InFlight {
+        bar0: flight::BAR0.load(Ordering::Relaxed),
+        sid: flight::SID.load(Ordering::Relaxed) as u32,
+        own_ipa: flight::OWN_IPA.load(Ordering::Relaxed),
+        own_pa: flight::OWN_PA.load(Ordering::Relaxed),
+        peer_ipa: flight::PEER_IPA.load(Ordering::Relaxed),
+        peer_pa: flight::PEER_PA.load(Ordering::Relaxed),
+    }
+}
+
+/// Record that THIS guest executed: one exit charged to its slot, and whether the PC moved.
+#[cfg(feature = "smmu")]
+fn flight_note_progress(per_guest: &PerGuest<AtomicU64, NUM_GUESTS>, moves: &AtomicU64) {
+    per_guest.at(current_slot()).fetch_add(1, Ordering::Relaxed);
+    let elr: u64;
+    // SAFETY: `ELR_EL2` is readable at EL2 and holds the address the exiting guest will resume at.
+    unsafe {
+        asm!("mrs {e}, ELR_EL2", e = out(reg) elr, options(nomem, nostack, preserves_flags));
+    }
+    if flight::LAST_ELR.swap(elr, Ordering::Relaxed) != elr {
+        moves.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// **⑲-3b's exit-path step.** Runs on every entry to EL2 from a guest.
+#[cfg(feature = "smmu")]
+fn flight_tick() {
+    let n = flight::EXITS.fetch_add(1, Ordering::Relaxed) + 1;
+    let phase = flight::PHASE.load(Ordering::Relaxed);
+    if phase == 0 || phase >= 5 {
+        return;
+    }
+    let f = flight_handle();
+    match phase {
+        // Armed, but let the guests get going first.
+        1 => {
+            if n >= FLIGHT_KICK_AFTER {
+                crate::dmawitness::inflight_kick(&f, true);
+                // Non-vacuity, read AFTER the kick and before any guest runs again: the target must
+                // still hold its sentinel, i.e. the transfer has not already happened.
+                if crate::dmawitness::inflight_landed(&f) {
+                    flight::LANDED_AT_KICK.store(1, Ordering::Relaxed);
+                }
+                flight::KICK1.store(n, Ordering::Relaxed);
+                flight::PHASE.store(2, Ordering::Relaxed);
+            }
+        }
+        // The permitted arm is in flight. `inflight_landed` is a plain read, so this is affordable
+        // on every entry and the landing is caught within one exit of happening.
+        2 => {
+            flight_note_progress(&flight::EXITS_PERMITTED, &flight::ELR_MOVES_PERMITTED);
+            if crate::dmawitness::inflight_landed(&f) {
+                flight::LAND1.store(n, Ordering::Relaxed);
+                // Straight into the refusal arm: same device, same derived binding, an IPA in the
+                // PEER's window. This re-seeds both sites, which is why LAND1 is recorded first.
+                crate::dmawitness::inflight_kick(&f, false);
+                flight::KICK2.store(n, Ordering::Relaxed);
+                flight::PHASE.store(3, Ordering::Relaxed);
+            }
+        }
+        // The refused arm is in flight. Nothing will land, so retirement is the only signal and it
+        // costs an MMIO read — polled sparsely.
+        3 => {
+            flight_note_progress(&flight::EXITS_REFUSED, &flight::ELR_MOVES_REFUSED);
+            if n.is_multiple_of(FLIGHT_RETIRE_POLL) && crate::dmawitness::inflight_retired(&f) {
+                flight::RETIRE2.store(n, Ordering::Relaxed);
+                flight::PEER_INTACT.store(
+                    u64::from(crate::dmawitness::inflight_peer_intact(&f)),
+                    Ordering::Relaxed,
+                );
+                if let Some((kind, sid, addr)) = crate::dmawitness::inflight_event() {
+                    flight::EV_KIND.store(u64::from(kind), Ordering::Relaxed);
+                    flight::EV_SID.store(u64::from(sid), Ordering::Relaxed);
+                    flight::EV_ADDR.store(addr, Ordering::Relaxed);
+                }
+                flight::PHASE.store(5, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Record that EL2 has just been entered from a guest, and charge the interval to whoever held the
 /// pCPU (③-b2b-ii-e). Called first thing in both Linux-mode handlers, which between them are every
 /// entry to EL2 on this path.
+///
+/// ⑲-3b hangs its exit-path step here for exactly that reason: this is every entry to EL2, so it is
+/// the one place that can observe a transfer while a guest is the thing running.
 fn note_el2_entry() {
+    #[cfg(feature = "smmu")]
+    flight_tick();
     let now = {
         use hv_hal::TimeSource;
         crate::time::GenericTimer.now()
@@ -2943,6 +3209,8 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     report_tick_deferral(uart);
     report_per_guest_state(uart);
     report_dma_pad(uart);
+    #[cfg(feature = "smmu")]
+    report_dma_inflight(uart);
     if (0..NUM_GUESTS).all(|s| retirement_of(s) == Retirement::PoweredOff) {
         let _ = writeln!(
             uart,
@@ -5526,9 +5794,10 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // be pointed at one. Here and not later: nothing is executing yet, so writing the positive
     // control's sentinel into dom 1's RAM cannot disturb a running kernel.
     //
-    // ⚠ **This is CONFINEMENT, not SIMULTANEITY.** Honest-ledger item 2(b) stays open: no vCPU runs
-    // while this device DMAs. What changes is WHOSE map confines it — a real guest's proven image
-    // rather than apparatus built for the test.
+    // ⚠ **This rung is CONFINEMENT, not SIMULTANEITY** — nothing runs while THIS device DMAs. What
+    // it changes is WHOSE map confines it: a real guest's proven image rather than apparatus built
+    // for the test. Honest-ledger item 2(b) is closed a few lines below by ⑲-3b, which arms a second
+    // transfer that is deliberately still in flight when the `eret` happens.
     //
     // ⑲-3a: both targets are now the guests' **reserved landing pads**. They used to be
     // `guest_ram_base(slot) + 0x0800_0000` — a hand-picked address chosen for being above the blobs,
@@ -5553,6 +5822,37 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // what EL2 put there. Any EL2 write to a pad added below this line silently turns the power-off
     // check into a check of that write instead.
     seed_dma_pads(uart);
+
+    // ★★ ⑲-3b — ARM the in-flight observation. One `DeviceAssign` through the proven dispatch; the
+    // kick itself waits until the guests have been running for `FLIGHT_KICK_AFTER` exits.
+    //
+    // The targets are the SECOND page of each guest's reserved pad. The base holds ⑲-3a's sentinel
+    // and `report_dma_pad` still checks it, so the two witnesses share the pad without sharing an
+    // address.
+    #[cfg(feature = "smmu")]
+    {
+        let l1_peer = hv_s2::arm64::vttbr_table(vttbr[1]);
+        match crate::dmawitness::inflight_arm(
+            uart,
+            hv,
+            slot_dom(SLOT_A),
+            vttbr[SLOT_A],
+            l1_peer,
+            dma_pad_ipa(SLOT_A) + 0x1000,
+            dma_pad_ipa(1) + 0x1000,
+        ) {
+            Some(f) => {
+                flight::BAR0.store(f.bar0, Ordering::Relaxed);
+                flight::SID.store(u64::from(f.sid), Ordering::Relaxed);
+                flight::OWN_IPA.store(f.own_ipa, Ordering::Relaxed);
+                flight::OWN_PA.store(f.own_pa, Ordering::Relaxed);
+                flight::PEER_IPA.store(f.peer_ipa, Ordering::Relaxed);
+                flight::PEER_PA.store(f.peer_pa, Ordering::Relaxed);
+                flight::PHASE.store(1, Ordering::Relaxed);
+            }
+            None => crate::park(),
+        }
+    }
 
     // ③-b2b-i put guest A's vCPU under hv-core's REAL scheduler before it ever ran, so the
     // preemption at each timer tick is a pair of transitions against a model that already has it

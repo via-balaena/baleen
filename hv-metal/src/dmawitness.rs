@@ -1400,10 +1400,16 @@ fn fault_at(e: &Option<smmu::SmmuEvent>, kind: u8, sid: u32, asked: u64) -> bool
 /// Called once `VTTBR` holds both images and before the `eret` into guest A. The tables are real and
 /// final; nothing is executing yet.
 ///
-/// ⚠ **So this is CONFINEMENT, not SIMULTANEITY.** Honest-ledger item 2(b) — *"the two consumers are
-/// not simultaneous; no vCPU runs while the device DMAs"* — is **NOT** closed by this rung and must
-/// not be read as closed. What is closed is that the device is confined by a *real guest's* proven
-/// map rather than a synthetic one.
+/// ⚠ **So THIS rung is CONFINEMENT, not SIMULTANEITY.** What it closes is that the device is
+/// confined by a *real guest's* proven map rather than a synthetic one. Honest-ledger item 2(b) —
+/// *"the two consumers are not simultaneous; no vCPU runs while the device DMAs"* — is not closed
+/// here, and this witness must not be read as closing it.
+///
+/// **⑲-3b closes it, in [`inflight_arm`] and `linux::report_dma_inflight`**, by observing a transfer
+/// in flight across guest execution. Note that ⑲-3b could NOT reuse this function's
+/// `bind_stream_stage2`: a hand-poked STE does not survive a dispatch, because rung 4b re-derives the
+/// stream table from the model every time. This one gets away with it only because nothing
+/// dispatches between its bind and its unbind.
 ///
 /// ## Why the targets are where they are, and the hazard that chose them
 ///
@@ -1511,4 +1517,155 @@ pub(crate) fn witness_real_guest(
         );
         crate::park();
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ⑲-3b — A TRANSFER IN FLIGHT ACROSS GUEST EXECUTION
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⑲-3b's handle: everything the exit path needs to drive and observe one transfer without
+/// re-deriving anything.
+///
+/// Built once, before the first `eret`, by [`inflight_arm`]. The exit path then only reads it.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+#[derive(Clone, Copy)]
+pub(crate) struct InFlight {
+    /// The `edu` device's BAR0, for the command registers.
+    pub(crate) bar0: u64,
+    /// Its StreamID, which is what the derived table binds.
+    pub(crate) sid: u32,
+    /// The IPA the permitted transfer asks for, and where its guest's table puts it.
+    pub(crate) own_ipa: u64,
+    pub(crate) own_pa: u64,
+    /// The IPA in the PEER's window the refused transfer asks for, and the PEER's landing site,
+    /// which must stay intact.
+    pub(crate) peer_ipa: u64,
+    pub(crate) peer_pa: u64,
+}
+
+/// **⑲-3b — confine the bus master by ASKING THE MODEL, not by writing an STE.**
+///
+/// ⚠ **This is the whole reason ⑲-3b could not reuse ⑲-2's `bind_stream_stage2`, and it was found by
+/// measurement, not by reading.** SMMU rung 4b makes the stream table a pure function of the model's
+/// device→domain relation, re-derived by `teardown::dispatch` **after every dispatch**. ⑲-2 pokes an
+/// STE directly and gets away with it only because nothing dispatches between its bind and its
+/// unbind. The moment guests run, the first scheduler transition re-derives the table from a model
+/// that has no device assigned, publishes all-deny, and the in-flight transfer aborts with the
+/// sentinel untouched — which is exactly what the ⑲-3b probe measured before this function existed.
+///
+/// So the binding is made by **one `DeviceAssign` through the proven dispatch**, and it then survives
+/// tens of thousands of re-derivations *because* each one recomputes the same table from the same
+/// model state. That is rung 4b's thesis finally load-bearing across a running workload.
+///
+/// Returns `None` if anything that would make the observation vacuous is missing; the caller halts.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn inflight_arm(
+    uart: &mut Pl011,
+    hv: &mut Hypervisor,
+    own: DomId,
+    vttbr_own: u64,
+    l1_peer: u64,
+    own_ipa: u64,
+    peer_ipa: u64,
+) -> Option<InFlight> {
+    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_VMID_BITS};
+
+    let bdf = pcie::find(EDU_VENDOR, EDU_DEVICE)?;
+    let bar0 = pcie::enable_with_bar0(bdf);
+    let sid = pcie::stream_id(bdf);
+
+    let l1_own = vttbr_table(vttbr_own);
+    let vmid_own = vttbr_vmid(vttbr_own, BALEEN_VMID_BITS);
+    let own_pa = crate::stage2::walk_stage2(l1_own, own_ipa).map(|r| r.pa)?;
+    let peer_pa = crate::stage2::walk_stage2(l1_peer, peer_ipa).map(|r| r.pa)?;
+    // The refusal arm's premise: this guest's own image maps NOTHING at the peer's IPA.
+    if crate::stage2::walk_stage2(l1_own, peer_ipa).is_some() {
+        let _ = writeln!(
+            uart,
+            "baleen: dmaflight FAIL: this guest's image maps {peer_ipa:#x} after all, so the refusal arm would be vacuous"
+        );
+        return None;
+    }
+
+    // ── ONE HYPERCALL, and no hardware call at all. ──────────────────────────────────────────────
+    if let Err(e) = crate::teardown::dispatch(
+        hv,
+        DOM0,
+        HvCall::DeviceAssign {
+            dev: DEV_EDU,
+            to: own,
+        },
+    ) {
+        let _ = writeln!(
+            uart,
+            "baleen: dmaflight FAIL: the model REFUSED DeviceAssign{{dev {DEV_EDU} -> domain {own}}}: {e:?}"
+        );
+        return None;
+    }
+
+    // READ BACK what the derivation published, and require it to be this guest's own map. Without
+    // this the rung would be asserting that a hypercall returned Ok.
+    let derived = smmu::published_binding(sid);
+    let matches = derived.is_some_and(|b| b.s2ttb == l1_own && b.vmid == vmid_own);
+    if !matches {
+        let _ = writeln!(
+            uart,
+            "baleen: dmaflight FAIL: after DeviceAssign the published table does not bind StreamID {sid} to domain {own}'s own map (wanted S2TTB={l1_own:#x} VMID={vmid_own}, got S2TTB={:#x} VMID={})",
+            derived.map_or(0, |b| b.s2ttb),
+            derived.map_or(0, |b| b.vmid),
+        );
+        return None;
+    }
+
+    Some(InFlight {
+        bar0,
+        sid,
+        own_ipa,
+        own_pa,
+        peer_ipa,
+        peer_pa,
+    })
+}
+
+/// Seed both landing sites and KICK one transfer, without waiting for it.
+///
+/// ⚠ `drain_events` FIRST — [`take_event`](smmu::take_event) returns the OLDEST record, and by this
+/// point rungs 1–2 and ⑲-2 have produced several. A ⑲-3b probe read one of theirs and drew the wrong
+/// conclusion from it; that is what this line is for.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn inflight_kick(f: &InFlight, permitted: bool) {
+    smmu::drain_events();
+    poke(f.own_pa, SENTINEL_MAGIC);
+    poke(f.peer_pa, SENTINEL_MAGIC);
+    let issued = if permitted { f.own_ipa } else { f.peer_ipa };
+    mmio_write64(f.bar0, EDU_REG_DMA_SRC, EDU_DMA_BUF);
+    mmio_write64(f.bar0, EDU_REG_DMA_DST, issued);
+    mmio_write64(f.bar0, EDU_REG_DMA_CNT, 8);
+    mmio_write64(f.bar0, EDU_REG_DMA_CMD, EDU_DMA_RUN | EDU_DMA_TO_RAM);
+}
+
+/// Whether the permitted transfer has reached memory. A plain read — no exit to QEMU — so the exit
+/// path can afford this on **every** entry to EL2.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn inflight_landed(f: &InFlight) -> bool {
+    peek(f.own_pa) != SENTINEL_MAGIC
+}
+
+/// Whether the peer's landing site is still untouched.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn inflight_peer_intact(f: &InFlight) -> bool {
+    peek(f.peer_pa) == SENTINEL_MAGIC
+}
+
+/// Whether the engine has retired the command. **One MMIO read, i.e. one exit to QEMU**, so the
+/// caller polls this sparsely rather than on every entry.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn inflight_retired(f: &InFlight) -> bool {
+    mmio_read64(f.bar0, EDU_REG_DMA_CMD) & EDU_DMA_RUN == 0
+}
+
+/// The SMMU's own record of the refusal, as `(kind, sid, addr)`.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+pub(crate) fn inflight_event() -> Option<(u8, u32, u64)> {
+    smmu::take_event().map(|e| (e.kind, e.sid, e.addr))
 }
