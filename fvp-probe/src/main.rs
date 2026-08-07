@@ -25,11 +25,22 @@
 //! pci.pci_smmuv3.mmu.size_of_ste_cache  = 0   "...cache holding STE structures."
 //! ```
 //!
-//! ★ **That default of zero is the gift, because it is a BUILT-IN CONTROL.** The same binary, run
-//! twice, must give opposite answers: with caching off a stale mapping is impossible, with it on a
-//! stale mapping is expected. A test that can only be run in the configuration where it passes is
-//! the failure mode this project keeps finding (design-lesson #198); here the negative arm costs one
-//! command-line flag.
+//! ⚠⚠ **"ZERO ENTRIES" IS NOT "NO CACHE", AND THIS FILE WAS FOUNDED ON THAT MISREADING.** It said
+//! here that the default of zero was a *built-in control* giving opposite answers in two runs. The
+//! model says otherwise — every `size_of_*` parameter's own description ends:
+//!
+//! > "If this is zero then it is treated as a large number ('infinite') but it is bounded"
+//!
+//! So the default is an **infinite** cache, and the arm first labelled "caching ON" (64 entries)
+//! made it *smaller*. Both arms cached, which is why the first comparison returned identical columns
+//! — the result that sent me to read the descriptions.
+//!
+//! ★ **The design principle outlived its premise, and that is why the error surfaced.** A witness
+//! runnable only where it passes is design-lesson #198's failure mode, so `run-fvp.sh --both` makes
+//! reporting one arm harder than reporting the pair; the comparison then falsified its own control
+//! before any result was written up. The arms now contrast cache **capacity** (infinite vs one
+//! entry), because no setting appears to disable the cache at all — and 2d is capacity-dependent,
+//! which is what makes it evidence rather than an observation.
 //!
 //! ## Status
 //!
@@ -488,11 +499,16 @@ fn milestone_2a() {
 
 /// Report an experiment's outcome in a form the two-run comparison can read mechanically.
 ///
-/// ★ The probe deliberately does NOT decide whether the outcome is correct. It cannot: "the mapping
-/// went stale" is the RIGHT answer with caching on and the WRONG one with caching off, and this
-/// binary is not told which run it is in. Deciding here would mean baking in an expectation that
-/// only holds for one arm — which is how a witness ends up only runnable in the configuration where
-/// it passes (design-lesson #198). The comparison belongs to whatever ran both.
+/// ★ The probe deliberately does NOT decide whether the outcome is correct. It cannot: whether "the
+/// mapping went stale" is the right answer depends on the cache capacity the model was given, and
+/// this binary is not told which arm it is running in. Deciding here would bake in an expectation
+/// that holds for one configuration — which is how a witness ends up only runnable where it passes
+/// (design-lesson #198). The comparison belongs to whatever ran both.
+///
+/// ⚠ That separation is what saved this milestone. The arms were originally believed to be
+/// caching-off vs caching-on; they were not, and the probe reporting raw observations rather than
+/// verdicts meant the identical columns were visible as data instead of being pre-judged into a
+/// pass.
 fn result(name: &str, value: &str) {
     puts("@@ RESULT ");
     puts(name);

@@ -24,11 +24,20 @@
 //! > An ATOS request is permitted to use and insert cached configuration structures and
 //! > translations, consistent with any caches that are provided for transaction translation.
 //!
-//! ⚠ **"Permitted", not "required" — so a null result proves nothing on its own.** That is exactly
-//! what the `size_of_tlb`/`size_of_ste_cache` control is for: staleness must APPEAR with caching on
-//! and VANISH with it off. If it never appears even with caching on, this implementation declined to
-//! use its caches for ATOS and a real bus master would be needed — a **detectable** outcome, not a
-//! silent one. Never report one arm alone.
+//! ⚠ **"Permitted", not "required" — so a null result would prove nothing on its own.** The control
+//! that was meant to cover this — run with the cache off, run with it on — **does not exist**: every
+//! `size_of_*` parameter reads "if this is zero then it is treated as a large number ('infinite')",
+//! so the default caches and no setting disables it.
+//!
+//! What each experiment rests on instead is its own **internal** control, which is stronger anyway
+//! because it lives inside a single run:
+//!
+//! * the post-invalidation step must show the NEW mapping — that proves the write reached memory, so
+//!   the staleness before it was genuinely a cached translation and not a failed store;
+//! * 2d's difference is between **two streams in the same run**, so it needs no second run at all;
+//! * and 2d is **capacity-dependent** — shrink the TLB to one entry and the two streams evict each
+//!   other, no staleness survives to be scoped, and the result flips. A difference that disappears
+//!   when the cache is too small to hold it is caused by the cache.
 //!
 //! ## Why it shares no code with `hv-s2`
 //!
