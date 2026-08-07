@@ -62,7 +62,8 @@ fn main() {
             let shipped = qemu_linux(true, LinuxBoot::Shipped);
             let faulted = qemu_linux(true, LinuxBoot::UnmappedFault);
             let looped = qemu_linux(true, LinuxBoot::PeerLoop);
-            shipped && faulted && looped
+            let smmu = qemu_linux(true, LinuxBoot::Smmu);
+            shipped && faulted && looped && smmu
         }
         // ⑲-1 — **LOCAL ONLY, and deliberately NOT part of `qemu-linux-test`.** See
         // `LINUX_SMMU_MARKERS`: this boot needs an SMMUv3 that implements STAGE-2, and the CI
@@ -361,6 +362,11 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
     // markers would fail for a reason that has nothing to do with the SMMU. `boot-test.sh` learned
     // that the hard way and says so; this is the same line, for the same reason.
     if boot == LinuxBoot::Smmu {
+        // EXPERIMENT: QEMU's SMMUv3 advertises stage-2 only when asked. `arm-smmuv3.stage` is "1"
+        // (stage-1 only) by DEFAULT and landed in QEMU 8.1; the runner has 8.2.2. If this is why
+        // `IDR0.S2P` read 0 on CI, the boot becomes CI-gateable and no staleness tripwire is needed.
+        args.push("-global".into());
+        args.push("arm-smmuv3.stage=2".into());
         args.push("-device".into());
         args.push("edu,dma_mask=0xffffffffff".into());
     }
