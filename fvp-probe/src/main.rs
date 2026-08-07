@@ -33,16 +33,22 @@
 //!
 //! ## Status
 //!
-//! **Milestone 1: boot, identify the exception level, read the SMMU's ID registers, exit.** It
-//! *reads* the SMMU but drives nothing — no stream table, no queues, no DMA — which is deliberate:
-//! this is the first code this project ever executed on the platform, so the toolchain (linker
-//! script, entry, load address, UART) and the SMMU's base address are proven before anything harder
-//! is written on top of them.
+//! **[`probe_main`] is the authoritative list of what this instrument does** — it is a flat
+//! sequence of reports, so reading it takes about as long as reading a summary of it would.
 //!
-//! ⚠ This paragraph used to say "nothing here touches the SMMU yet", which was **false the day it
-//! was written** — `probe_main` has always read `SMMU_IDR0`. It survived because a status line is
-//! the last thing a reader checks against the code. Caught by the standing rule that the full diff
-//! is read before every push.
+//! What holds across all of them, and is the part worth stating in prose: **everything here so far
+//! only OBSERVES.** It reads registers and walks config space; it programs no stream table, drives
+//! no queue, and issues no DMA. The first write to a device register will be milestone 2, and the
+//! order is deliberate — the toolchain, the UART, the SMMU's base address and the presence of a bus
+//! master are each established before anything is built on them.
+//!
+//! ⚠ **This section is deliberately NOT a feature list, because two consecutive ones rotted.** It
+//! said "nothing here touches the SMMU yet" while `probe_main` was reading `SMMU_IDR0` — false the
+//! day it was written. That was corrected to name the SMMU reads, and *that* went stale within the
+//! same session when the PCIe scan landed and became the largest thing in the file. **A status
+//! paragraph that enumerates what the code does is a second copy of the code, and the copy is what
+//! drifts.** Both were caught by the standing rule that the full diff is read before every push,
+//! which is evidence for the rule and against the paragraph.
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
