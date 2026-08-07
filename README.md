@@ -45,10 +45,13 @@ Most of the value here is in **not** letting these blur into one word.
 
 ### What is actually distinctive
 
-- **The proven model is wired in as a live oracle.** The metal dispatches real transitions
-  through `hv-core` and **halts if the model refuses one**. It cannot silently drift from what
-  was proved — it dies loudly instead. Most verified-systems work proves a model, hand-writes an
-  implementation, and bridges them with prose.
+- **The proven model is wired in as a live oracle.** The metal does not reimplement the model's
+  decisions — it *asks* it. Domain lifecycle, `p2m` operations and every scheduler transition
+  are dispatched into `hv-core` at runtime through a single funnel, and **a refusal halts the
+  machine**. On those transitions the metal cannot silently drift from what was proved; it dies
+  loudly instead. (Scope, precisely: this binds the metal to the model *where it dispatches*.
+  It is not a proof that the implementation refines the model — that is what seL4-style
+  functional-correctness work does and this does not.)
 - **A witness/probe discipline for the unprovable layer.** Every mechanism carries a required
   boot marker, a forbidden twin, and a **kill probe that is actually run** — and probes that
   *fail* to kill are recorded as findings rather than quietly dropped. Several designs here exist
