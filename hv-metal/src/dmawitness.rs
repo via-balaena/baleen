@@ -24,6 +24,18 @@
 //! ⑲-2; what it does not contribute there is rung 3's non-identity translation claim, which its
 //! own doc explains is unreachable on identity-mapped guests.
 //!
+//! ★★ **㉑ — and the module now drives TWO bus masters under `real-linux`.** `witness_two_masters`
+//! assigns device 0 to dom 1 and device 1 to dom 2 **in the model**, and the derivation publishes two
+//! entries with two different `S2TTB`s. The 2×2 that follows is the one thing a single device could
+//! never show: the same two addresses answered opposite ways by which requester asked. Read its doc
+//! for why that is a real gap and why the looser version of the claim — "the earlier rungs could not
+//! tell a per-stream SMMU from a global one" — is FALSE (rung 2 phase 3 already settles *permission*;
+//! what was open was *translation*).
+//!
+//! So under `real-linux` the module contributes rungs 1–2, ⑲-2, ⑲-3b's in-flight arms, and ㉑'s
+//! matrix; under `not(real-linux)` it contributes rungs 1–4b. **No configuration runs all of them**,
+//! which is why the per-config marker lists in `xtask` differ.
+//!
 //! ## Why QEMU's `edu` device
 //!
 //! The natural candidate was `virtio-blk-pci`, but driving virtio means a virtqueue, descriptor rings,
@@ -427,9 +439,7 @@ fn rung2(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
     // same reason it cannot name a physical address (design-lesson #14e). This one line is the
     // device-axis twin of `stage2::frame_ipa`, and it is handed to the stream table rather than
     // recomputed anywhere, so there is one derivation of it (design-lesson #14c).
-    let mut stream_of = [0u32; crate::NUM_DEVICES];
-    stream_of[DEV_EDU as usize] = sid;
-    let setup = smmu::install_stream_table(stream_of);
+    let setup = smmu::install_stream_table(stream_map(uart));
 
     // ── Phase 1: through-STE positive control ────────────────────────────────────────────────────
     let bound = smmu::bind_stream_bypass(sid);
@@ -621,10 +631,44 @@ const F_B_RW: Mfn = 5;
 #[cfg(feature = "smmu")]
 const F_HOLE: Mfn = 6;
 
-/// The model's token for the one bus master this machine has. `hv-core` knows it as an opaque
-/// index and nothing more; [`rung2`] maps it to [`pcie::stream_id`]'s StreamID exactly once.
+/// The model's token for the FIRST bus master — the only one on the synthetic SMMU machine, and
+/// device 0 of two on the real-Linux one (㉑). `hv-core` knows it as an opaque index and nothing
+/// more; [`stream_map`] is the single place any `DevId` becomes a StreamID.
 #[cfg(feature = "smmu")]
 const DEV_EDU: hv_core::device::DevId = 0;
+
+/// **The one derivation of `DevId → StreamID`, for every device the model carries.**
+///
+/// `hv-core` names its bus masters `DevId 0..NUM_DEVICES` and can say nothing else about them — no
+/// BDF, no RequesterID, no StreamID — for the same reason it cannot name a physical address
+/// (design-lesson #14e). This function is the device-axis twin of `stage2::frame_ipa`, and the map
+/// is handed to the stream table rather than recomputed anywhere (design-lesson #14c).
+///
+/// **`DevId i` IS the i-th `edu` in ascending PCIe slot order**, which makes the map injective by
+/// construction — the premise rung 4a's exclusivity rests on, and which
+/// `a_map_that_aliases_two_devices_onto_one_entry_is_refused` proves the builder enforces.
+///
+/// Halts if the machine has fewer devices than the model claims. A model carrying a token no
+/// hardware answers to would derive a stream-table entry for a StreamID nothing can present, and
+/// every assertion about that device would be vacuously true.
+#[cfg(feature = "smmu")]
+fn stream_map(uart: &mut Pl011) -> [u32; crate::NUM_DEVICES] {
+    let mut map = [0u32; crate::NUM_DEVICES];
+    for (i, slot) in map.iter_mut().enumerate() {
+        match pcie::find_nth(EDU_VENDOR, EDU_DEVICE, i) {
+            Some(bdf) => *slot = pcie::stream_id(bdf),
+            None => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: smmu FAIL: the model carries {} bus master(s) but this machine has only {i}; a DevId nothing answers to makes every claim about it vacuous; halting",
+                    crate::NUM_DEVICES
+                );
+                crate::park();
+            }
+        }
+    }
+    map
+}
 
 /// The magic at the address the device **asks for** (the IPA, read as a raw physical address).
 ///
@@ -1668,4 +1712,232 @@ pub(crate) fn inflight_retired(f: &InFlight) -> bool {
 #[cfg(all(feature = "smmu", feature = "real-linux"))]
 pub(crate) fn inflight_event() -> Option<(u8, u32, u64)> {
     smmu::take_event().map(|e| (e.kind, e.sid, e.addr))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// ㉑ — TWO BUS MASTERS, AND THE TABLE THAT TELLS THEM APART
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// **㉑ — two live requesters, two DIFFERENT Stage-2 images, and the same address answered both
+/// ways depending on WHICH device asked.**
+///
+/// ## The gap this closes, stated precisely because a looser version of it is false
+///
+/// It is tempting to say the earlier rungs could not tell a per-stream SMMU from a global one. They
+/// can: [`rung2`]'s phase 3 binds a permissive STE at a *neighbouring* StreamID and the device is
+/// still aborted, naming its own — so **permission** is witnessed per-stream, and a stream-blind
+/// SMMU would fail that phase.
+///
+/// What no rung has had is **two live requesters translating through two different `S2TTB`s at
+/// once**. Phase 3 uses *bypass* entries, and every other DMA witness — rungs 3 and 4b, ⑲-2, ⑲-3b —
+/// drives a single device. An SMMU that honoured per-stream *permission* while applying one global
+/// *translation* (say, whichever `S2TTB` was programmed last) would pass every one of them. Since
+/// the entire confinement story is a claim about **which tables a device walks**, that is the
+/// assumption most worth witnessing and the one that was still resting on the fixture's shape.
+///
+/// ## The discriminator
+///
+/// | | dom {A}'s pad | dom {B}'s pad |
+/// |---|---|---|
+/// | device 0 (StreamID a) | **lands** | **refused** |
+/// | device 1 (StreamID b) | **refused** | **lands** |
+///
+/// The diagonal is the content: *the same two addresses, opposite answers, decided by the
+/// requester.* No single global translation can produce that table — the two rows contradict each
+/// other unless the walk really is selected per stream.
+///
+/// ## The release arm, which one device also could not have
+///
+/// Releasing the only bus master leaves the table denying every stream, so "this device was
+/// released" and "the table denies everything" are the same observation. With two, releasing device
+/// 0 must deny **exactly one** stream and leave device 1 reaching its own domain untouched. That is
+/// the biconditional of rung 4b — *the table permits a stream iff the model assigns its device* —
+/// finally observable in the direction where a stuck-at-deny table would be caught.
+///
+/// Runs at the quiesced moment (after emission, before the first `eret`), like ⑲-2: the timing
+/// question is ⑲-3b's and is already closed for device 0. Both devices are RELEASED on the way out,
+/// so the machine ⑲-3b arms afterwards is the one it expects.
+#[cfg(all(feature = "smmu", feature = "real-linux"))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "two domains x (DomId, VTTBR, pad IPA) plus the uart and the hypervisor; bundling them \
+              into a struct would put the two guests' fields side by side in one value, which is \
+              exactly the confusion the pairwise arguments make impossible to write by accident"
+)]
+pub(crate) fn witness_two_masters(
+    uart: &mut Pl011,
+    hv: &mut Hypervisor,
+    dom_a: DomId,
+    dom_b: DomId,
+    vttbr_a: u64,
+    vttbr_b: u64,
+    pad_a: u64,
+    pad_b: u64,
+) {
+    use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_VMID_BITS};
+
+    const DEV_A: hv_core::device::DevId = 0;
+    const DEV_B: hv_core::device::DevId = 1;
+
+    let fail = |uart: &mut Pl011, what: &str| -> ! {
+        let _ = writeln!(uart, "baleen: twomasters FAIL: {what}; halting");
+        crate::park()
+    };
+
+    let (Some(bdf_a), Some(bdf_b)) = (
+        pcie::find_nth(EDU_VENDOR, EDU_DEVICE, 0),
+        pcie::find_nth(EDU_VENDOR, EDU_DEVICE, 1),
+    ) else {
+        fail(uart, "this machine does not present two edu bus masters");
+    };
+    let (bar_a, bar_b) = (pcie::enable_with_bar0(bdf_a), pcie::enable_with_bar0(bdf_b));
+    let (sid_a, sid_b) = (pcie::stream_id(bdf_a), pcie::stream_id(bdf_b));
+    if sid_a == sid_b || bar_a == bar_b {
+        fail(
+            uart,
+            "the two devices did not come out distinct (StreamID or BAR0 collision)",
+        );
+    }
+
+    let (l1_a, l1_b) = (vttbr_table(vttbr_a), vttbr_table(vttbr_b));
+    let (vmid_a, vmid_b) = (
+        vttbr_vmid(vttbr_a, BALEEN_VMID_BITS),
+        vttbr_vmid(vttbr_b, BALEEN_VMID_BITS),
+    );
+    let (Some(pa_a), Some(pa_b)) = (
+        crate::stage2::walk_stage2(l1_a, pad_a).map(|r| r.pa),
+        crate::stage2::walk_stage2(l1_b, pad_b).map(|r| r.pa),
+    ) else {
+        fail(uart, "a guest's own image maps nothing at its landing pad");
+    };
+    // The refusals' premise: neither image maps the OTHER's pad.
+    if crate::stage2::walk_stage2(l1_a, pad_b).is_some()
+        || crate::stage2::walk_stage2(l1_b, pad_a).is_some()
+    {
+        fail(
+            uart,
+            "a guest's image maps its peer's pad, so a refusal arm would be vacuous",
+        );
+    }
+
+    // ── Assign BOTH, in the model. Two hypercalls; no hardware call at all. ──────────────────────
+    for (dev, to) in [(DEV_A, dom_a), (DEV_B, dom_b)] {
+        if crate::teardown::dispatch(hv, DOM0, HvCall::DeviceAssign { dev, to }).is_err() {
+            fail(uart, "the model refused a DeviceAssign");
+        }
+    }
+
+    // ── The derivation published TWO entries, and they must DIFFER. ──────────────────────────────
+    // This is the configuration the rung exists to create, so it is checked before anything is
+    // transferred: if both streams resolved to one S2TTB, the matrix below would be measuring a
+    // machine that cannot distinguish them and every "refused" would have a duller explanation.
+    let (Some(bind_a), Some(bind_b)) = (
+        smmu::published_binding(sid_a),
+        smmu::published_binding(sid_b),
+    ) else {
+        fail(
+            uart,
+            "the derivation did not publish an entry for both StreamIDs",
+        );
+    };
+    let derived_apart = bind_a.s2ttb == l1_a
+        && bind_a.vmid == vmid_a
+        && bind_b.s2ttb == l1_b
+        && bind_b.vmid == vmid_b
+        && bind_a.s2ttb != bind_b.s2ttb
+        && bind_a.vmid != bind_b.vmid;
+    if !derived_apart {
+        fail(
+            uart,
+            "the two published entries are not each their own domain's map",
+        );
+    }
+
+    // ── The 2x2. Each cell seeds BOTH pads, so "unchanged" is never a stale read. ────────────────
+    let cell = |issued: u64, bar: u64| -> (bool, bool, Option<(u8, u32, u64)>) {
+        smmu::drain_events();
+        poke(pa_a, SENTINEL_MAGIC);
+        poke(pa_b, SENTINEL_MAGIC);
+        let retired = trigger_dma(bar, issued);
+        let landed_a = peek(pa_a) != SENTINEL_MAGIC;
+        let landed_b = peek(pa_b) != SENTINEL_MAGIC;
+        let ev = smmu::take_event().map(|e| (e.kind, e.sid, e.addr));
+        // Only the cell's own target may have moved; the other pad is a second sentinel, so a
+        // transfer that landed in the WRONG guest is caught rather than read as a plain refusal.
+        let _ = retired;
+        (landed_a, landed_b, ev)
+    };
+
+    let (a_own_a, a_own_b, a_own_ev) = cell(pad_a, bar_a);
+    let a_reaches_own = a_own_a && !a_own_b && a_own_ev.is_none();
+
+    let (a_peer_a, a_peer_b, a_peer_ev) = cell(pad_b, bar_a);
+    let a_refused_peer = !a_peer_a
+        && !a_peer_b
+        && matches!(a_peer_ev, Some((k, s, addr))
+            if k == smmu::EVT_F_TRANSLATION && s == sid_a && addr == pad_b);
+
+    let (b_own_a, b_own_b, b_own_ev) = cell(pad_b, bar_b);
+    let b_reaches_own = b_own_b && !b_own_a && b_own_ev.is_none();
+
+    let (b_peer_a, b_peer_b, b_peer_ev) = cell(pad_a, bar_b);
+    let b_refused_peer = !b_peer_a
+        && !b_peer_b
+        && matches!(b_peer_ev, Some((k, s, addr))
+            if k == smmu::EVT_F_TRANSLATION && s == sid_b && addr == pad_a);
+
+    // ── The release arm: deny EXACTLY ONE stream. ────────────────────────────────────────────────
+    if crate::teardown::dispatch(
+        hv,
+        DOM0,
+        HvCall::DeviceRelease {
+            dev: DEV_A,
+            from: dom_a,
+        },
+    )
+    .is_err()
+    {
+        fail(uart, "the model refused DeviceRelease for device 0");
+    }
+    let (ra_a, ra_b, ra_ev) = cell(pad_a, bar_a);
+    let released_a_denied = !ra_a
+        && !ra_b
+        && matches!(ra_ev, Some((k, s, _)) if k == smmu::EVT_C_BAD_STE && s == sid_a);
+    let (rb_a, rb_b, rb_ev) = cell(pad_b, bar_b);
+    let survivor_b_ok = rb_b && !rb_a && rb_ev.is_none();
+
+    // Leave the machine as ⑲-3b expects to find it.
+    if crate::teardown::dispatch(
+        hv,
+        DOM0,
+        HvCall::DeviceRelease {
+            dev: DEV_B,
+            from: dom_b,
+        },
+    )
+    .is_err()
+    {
+        fail(uart, "the model refused DeviceRelease for device 1");
+    }
+    let quiesced = smmu::denies_everything();
+
+    let ok = a_reaches_own
+        && a_refused_peer
+        && b_reaches_own
+        && b_refused_peer
+        && released_a_denied
+        && survivor_b_ok
+        && quiesced;
+
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: twomasters OK: TWO live bus masters, TWO different Stage-2 images, one derivation — StreamID {sid_a} bound to dom {dom_a} (S2TTB={l1_a:#x} VMID={vmid_a}) and StreamID {sid_b} to dom {dom_b} (S2TTB={l1_b:#x} VMID={vmid_b}). Device 0 reached {pad_a:#x} and was ABORTED at {pad_b:#x}; device 1 reached {pad_b:#x} and was ABORTED at {pad_a:#x} — the SAME two addresses answered opposite ways by which device asked, which no single global translation can produce. Then DeviceRelease{{dev 0}} denied StreamID {sid_a} (C_BAD_STE) while StreamID {sid_b} still reached its own domain: the table denies EXACTLY the stream the model released, not everything"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: twomasters FAIL: sids={sid_a}/{sid_b} bars={bar_a:#x}/{bar_b:#x} derived_apart={derived_apart} a_reaches_own={a_reaches_own} a_refused_peer={a_refused_peer} b_reaches_own={b_reaches_own} b_refused_peer={b_refused_peer} released_a_denied={released_a_denied} survivor_b_ok={survivor_b_ok} quiesced={quiesced}"
+        );
+    }
 }

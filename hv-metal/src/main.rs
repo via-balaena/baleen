@@ -387,11 +387,22 @@ const _: () = assert!(
 
 /// DMA-capable devices in the model — the SMMU arc's rung-4 assignment axis.
 ///
-/// One, because this machine has exactly one bus master baleen drives (QEMU's `edu`, at PCIe
-/// slot 1 ⇒ StreamID 8) and modelling devices that do not exist would put unassignable tokens in
-/// the relation the stream table is derived from. Every device boots **unassigned**, which the
-/// derivation refines to a *denying* stream-table entry — so the model's fail-closed default and
-/// the hardware's are the same default, not two that happen to agree.
+/// **The model's device population must match the MACHINE's**, which is why this is per-config
+/// rather than one number: modelling devices that do not exist would put unassignable tokens in the
+/// relation the stream table is derived from. `NUM_FRAMES` below is split for the same reason.
+/// Every device boots **unassigned**, which the derivation refines to a *denying* stream-table entry
+/// — so the model's fail-closed default and the hardware's are the same default, not two that happen
+/// to agree. Both values sit under `hv_s2::smmu::MAX_PROVEN_DEVICES`, asserted in `smmu.rs`.
+///
+/// **㉑ — TWO on the real-Linux machine**, at PCIe slots 1 and 2 ⇒ StreamIDs 8 and 16, because that
+/// is the only configuration with two real domains to assign them to. One device can show that
+/// *permission* is per-stream (rung 2 phase 3, a permissive entry at a neighbouring StreamID);
+/// showing that *translation* is per-stream needs two requesters walking two different Stage-2
+/// images at once, and that is what the second one is for.
+#[cfg(feature = "real-linux")]
+pub(crate) const NUM_DEVICES: usize = 2;
+/// One, because the synthetic SMMU machine has exactly one `edu` (PCIe slot 1 ⇒ StreamID 8).
+#[cfg(not(feature = "real-linux"))]
 pub(crate) const NUM_DEVICES: usize = 1;
 /// Machine frames in the model. `pub(crate)` so [`guest`]'s per-frame fault-record array can
 /// compile-time-assert it covers every model frame (see `guest::NFRAMES`).
