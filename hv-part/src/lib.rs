@@ -100,9 +100,9 @@ impl Partition {
     /// **Whether this partition is one the derivations below are meaningful for.**
     ///
     /// Every property in this crate is stated *given* this. It is not a defensive check but the
-    /// precondition: a partition with zero-byte frames or a window that does not fit has no
-    /// disjointness to prove, and a proof that quantified over those too would be proving something
-    /// about nonsense (and would fail, hiding the real property).
+    /// precondition: a partition with zero-length windows, or one whose windows do not fit in the
+    /// backed RAM, has no disjointness to prove — and a proof that quantified over those too would
+    /// be proving something about nonsense (and would fail, hiding the real property).
     ///
     /// `frames_per_guest * num_guests == num_sup_frames` is the **exact halving** `hv-metal`'s
     /// `const assert!` already demands: with a remainder, the top frames belong to nobody, and the
