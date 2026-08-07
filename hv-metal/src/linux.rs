@@ -2411,6 +2411,12 @@ fn flight_tick() {
                 if crate::dmawitness::inflight_landed(&f) {
                     flight::LANDED_AT_KICK.store(1, Ordering::Relaxed);
                 }
+                // KILL PROBE — TEMPORARY. Spin at EL2 until the transfer lands instead of
+                // returning to the guest. This removes exactly the thing the rung claims: guest
+                // execution during the flight. Every progress conjunct must collapse.
+                while !crate::dmawitness::inflight_landed(&f) {
+                    core::hint::spin_loop();
+                }
                 flight::KICK1.store(n, Ordering::Relaxed);
                 flight::PHASE.store(2, Ordering::Relaxed);
             }
