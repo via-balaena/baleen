@@ -196,6 +196,24 @@ fn guest_load_addrs(slot: u64) -> GuestLoad {
     }
 }
 
+/// ⑲-3a — how much of the top of each guest's window is reserved `no-map` as the DMA landing pad.
+///
+/// 2 MiB, and the size is not arbitrary: a Stage-2 block on this platform is 2 MiB, so a pad of
+/// exactly one block cannot force the emitter to split a mapping it would otherwise make whole, and
+/// the reservation cannot straddle two of them. It sits at the TOP of the window rather than
+/// anywhere else because that is the one place whose address is a function of the split alone.
+const LINUX_DMA_PAD_SIZE: u64 = 0x20_0000;
+
+/// The base of guest `slot`'s DMA landing pad — the top [`LINUX_DMA_PAD_SIZE`] of its own window.
+///
+/// Mirrors `hv-metal/src/linux.rs`'s `dma_pad_ipa`. The two derivations are checked against each
+/// other by [`render_guest_dtb`]'s substitution check plus the `dmapad` witness, which walks this
+/// address in the guest's live Stage-2 image and refuses to assert anything if it maps nothing.
+fn dma_pad_base(slot: u64) -> u64 {
+    let at = guest_load_addrs(slot);
+    at.ram_base + at.ram_size - LINUX_DMA_PAD_SIZE
+}
+
 /// Where the fault-probe node sits — an IPA in **no** window this build maps or emulates.
 ///
 /// Chosen and CHECKED against the four things that could make it inert: the emulated GIC
@@ -485,6 +503,25 @@ fn render_guest_dtb(
         (
             format!("reg = <0x00 0x{:x} 0x00 0x1000>;", peer_of(0).ram_base),
             format!("reg = <0x00 0x{:x} 0x00 0x1000>;", peer_of(slot).ram_base),
+        ),
+        // ⑲-3a: the DMA landing pad — the top `LINUX_DMA_PAD_SIZE` of this guest's own window,
+        // reserved `no-map`. Derived from `ram_base`/`ram_size` here and from the frame count in
+        // `hv-metal`, so the checked substitution below is what keeps the two derivations honest.
+        (
+            format!("dma-pad@{:x} {{", dma_pad_base(0)),
+            format!("dma-pad@{:x} {{", dma_pad_base(slot)),
+        ),
+        (
+            format!(
+                "reg = <0x00 0x{:x} 0x00 0x{:x}>;",
+                dma_pad_base(0),
+                LINUX_DMA_PAD_SIZE
+            ),
+            format!(
+                "reg = <0x00 0x{:x} 0x00 0x{:x}>;",
+                dma_pad_base(slot),
+                LINUX_DMA_PAD_SIZE
+            ),
         ),
     ];
 
@@ -1043,6 +1080,11 @@ const LINUX_MARKERS: &[&str] = &[
     // timer_forward_refused=true`. The shipped guest never fills its bank, so the probe manufactures
     // the condition; the marker is what says it really did.
     "baleen: tickdefer OK: a FULL list-register bank DEFERS the forwarded timer instead of halting",
+    // ⑲-3a — EL2's half of the landing-pad claim: the sentinel it wrote into each guest's reserved
+    // range before the first `eret` is still there after both kernels ran to userspace and powered
+    // off. On its own this is only consistent with the reservation being honoured — see the
+    // kernel-side marker below, which is the half that says Linux SAW the range.
+    "baleen: dmapad OK:",
 ];
 
 /// What the **fault-probe** boot must show, and it is the whole rung in five lines.
@@ -1261,6 +1303,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // device models / contexts / witnesses are still shared, or a handler is indexing them with the
     // wrong slot. The message names which counter leaked.
     "baleen: perguest FAIL",
+    // ⑲-3a: a guest wrote inside the range its own device tree reserves `no-map`, or the pad stopped
+    // being mapped/writable at all. Either way the DMA landing pad is not the undisturbed page the
+    // simultaneity rung is about to aim a live bus master at.
+    "baleen: dmapad FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch

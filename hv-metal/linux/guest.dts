@@ -83,6 +83,48 @@
 		reg = <0x00 0x48000000 0x00 0x1c000000>;
 	};
 
+	/*
+	 * ⑲-3a — THE DMA LANDING PAD, and the THIRD content edit this file has ever had.
+	 *
+	 * ⑲-2 confined a bus master to a real guest's own Stage-2 map, but it had to take its evidence
+	 * with the guests STOPPED: it ran after the tables were emitted and before the `eret`, precisely
+	 * so a landing DMA could not corrupt a running kernel. ⑲-3 removes that qualification, and the
+	 * moment it does, "aim at somewhere the kernel isn't" stops being available — the kernel IS
+	 * running, and every page of the window above belongs to it.
+	 *
+	 * This node is the answer, and the point is that it is a DECLARATION rather than a guess. The
+	 * range is the top 2 MiB of this guest's own half of the window: inside the memory node above and
+	 * inside Stage-2 (so a DMA here is a transfer to an address the guest genuinely owns, which is
+	 * what makes the permitted arm mean anything), and `no-map` tells Linux to keep it out of the
+	 * linear map entirely. "The kernel does not touch this page" is therefore something the machine
+	 * description SAYS, not something a boot happened to get away with.
+	 *
+	 * It is present in EVERY configuration, including the shipped one. ⑲-1 established that the SMMU
+	 * boot runs byte-identical device trees — the guests must not be able to tell they are on a
+	 * machine with an SMMU — so a pad that appeared only for the DMA boot would break that property
+	 * for the sake of the rung testing it. The cost is that every boot now reserves 2 MiB it may not
+	 * use; the benefit is that the witness below (`dmapad`) runs in all four, so "the kernel never
+	 * wrote here" is asserted against four different guest workloads instead of one.
+	 *
+	 * ⚠ THE WITNESS'S HONEST CEILING, because the two are easy to conflate: EL2 seeds a sentinel here
+	 * before the guests run and checks it at power-off. A surviving sentinel is CONSISTENT with the
+	 * kernel simply never having reached the top of a 448 MiB window, and on its own proves little.
+	 * What makes it a reservation rather than luck is the kernel's OWN log line for this node, which
+	 * `xtask` asserts as a marker: Linux says it saw the range and mapped nothing there.
+	 *
+	 * `xtask` rewrites the address per guest, exactly as it does for peer-probe.
+	 */
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		dma-pad@63e00000 {
+			reg = <0x00 0x63e00000 0x00 0x200000>;
+			no-map;
+		};
+	};
+
 	apb-pclk {
 		compatible = "fixed-clock";
 		#clock-cells = <0x00>;
