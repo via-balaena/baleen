@@ -50,6 +50,8 @@
 //! drifts.** Both were caught by the standing rule that the full diff is read before every push,
 //! which is evidence for the rule and against the paragraph.
 
+mod smmu;
+
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use core::ptr::{read_volatile, write_volatile};
@@ -362,6 +364,128 @@ fn is_if_64(is_64: bool) -> &'static str {
     }
 }
 
+/// Report one ATOS answer on a single line, tagged with what the caller expected of it.
+fn report_translation(label: &str, t: &smmu::Translation) {
+    puts("@@ ");
+    puts(label);
+    if t.timeout {
+        puts("  TIMEOUT (the SMMU never cleared GATOS_CTRL.RUN)\n");
+        return;
+    }
+    if t.fault {
+        puts("  FAULT   PAR=");
+        puthex_w(t.par, 16);
+        puts("\n");
+        return;
+    }
+    puts("  PA=");
+    puthex_w(t.pa, 16);
+    puts(" size=");
+    puthex_w(t.size, 8);
+    puts("  PAR=");
+    puthex_w(t.par, 16);
+    puts("\n");
+}
+
+/// **Milestone 2a — the through-path positive control, and the deny control beside it.**
+///
+/// ## Why these two phases come before any staleness experiment
+///
+/// SMMU rung 2 recorded the trap this is avoiding, and it is worth restating because it is the
+/// reason for the ordering rather than a general caution. **An ∀-StreamID deny result passes
+/// trivially if nothing ever reaches the stream table at all.** A mis-sized `STRTAB_BASE_CFG`, a
+/// wrong `SIDSIZE`, an STE at the wrong stride, a StreamID that is not the device's RequesterID, or
+/// `SMMUEN` never taking — every one of those yields "the translation faulted", which is
+/// indistinguishable from the property holding.
+///
+/// So the first thing that must work is a translation that **succeeds and lands where the TABLE
+/// says**, not where the caller asked. `TEST_IPA` is `0x1000_0000` and the answer must be
+/// `TARGET_A`; if the SMMU were bypassing, the answer would be `0x1000_0000` itself, which is why
+/// the two addresses are deliberately unequal.
+///
+/// Only then does phase 2's fault mean anything: a second StreamID, one the stream table leaves at
+/// `V=0`, must be refused *by the same SMMU in the same state that just answered phase 1*.
+fn milestone_2a() {
+    puts("@@ --- milestone 2a: ATOS through-path + deny control ---\n");
+
+    smmu::build_tables(smmu::L1_A, smmu::L2_A, smmu::TARGET_A);
+
+    if !smmu::bring_up() {
+        puts("@@ 2a FAIL — the SMMU did not acknowledge bring-up; nothing below is meaningful\n");
+        return;
+    }
+    puts("@@ SMMU_GERROR = ");
+    puthex_w(u64::from(smmu::gerror()), 8);
+    puts("\n");
+
+    smmu::bind(smmu::SID_A, smmu::L1_A, smmu::VMID_A);
+    puts("@@ STE[f0].S2TTB read back = ");
+    puthex_w(smmu::ste_s2ttb(smmu::SID_A), 16);
+    puts("\n");
+
+    // What is actually in memory at the addresses the STE names. Read back, not recomputed:
+    // recomputing would only show the same expression evaluating twice.
+    let (l1a, l1d, l2a, l2d) = smmu::descriptors(smmu::L1_A, smmu::L2_A);
+    puts("@@ L1[");
+    puthex_w(l1a, 8);
+    puts("] = ");
+    puthex_w(l1d, 16);
+    puts("\n@@ L2[");
+    puthex_w(l2a, 8);
+    puts("] = ");
+    puthex_w(l2d, 16);
+    puts("\n");
+
+    // Phase 1 — the positive control. MUST succeed, and MUST answer TARGET_A.
+    let t = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    report_translation("2a.1 bound   sid=f0 ipa=0x10000000 expect PA=0x82000000", &t);
+    let (rsid, raddr) = smmu::atos_request_readback();
+    puts("@@      request read back: GATOS_SID=");
+    puthex_w(rsid, 16);
+    puts(" GATOS_ADDR=");
+    puthex_w(raddr, 16);
+    puts("\n");
+
+    // ★ THE WALK PROBE, and it is what proved the mechanism was right while the decode was wrong.
+    // ATOS answers with the TRANSLATION, not with a byte address, so every IPA inside the mapped
+    // 2 MiB block must return the SAME block — identical `PA` and `size`. The block boundary is
+    // where the answer must change, and it must change to a fault, because nothing maps the next
+    // block. If `+0x200000` did not fault, the walk would not be using this code's table at all and
+    // every other reading would be worthless.
+    let p1 = smmu::translate(smmu::SID_A, smmu::TEST_IPA + 0x1000);
+    report_translation("2a.p +0x1000    (inside the block, expect the SAME block)", &p1);
+    let p2 = smmu::translate(smmu::SID_A, smmu::TEST_IPA + 0x10_0000);
+    report_translation("2a.p +0x100000  (inside the block, expect the SAME block)", &p2);
+    let p3 = smmu::translate(smmu::SID_A, smmu::TEST_IPA + 0x20_0000);
+    report_translation("2a.p +0x200000  (NEXT block, unmapped, expect FAULT)    ", &p3);
+    let walk_ok = p1.pa == smmu::TARGET_A
+        && p2.pa == smmu::TARGET_A
+        && p1.size == 0x20_0000
+        && p3.fault
+        && !p3.timeout;
+
+    // Phase 2 — the deny control, on a StreamID left at V=0.
+    let d = smmu::translate(smmu::SID_B, smmu::TEST_IPA);
+    report_translation("2a.2 unbound sid=f1 ipa=0x10000000 expect FAULT           ", &d);
+
+    // The floor requires ALL of: the bound stream translates, to exactly the frame the table names,
+    // at exactly the block size the descriptor programmed, with the block boundary in the right
+    // place, and an unbound stream refused by the same SMMU in the same state.
+    let ok = !t.fault
+        && !t.timeout
+        && t.pa == smmu::TARGET_A
+        && t.size == 0x20_0000
+        && walk_ok
+        && d.fault
+        && !d.timeout;
+    puts(if ok {
+        "@@ 2a OK — the SMMU translates to the frame the table names, at the size the descriptor \
+         programmed, and refuses an unbound stream\n"
+    } else {
+        "@@ 2a FAIL — the floor is not established; do NOT interpret any staleness result\n"
+    });
+}
+
 extern "C" fn probe_main() -> ! {
     uart_init();
     puts("\n@@ FVPPROBE-BEGIN\n");
@@ -433,6 +557,7 @@ extern "C" fn probe_main() -> ! {
     puts("\n");
 
     pcie_scan();
+    milestone_2a();
 
     puts("@@ FVPPROBE-END\n");
     semihosting_exit()

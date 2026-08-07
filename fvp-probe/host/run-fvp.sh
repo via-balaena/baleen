@@ -39,6 +39,14 @@ for arg in "$@"; do
         --cache-on)     CACHE="on" ;;
         --cache-off)    CACHE="off" ;;
         --list-params)  MODE="list-params" ;;
+        # ⚠ These two exist because Arm's BUNDLED documentation does NOT carry the
+        # `SMMUv3TestEngine`'s register map — §4.7.36 gives its ports and CADI targets and stops —
+        # and Arm's web documentation renders client-side, so it cannot be fetched either. The model
+        # is its own most authoritative source about itself, and interrogating it through supported
+        # CLI introspection is squarely permitted (§2.8 covers the documentation; §2.4's ban on
+        # reverse engineering is why `strings` on the binary is NOT the route taken).
+        --list-regs)      MODE="list-regs" ;;
+        --list-instances) MODE="list-instances" ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
@@ -104,11 +112,12 @@ if [[ "$CACHE" == "on" ]]; then
     )
 fi
 
-if [[ "$MODE" == "list-params" ]]; then
-    FVP_ARGS+=(--list-params)
-else
-    FVP_ARGS+=(-a /probe.elf --cyclelimit "$CYCLELIMIT" --stat)
-fi
+case "$MODE" in
+    list-params)    FVP_ARGS+=(--list-params) ;;
+    list-regs)      FVP_ARGS+=(--list-regs) ;;
+    list-instances) FVP_ARGS+=(--list-instances) ;;
+    *)              FVP_ARGS+=(-a /probe.elf --cyclelimit "$CYCLELIMIT" --stat) ;;
+esac
 
 # ─── the payload archive ─────────────────────────────────────────────────────────────────────────
 
@@ -162,10 +171,10 @@ wait "$QEMU_PID" 2>/dev/null || true
 
 # ─── report ──────────────────────────────────────────────────────────────────────────────────────
 
-if [[ "$MODE" == "list-params" ]]; then
-    echo "run-fvp: parameters written to $LOG"
-    grep -i "smmu" "$LOG" | head -60 || true
-    echo "  (full list: $LOG)"
+if [[ "$MODE" != "probe" ]]; then
+    echo "run-fvp: $MODE output written to $LOG ($(wc -l < "$LOG" | tr -d ' ') lines)"
+    grep -i "smmu" "$LOG" | head -40 || true
+    echo "  (full output: $LOG)"
     exit 0
 fi
 
