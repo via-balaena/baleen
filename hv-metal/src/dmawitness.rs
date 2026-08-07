@@ -7,6 +7,14 @@
 //! be a device that actually performs it, so this module builds the smallest possible one and then
 //! observes whether its writes land.
 //!
+//! ⚠ **⑲-1 — "rungs 1–3" IS NOW CONFIGURATION-DEPENDENT, and the title is kept only because the
+//! `smmu` configuration is still where this module is fully exercised.** Rungs 1 and 2 are about the
+//! SMMU itself and run everywhere the feature is on, including alongside real Linux guests. **Rungs 3
+//! and 4 are about a DOMAIN's `p2m` and run only under `not(real-linux)`** — they must own the
+//! machine's domains and frames, and in a real-Linux build both collide (model frames land inside the
+//! 448-frame super partition; `DOM_A`/`DOM_B` are the real guests' own ids). The full reasoning, and
+//! the measurement that forced it, is on the `rung3` call in `witness` below.
+//!
 //! ## Why QEMU's `edu` device
 //!
 //! The natural candidate was `virtio-blk-pci`, but driving virtio means a virtqueue, descriptor rings,
