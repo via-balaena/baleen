@@ -427,9 +427,7 @@ fn rung2(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
     // same reason it cannot name a physical address (design-lesson #14e). This one line is the
     // device-axis twin of `stage2::frame_ipa`, and it is handed to the stream table rather than
     // recomputed anywhere, so there is one derivation of it (design-lesson #14c).
-    let mut stream_of = [0u32; crate::NUM_DEVICES];
-    stream_of[DEV_EDU as usize] = sid;
-    let setup = smmu::install_stream_table(stream_of);
+    let setup = smmu::install_stream_table(stream_map(uart));
 
     // ── Phase 1: through-STE positive control ────────────────────────────────────────────────────
     let bound = smmu::bind_stream_bypass(sid);
@@ -625,6 +623,39 @@ const F_HOLE: Mfn = 6;
 /// index and nothing more; [`rung2`] maps it to [`pcie::stream_id`]'s StreamID exactly once.
 #[cfg(feature = "smmu")]
 const DEV_EDU: hv_core::device::DevId = 0;
+
+/// **The one derivation of `DevId → StreamID`, for every device the model carries.**
+///
+/// `hv-core` names its bus masters `DevId 0..NUM_DEVICES` and can say nothing else about them — no
+/// BDF, no RequesterID, no StreamID — for the same reason it cannot name a physical address
+/// (design-lesson #14e). This function is the device-axis twin of `stage2::frame_ipa`, and the map
+/// is handed to the stream table rather than recomputed anywhere (design-lesson #14c).
+///
+/// **`DevId i` IS the i-th `edu` in ascending PCIe slot order**, which makes the map injective by
+/// construction — the premise rung 4a's exclusivity rests on, and which
+/// `a_map_that_aliases_two_devices_onto_one_entry_is_refused` proves the builder enforces.
+///
+/// Halts if the machine has fewer devices than the model claims. A model carrying a token no
+/// hardware answers to would derive a stream-table entry for a StreamID nothing can present, and
+/// every assertion about that device would be vacuously true.
+#[cfg(feature = "smmu")]
+fn stream_map(uart: &mut Pl011) -> [u32; crate::NUM_DEVICES] {
+    let mut map = [0u32; crate::NUM_DEVICES];
+    for (i, slot) in map.iter_mut().enumerate() {
+        match pcie::find_nth(EDU_VENDOR, EDU_DEVICE, i) {
+            Some(bdf) => *slot = pcie::stream_id(bdf),
+            None => {
+                let _ = writeln!(
+                    uart,
+                    "baleen: smmu FAIL: the model carries {} bus master(s) but this machine has only {i}; a DevId nothing answers to makes every claim about it vacuous; halting",
+                    crate::NUM_DEVICES
+                );
+                crate::park();
+            }
+        }
+    }
+    map
+}
 
 /// The magic at the address the device **asks for** (the IPA, read as a raw physical address).
 ///

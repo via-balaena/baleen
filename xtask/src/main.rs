@@ -395,6 +395,14 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
         args.push("arm-smmuv3.stage=2".into());
         args.push("-device".into());
         args.push("edu,dma_mask=0xffffffffff".into());
+        // ★ ㉑ — a SECOND bus master, and it is the whole rung. QEMU puts consecutive `-device edu`s
+        // at PCIe slots 1 and 2, so their RequesterIDs — and therefore their StreamIDs — are 8 and
+        // 16 (VERIFIED with `query-pci` before this line was written: both enumerate, vendor 0x1234
+        // device 0x11e8). Two requesters is the only way to show the SMMU's *translation* is
+        // per-stream rather than merely its *permission*: with one device, "bound to dom 1's tables"
+        // and "configured for dom 1" are the same observation.
+        args.push("-device".into());
+        args.push("edu,dma_mask=0xffffffffff".into());
     }
 
     // ③-b2b-ii-b: every guest's three blobs, and the guard that they land in RAM that EXISTS.

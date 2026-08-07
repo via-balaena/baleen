@@ -39,9 +39,19 @@
 const ECAM_BASE: u64 = 0x40_1000_0000;
 
 /// The 32-bit PCIe MMIO window on QEMU `virt` (device tree `ranges`, the `0x2000000` entry: child
-/// `0x1000_0000`, size `0x2eff_0000`). BAR0 is placed at its base — there is exactly one device in
-/// the SMMU witness configuration, so no allocator is needed.
+/// `0x1000_0000`, size `0x2eff_0000`).
 const PCIE_MMIO_BASE: u32 = 0x1000_0000;
+
+/// How far apart consecutive devices' BAR0s are placed.
+///
+/// ㉑ put a SECOND bus master on this bus, and the single-device arrangement this file used to
+/// describe — "BAR0 is placed at the window's base, there is exactly one device" — would have given
+/// both of them the same MMIO address. **The fix is not an allocator but a function of the BDF**:
+/// `dev` is unique on the bus by construction, so basing the address on it makes a collision
+/// *unrepresentable* rather than merely avoided by whoever calls next. 16 MiB is far above `edu`'s
+/// 1 MiB BAR (BARs must be naturally aligned to their size, so the stride must dominate it), and
+/// even slot 31 lands at `0x2f00_0000`, inside the 752 MiB window.
+const PCIE_MMIO_STRIDE: u32 = 0x0100_0000;
 
 /// Config-space offsets used here (PCI 3.0 header type 0).
 const CFG_VENDOR_DEVICE: u64 = 0x00;
@@ -109,11 +119,24 @@ fn cfg_write32(bdf: Bdf, off: u64, v: u32) {
 /// An absent slot reads `0xffff_ffff` (all ones) for vendor/device — the architectural "no device
 /// responded" value, which is why the scan tests it rather than trusting a device count.
 pub(crate) fn find(vendor: u16, device: u16) -> Option<Bdf> {
+    find_nth(vendor, device, 0)
+}
+
+/// The `n`th function on bus 0 matching `vendor`/`device`, in ascending slot order.
+///
+/// ㉑ needs two of the SAME model of device — two `edu`s, which is what gives two distinct
+/// StreamIDs off one driver — so matching by ID alone stopped being enough to name one. Ascending
+/// slot order is a stable enumeration, so "device 0" and "device 1" mean the same two functions on
+/// every boot, which is what lets the model's `DevId` axis be pinned to them.
+pub(crate) fn find_nth(vendor: u16, device: u16, n: usize) -> Option<Bdf> {
     let want = (u32::from(device) << 16) | u32::from(vendor);
-    (0..32u8).map(|dev| Bdf { dev }).find(|&bdf| {
-        let id = cfg_read32(bdf, CFG_VENDOR_DEVICE);
-        id != 0xffff_ffff && id == want
-    })
+    (0..32u8)
+        .map(|dev| Bdf { dev })
+        .filter(|&bdf| {
+            let id = cfg_read32(bdf, CFG_VENDOR_DEVICE);
+            id != 0xffff_ffff && id == want
+        })
+        .nth(n)
 }
 
 /// Assign BAR0 to [`PCIE_MMIO_BASE`], enable memory decode, and enable **bus mastering** so the
@@ -123,8 +146,10 @@ pub(crate) fn find(vendor: u16, device: u16) -> Option<Bdf> {
 /// any BAR a witness device asks for, so placing it at the window base is sufficient. A general
 /// allocator is deliberately out of scope.
 pub(crate) fn enable_with_bar0(bdf: Bdf) -> u64 {
-    cfg_write32(bdf, CFG_BAR0, PCIE_MMIO_BASE);
+    // Derived from the BDF, not from a counter the caller keeps: see `PCIE_MMIO_STRIDE`.
+    let base = PCIE_MMIO_BASE + u32::from(bdf.dev) * PCIE_MMIO_STRIDE;
+    cfg_write32(bdf, CFG_BAR0, base);
     let cmd = cfg_read32(bdf, CFG_COMMAND);
     cfg_write32(bdf, CFG_COMMAND, cmd | CMD_MEM_ENABLE | CMD_BUS_MASTER);
-    u64::from(PCIE_MMIO_BASE)
+    u64::from(base)
 }
