@@ -24,27 +24,89 @@ test on a multi-year solo project.
 > `via-balaena/baleen` repository. The internal library crates (`hv-*`) are marked
 > `publish = false` and are not intended for crates.io.
 
+## What this is, honestly
+
+**A small type-1 hypervisor whose isolation core is machine-checked, and a discipline for
+evidencing the part that cannot be.**
+
+Conceptually it is **Xen-shaped**, not seL4-shaped: `hv-core`'s vocabulary is domains, grant
+tables, event channels, a p2m and a scheduler. seL4 is a different category of object — a
+microkernel you build a VMM *on top of* — and its proof is a different kind of claim.
+
+### Three tiers of evidence, kept apart on purpose
+
+Most of the value here is in **not** letting these blur into one word.
+
+| tier | what it covers | how |
+| --- | --- | --- |
+| **Proven** | the model's isolation invariants; the emitter refining the authorized leaf map | **113 Kani** harnesses (∀-values at bounded size) + **117 Verus** obligations (∀-N); ∀-address refinement over `hv-s2` |
+| **Demonstrated** | the metal | boot witnesses: two unmodified Alpine kernels, four vCPUs, one pCPU, **zero** Stage-2 device pass-through, each guest hardware-refused from its peer's RAM |
+| **Argued** | Tier-D non-interference's instantiation to concrete Baleen | prose composition over proved generic lemmas — declared, not hidden |
+
+### What is actually distinctive
+
+- **The proven model is wired in as a live oracle.** The metal dispatches real transitions
+  through `hv-core` and **halts if the model refuses one**. It cannot silently drift from what
+  was proved — it dies loudly instead. Most verified-systems work proves a model, hand-writes an
+  implementation, and bridges them with prose.
+- **A witness/probe discipline for the unprovable layer.** Every mechanism carries a required
+  boot marker, a forbidden twin, and a **kill probe that is actually run** — and probes that
+  *fail* to kill are recorded as findings rather than quietly dropped. Several designs here exist
+  because a probe refuted its own prediction.
+- **An honest ledger.** `docs/` and the commit log keep refuted hypotheses, undercounts and
+  wrong diagnoses in place, because the reasoning is the reusable part.
+
+### What it is not
+
+- **Not seL4-tier.** seL4 proves full functional correctness at roughly 20 lines of proof per
+  line of code. This is property-directed verification at closer to 0.8:1 — a deliberately
+  different bargain, buying a weaker guarantee much more cheaply, and enforcing the rest at
+  runtime. If you need seL4's guarantee, the gap *is* the point.
+- **Not feature-comparable to Xen.** No toolstack, no migration, no PV drivers, one board.
+- **Not production.** EL2 runs MMU-off and single-CPU; `hv-metal` is ~11k lines that are **not**
+  a Kani target, and every rung's docs say so where it matters.
+
+The open question this is really poking at: **how much assurance can you get for a small
+fraction of a full-verification budget, and exactly which parts do you lose?** The honest ledger
+is what makes that answerable instead of rhetorical.
+
 ## Workspace
 
-| crate           | what it is                                                                            | status |
-| --------------- | ------------------------------------------------------------------------------------- | ------ |
-| `hv-hal`        | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`)       | ✅ M1  |
-| `hv-core`       | all logic as a `no_std` library, zero `unsafe`: dispatch and state machines           | ✅ M1  |
-| `hv-sim`        | host harness — fake memory, hand-cranked clock, seeded deterministic simulation       | ✅ M1  |
-| `hv-metal`      | bare-metal binary: boot, enter EL2/VMX, the thin fenced `unsafe` core                  | 🚧 M4  |
-| `hv-fuzz`       | `cargo-fuzz` targets against the hypercall dispatcher                                  | ⏳ M2  |
-| `xtask`         | build/test automation (`cargo xtask <task>`)                                          | ✅ M1  |
+Sizes are non-comment lines, measured at the commit this table was last updated. The
+comment ratio is high on purpose: much of this project's argument lives in doc comments,
+and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot rot.
 
-`hv-metal` and `hv-fuzz` are intentionally absent from the workspace until their
-milestones — both need a custom target / nightly.
+| crate       | what it is                                                                              | lines  |
+| ----------- | --------------------------------------------------------------------------------------- | ------ |
+| `hv-hal`    | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`)         | **18** |
+| `hv-core`   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, zero `unsafe`, **zero external crates** | 7 615 |
+| `hv-s2`     | the Stage-2 page-table **emitter**, and the ∀-address refinement theorems over it        | 3 594  |
+| `hv-vdev`   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets | 860 |
+| `hv-sim`    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps | 5 653 |
+| `hv-verify` | the **Kani harnesses** (113) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) | 2 787 + 3 560 |
+| `hv-metal`  | the bare-metal AArch64/EL2 binary: boot, Stage-2, vGIC, the real-Linux path              | 10 946 |
+| `hv-fuzz`   | `cargo-fuzz` targets against the hypercall dispatcher                                    | —      |
+| `xtask`     | build/test automation and the gate corpora (`cargo xtask <task>`)                        | 828    |
 
-**Direction (2026-07-18):** with the model proven end-to-end (`docs/TIER-B/C/D`), the
-build target is a **greenfield "slim Qubes"** — GPU-accelerated near-metal disposables, an
-offline vault, direct device attach, and a trusted input/GUI domain, on the proven core,
-using **hardware-virt + virtio** so unmodified guests need no knowledge of Baleen. The
-planned Xen personality (`baleen-xenabi`) is **dropped**: matching Xen's ABI would drag its
-unproven semantics onto the clean core and leave us chasing an external surface forever. See
-[**`docs/ROADMAP.md`**](docs/ROADMAP.md) for the phased, diamond-every-layer plan.
+`hv-metal` and `hv-fuzz` are **excluded from the workspace** — not "until their
+milestones", but permanently: `hv-metal` builds for `aarch64-unknown-none-softfloat` and
+cannot link for the host, and `hv-fuzz` needs nightly/libFuzzer at build time. Both are
+built and gated out-of-band (`cargo xtask qemu-test`, `qemu-linux-test`, and the
+`fuzz targets build` job). ⚠ The exclusion has a cost worth knowing: an excluded crate
+loses **every** `--workspace` gate, not just the one it was excluded for — `hv-metal`'s
+rustdoc was built by nothing at all until that was noticed and fixed.
+
+**Direction (2026-08-07).** The long-run build target is unchanged: a greenfield **"slim
+Qubes"** — GPU-accelerated near-metal disposables, an offline vault, direct device attach and
+a trusted input/GUI domain, on the proven core, using **hardware-virt + virtio** so unmodified
+guests need no knowledge of Baleen. The once-planned Xen personality (`baleen-xenabi`) stays
+**dropped**: matching Xen's ABI would drag its unproven semantics onto a clean core and leave
+us chasing an external surface forever. See [**`docs/ROADMAP.md`**](docs/ROADMAP.md).
+
+What has changed since that was written is where the work actually is. The model is proven
+and the effort has moved to the **seam between the proof and the metal** — see *What this is,
+honestly* below. Two unmodified Alpine kernels now run isolated on hardware EL2, and the
+current arc is putting a **DMA-capable device** under the same proven `p2m` the CPU uses.
 
 ### Identity vs. personality
 
@@ -177,10 +239,25 @@ finding: `WritableExceedsMaps` is **not** self-inductive under unmap — its pre
 *borrows* from `RefcountMismatch`, so the "±1 lockstep" is a genuine coupling, and
 `RefcountMismatch`'s own (scalar-to-`Vec`) preservation is the next, Verus-shaped obligation.
 The decision, repo/CI shape, what is proven, and that finding live in
-[`docs/TIER-C-SPIKE.md`](docs/TIER-C-SPIKE.md). The proofs run in the scheduled
-`Deep verification` workflow (`cargo kani -p hv-verify`), not the per-PR gate.
+[`docs/TIER-C-SPIKE.md`](docs/TIER-C-SPIKE.md). ⚠ **This paragraph used to end "the proofs run in the scheduled `Deep verification`
+workflow, not the per-PR gate". That is no longer true and has not been for some time.**
+`kani proofs (PR)` and `verus proofs (PR)` are **required checks on `main`**, run on any PR
+touching `hv-hal` / `hv-core` / `hv-s2` / `hv-vdev` / `hv-verify`; a PR that touches none of
+them green-skips in seconds. `Deep verification` still exists for what does *not* belong in a
+PR gate — the ∀-size enumerator sweeps, fuzzing, and a weekly backstop re-run of the proofs.
 
 ## Milestones
+
+> **Read this as a LOG, not as status.** It is kept in full because the reasoning is the
+> reusable part, and it is append-only — entries describing something as "next" or "planned"
+> are records of what was true when written. **For where the project actually is, read
+> *What this is, honestly* above**, and the direction note under *Workspace*.
+>
+> Where it is, in one line: two unmodified Alpine Linux kernels boot on hv-metal's EL2 with
+> **two vCPUs each**, time-slicing one physical CPU, owning **no real device MMIO at all** and
+> half the RAM window each, hardware-refused from one another's memory — with an SMMU denying
+> bus-master DMA by default in the same machine, all of it under required CI gates.
+
 
 - **M1 — architecture proof** *(this commit)*: `hv-core` dispatches two toy
   hypercalls, driven entirely by `hv-sim` with deterministic seeded replay. No
