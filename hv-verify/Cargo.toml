@@ -26,6 +26,10 @@ hv-s2 = { path = "../hv-s2" }
 # locality over EVERY offset a guest can name — the surface a boot witness cannot reach, because a
 # booting kernel only ever offers the offsets it happens to use.
 hv-vdev = { path = "../hv-vdev" }
+# The machine's partition among guest slots. `hv-metal` used to derive this itself and guard it with
+# `const assert!`s at the two slots the board deploys; under the fence the same arithmetic is proven
+# for a SYMBOLIC partition (see `partition`).
+hv-part = { path = "../hv-part" }
 
 [lints]
 workspace = true
