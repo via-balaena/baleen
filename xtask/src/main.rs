@@ -62,7 +62,8 @@ fn main() {
             let shipped = qemu_linux(true, LinuxBoot::Shipped);
             let faulted = qemu_linux(true, LinuxBoot::UnmappedFault);
             let looped = qemu_linux(true, LinuxBoot::PeerLoop);
-            shipped && faulted && looped
+            let smmu = qemu_linux(true, LinuxBoot::Smmu);
+            shipped && faulted && looped && smmu
         }
         "metal-lint" => metal_lint(),
         "doc-markers" => doc_markers(),
@@ -214,6 +215,16 @@ enum LinuxBoot {
     /// Dom 1's device tree names **many** peripherals inside its PEER's RAM, so its bus scan crosses
     /// `MAX_PEER_FAULTS` and it is retired for LOOPING rather than for one bad access.
     PeerLoop,
+    /// ★ ⑲-1 — **the same shipped boot, on a machine that HAS an SMMU and a real bus master.**
+    ///
+    /// Identical guests, identical device trees; the machine gains `iommu=smmuv3` and a live `edu`
+    /// PCIe device, and hv-metal is built with `smmu` as well. Until this rung the two halves of the
+    /// isolation claim had never been in one machine: every DMA result came from a boot with no real
+    /// guest, and every real-guest boot had no bus master.
+    ///
+    /// It asserts BOTH corpora — the full shipped real-Linux marker set *and* the SMMU's rung-1/2
+    /// markers — so neither half can rot behind the other.
+    Smmu,
 }
 
 /// How many extra peer-probe nodes the [`LinuxBoot::PeerLoop`] device tree carries.
@@ -304,7 +315,7 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
         }
     }
 
-    if !metal_build_linux() {
+    if !metal_build_linux(boot) {
         return false;
     }
 
@@ -312,7 +323,12 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
     // `-kernel` (hv-metal) boots at EL2; hv-metal then erets into the kernel with x0 = the DTB.
     let mut args: Vec<String> = vec![
         "-M".into(),
-        "virt,virtualization=on,gic-version=3".into(),
+        // ⑲-1: the SMMU boot adds `iommu=smmuv3`. QEMU's SMMUv3 fronts the PCIe root complex, which
+        // is why the bus master below is a PCIe device and not the virtio-mmio the guests use.
+        match boot {
+            LinuxBoot::Smmu => "virt,virtualization=on,gic-version=3,iommu=smmuv3".into(),
+            _ => "virt,virtualization=on,gic-version=3".to_string(),
+        },
         // A stable ARMv8.0 baseline for the guest — NOT `-cpu max`. `max` advertises bleeding-edge
         // features (S1PIE, SME, GCS, pointer-auth) whose EL1 use traps to EL2 for the hypervisor to
         // enable (HCRX_EL2 …); our minimal EL2 doesn't, so the kernel traps on `PIRE0_EL1` early.
@@ -333,6 +349,15 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
         "-kernel".into(),
         METAL_BIN.into(),
     ];
+
+    // ★ ⑲-1 — the bus master. `dma_mask` is not decoration: `edu` defaults to a 28-bit mask, which
+    // cannot reach the metal's sentinel, so the device would silently transfer nothing and the SMMU
+    // markers would fail for a reason that has nothing to do with the SMMU. `boot-test.sh` learned
+    // that the hard way and says so; this is the same line, for the same reason.
+    if boot == LinuxBoot::Smmu {
+        args.push("-device".into());
+        args.push("edu,dma_mask=0xffffffffff".into());
+    }
 
     // ③-b2b-ii-b: every guest's three blobs, and the guard that they land in RAM that EXISTS.
     //
@@ -531,6 +556,9 @@ fn render_guest_dtb(
         LinuxBoot::Shipped => "",
         LinuxBoot::UnmappedFault => "-fault",
         LinuxBoot::PeerLoop => "-peerloop",
+        // ⑲-1: byte-identical device trees to the shipped boot — the guests must not be able to
+        // tell they are on a machine with an SMMU, which is the point.
+        LinuxBoot::Smmu => "",
     };
     let dts_out = dir.join(format!("guest-dom{dom}{suffix}.dts"));
     let dtb_out = dir.join(format!("guest-dom{dom}{suffix}.dtb"));
@@ -1047,6 +1075,54 @@ const LINUX_FAULT_FORBIDDEN: &[&str] = &[
     "baleen: dom 1 issued PSCI SYSTEM_OFF",
 ];
 
+/// ★ **⑲-1's corpus: the shipped real-Linux boot PLUS the SMMU's own markers, in ONE boot.**
+///
+/// ## Why this list is a concatenation and not a new set
+///
+/// The rung's whole claim is that co-locating the two halves changes NEITHER. So the guest half is
+/// [`LINUX_MARKERS`] **entire** — same guests, same device trees, same witnesses, byte for byte —
+/// and the device half is the SMMU's rung-1/2 markers, which `boot-test.sh` already asserts in the
+/// `smmu` configuration. If either half needed weakening to sit beside the other, the concatenation
+/// would fail and that would be the finding.
+///
+/// ## What the SMMU markers mean here, and the one that is load-bearing
+///
+/// * **rung1 DEFAULT-DENY** — the SMMU aborts a real bus master's DMA before `SMMUEN`.
+/// * **rung2 THROUGH-STE** — the POSITIVE control, and without it the denials are vacuous: the same
+///   device, bound to a bypass STE, DMAs successfully. A wrong `LOG2SIZE`, a mis-aligned
+///   `STRTAB_BASE` or a StreamID that is not the device's RequesterID makes *everything* "abort",
+///   which would look like flawless isolation.
+/// * **rung2 STREAM-TABLE / STREAMID-SPECIFIC / OUT-OF-RANGE** — the denials proper, each with the
+///   SMMU's own event-queue record naming the offending StreamID.
+///
+/// ⚠ **What this configuration does NOT assert, stated so the corpus is not read as more than it
+/// is.** Rungs 3 and 4 — a device confined to a *domain's* `p2m` — do not run here; they are
+/// synthetic-configuration apparatus that cannot coexist with real guests (two collisions, both
+/// recorded on `dmawitness::witness`). So this boot shows an SMMU that denies by default *beside* two
+/// isolated kernels; it does **not** yet show a device confined to a real guest's memory. That is
+/// ⑲-2, and conflating the two would be exactly the altitude error the ledger warns about.
+///
+/// ## ★ THE PROBE, and it killed harder than predicted
+///
+/// | probe | predicted | measured |
+/// |---|---|---|
+/// | drop `iommu=smmuv3`, keep the `smmu` binary | the SMMU markers redden, the guest half stays green | **the WHOLE boot dies** — `EC=0x25` data abort at EL2, `FAR=0x09050044` |
+///
+/// `0x0905_0044` is the SMMU's own MMIO window. A binary built with `smmu` probes for an SMMU at
+/// boot, and on a machine without one it takes an **external abort at EL2** before Linux is ever
+/// entered. **So the binary and the machine are a matched pair, and mismatching them is fatal early
+/// rather than degrading** — worth knowing before anyone assumes the feature is inert on a plain
+/// `virt`. It also means the guest half of this corpus cannot fail *independently* of the device
+/// half in that direction, which is why the probe is recorded with what it actually showed rather
+/// than with the tidier result that was expected.
+const LINUX_SMMU_MARKERS: &[&str] = &[
+    "baleen: smmu rung1 DEFAULT-DENY",
+    "baleen: smmu rung2 THROUGH-STE",
+    "baleen: smmu rung2 STREAM-TABLE",
+    "baleen: smmu rung2 STREAMID-SPECIFIC",
+    "baleen: smmu rung2 OUT-OF-RANGE",
+];
+
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
 ///
 /// `LINUX GUEST TRAP` is the sharp one: `handle_linux_sync` prints it for any lower-EL synchronous
@@ -1219,12 +1295,19 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
     // absent. `LINUX_FORBIDDEN` is SHARED and unweakened — `LINUX GUEST TRAP` now means "EL2 hit
     // something fatal", which must not happen in either run, and the guest-fault diagnostics were
     // renamed to `guest FAULT:` precisely so that canary keeps its meaning here.
-    let markers: &[&str] = match boot {
-        LinuxBoot::Shipped => LINUX_MARKERS,
-        LinuxBoot::UnmappedFault => LINUX_FAULT_MARKERS,
-        LinuxBoot::PeerLoop => LINUX_PEER_LOOP_MARKERS,
+    // ⑲-1: the SMMU boot's corpus is a CONCATENATION, built here rather than written out, so the
+    // guest half stays literally `LINUX_MARKERS` and cannot drift from the shipped boot's.
+    let markers: Vec<&str> = match boot {
+        LinuxBoot::Shipped => LINUX_MARKERS.to_vec(),
+        LinuxBoot::UnmappedFault => LINUX_FAULT_MARKERS.to_vec(),
+        LinuxBoot::PeerLoop => LINUX_PEER_LOOP_MARKERS.to_vec(),
+        LinuxBoot::Smmu => LINUX_MARKERS
+            .iter()
+            .chain(LINUX_SMMU_MARKERS.iter())
+            .copied()
+            .collect(),
     };
-    for m in markers {
+    for m in &markers {
         if serial.contains(m) {
             println!("qemu-linux-test: OK — found '{m}'");
         } else {
@@ -1235,7 +1318,7 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
     // `LINUX_FAULT_FORBIDDEN` applies to BOTH retiring boots: in each of them a domain was KILLED,
     // so neither may claim every guest powered off, and dom 1 may not claim it shut down.
     let forbidden = LINUX_FORBIDDEN.iter().chain(match boot {
-        LinuxBoot::Shipped => [].iter(),
+        LinuxBoot::Shipped | LinuxBoot::Smmu => [].iter(),
         LinuxBoot::UnmappedFault | LinuxBoot::PeerLoop => LINUX_FAULT_FORBIDDEN.iter(),
     });
     for m in forbidden {
@@ -1263,7 +1346,13 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
 }
 
 /// Build `hv-metal` for the bare-metal target with `real-linux` + `selftest` (M5 Arc 5e/6b).
-fn metal_build_linux() -> bool {
+fn metal_build_linux(boot: LinuxBoot) -> bool {
+    // ⑲-1: the SMMU boot needs the `smmu` feature as well — the machine has an SMMU, so the binary
+    // must be the one that programs it. Every other boot is unchanged.
+    let features = match boot {
+        LinuxBoot::Smmu => "real-linux,selftest,smmu",
+        _ => "real-linux,selftest",
+    };
     run(
         "cargo",
         &[
@@ -1278,7 +1367,7 @@ fn metal_build_linux() -> bool {
             // 448 super-span blocks plus the device window read back and decoded, every other slot
             // asserted dead. Without it the one real guest's emission would be the only one not
             // verified at runtime (M5 Arc 6b).
-            "real-linux,selftest",
+            features,
         ],
     )
 }
@@ -1318,6 +1407,10 @@ const METAL_LINT_CONFIGS: &[&[&str]] = &[
     &["--features", "smmu"],
     &["--features", "real-linux"],
     &["--features", "real-linux,selftest"],
+    // ⑲-1 — the combined configuration. It is BUILT AND BOOTED by `qemu-linux-test`'s `Smmu` boot,
+    // so by this list's own stated invariant it must be linted; before this rung it was a config
+    // that compiled and that no gate ever looked at, which is ⑭b's finding one rung along.
+    &["--features", "real-linux,selftest,smmu"],
 ];
 
 fn metal_lint() -> bool {
