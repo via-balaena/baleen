@@ -94,6 +94,7 @@ and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot
 | `hv-verify` | the **Kani harnesses** (128) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) | 2 897 + 3 560 |
 | `hv-metal`  | the bare-metal AArch64/EL2 binary: boot, Stage-2, vGIC, the real-Linux path              | 10 946 |
 | `hv-fuzz`   | `cargo-fuzz` targets against the hypercall dispatcher                                    | —      |
+| `fvp-probe` | ⚠ **not part of the hypervisor** — a standalone bare-metal instrument for Arm's AEM FVP, measuring SMMU translation caching and invalidation (honest-ledger 2(d)), which QEMU structurally cannot show. Workspace-excluded and deliberately **not** CI-gated; see its README | 214 |
 | `xtask`     | build/test automation and the gate corpora (`cargo xtask <task>`)                        | 828    |
 
 `hv-metal` and `hv-fuzz` are **excluded from the workspace** — not "until their

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+
+# Standalone: not a member of the repo workspace (see the root Cargo.toml `exclude`).
+[workspace]
+
+[package]
+name = "fvp-probe"
+description = "A standalone bare-metal AArch64 measurement instrument for Arm's Base RevC AEM FVP: does the SMMU's translation caching exist, and does invalidation matter? Answers honest-ledger item 2(d), which QEMU structurally cannot. NOT part of the hypervisor and NOT gated by CI — see README.md."
+publish = false
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+
+[[bin]]
+name = "fvp-probe"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+debug = true
