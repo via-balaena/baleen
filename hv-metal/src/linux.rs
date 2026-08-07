@@ -2331,7 +2331,7 @@ const FLIGHT_RETIRE_POLL: u64 = 64;
 
 #[cfg(feature = "smmu")]
 mod flight {
-    use super::{AtomicU64, NUM_GUESTS, PerGuest};
+    use super::{AtomicU64, PerGuest, NUM_GUESTS};
     /// 0 not armed · 1 armed, waiting · 2 permitted arm in flight · 3 refused arm in flight · 5 done.
     pub(super) static PHASE: AtomicU64 = AtomicU64::new(0);
     pub(super) static EXITS: AtomicU64 = AtomicU64::new(0);
