@@ -24,6 +24,18 @@
 //! ⑲-2; what it does not contribute there is rung 3's non-identity translation claim, which its
 //! own doc explains is unreachable on identity-mapped guests.
 //!
+//! ★★ **㉑ — and the module now drives TWO bus masters under `real-linux`.** `witness_two_masters`
+//! assigns device 0 to dom 1 and device 1 to dom 2 **in the model**, and the derivation publishes two
+//! entries with two different `S2TTB`s. The 2×2 that follows is the one thing a single device could
+//! never show: the same two addresses answered opposite ways by which requester asked. Read its doc
+//! for why that is a real gap and why the looser version of the claim — "the earlier rungs could not
+//! tell a per-stream SMMU from a global one" — is FALSE (rung 2 phase 3 already settles *permission*;
+//! what was open was *translation*).
+//!
+//! So under `real-linux` the module contributes rungs 1–2, ⑲-2, ⑲-3b's in-flight arms, and ㉑'s
+//! matrix; under `not(real-linux)` it contributes rungs 1–4b. **No configuration runs all of them**,
+//! which is why the per-config marker lists in `xtask` differ.
+//!
 //! ## Why QEMU's `edu` device
 //!
 //! The natural candidate was `virtio-blk-pci`, but driving virtio means a virtqueue, descriptor rings,
@@ -619,8 +631,9 @@ const F_B_RW: Mfn = 5;
 #[cfg(feature = "smmu")]
 const F_HOLE: Mfn = 6;
 
-/// The model's token for the one bus master this machine has. `hv-core` knows it as an opaque
-/// index and nothing more; [`rung2`] maps it to [`pcie::stream_id`]'s StreamID exactly once.
+/// The model's token for the FIRST bus master — the only one on the synthetic SMMU machine, and
+/// device 0 of two on the real-Linux one (㉑). `hv-core` knows it as an opaque index and nothing
+/// more; [`stream_map`] is the single place any `DevId` becomes a StreamID.
 #[cfg(feature = "smmu")]
 const DEV_EDU: hv_core::device::DevId = 0;
 

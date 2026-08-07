@@ -139,12 +139,13 @@ pub(crate) fn find_nth(vendor: u16, device: u16, n: usize) -> Option<Bdf> {
         .nth(n)
 }
 
-/// Assign BAR0 to [`PCIE_MMIO_BASE`], enable memory decode, and enable **bus mastering** so the
-/// device can originate DMA. Returns the BAR0 base as a physical address.
+/// Assign BAR0 at this device's own slot in the window, enable memory decode, and enable **bus
+/// mastering** so the device can originate DMA. Returns the BAR0 base as a physical address.
 ///
 /// No size negotiation: the caller knows the device, and the `virt` 32-bit window (752 MiB) dwarfs
-/// any BAR a witness device asks for, so placing it at the window base is sufficient. A general
-/// allocator is deliberately out of scope.
+/// any BAR a witness device asks for, so [`PCIE_MMIO_BASE`] plus a [`PCIE_MMIO_STRIDE`]-sized slot
+/// per BDF is sufficient. A general allocator is deliberately out of scope — ㉑ needed two devices
+/// not to collide, which is a weaker requirement than allocating, and one the BDF already answers.
 pub(crate) fn enable_with_bar0(bdf: Bdf) -> u64 {
     // Derived from the BDF, not from a counter the caller keeps: see `PCIE_MMIO_STRIDE`.
     let base = PCIE_MMIO_BASE + u32::from(bdf.dev) * PCIE_MMIO_STRIDE;
