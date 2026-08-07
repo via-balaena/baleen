@@ -36,17 +36,23 @@
 //! on QEMU `virt`, and ③-b1 because the emulated distributor reports a `GICD_TYPER` covering the
 //! INTIDs the existing DTB already names.
 //!
-//! **The tree has now gained TWO nodes, and the distinction is worth keeping sharp.** The property
+//! **The tree has now gained THREE nodes, and the distinction is worth keeping sharp.** The property
 //! earned above is that *taking a device away from a guest never required editing its description*;
-//! that is untouched, because neither addition takes anything away.
+//! that is untouched, because no addition takes anything away.
 //!
 //! * **③-b2b-ii-d — the peer probe.** Not an accommodation of our emulation: it is the negative
 //!   test's instrument, the one node in the tree that exists in order to FAIL.
 //! * **⑱-4b-ii — `cpu@1`.** The other direction of the same property, and the honest exception to
 //!   it: a guest cannot USE a CPU its machine description does not mention, so GIVING it one has to
 //!   be said in the tree. Taking away needs no edit; handing over does.
+//! * **⑲-3a — `reserved-memory/dma-pad`.** The top 2 MiB of each window, `no-map`, so that a bus
+//!   master has somewhere to land that the kernel is DECLARED not to touch rather than observed not
+//!   to. See [`dma_pad_ipa`] and [`report_dma_pad`]. This one is closest to an accommodation and
+//!   should be called that: the guest gives up 2 MiB of usable RAM to make a hypervisor-side
+//!   experiment safe, and it pays that cost in every configuration, not only the one that DMAs.
 //!
-//! Say "the DTS gained a probe, and then a second CPU" — not "the DTS is untouched".
+//! Say "the DTS gained a probe, then a second CPU, then a reserved range" — not "the DTS is
+//! untouched".
 //!
 //! So **four** things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` Stage-2
 //! **data abort**, which [`handle_linux_sync`] routes to the emulated GIC or the emulated PL011 and

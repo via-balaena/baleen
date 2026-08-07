@@ -10,11 +10,20 @@
  * (see docs/ARC-5-M5-GUEST-INTERFACE.md). Only the nodes the guest actually drives are present, so
  * Linux probes ONLY what hv-metal passes through in Stage-2 — no peripheral it can't reach.
  *
- * Derived from the QEMU `virt` (gic-version=3, virtualization=on) device tree, with three changes:
+ * Derived from the QEMU `virt` (gic-version=3, virtualization=on) device tree. The THREE ORIGINAL
+ * departures — the ones that make this a baleen guest rather than a QEMU one:
  *   1. psci `method` = "hvc"  (Linux's PSCI HVCs trap to hv-metal's Arc-5c handler; there is no EL3).
  *   2. /memory relocated to 0x4800_0000 (hv-metal owns the low 128 MiB; the guest owns the rest).
  *   3. /chosen carries our bootargs + the initramfs range (initrd-end patched by `cargo xtask
  *      qemu-linux` to start + the initramfs file size).
+ *
+ * ...and the THREE CONTENT EDITS since, each with its rationale at the node itself. Listed here
+ * because ③ earned the property that taking a device AWAY never required touching this file, and an
+ * accurate count is the only way that property stays checkable:
+ *   4. ③-b2b-ii-d — `peer-probe`, a node naming an address in the OTHER guest's RAM. The negative
+ *      test's instrument, and the only node here that exists to fail.
+ *   5. ⑱-4b-ii — `cpu@1`. A guest cannot use a CPU its machine description does not mention.
+ *   6. ⑲-3a — `reserved-memory/dma-pad`, the `no-map` range a bus master may land in.
  *
  * The GICv3 / PL011 / timer reg + interrupt values are the REAL QEMU `virt` addresses, because the
  * guest drives the real hardware (hv-metal maps GICD 0x0800_0000 + GICR 0x080a_0000 + PL011
