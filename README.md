@@ -58,10 +58,14 @@ Most of the value here is in **not** letting these blur into one word.
 
 ### What it is not
 
-- **Not seL4-tier.** seL4 proves full functional correctness at roughly 20 lines of proof per
-  line of code. This is property-directed verification at closer to 0.8:1 — a deliberately
-  different bargain, buying a weaker guarantee much more cheaply, and enforcing the rest at
-  runtime. If you need seL4's guarantee, the gap *is* the point.
+- **Not seL4-tier.** seL4 proves full functional correctness, at a proof-to-code ratio widely
+  reported around 20:1. Here it is **0.53:1** — 6 347 non-comment lines of Kani + Verus against
+  the 12 069 of `hv-core` + `hv-s2` + `hv-vdev` — property-directed verification rather than
+  functional correctness. A deliberately different bargain: a weaker guarantee, far more
+  cheaply, with the remainder enforced at runtime instead. If you need seL4's guarantee, the
+  gap *is* the point. (Both sides of that ratio are non-comment lines; comparing
+  comments-included proof against comments-excluded code would flatter it to ~0.8:1, which is
+  the sort of thing this repo's ledger exists to catch.)
 - **Not feature-comparable to Xen.** No toolstack, no migration, no PV drivers, one board.
 - **Not production.** EL2 runs MMU-off and single-CPU; `hv-metal` is ~11k lines that are **not**
   a Kani target, and every rung's docs say so where it matters.
@@ -79,7 +83,7 @@ and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot
 | crate       | what it is                                                                              | lines  |
 | ----------- | --------------------------------------------------------------------------------------- | ------ |
 | `hv-hal`    | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`)         | **18** |
-| `hv-core`   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, zero `unsafe`, **zero external crates** | 7 615 |
+| `hv-core`   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, **zero external crates** (one path dep on `hv-hal`), and zero `unsafe` — measured, though not yet `#![forbid(unsafe_code)]`-enforced | 7 615 |
 | `hv-s2`     | the Stage-2 page-table **emitter**, and the ∀-address refinement theorems over it        | 3 594  |
 | `hv-vdev`   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets | 860 |
 | `hv-sim`    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps | 5 653 |
