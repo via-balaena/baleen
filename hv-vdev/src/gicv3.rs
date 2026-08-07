@@ -79,8 +79,17 @@
 //! * ~~**One redistributor, `Last` set.**~~ **CLOSED BY ⑱-2.** The model presents one redistributor
 //!   **per vCPU** — [`VirtGic`] is generic over `VCPUS` — each with its own banked INTIDs 0..31, its
 //!   own `GICR_WAKER` handshake, and a `GICR_TYPER` carrying its own affinity and processor number
-//!   with `Last` on exactly the final one. `hv-metal` still deploys `VirtGic<1>`, so **nothing that
-//!   boots exercises the second redistributor** — the evidence is the proofs, listed below.
+//!   with `Last` on exactly the final one.
+//!
+//!   ⚠ **This entry used to end "`hv-metal` still deploys `VirtGic<1>`, so nothing that boots
+//!   exercises the second redistributor — the evidence is the proofs". THAT IS NO LONGER TRUE, and
+//!   it stopped being true two rungs before anyone corrected it.** `hv-metal`'s `vgic.rs` deploys
+//!   `VirtGic<{ role::VCPUS_PER_GUEST }>`, and ⑱-3b-ii raised that constant to 2 — so the boot has
+//!   been walking both frames since then, measured as **410 → 413 GICD/GICR register traps per
+//!   dom**. ⑱-4b-ii makes it load-bearing rather than merely exercised: a secondary started by
+//!   `PSCI CPU_ON` matches its own `MPIDR_EL1` against each `GICR_TYPER` affinity in
+//!   `gic_populate_rdist`, and boots only if it finds ITS OWN frame. Corrected by ⑱-4b-ii; the
+//!   proofs below remain the ∀-value evidence, but they are no longer the ONLY evidence.
 //! * **`IROUTER` is recorded, not honoured** — every SPI can only land in one place. Pinned as both
 //!   halves: the value reads back, and writing any routing for any SPI changes no INTID's enable.
 //!   **Still open after ⑱-2**, and now the only one of the three that is: the model can *describe*

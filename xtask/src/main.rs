@@ -102,7 +102,7 @@ fn main() {
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
-                 metal-lint fmt --check + clippy -D warnings for hv-metal ({} feature configs)",
+                 metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)",
                 METAL_LINT_CONFIGS.len()
             );
             exit(2);
@@ -726,6 +726,20 @@ const LINUX_MARKERS: &[&str] = &[
     "  node   0: [mem 0x0000000064000000-0x000000007fffffff]",
     "[dom 2] ########## BALEEN-STEP0-OK ##########",
     "[dom 2] baleen-guest-ram: 64000000-7fffffff:SystemRAM",
+    // ★ ⑱-4b-i, and these two are the GUEST-OBSERVED half of that rung — the only assertion in this
+    // list that a guest which went idle was given the pCPU back.
+    //
+    // `baleen: idle OK` is EL2's account: it counted the blocks and the wakes and they balanced.
+    // These are the kernels' account, and the two can disagree in the direction that matters. EL2
+    // issuing a `SchedWake` says the MODEL made a vCPU runnable; only the guest printing the line
+    // AFTER its `sleep` says the kernel actually resumed and ran userspace again. A wake that the
+    // scheduler records but never acts on would leave `idle OK` green and these absent.
+    //
+    // Requiring END and not START is deliberate: START proves nothing (it precedes the idling), and
+    // a boot that prints START without END is precisely a starved guest, which is what the kill
+    // probe produces.
+    "[dom 1] ########## BALEEN-IDLE-END ##########",
+    "[dom 2] ########## BALEEN-IDLE-END ##########",
     // ③-b2b-ii-a's own witness, and the only assertion here that can tell an INDEXED per-guest state
     // from a shared one. Everything else this rung changed is structural: with one guest running,
     // eight arrays-of-one behave exactly like the eight globals they replaced. What cannot survive a
@@ -799,23 +813,68 @@ const LINUX_MARKERS: &[&str] = &[
     // `Aff0 = slot` instead of `Aff0 = vCPU` gives dom 2 an MPIDR its own `cpu@0 { reg = <0x00>; }`
     // does not describe, and dom 2 must then fail to boot.
     "baleen: identity OK: every entry to EL1 carries an identity EL2 CHOSE",
-    // ★ ⑱-3b-ii — **THE vCPU AXIS IS PLURAL, AND THE MODEL IS WHAT KEEPS THE SECOND ONE OFF THE
-    // pCPU.** `VCPUS_PER_GUEST` is 2, so every guest now has a second vCPU: hv-core allocated it, the
-    // emulated GIC gives it its own redistributor (⑱-2, proved at two and until now deployed at one),
-    // and the scheduler offers it as a candidate on every rotation. It has no seeded context —
-    // dispatching it would `eret` to PC = 0 — and `PSCI CPU_ON` is ⑱-4.
+    // ★★ ⑱-4b-i — **AN IDLE vCPU LEAVES THE SCHEDULER'S CANDIDATE SET.** `handle_linux_wfi` issued
+    // `SchedPreempt` — `Running -> Runnable` — for a vCPU that had just said it had nothing to do.
+    // The model has the right word for that (`Blocked`) and this port was not using it.
     //
-    // ⚠ **Nothing in hv-metal forbids that dispatch.** hv-core boots every vCPU `Offline`,
-    // `SchedAdmit` is the only exit from that state, and the metal admits only the boot vCPU; what
-    // refuses the second one is `next_runnable`'s `state_of(..) == Some(Runnable)` — a proven state
-    // machine's answer, not a range check this port keeps. That is the claim, and the marker's
-    // load-bearing conjunct is the dispatch count being zero.
+    // ⚠ **MEASURED ON `main`, not argued.** With `guest-init.sh`'s sleep in place and `SchedPreempt`
+    // still there, dom 1 and dom 2 trapped **8,735 `wfi`s each and yielded on every one** — counts
+    // identical to the unit, the signature of perfect alternation — for **17,613 context switches**
+    // against 72 per guest on a boot that never idles. Each guest went idle, was handed the pCPU by
+    // a peer that was also idle, and handed it straight back. It is a 122x pathology rather than a
+    // hang, which is exactly why it survived this long: the guests' own ticks keep breaking the
+    // cycle, so the wall clock looks fine. Safe by workload, not by construction.
     //
-    // The non-vacuity conjunct is `NUM_GUESTS * (VCPUS_PER_GUEST - 1) > 0`, which is COMPILE-TIME and
-    // reads zero on `main` — so this marker is false there rather than green (design-lesson #99).
-    // The guest-observable half (410 → 413 GICD/GICR traps per dom, the driver walking to the
-    // redistributor that carries `Last`) is a WORKLOAD number and is reported, never asserted.
+    // Two identities are asserted IN hv-metal, which parks on either: `readback == blocked` (the
+    // model itself reports the vCPU as `Blocked`, not merely that EL2 asked for it) and
+    // `woken == blocked` (liveness — nothing was put to sleep and abandoned). Both are vacuously
+    // true at zero, which is why non-vacuity lives HERE instead: `idle OK` is printed only when
+    // something was actually blocked, so requiring the string is what makes the witness non-empty.
+    //
+    // ⚠ **Requiring it in THIS list and not the fault lists is load-bearing, and was measured.**
+    // Blocking needs a peer, and the fault configurations kill dom 1 — so dom 2 idles alone, takes
+    // `wait_at_el2` every time and blocks zero times. That is a correct boot. An earlier version
+    // asserted `blocked > 0` inside hv-metal, which parked EL2 on the fault boot and hung it to a
+    // 300 s timeout; the count is a claim about the workload, and the workload differs per config.
+    //
+    // ⚠ The yield counts are REPORTED, never asserted — the collapse from 8,735 is the headline but
+    // its exact value is tick rates and luck (design-lesson #127). And the reverse probe, restoring
+    // `SchedPreempt`, does NOT kill: the machine still works, just far harder. The probe that kills
+    // is deleting the waker, which starves a sleeping guest — and that probe only became usable
+    // because of the sleep, since it cannot fire on a boot that never idles.
+    "baleen: idle OK: a vCPU that executed WFI left the scheduler's candidate set and came back",
+    // ★★ ⑱-4b-ii — **THE SECOND vCPU EXECUTES.** `PSCI CPU_ON` seeds a secondary's context, admits
+    // it to hv-core, and the guest's own kernel reports two processors activated.
+    //
+    // ⑱-3b-ii's version of this marker asserted `DISPATCHED_NONBOOT == 0` — no vCPU but the boot one
+    // ever reached the pCPU — which was right while nothing could start one and is false BY DESIGN
+    // now. It is REPLACED, not relaxed, by the two statements it stood in for:
+    //
+    //   * `seeded == admitted` — EL2 never made a vCPU eligible to run without first giving it a
+    //     context. The hazard was never "a non-boot vCPU", it was an UNSEEDED one, measured at
+    //     ⑱-3b-ii as `EC=0x20 ELR=FAR=0x0` and a boot that never finished.
+    //   * `nonboot_offline == nonboot` — every secondary is Offline once its domain retires. ⚠ This
+    //     conjunct was DELIBERATELY WEAK in ⑱-3b-ii, which said so, and is now LOAD-BEARING: with a
+    //     secondary actually running, a domain that retires only its running vCPU leaves a sibling
+    //     Runnable, and the scheduler keeps handing the pCPU to a retired guest's parked vCPU while
+    //     the peer starves.
+    //
+    // The dispatch count is the rung's headline and is REPORTED, never asserted — a guest that never
+    // calls CPU_ON produces zero, and that is a correct boot (design-lesson #127).
     "baleen: vcpus OK: each of the",
+    // ★★ ⑱-4b-ii — **THE KERNEL'S OWN ACCOUNT, and it is stronger evidence than EL2's.**
+    //
+    // `baleen: vcpus OK` is EL2 saying it seeded and admitted a secondary. This is a real Linux
+    // kernel saying the secondary CAME UP AND RAN — it brought it online, ran a task on it, and
+    // counted it. EL2 can be wrong about the first in a way that leaves this absent.
+    //
+    // ⚠ **The FORBIDDEN twin below is what makes the pair complete, and it is why this one can be
+    // an unprefixed substring.** `serial.contains` matches anywhere, so this string proves only that
+    // AT LEAST ONE guest activated two CPUs — a per-dom form is unwritable because the console
+    // prefix and the message are separated by a variable `[    N.NNNNNN]` timestamp. The twin closes
+    // that gap from the other side: `SMP: Total of 1 processors activated.` appears the moment
+    // EITHER guest fails, so requiring one and forbidding the other pins both.
+    "SMP: Total of 2 processors activated.",
     // ★ ⑱-5 — **AN SGI IS DECODED UNDER THE FENCE AND ROUTED BY TARGET.** `ICC_SGI1R_EL1` names its
     // targets by physical affinity, which is why the architecture traps it to EL2 at all. hv-metal
     // used to read bits [27:24] only — the INTID — and its own doc admitted the affinity fields were
@@ -1004,6 +1063,22 @@ const LINUX_FORBIDDEN: &[&str] = &[
     "baleen: LINUX GUEST TRAP",
     "baleen: lroverflow FAIL",
     "baleen: tickdefer FAIL",
+    // ★★ ⑱-4b-ii's negative half, and the load-bearing half of that rung's guest-observed witness.
+    //
+    // MEASURED as the EXACT baseline output: with `cpu@1` in the device tree and `CPU_ON` still
+    // answering NOT_SUPPORTED, both kernels print `psci: failed to boot CPU1 (-95)` and then this
+    // line, and the boot otherwise succeeds. So it is precisely the string a regression produces.
+    //
+    // It is forbidden in EVERY configuration, and that is deliberate: it fires for whichever guest
+    // failed, which is the "both guests" coverage the required `SMP: Total of 2` substring cannot
+    // give on its own. It also catches the case `baleen: vcpus OK` cannot see at all — a build where
+    // CPU_ON silently never fires leaves `seeded == admitted` reading `0 == 0` and that marker green.
+    "SMP: Total of 1 processors activated.",
+    // ⑱-4b-i's negative half. It fires for three distinguishable reasons and the message says which:
+    // a vCPU EL2 blocked that the model does not report as `Blocked`; a vCPU blocked and never woken
+    // (a STARVED guest — what the kill probe induces); or no guest idling at all, which would mean
+    // `guest-init.sh`'s sleep had stopped producing the state the witness is about.
+    "baleen: idle FAIL",
     "Kernel panic",
     "baleen: linux model setup",
     "baleen: vpl011 FAIL",
@@ -1256,6 +1331,45 @@ fn metal_lint() -> bool {
             "--check",
         ],
     ) && METAL_LINT_CONFIGS.iter().all(|cfg| metal_clippy(cfg))
+        && METAL_LINT_CONFIGS.iter().all(|cfg| metal_doc(cfg))
+}
+
+/// **Build `hv-metal`'s rustdoc for one feature config, denying every rustdoc warning.**
+///
+/// ## Why this exists: an EXCLUDED crate loses every `--workspace` gate, not just the one
+///
+/// `cargo xtask doc` runs `cargo doc --workspace`, and `hv-metal` is workspace-**excluded** — so
+/// until this rung its rustdoc was built by **nothing at all**, in any job, ever. `metal-lint`
+/// covered `fmt` and `clippy` for it and stopped there. Design-lesson #173 is the general form:
+/// excluding a crate to escape one gate silently excuses it from all of them.
+///
+/// **MEASURED when the gate was added: 33 distinct broken intra-doc links**, across every module and
+/// every feature config — 24 in the default build, 23 under `selftest`, **30 under `smmu`**, 18
+/// under `real-linux`, 17 under `real-linux,selftest`. Given how much of this project's argument
+/// lives in doc comments, links that rot silently are a real cost.
+///
+/// ⚠ **PER CONFIG, and that is load-bearing rather than thorough-for-its-own-sake.** The count above
+/// is not uniform: `smmu` was the worst and `real-linux` — the only config anyone had ever measured
+/// — was among the best. A single-config gate would have reported 18, "fixed" those, and left 15
+/// live in configurations it never built. That is design-lesson #155's shape (an audit that measures
+/// one case and generalises), and it is why this iterates [`METAL_LINT_CONFIGS`] exactly as clippy
+/// does: the invariant that list already states is *every configuration that is BUILT AND BOOTED is
+/// linted*, and "linted" now includes its docs.
+///
+/// `-D warnings` rather than `-D rustdoc::broken_intra_doc_links`, matching [`doc`]'s bar for the
+/// workspace: all five configs meet it today, so the stricter form costs nothing and catches the
+/// next class too.
+fn metal_doc(extra: &[&str]) -> bool {
+    let mut args = vec![
+        "doc",
+        "--manifest-path",
+        "hv-metal/Cargo.toml",
+        "--target",
+        METAL_TARGET,
+        "--no-deps",
+    ];
+    args.extend_from_slice(extra);
+    run_env("cargo", &args, &[("RUSTDOCFLAGS", "-D warnings")])
 }
 
 /// Run clippy over `hv-metal` for the bare-metal target with `extra` cargo args, denying warnings.

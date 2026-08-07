@@ -127,7 +127,7 @@ _start:
 /// Base of the PL011 UART on the QEMU `virt` machine.
 ///
 /// `pub(crate)` since ③-a1: the real-Linux guest's PL011 is **emulated** at this same address
-/// ([`vpl011`]), and that module compile-time-asserts the two agree — the guest is offered the
+/// (`vpl011`), and that module compile-time-asserts the two agree — the guest is offered the
 /// device `guest.dts` already names, so the DTB needed no edit.
 pub(crate) const UART0_BASE: usize = 0x0900_0000;
 

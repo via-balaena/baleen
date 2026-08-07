@@ -208,7 +208,7 @@ pub(crate) fn inject(intid: u32) -> bool {
 /// priority an injection gets.
 ///
 /// Returns `None` exactly when `pintid` cannot be named by the `pINTID` field. That refusal used to
-/// live in [`inject_hw`] as a range test; it is now the encoder's, and proven total there
+/// live in `inject_hw` as a range test; it is now the encoder's, and proven total there
 /// (`a_physical_intid_is_refused_exactly_when_it_cannot_be_named`).
 fn encode_lr(vintid: u32, hw: Option<u32>) -> Option<u64> {
     hv_vdev::vgic_cpuif::encode_lr(vintid, hw, INJECT_PRIORITY)
@@ -453,7 +453,7 @@ pub(crate) fn enable_lr_sysreg_access() {
     }
 }
 
-/// The number of implemented list registers, `ICH_VTR_EL2.ListRegs + 1` (bits [4:0]) — 4 on QEMU
+/// The number of implemented list registers, `ICH_VTR_EL2.ListRegs + 1` (bits `[4:0]`) — 4 on QEMU
 /// `virt` GICv3, clamped to [`MAX_LIST_REGISTERS`]. Accesses to `ICH_LR<n>_EL2` for `n >=` this are
 /// UNPREDICTABLE, so every LR loop bounds itself by this. `ICH_VTR_EL2` is an `ICH_*` register readable
 /// at EL2 without the CPU-interface `ICC_SRE_EL2` gate (the same class as the LRs, which the Arc-7c
@@ -477,7 +477,7 @@ pub(crate) fn num_list_registers() -> usize {
 pub(crate) const MAX_AP_REGISTERS: usize = 4;
 
 /// The number of implemented **active-priority** registers per group, from `ICH_VTR_EL2.PRIbits`
-/// (bits [31:29], holding *PRIbits − 1*) — **1 on QEMU `virt`, which reports PRIbits = 5**.
+/// (bits `[31:29]`, holding *PRIbits − 1*) — **1 on QEMU `virt`, which reports PRIbits = 5**.
 ///
 /// The architecture ties the count to the number of priority bits the virtual interface implements:
 /// `PRIbits == 5` ⇒ `ICH_AP<x>R0_EL2` only; `6` ⇒ `R0..R1`; `7` ⇒ `R0..R3`. **An access to a
@@ -721,7 +721,7 @@ unsafe fn write_vmcr(v: u64) {
 /// the sibling, whose interface then refused to signal anything at or below it. Both siblings
 /// wedged: the guest was offered its tick forever (four Pending vINTID 27 filling the bank,
 /// `TIMER_DEFERRED` past 3800) and could never acknowledge one. Removing this member again
-/// reproduces that stall; see [`crate::linux`]'s `report_active_priorities` for the probe table.
+/// reproduces that stall; see `crate::linux`'s `report_active_priorities` for the probe table.
 ///
 /// ⚠ **It refuted the diagnosis on record**, which was that a descheduled vCPU's timer deadline is
 /// never delivered. The tick arrives about once per slice per vCPU, forever; what fails is the

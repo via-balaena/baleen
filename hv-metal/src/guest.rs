@@ -2767,7 +2767,7 @@ fn restore_context(vcpu: usize, frame: &mut GuestFrame) {
 }
 
 /// Enter the guest at EL1 and never return: switch `SP_EL2` to the dedicated exception stack, set
-/// `SPSR_EL2`, and `eret`. `ELR_EL2` was already set via [`ArmVcpu::set_entry`]. Unchanged from Arc 4.
+/// `SPSR_EL2`, and `eret`. `ELR_EL2` was already set via `ArmVcpu::set_entry`. Unchanged from Arc 4.
 fn enter_guest(exc_stack_top: u64) -> ! {
     // SAFETY: `SPSR_EL2` is RW at EL2; `mov sp,x` switches `SP_EL2`. After the switch only `eret`
     // runs, so no Rust stack access follows. `eret` transfers to EL1 at `ELR_EL2` with `SPSR_EL2`.
@@ -2785,7 +2785,7 @@ fn enter_guest(exc_stack_top: u64) -> ! {
     }
 }
 
-/// Read `ESR_EL2` and return its exception class (`EC`, bits [31:26]).
+/// Read `ESR_EL2` and return its exception class (`EC`, bits `[31:26]`).
 fn esr_el2_ec() -> u64 {
     let esr: u64;
     // SAFETY: `ESR_EL2` is RO at EL2; no memory effect.

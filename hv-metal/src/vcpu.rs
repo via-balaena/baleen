@@ -47,7 +47,7 @@
 //! This module holds the state a guest **owns and mutates**, which is why save/restore/poison is the
 //! right shape for it. Some per-vCPU state is EL2's instead — the guest cannot write it, so there is
 //! nothing to save, and poisoning it would only break the guest. It is *installed* by
-//! [`crate::linux::switch_context`] from the incoming vCPU's identity rather than carried here:
+//! `crate::linux::switch_context` from the incoming vCPU's identity rather than carried here:
 //! `VTTBR_EL2` (the domain's Stage-2, since ③-b2b-ii-c2) and, since ⑱-1, `VMPIDR_EL2`/`VPIDR_EL2`
 //! (the `MPIDR_EL1`/`MIDR_EL1` the guest reads).
 //!
@@ -75,7 +75,7 @@
 //!
 //! ## One derivation
 //!
-//! The table is declared **once**, by [`ctx_regs!`], which generates the enum, the `ALL` slice, the
+//! The table is declared **once**, by `ctx_regs!`, which generates the enum, the `ALL` slice, the
 //! names and both accessors together. There is no second list to drift from the first — adding a
 //! register is one line, and the exhaustive wildcard-free matches mean the compiler, not a reviewer,
 //! is what notices if an accessor forgets it (the Phase I-1 `Transition` shape, one layer out).
@@ -369,8 +369,23 @@ impl VcpuCtx {
     /// its ten-thousandth — so there is no second entry sequence to keep in step with the first, and
     /// no path that runs once at boot and is never exercised again.
     ///
-    /// The state is the arm64 boot protocol's, and everything not named here is deliberately zero:
-    /// `x1..x3` (the protocol requires it), and every EL1 register the kernel sets up for itself.
+    /// ## ★ ⑱-4b-ii — TWO CONTRACTS, ONE FUNCTION, and `x0` is the only difference
+    ///
+    /// This seeds a vCPU's first entry, and since `PSCI CPU_ON` there are two kinds of first entry:
+    ///
+    /// * **the arm64 boot protocol** (a guest's first vCPU): `x0` is the **DTB address**, and the
+    ///   entry point is where EL2 loaded the kernel;
+    /// * **`PSCI CPU_ON`** (a secondary): `x0` is the **`context_id` the caller passed in `x3`**, and
+    ///   the entry point is the one it passed in `x2`. MEASURED: Linux passes `context_id = 0`.
+    ///
+    /// The parameter is named `x0` rather than `dtb` because **the register is the contract** and its
+    /// *meaning* belongs at the call site that knows which contract it is honouring. Two functions
+    /// would be two derivations of "how does a vCPU start" that agree until one is changed (#74);
+    /// one function with the meaning named where it is known is the same call `sctlr` already makes.
+    ///
+    /// The state is otherwise the arm64 boot protocol's, and everything not named here is
+    /// deliberately zero: `x1..x3` (both contracts require it), and every EL1 register the kernel
+    /// sets up for itself.
     /// `TTBR*`/`TCR_EL1` being zero is not a hazard because `sctlr` is entered with the MMU off,
     /// which is the same condition guest A is entered under.
     ///
@@ -378,10 +393,11 @@ impl VcpuCtx {
     /// [`crate::linux`]'s `init_guest_el1` has cleared the enables, so guest B starts from the
     /// identical value guest A did — RES1 bits and all. Deriving it here would be a second answer to
     /// "what `SCTLR_EL1` does a guest boot with", and the two would agree until a board changed.
-    pub(crate) fn seed_boot(&mut self, entry: u64, dtb: u64, spsr: u64, sctlr: u64) {
+    pub(crate) fn seed_boot(&mut self, entry: u64, x0: u64, spsr: u64, sctlr: u64) {
         *self = Self::new();
-        // The arm64 boot protocol: `x0` is the DTB, `x1..x3` are zero.
-        self.x[0] = dtb;
+        // `x0` is the DTB for a guest's boot vCPU and the PSCI `context_id` for a secondary; `x1..x3`
+        // are zero either way, which both contracts require.
+        self.x[0] = x0;
         self.regs.set(CtxReg::ElrEl2, entry);
         self.regs.set(CtxReg::SpsrEl2, spsr);
         self.regs.set(CtxReg::SctlrEl1, sctlr);

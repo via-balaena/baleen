@@ -13,7 +13,7 @@
 //! those were three lists maintained by hand in three places, with nothing tying them together.
 //!
 //! That is precisely how `v0..v31` stayed unsaved from M5 Arc 1 to ③-b2b-ii-f: not carelessness, a
-//! structurally unenforced list. And [`crate::vcpu`]'s own `ctx_regs!` macro exists to prevent
+//! structurally unenforced list. And `crate::vcpu`'s own `ctx_regs!` macro exists to prevent
 //! exactly this defect *one layer down*, in its own words — *"there is no second list to drift from
 //! the first … the compiler, not a reviewer, is what notices if an accessor forgets it"*. The layer
 //! above it had the very defect the macro was written for.
@@ -46,7 +46,7 @@
 //!
 //! ## Why `poison` takes a receiver it never reads
 //!
-//! [`CtxPoison::poison`] clobbers live hardware and needs nothing from `&self`. It takes one anyway,
+//! `CtxPoison::poison` clobbers live hardware and needs nothing from `&self`. It takes one anyway,
 //! as a **type witness**, and that is the load-bearing part of the design rather than an oversight:
 //! an associated `poison()` cannot be driven from a destructuring, so a forgotten component would
 //! degrade from a hard error to an unused binding. Taking a receiver makes poisoning a *use* of the
@@ -86,7 +86,7 @@
 /// One component of a vCPU context — a piece of CPU state that a switch must carry.
 ///
 /// Implemented by every field of a context struct that lives in **hardware** rather than in the
-/// exception frame. The GPR array is deliberately not a member: see [`crate::vcpu::VcpuCtx::save`]
+/// exception frame. The GPR array is deliberately not a member: see `crate::vcpu::VcpuCtx::save`
 /// for why a whole-array assignment needs no help from this trait, and why it is still named in
 /// every destructuring.
 pub(crate) trait CtxComponent {

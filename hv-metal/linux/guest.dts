@@ -39,10 +39,37 @@
 		#address-cells = <0x01>;
 		#size-cells = <0x00>;
 
+		/* ⑱-4b-ii — TWO CPUs, and this is the SECOND content edit this file has ever had.
+		   ③'s earned property was that taking a device AWAY never required editing the guest's
+		   description; the first addition was ③-b2b-ii-d's peer-probe node, and this is the
+		   second. It is not a weakening of that property so much as its other direction: a guest
+		   cannot USE a CPU its machine description does not mention, so GIVING it one has to be
+		   said here. Say "the DTS gained a probe, and then a second CPU"; do not say it is
+		   untouched.
+
+		   `reg` is the hwid Linux matches against `MPIDR_EL1 & MPIDR_HWID_BITMASK`, and
+		   `linux.rs`'s `guest_mpidr` is the one derivation of it — pinned by a `const assert!`
+		   for cpu 0 and, since this rung, reachable for cpu 1 only through the same function.
+		   `enable-method` matches the form QEMU's own generated DTB uses, and the `psci` node
+		   above already declared `cpu_on = <0xc4000003>` long before anything answered it.
+
+		   MEASURED with this node present and `CPU_ON` still unimplemented: each guest calls the
+		   FID exactly once (`x1=0x1`, `x2` = an address in its OWN RAM, `x3=0x0`), is told
+		   NOT_SUPPORTED, prints `psci: failed to boot CPU1 (-95)` and continues to userspace with
+		   `SMP: Total of 1 processors activated.` — which is why that string is a FORBIDDEN
+		   marker now. */
 		cpu@0 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a57";
 			reg = <0x00>;
+			enable-method = "psci";
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a57";
+			reg = <0x01>;
+			enable-method = "psci";
 		};
 	};
 
