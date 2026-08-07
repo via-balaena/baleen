@@ -1400,10 +1400,16 @@ fn fault_at(e: &Option<smmu::SmmuEvent>, kind: u8, sid: u32, asked: u64) -> bool
 /// Called once `VTTBR` holds both images and before the `eret` into guest A. The tables are real and
 /// final; nothing is executing yet.
 ///
-/// ⚠ **So this is CONFINEMENT, not SIMULTANEITY.** Honest-ledger item 2(b) — *"the two consumers are
-/// not simultaneous; no vCPU runs while the device DMAs"* — is **NOT** closed by this rung and must
-/// not be read as closed. What is closed is that the device is confined by a *real guest's* proven
-/// map rather than a synthetic one.
+/// ⚠ **So THIS rung is CONFINEMENT, not SIMULTANEITY.** What it closes is that the device is
+/// confined by a *real guest's* proven map rather than a synthetic one. Honest-ledger item 2(b) —
+/// *"the two consumers are not simultaneous; no vCPU runs while the device DMAs"* — is not closed
+/// here, and this witness must not be read as closing it.
+///
+/// **⑲-3b closes it, in [`inflight_arm`] and `linux::report_dma_inflight`**, by observing a transfer
+/// in flight across guest execution. Note that ⑲-3b could NOT reuse this function's
+/// `bind_stream_stage2`: a hand-poked STE does not survive a dispatch, because rung 4b re-derives the
+/// stream table from the model every time. This one gets away with it only because nothing
+/// dispatches between its bind and its unbind.
 ///
 /// ## Why the targets are where they are, and the hazard that chose them
 ///

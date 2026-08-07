@@ -10,6 +10,13 @@
 //! `hv-core`/`hv-hal` are untouched; this whole module is behind the `real-linux` feature, so the
 //! default build (the CI boot-test) is byte-for-byte unchanged.
 //!
+//! ⚠ **"No isolation content" STOPPED BEING TRUE AT ⑲-2, and is now decisively false.** This file
+//! carries the device half of the isolation claim: [`report_dma_inflight`] observes a bus master
+//! confined by a real guest's own DERIVED Stage-2 binding while both kernels execute, and
+//! [`report_dma_pad`] is what makes a landing site available to aim it at. The sentence above is
+//! kept because it is true of the arc's ORIGINAL scope and explains why the file is shaped the way
+//! it is — but read it as history, not as a description of what is asserted here today.
+//!
 //! ⚠ **THIS PARAGRAPH SAID "a SINGLE EL1 guest that owns the machine" UNTIL ⑱-4b, AND HAD BEEN
 //! FALSE SINCE ③-b2b-ii.** What actually boots today is **two** unmodified kernels, each with
 //! **two vCPUs** (⑱-4b-ii's `PSCI CPU_ON`), time-slicing one physical CPU — four vCPUs in total,
@@ -5786,9 +5793,10 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // be pointed at one. Here and not later: nothing is executing yet, so writing the positive
     // control's sentinel into dom 1's RAM cannot disturb a running kernel.
     //
-    // ⚠ **This is CONFINEMENT, not SIMULTANEITY.** Honest-ledger item 2(b) stays open: no vCPU runs
-    // while this device DMAs. What changes is WHOSE map confines it — a real guest's proven image
-    // rather than apparatus built for the test.
+    // ⚠ **This rung is CONFINEMENT, not SIMULTANEITY** — nothing runs while THIS device DMAs. What
+    // it changes is WHOSE map confines it: a real guest's proven image rather than apparatus built
+    // for the test. Honest-ledger item 2(b) is closed a few lines below by ⑲-3b, which arms a second
+    // transfer that is deliberately still in flight when the `eret` happens.
     //
     // ⑲-3a: both targets are now the guests' **reserved landing pads**. They used to be
     // `guest_ram_base(slot) + 0x0800_0000` — a hand-picked address chosen for being above the blobs,

@@ -1244,7 +1244,8 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
     // ⚠ Two things it does NOT claim, both stated on `dmawitness::witness_real_guest`: the positive
     // arm is a CONTROL only (real guests are identity-mapped, so it cannot separate "translated"
     // from "passed through" — that is rung 3's, on a non-identity map); and this is CONFINEMENT,
-    // not SIMULTANEITY — ledger item 2(b) stays open, no vCPU runs while this device DMAs.
+    // not SIMULTANEITY — nothing runs while THIS device DMAs. Ledger item 2(b) is closed by the
+    // `dmaflight OK` marker below, not by this one.
     "baleen: smmu realguest OK",
     // ★★ ⑲-3b — the same confinement, IN FLIGHT ACROSS GUEST EXECUTION, which closes honest-ledger
     // item 2(b). Every DMA result before this one was taken with the machine quiesced around the
@@ -1342,8 +1343,8 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // wrong slot. The message names which counter leaked.
     "baleen: perguest FAIL",
     // ⑲-3a: a guest wrote inside the range its own device tree reserves `no-map`, or the pad stopped
-    // being mapped/writable at all. Either way the DMA landing pad is not the undisturbed page the
-    // simultaneity rung is about to aim a live bus master at.
+    // being mapped/writable at all. Either way the DMA landing pad is not the undisturbed page
+    // ⑲-3b aims a live bus master at while both kernels are running.
     "baleen: dmapad FAIL",
     // ⑲-3b: the in-flight observation did not complete, or one of its arms did not behave. The
     // message names every counter, so the failing conjunct is readable without a rebuild.
