@@ -1484,41 +1484,6 @@ pub(crate) fn witness_real_guest(
         crate::park();
     }
 
-    // ⑲-3 TEMPORARY BASELINE PROBE — reverted before the rung lands. ⑲-3 wants to kick a DMA, `eret`
-    // into a guest, and observe the transfer land WHILE the guest executes. That is only possible if
-    // the engine retires the command asynchronously; if QEMU performs the copy inside the MMIO write
-    // then the transfer is over before the `eret` and the whole shape is unreachable. Measure it
-    // rather than reasoning about `edu.c`.
-    {
-        poke(landing_own, SENTINEL_MAGIC);
-        mmio_write64(bar0, EDU_REG_DMA_SRC, EDU_DMA_BUF);
-        mmio_write64(bar0, EDU_REG_DMA_DST, ipa_own);
-        mmio_write64(bar0, EDU_REG_DMA_CNT, 8);
-        mmio_write64(bar0, EDU_REG_DMA_CMD, EDU_DMA_RUN | EDU_DMA_TO_RAM);
-        // Read back BEFORE spinning: if RUN is already clear here, the engine is synchronous.
-        let run_now = mmio_read64(bar0, EDU_REG_DMA_CMD) & EDU_DMA_RUN;
-        let mem_now = peek(landing_own);
-        let mut polls: u64 = 0;
-        while polls < 20_000_000 && mmio_read64(bar0, EDU_REG_DMA_CMD) & EDU_DMA_RUN != 0 {
-            polls += 1;
-            core::hint::spin_loop();
-        }
-        let mem_after = peek(landing_own);
-        // A second scale, in units that do NOT exit to QEMU on every step: how many plain CPU
-        // iterations a retirement costs. The poll count above is inflated by one MMIO trap each.
-        poke(landing_own, SENTINEL_MAGIC);
-        mmio_write64(bar0, EDU_REG_DMA_CMD, EDU_DMA_RUN | EDU_DMA_TO_RAM);
-        let mut spins: u64 = 0;
-        while spins < 200_000_000 && peek(landing_own) == SENTINEL_MAGIC {
-            spins += 1;
-            core::hint::spin_loop();
-        }
-        let _ = writeln!(
-            uart,
-            "baleen: 19-3 PROBE: run_after_kick={run_now} mem_after_kick={mem_now:#x} polls_to_retire={polls} mem_after_spin={mem_after:#x} cpu_spins_to_land={spins}"
-        );
-    }
-
     // ── Arm 1 — the POSITIVE control. Without it the refusal below is vacuous: a wedged SMMU
     //    refuses everything and looks like flawless isolation.
     let (own_before, own_after, own_retired) = probe(ipa_own, landing_own);
