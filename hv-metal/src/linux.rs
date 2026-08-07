@@ -5823,6 +5823,20 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     // check into a check of that write instead.
     seed_dma_pads(uart);
 
+    // ★★ ㉑ — TWO BUS MASTERS, at the quiesced moment. Leaves both devices released, so ⑲-3b's arm
+    // below finds the machine it expects.
+    #[cfg(feature = "smmu")]
+    crate::dmawitness::witness_two_masters(
+        uart,
+        hv,
+        slot_dom(SLOT_A),
+        slot_dom(1),
+        vttbr[SLOT_A],
+        vttbr[1],
+        dma_pad_ipa(SLOT_A) + 0x2000,
+        dma_pad_ipa(1) + 0x2000,
+    );
+
     // ★★ ⑲-3b — ARM the in-flight observation. One `DeviceAssign` through the proven dispatch; the
     // kick itself waits until the guests have been running for `FLIGHT_KICK_AFTER` exits.
     //

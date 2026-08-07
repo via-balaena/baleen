@@ -1266,6 +1266,12 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
     // hand-poked STE measurably does NOT survive this — which is what makes it rung 4b's thesis
     // doing work rather than a property nothing depended on.
     "baleen: dmaflight OK",
+    // ★★ ㉑ — the SMMU's TRANSLATION is per-stream, not merely its permission. Two live requesters
+    // walking two different Stage-2 images: the same two addresses answered opposite ways by which
+    // device asked. Rung 2 phase 3 already showed permission is per-stream (a permissive entry at a
+    // neighbouring StreamID does not let the device through); this is the half that needed a second
+    // requester, and it is the half the confinement story actually rests on.
+    "baleen: twomasters OK",
 ];
 
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
@@ -1357,6 +1363,8 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // ⑲-3b: the in-flight observation did not complete, or one of its arms did not behave. The
     // message names every counter, so the failing conjunct is readable without a rebuild.
     "baleen: dmaflight FAIL",
+    // ㉑: the 2x2 did not come out, or releasing one device did not deny exactly one stream.
+    "baleen: twomasters FAIL",
 ];
 
 /// How long to let the boot run before declaring it hung. Generous on purpose: this is cross-arch
