@@ -202,7 +202,7 @@ fn guest_load_addrs(slot: u64) -> GuestLoad {
 /// exactly one block cannot force the emitter to split a mapping it would otherwise make whole, and
 /// the reservation cannot straddle two of them. It sits at the TOP of the window rather than
 /// anywhere else because that is the one place whose address is a function of the split alone.
-const LINUX_DMA_PAD_SIZE: u64 = 0x40_0000;
+const LINUX_DMA_PAD_SIZE: u64 = 0x20_0000;
 
 /// The base of guest `slot`'s DMA landing pad — the top [`LINUX_DMA_PAD_SIZE`] of its own window.
 ///
