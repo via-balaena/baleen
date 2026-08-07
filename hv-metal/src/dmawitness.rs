@@ -1547,11 +1547,27 @@ pub(crate) fn probe_kick_inflight(
         let _ = writeln!(uart, "baleen: 19-3b PROBE: bind failed");
         return None;
     }
+    // ⚠ DRAIN FIRST. `take_event` returns the OLDEST record, and ⑲-2 has already produced several
+    // (`prod=10` when this was missing), so without this the event evidence is somebody else's.
+    let stale = smmu::drain_events();
     poke(watch_pa, SENTINEL_MAGIC);
     mmio_write64(bar0, EDU_REG_DMA_SRC, EDU_DMA_BUF);
     mmio_write64(bar0, EDU_REG_DMA_DST, target_ipa);
     mmio_write64(bar0, EDU_REG_DMA_CNT, 8);
     mmio_write64(bar0, EDU_REG_DMA_CMD, EDU_DMA_RUN | EDU_DMA_TO_RAM);
+    // DIAGNOSTIC: does a RE-BOUND stream transfer at all, with EL2 holding the CPU? ⑲-2 unbinds at
+    // the end of its own witness, so this path is the first to bind a second time. If this lands,
+    // the binding is fine and the in-flight observation is at fault; if not, the re-bind is.
+    let mut polls = 0u64;
+    while polls < 4_000_000 && mmio_read64(bar0, EDU_REG_DMA_CMD) & EDU_DMA_RUN != 0 {
+        polls += 1;
+    }
+    let landed_sync = peek(watch_pa) != SENTINEL_MAGIC;
+    let _ = writeln!(
+        uart,
+        "baleen: 19-3b PROBE sync: stale_drained={stale} polls={polls} landed_sync={landed_sync} held={:#x}",
+        peek(watch_pa)
+    );
     Some((bar0, watch_pa))
 }
 
