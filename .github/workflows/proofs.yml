@@ -94,7 +94,7 @@ jobs:
           # failure mode this filter must never have, a device-model change that green-skips the
           # gate that exists to check it.
           #
-          # `hv-part` (Tier A) is added in the SAME commit as its harnesses, which is the direction
+          # `hv-part` (㉒) is added in the SAME commit as its harnesses, which is the direction
           # the note above warns about — so state why it is safe here: the crate is created by that
           # commit, so there is no window in which a `hv-part` change could have green-skipped a
           # gate that already existed. The hazard that note describes is a path added LATER than the

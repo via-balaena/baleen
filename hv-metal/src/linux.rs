@@ -407,7 +407,7 @@ const INITRD_ADDR: u64 = 0x4c00_0000;
 
 /// **How this machine is divided among guest slots — the deployment, and the ONE instance.**
 ///
-/// The arithmetic moved to `hv-part` (Tier A): it used to be four `const fn`s here, guarded by
+/// The arithmetic moved to `hv-part` (㉒): it used to be four `const fn`s here, guarded by
 /// `const assert!`s evaluated at the two slots this board deploys, and `hv-metal` is
 /// workspace-EXCLUDED so no proof could reach them. What stays here is which numbers go in.
 ///
@@ -2909,7 +2909,7 @@ fn preempt_through_the_scheduler(cur: Running, frame: &mut LinuxFrame) {
 /// the emitted images come from, so "whose memory is this" has one answer on this path and it is the
 /// one the emitter used.
 fn guest_owning(ipa: u64) -> Option<usize> {
-    // ⑯-Tier-A: the containment test is `hv-part`'s, and `owner_of` is PROVEN to be exactly the
+    // ㉒: the containment test is `hv-part`'s, and `owner_of` is PROVEN to be exactly the
     // inverse of the window map (both directions — a version that always answered "nobody" would
     // pass a soundness-only harness, and the completeness arm was probe-confirmed to catch it).
     PARTITION.owner_of(ipa).map(|slot| slot as usize)

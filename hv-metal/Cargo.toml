@@ -51,7 +51,7 @@ hv-hal = { path = "../hv-hal" }
 # which frames a domain reaches and encodes the descriptors, as pure zero-`unsafe` code under the
 # workspace fence; hv-metal keeps only the publish (barriers + TLB maintenance + VTTBR).
 hv-s2 = { path = "../hv-s2" }
-# How this machine is PARTITIONED among guest slots (Tier A). The slot-indexed arithmetic used to
+# How this machine is PARTITIONED among guest slots (㉒). The slot-indexed arithmetic used to
 # live here, guarded by `const assert!`s at the two slots the board deploys; under the fence the same
 # `const fn`s are proven for a symbolic partition. This crate keeps the DEPLOYMENT — which numbers go
 # in — and asserts the shipped instance against the very predicates `hv-verify` proved total.
