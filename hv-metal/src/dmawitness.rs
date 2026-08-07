@@ -1583,12 +1583,12 @@ pub(crate) fn probe_dump(uart: &mut Pl011, bar0: u64, watch_pa: u64) {
          event={}",
         smmu::present(),
         smmu::translating(),
-        match ev {
+        match &ev {
             Some(e) => e.kind as u64,
             None => 0xff,
         }
     );
-    if let Some(e) = ev {
+    if let Some(e) = &ev {
         let _ = writeln!(
             uart,
             "baleen: 19-3b PROBE event: kind={:#x} sid={} addr={:#x} prod={}",
