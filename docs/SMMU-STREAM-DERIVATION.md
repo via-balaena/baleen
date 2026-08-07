@@ -256,11 +256,27 @@ change that was wrong.** Rung 3 recorded this as a declared residual and predict
 where a stale translation would be answerable. Rung 5's phase does exercise exactly that path, and
 the probe is still green. So the residual is **inherited unchanged, and the proposed way to close it
 is now ruled out**: on this platform `CMD_CFGI_STE` alone is sufficient to make a rebind take (the
-previous row shows it is genuinely load-bearing), which is consistent with QEMU dropping the
-stream's cached translations along with its configuration. The command stays because the
+previous row shows it is genuinely load-bearing), ~~which is consistent with QEMU dropping the
+stream's cached translations along with its configuration~~. The command stays because the
 architecture requires it — *reasoned, not witnessed*, the same standing as the cache maintenance in
 `scrub_frame`. Witnessing it needs a platform that caches stage-2 translations across a
 configuration invalidation, i.e. not this one (design-lesson #72).
+
+✅ **THAT LAST SENTENCE NAMED THE INSTRUMENT, AND IT HAS NOW BEEN BUILT** — `fvp-probe` on Arm's
+Base RevC AEM, 2026-08-07 (`docs/SMMU-TRANSLATION.md` §5a). Two corrections fall out, and the
+struck clause above is the first:
+
+* **`CMD_CFGI_STE` does NOT drop cached translations.** On a platform that caches, a re-pointed STE
+  stays shadowed by the cached translation even after `CMD_CFGI_STE`, until the VMID changes or the
+  TLB is invalidated. So the guess that QEMU drops translations along with configuration is not what
+  is happening; **QEMU simply caches nothing**, and the two are indistinguishable there.
+* **`CMD_TLBI_*` is load-bearing wherever caching exists** — change a descriptor without it and the
+  old frame is still returned; issue it and the new one is.
+
+⚠ The residual's own wording is **still accurate and still stands**: this is not boot-witnessed.
+`hv-metal` runs on QEMU, and `fvp-probe` is a separate program sharing none of its code. What
+changed is that the command is now known to be *code whose effect QEMU cannot exhibit*, rather than
+code of unknown value.
 
 **2. The `NoBinding` refusal is unreachable in this boot, and is kept anyway.** Making it skip the
 device instead of halting changes nothing observable, because `stage2::build_stage2_from_p2m`

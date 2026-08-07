@@ -207,11 +207,49 @@ platform, and the guard has to move somewhere the platform is not.
    the binding is derived from the `VTTBR_EL2` value (§2b), the metal's `bind_stream_stage2` reads the
    entry back through the decode seam and requires it to equal the binding requested, and Kani proves
    the round-trip. **Declared residual: the VMID field is not boot-witnessed on this platform.**
-2. **Removing `CMD_TLBI_NSNH_ALL` changes nothing observable.** Two explanations fit — QEMU's
+   ✅ **The REASONING is now confirmed on a platform that does cache** — see §5a below. The residual
+   itself is unchanged: it says *not boot-witnessed*, and baleen's boot still runs on QEMU.
+2. **Removing `CMD_TLBI_NSNH_ALL` changes nothing observable.** ~~Two explanations fit — QEMU's
    `CMD_CFGI_STE` may already drop that stream's cached translations, or nothing is cached across
-   these operations — and this repo has established neither. The command stays because the
+   these operations — and this repo has established neither.~~ **The first explanation is now
+   REFUTED and the second is the live one — see §5a.** The command stays because the
    architecture requires it when the tables a stream reaches change; it is **reasoned, not witnessed**,
    the same standing as the cache maintenance in `scrub_frame`.
+
+## 5a. Both of those, measured on a platform that caches — Arm's AEM FVP (2026-08-07)
+
+The two probes above refused to go red **because QEMU's SMMU models no translation caching at all**.
+That was one of two candidate explanations and this repo could not choose between them, which is
+the state §5's entry 2 recorded. It can now.
+
+`fvp-probe` — a **standalone** instrument that shares no code with `hv-metal` and is **not CI-gated**
+(`fvp-probe/README.md` explains why it must not become a gate) — drives an SMMUv3 on Arm's Base RevC
+AEM through the **ATOS** interface (`SMMU_GATOS_*`), which the architecture specifies *"interacts
+with configuration and TLB invalidation in the same way as a translation that is performed for a
+transaction"* (IHI 0070D.a §9).
+
+| what was in doubt | measured on the AEM |
+|---|---|
+| Are stage-2 translations cached at all? | **Yes.** Change one block descriptor without invalidating and the old frame is still returned. |
+| Does `CMD_TLBI_*` do anything? | **Yes.** After it, the same question returns the new frame. |
+| Does `CMD_CFGI_STE` drop cached *translations*? | **No** — it invalidates configuration only. A re-pointed STE stays shadowed by the cached translation until the VMID changes or the TLB is invalidated. |
+| Are cached entries `S2VMID`-tagged? | **Yes.** Two StreamIDs sharing one descriptor under different VMIDs: invalidating one VMID frees exactly one stream and leaves the other stale. |
+
+★ **So §5's entry 2 resolves to its second explanation.** `CMD_CFGI_STE` does *not* subsume the
+TLBI, so on QEMU the reason the probe stays green is that nothing is cached there. The guard is
+**code whose effect QEMU cannot exhibit**, not code of unknown value — which is a materially
+different thing to carry.
+
+★ The VMID result is **capacity-controlled**: with the model's TLB reduced to one entry the two
+streams evict each other, no staleness survives to be scoped, and the observation disappears. A
+difference that vanishes when the cache is too small to hold it is caused by the cache.
+
+⚠ **WHAT THIS DOES NOT CHANGE.** Ledger item 2(d) says these are *not boot-witnessed*, and they
+still are not: `hv-metal` runs on QEMU, and the instrument above is a separate program that shares
+none of its code. Closing that would mean running `hv-metal` itself on a caching platform, which is
+the FVP port this project has **declined** (`baleen-diamond-roadmap`). It is also a **model**, not
+silicon, and ATOS rather than a live bus master — the architecture's "same caches as a transaction"
+sentence is load-bearing in the claim.
 
 ## 6. What rung 3 does **not** claim
 
