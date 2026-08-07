@@ -486,6 +486,159 @@ fn milestone_2a() {
     });
 }
 
+/// Report an experiment's outcome in a form the two-run comparison can read mechanically.
+///
+/// ★ The probe deliberately does NOT decide whether the outcome is correct. It cannot: "the mapping
+/// went stale" is the RIGHT answer with caching on and the WRONG one with caching off, and this
+/// binary is not told which run it is in. Deciding here would mean baking in an expectation that
+/// only holds for one arm — which is how a witness ends up only runnable in the configuration where
+/// it passes (design-lesson #198). The comparison belongs to whatever ran both.
+fn result(name: &str, value: &str) {
+    puts("@@ RESULT ");
+    puts(name);
+    putb(b'=');
+    puts(value);
+    puts("\n");
+}
+
+/// Classify an answer against the two frames it could name.
+fn which(t: &smmu::Translation) -> &'static str {
+    if t.timeout {
+        "TIMEOUT"
+    } else if t.fault {
+        "FAULT"
+    } else if t.pa == smmu::TARGET_A {
+        "A"
+    } else if t.pa == smmu::TARGET_B {
+        "B"
+    } else {
+        "OTHER"
+    }
+}
+
+/// **2b — is the STE cached, and does `CMD_CFGI_STE` matter?**
+///
+/// Rewrite the STE to name a different table set *without* telling the SMMU. If the answer does not
+/// move, the configuration cache is real. The third step is the control that makes the second
+/// interpretable: after `CMD_CFGI_STE` the answer MUST move, which proves the rewrite was real and
+/// reached memory. Without it, "no change" would also be consistent with the STE write having gone
+/// nowhere at all.
+fn milestone_2b() {
+    puts("@@ --- 2b: STE caching / CMD_CFGI_STE ---\n");
+    smmu::reset_all();
+    smmu::bind(smmu::SID_A, smmu::L1_A, smmu::VMID_A);
+
+    let base = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    report_translation("2b.1 baseline        (expect A)", &base);
+
+    // ⚠ The new binding uses a DIFFERENT VMID, and that is the whole repair.
+    //
+    // The first version rebound to `L1_B` under the SAME `VMID_A` and reported INCONCLUSIVE: even
+    // after `CMD_CFGI_STE` the answer stayed `A`. That was not a broken SMMU — **`CMD_CFGI_STE`
+    // invalidates the CONFIGURATION cache, not the TRANSLATION cache.** The STE change was picked
+    // up, and then the still-cached `(VMID_A, IPA)` translation shadowed it, so the walk never
+    // reached `L1_B`. The experiment conflated two caches and measured their conjunction.
+    //
+    // Rebinding under `VMID_B` means no cached translation applies to the new configuration, so
+    // what the answer depends on is exactly one thing: whether the SMMU re-read the STE.
+    smmu::bind_silently(smmu::SID_A, smmu::L1_B, smmu::VMID_B);
+    let quiet = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    report_translation("2b.2 STE->B, NO CFGI (A=stale)  ", &quiet);
+
+    smmu::invalidate_ste(smmu::SID_A);
+    let after = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    report_translation("2b.3 after CFGI_STE  (expect B) ", &after);
+
+    let sane = which(&base) == "A" && which(&after) == "B";
+    result("2b_ste_cache", if !sane { "INCONCLUSIVE" } else if which(&quiet) == "A" { "STALE" } else { "FRESH" });
+}
+
+/// **2c — is the stage-2 translation cached, and does `CMD_TLBI_*` matter?**
+///
+/// The same shape one level down: change the block descriptor in place, touching one 8-byte word,
+/// and re-ask without invalidating. ★ This is the experiment SMMU rung 3's gotcha 4 could not run —
+/// removing `CMD_TLBI_NSNH_ALL` on QEMU "changed nothing observable", and rung 4b re-probed it and
+/// it refused to go red a second time. Both were recorded as findings rather than passes, because
+/// QEMU models no caching and so cannot tell "the TLBI did nothing" from "there is nothing to
+/// invalidate".
+fn milestone_2c() {
+    puts("@@ --- 2c: stage-2 TLB / CMD_TLBI ---\n");
+    smmu::reset_all();
+    smmu::bind(smmu::SID_A, smmu::L1_A, smmu::VMID_A);
+
+    let base = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    report_translation("2c.1 baseline        (expect A)", &base);
+
+    smmu::remap(smmu::L2_A, smmu::TARGET_B);
+    let quiet = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    report_translation("2c.2 desc->B, NO TLBI (A=stale) ", &quiet);
+
+    smmu::invalidate_all();
+    let after = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    report_translation("2c.3 after TLBI      (expect B) ", &after);
+
+    let sane = which(&base) == "A" && which(&after) == "B";
+    result("2c_tlb", if !sane { "INCONCLUSIVE" } else if which(&quiet) == "A" { "STALE" } else { "FRESH" });
+}
+
+/// **2d — are cached translations tagged with the VMID?**
+///
+/// Two StreamIDs on **the same tables** under **different VMIDs**, then invalidate ONE VMID and ask
+/// both.
+///
+/// ★ This is a better instrument than the one ledger 2(d) has been waiting on. Rung 3 asked "does a
+/// wrong `STE.S2VMID` change anything observable?" and QEMU said no — but that was never evidence
+/// about VMID tagging, only about a platform that tags nothing. Here the discriminator is
+/// **VMID-scoped invalidation**: if entries carry a VMID, `CMD_TLBI_S2_IPA` for `VMID_A` must free
+/// exactly one of the two streams and leave the other stale. A difference between two streams
+/// reading the same descriptor cannot be explained by anything except the tag.
+fn milestone_2d() {
+    puts("@@ --- 2d: S2VMID tagging via scoped invalidation ---\n");
+    smmu::reset_all();
+    // The SAME table set for both, so any later difference is the VMID and nothing else.
+    smmu::bind(smmu::SID_A, smmu::L1_A, smmu::VMID_A);
+    smmu::bind(smmu::SID_B, smmu::L1_A, smmu::VMID_B);
+
+    let a0 = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    let b0 = smmu::translate(smmu::SID_B, smmu::TEST_IPA);
+    report_translation("2d.1 sid=f0 vmid=11 baseline (expect A)", &a0);
+    report_translation("2d.1 sid=f1 vmid=22 baseline (expect A)", &b0);
+
+    // One shared descriptor changes; neither stream is told.
+    smmu::remap(smmu::L2_A, smmu::TARGET_B);
+    let a1 = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    let b1 = smmu::translate(smmu::SID_B, smmu::TEST_IPA);
+    report_translation("2d.2 sid=f0 after desc->B, no TLBI     ", &a1);
+    report_translation("2d.2 sid=f1 after desc->B, no TLBI     ", &b1);
+
+    // Invalidate ONLY VMID_A.
+    smmu::invalidate_vmid(smmu::VMID_A);
+    let a2 = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    let b2 = smmu::translate(smmu::SID_B, smmu::TEST_IPA);
+    report_translation("2d.3 sid=f0 after TLBI(vmid=11) exp B  ", &a2);
+    report_translation("2d.3 sid=f1 after TLBI(vmid=11) exp A  ", &b2);
+
+    // The control: f1's staleness must be invalidatable too, or 2d.3 says nothing about scoping.
+    smmu::invalidate_vmid(smmu::VMID_B);
+    let b3 = smmu::translate(smmu::SID_B, smmu::TEST_IPA);
+    report_translation("2d.4 sid=f1 after TLBI(vmid=22) exp B  ", &b3);
+
+    let sane = which(&a0) == "A" && which(&b0) == "A" && which(&b3) == "B";
+    let scoped = which(&a2) == "B" && which(&b2) == "A";
+    result(
+        "2d_vmid",
+        if !sane {
+            "INCONCLUSIVE"
+        } else if scoped {
+            "SCOPED"
+        } else if which(&a2) == which(&b2) {
+            "UNSCOPED"
+        } else {
+            "OTHER"
+        },
+    );
+}
+
 extern "C" fn probe_main() -> ! {
     uart_init();
     puts("\n@@ FVPPROBE-BEGIN\n");
@@ -558,6 +711,9 @@ extern "C" fn probe_main() -> ! {
 
     pcie_scan();
     milestone_2a();
+    milestone_2b();
+    milestone_2c();
+    milestone_2d();
 
     puts("@@ FVPPROBE-END\n");
     semihosting_exit()

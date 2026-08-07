@@ -271,6 +271,22 @@ pub fn bind_silently(sid: u32, s2ttb: u64, vmid: u16) {
     write_ste(sid, s2ttb, vmid);
 }
 
+/// Return every structure to a known state: both table sets rebuilt at their own targets, both
+/// StreamIDs denied, every cache invalidated.
+///
+/// ⚠ **Each experiment must start from this, not from whatever the previous one left behind.**
+/// These phases deliberately create stale state; a phase that inherited it would report the
+/// PREVIOUS experiment's staleness as its own, and the transcript would look exactly the same.
+pub fn reset_all() {
+    build_tables(L1_A, L2_A, TARGET_A);
+    build_tables(L1_B, L2_B, TARGET_B);
+    zero(STRTAB + u64::from(SID_A) * 64, 64);
+    zero(STRTAB + u64::from(SID_B) * 64, 64);
+    invalidate_ste(SID_A);
+    invalidate_ste(SID_B);
+    invalidate_all();
+}
+
 // ─── command queue ──────────────────────────────────────────────────────────────────────────────
 
 fn submit(word0: u64, word1: u64) {

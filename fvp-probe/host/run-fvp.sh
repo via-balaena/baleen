@@ -4,20 +4,32 @@
 #
 # Build the probe, run it on Arm's model inside the VM, and print the transcript.
 #
-#   $ fvp-probe/host/run-fvp.sh                 # caching OFF — the model's default
-#   $ fvp-probe/host/run-fvp.sh --cache-on      # caching ON  — the other arm of the control
+#   $ fvp-probe/host/run-fvp.sh                 # default: the model's infinite SMMU cache
+#   $ fvp-probe/host/run-fvp.sh --cache-on      # minimal cache (size_of_tlb=1) — the other arm
+#   $ fvp-probe/host/run-fvp.sh --both          # run both arms and compare. PREFER THIS.
 #   $ fvp-probe/host/run-fvp.sh --list-params   # what knobs does this model actually have?
 #
-# ── THE CONTROL IS THE WHOLE POINT OF THE TWO MODES ──────────────────────────────────────────────
+# ── ⚠ THE PREMISE THIS FILE WAS WRITTEN ON IS REFUTED. READ THIS BEFORE TRUSTING ANY ARM ─────────
 #
-# `size_of_tlb` and `size_of_ste_cache` default to ZERO, i.e. the model caches nothing and behaves
-# like QEMU. Turn them up and caching becomes real. So the same binary, run both ways, must give
-# OPPOSITE answers: with caching off a stale mapping is impossible; with it on a stale mapping is
-# expected.
+# It used to say here that `size_of_tlb` and `size_of_ste_cache` default to ZERO, "i.e. the model
+# caches nothing and behaves like QEMU", and that the two arms therefore had to give opposite
+# answers. **That is false**, and the model says so itself — every `size_of_*` parameter's
+# description ends:
 #
-# ★ A witness that can only be run in the configuration where it passes is design-lesson #198's
-# failure mode, and this project has been bitten by it. Here the negative arm costs one flag, so
-# there is no excuse for reporting a result from one mode alone. **Run both. Report both.**
+#   "If this is zero then it is treated as a large number ('infinite') but it is bounded"
+#
+# So the default is an INFINITE cache, and the arm that was labelled "caching ON" (at 64 entries)
+# made the cache SMALLER than the default. Both arms cached. That is why the first comparison
+# produced identical results in both columns — the outcome that sent me to read the descriptions.
+#
+# ★ **The design principle survives its own premise being wrong, and is the reason this was caught.**
+# A witness runnable only in the configuration where it passes is design-lesson #198's failure mode;
+# `--both` exists so that reporting one arm is more work than reporting the pair. The comparison
+# then falsified its own control before any result was written up. **Run both. Report both.**
+#
+# The arms now compare cache CAPACITY (infinite vs one entry) rather than presence, because no
+# parameter setting appears to disable the cache at all. What the results actually rest on is each
+# experiment's INTERNAL control — the post-invalidation step that must show the new mapping.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,10 +46,18 @@ CYCLELIMIT="${FVP_CYCLELIMIT:-200000000}"
 
 MODE="probe"
 CACHE="off"
+# Extra `-C name=value` settings, appended verbatim. Exists so a claim ABOUT the model can be tested
+# on the model — in particular "an unknown parameter is rejected", which this script's caching arm
+# silently depends on and which was asserted here before it was ever checked.
+EXTRA_C=()
 for arg in "$@"; do
+    case "$arg" in
+        -C*=*) EXTRA_C+=(-C "${arg#-C}") ; continue ;;
+    esac
     case "$arg" in
         --cache-on)     CACHE="on" ;;
         --cache-off)    CACHE="off" ;;
+        --both)         MODE="both" ;;
         --list-params)  MODE="list-params" ;;
         # ⚠ These two exist because Arm's BUNDLED documentation does NOT carry the
         # `SMMUv3TestEngine`'s register map — §4.7.36 gives its ports and CADI targets and stops —
@@ -50,6 +70,46 @@ for arg in "$@"; do
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+
+# ─── the control, run as one command ─────────────────────────────────────────────────────────────
+#
+# ★ `--both` exists so that reporting a single arm takes MORE effort than reporting the pair.
+#
+# ⚠ WHAT IT COMPARES CHANGED, AND THE REASON IS A REFUTATION WORTH READING. It was designed as
+# caching-OFF vs caching-ON, on the belief that `size_of_tlb=0` disabled the cache. **It does not**
+# — every `size_of_*` parameter's own description says "If this is zero then it is treated as a
+# large number ('infinite')". The first run of this comparison produced IDENTICAL results in both
+# arms, which is what sent me to read the descriptions. **The comparison caught the flaw in itself,
+# which is the only reason it was found before the results were written up.**
+#
+# So the arms are now **infinite cache** (default) vs **minimal cache** (`size_of_tlb=1`), and the
+# discriminator is CAPACITY rather than presence: an experiment needing two live entries must behave
+# differently when only one fits. A result that is capacity-dependent is caused by caching; one that
+# is identical in both arms is not evidence of caching at all.
+#
+# ⚠ There appears to be NO configuration of this model with the SMMU cache genuinely disabled, so
+# a true negative arm is not available by parameter. What stands in for it is each experiment's
+# INTERNAL control — the post-invalidation step that must show the new mapping. Those do not depend
+# on this comparison and are what the results actually rest on.
+if [[ "$MODE" == "both" ]]; then
+    off_log="$FVP_DIR/results-infinite-cache.txt"
+    on_log="$FVP_DIR/results-minimal-cache.txt"
+    echo "run-fvp: arm 1 of 2 — infinite cache (default)"
+    "${BASH_SOURCE[0]}" --cache-off > "$off_log" 2>&1 || true
+    echo "run-fvp: arm 2 of 2 — minimal cache (size_of_tlb=1)"
+    "${BASH_SOURCE[0]}" --cache-on > "$on_log" 2>&1 || true
+    echo
+    printf '%-16s %-16s %-16s\n' "experiment" "infinite cache" "minimal cache"
+    printf '%-16s %-16s %-16s\n' "----------" "--------------" "-------------"
+    for name in $(grep -ho 'RESULT [a-z0-9_]*' "$off_log" "$on_log" | awk '{print $2}' | sort -u); do
+        o=$(grep -o "RESULT $name=[A-Z]*" "$off_log" | head -1 | cut -d= -f2)
+        n=$(grep -o "RESULT $name=[A-Z]*" "$on_log" | head -1 | cut -d= -f2)
+        printf '%-16s %-16s %-16s\n' "$name" "${o:-<none>}" "${n:-<none>}"
+    done
+    echo
+    echo "full transcripts: $off_log  /  $on_log"
+    exit 0
+fi
 
 [[ -f "$BASE_CPIO" ]] || { echo "missing $BASE_CPIO — run fvp-probe/host/mkinitramfs.sh first" >&2; exit 1; }
 [[ -f "$KERNEL" ]] || { echo "missing $KERNEL — run hv-metal/linux/fetch-guest-image.sh first" >&2; exit 1; }
@@ -102,13 +162,23 @@ FVP_ARGS=(
 )
 
 if [[ "$CACHE" == "on" ]]; then
-    # ⚠ THESE PARAMETER NAMES ARE FROM A RECORDED `--list-params` RUN, NOT FROM THE ARCHITECTURE.
-    # Verify them with `run-fvp.sh --list-params` before trusting a negative result: a MISSPELLED
-    # parameter is the classic way to get "caching made no difference" for a reason that has nothing
-    # to do with caching. The model rejects unknown `-C` names loudly, which is the saving grace.
+    # ⚠⚠ THE "CACHING OFF" PREMISE THIS FLAG WAS BUILT ON IS **REFUTED**. MEASURED, from the
+    # parameters' own descriptions:
+    #
+    #   "If this is zero then it is treated as a large number ('infinite') but it is bounded"
+    #
+    # It is on EVERY `size_of_*` cache parameter. So the default of 0 is an **INFINITE** cache, not
+    # an absent one — and this arm, at 64, made the TLB SMALLER than the default. Both arms cached,
+    # which is exactly why they produced identical results and why that was worth chasing.
+    #
+    # ★ Kept, renamed in meaning: this is now the **small-cache** arm, and it is still a real
+    # control — see `--both`. The parameter NAMES were verified by running the model with a
+    # deliberately misspelled one, which it rejects fatally ("parameter not found", run aborts, no
+    # UART output). So a silent typo cannot explain a null result here. That check was written down
+    # as an assumption before it was ever performed; performing it is what made the rest legible.
     FVP_ARGS+=(
-        -C pci.pci_smmuv3.mmu.size_of_tlb=64
-        -C pci.pci_smmuv3.mmu.size_of_ste_cache=16
+        -C pci.pci_smmuv3.mmu.size_of_tlb=1
+        -C pci.pci_smmuv3.mmu.size_of_ste_cache=1
     )
 fi
 
@@ -118,6 +188,11 @@ case "$MODE" in
     list-instances) FVP_ARGS+=(--list-instances) ;;
     *)              FVP_ARGS+=(-a /probe.elf --cyclelimit "$CYCLELIMIT" --stat) ;;
 esac
+
+# Last, so a caller can override anything set above.
+if [[ ${#EXTRA_C[@]} -gt 0 ]]; then
+    FVP_ARGS+=("${EXTRA_C[@]}")
+fi
 
 # ─── the payload archive ─────────────────────────────────────────────────────────────────────────
 

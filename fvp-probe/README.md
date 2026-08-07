@@ -24,10 +24,23 @@ pci.pci_smmuv3.mmu.size_of_tlb        = 0   "The number of entries in the TLB."
 pci.pci_smmuv3.mmu.size_of_ste_cache  = 0   "...cache holding STE structures."
 ```
 
-★ **The default of zero is a built-in control.** The same binary run twice must give opposite
-answers: caching off ⇒ a stale mapping is impossible; caching on ⇒ a stale mapping is expected. A
-witness that can only be run in the configuration where it passes is design-lesson #198's failure
-mode; here the negative arm costs one command-line flag.
+⚠⚠ **"ZERO ENTRIES" DOES NOT MEAN "NO CACHE", AND THAT MISREADING WAS THIS PROBE'S FOUNDING
+PREMISE.** The model says so itself — every `size_of_*` parameter's description ends:
+
+> "If this is zero then it is treated as a large number ('infinite') but it is bounded"
+
+So the default is an **infinite** cache, and the arm first labelled "caching ON" (64 entries) made it
+*smaller* than the default. Both arms cached, which is why the first comparison produced identical
+columns — the outcome that sent me to read the descriptions.
+
+★ **The design principle survived its premise being false, and that is the only reason the error was
+caught.** A witness runnable only in the configuration where it passes is design-lesson #198's
+failure mode, so `--both` was built to make reporting one arm harder than reporting the pair. The
+comparison then falsified its own control before any result was written up. Had only the default arm
+been run, three clean-looking findings would have shipped behind a control that did not exist.
+
+The arms now compare cache **capacity** — infinite versus one entry — because no setting appears to
+disable the cache at all.
 
 ## Why it is NOT a CI gate, and must not become one
 
@@ -82,10 +95,52 @@ SMMU. Measured:
 with its BAR sizes (below). This had to come first: milestone 2 needs a bus master it can actually
 drive, and whether one existed was in dispute between two sources.
 
-**Milestone 2 — not written.** Stream table + command/event queues, an STE for an
-`SMMUv3TestEngine`, a DMA, then: mutate the STE with **no** invalidation and DMA again (stale ⇒
-caching is real), then `CMD_CFGI_STE` / `CMD_TLBI_*` and DMA again (changed ⇒ invalidation matters).
-Run the whole thing twice, with `size_of_tlb`/`size_of_ste_cache` at `0` and at `N`.
+**Milestone 2 — done. Honest-ledger item 2(d) is closed, both halves.**
+
+The instrument is **ATOS** (`SMMU_GATOS_*`), not a DMA device — Arm publishes no register map for the
+`SMMUv3TestEngine` and the model exposes none, so the translation itself is the observable instead of
+where some bytes landed. IHI 0070D.a §9: an ATOS translation *"interacts with configuration and TLB
+invalidation in the same way as a translation that is performed for a transaction"*.
+
+| experiment | infinite cache (default) | minimal cache (`size_of_tlb=1`) |
+|---|---|---|
+| **2b** STE cache / `CMD_CFGI_STE` | STALE | STALE |
+| **2c** stage-2 TLB / `CMD_TLBI_*` | STALE | STALE |
+| **2d** `S2VMID` tagging | **SCOPED** | **UNSCOPED** |
+
+**2c — the stage-2 TLBI is load-bearing.** Change one block descriptor, ask again without
+invalidating: the old frame comes back. Issue `CMD_TLBI_*`: the new one does.
+
+```
+2c.1 baseline           PA=0x82000000     A
+2c.2 desc→B, NO TLBI    PA=0x82000000     A   ← stale
+2c.3 after TLBI         PA=0x82400000     B   ← invalidation matters
+```
+
+**2d — cached entries are `S2VMID`-tagged.** Two StreamIDs, *the same tables*, different VMIDs.
+Invalidate one VMID and exactly one stream goes fresh:
+
+```
+2d.2 f0/vmid=11 and f1/vmid=22, desc→B, no TLBI   both A     both stale
+2d.3 after TLBI(vmid=11)   f0 → B (fresh)   f1 → A (still stale)   ← the tag
+2d.4 after TLBI(vmid=22)   f1 → B                                  ← control
+```
+
+★ **And it is capacity-dependent, which is what makes it evidence.** With a one-entry TLB the two
+streams evict each other, no staleness survives to be scoped, and the result flips to `UNSCOPED`.
+A difference that disappears when the cache is made too small to hold it is caused by the cache.
+
+**2b — the STE configuration cache is real too**, which the ledger did not ask about: rewriting the
+STE without `CMD_CFGI_STE` leaves the old binding in force, and issuing it installs the new one.
+
+### ⚠ What this does NOT establish
+
+* **It is ATOS, not a bus master.** The architecture says ATOS shares the caches a transaction uses,
+  and that sentence is doing real work in the claim. No device DMA was performed.
+* **It is a MODEL, not silicon** — Arm's architecture-conformance model, which is stronger evidence
+  than QEMU and weaker than hardware.
+* **No configuration disables the SMMU cache**, so there is no true negative arm; what stands in for
+  it is each experiment's own post-invalidation step plus 2d's capacity control.
 
 ## Platform facts this depends on (each corroborated twice)
 
