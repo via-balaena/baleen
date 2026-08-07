@@ -103,8 +103,9 @@
 	 * boot runs byte-identical device trees — the guests must not be able to tell they are on a
 	 * machine with an SMMU — so a pad that appeared only for the DMA boot would break that property
 	 * for the sake of the rung testing it. The cost is that every boot now reserves 2 MiB it may not
-	 * use; the benefit is that the witness below (`dmapad`) runs in all four, so "the kernel never
-	 * wrote here" is asserted against four different guest workloads instead of one.
+	 * use; the benefit is that the `dmapad` witness (`report_dma_pad`, in `hv-metal/src/linux.rs`)
+	 * runs in all four, so "the kernel never wrote here" is asserted against four different guest
+	 * workloads instead of one.
 	 *
 	 * ⚠ THE WITNESS'S HONEST CEILING, because the two are easy to conflate: EL2 seeds a sentinel here
 	 * before the guests run and checks it at power-off. A surviving sentinel is CONSISTENT with the

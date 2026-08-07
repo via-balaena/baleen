@@ -663,7 +663,8 @@ fn render_guest_dtb(
 ///   **emulated in EL2**, not in the pass-through window, so the bytes additionally have to survive
 ///   `vpl011`'s relay to the real UART. Un-forgeable in the same way `ro=0x5eed` is on the synthetic
 ///   path.
-/// * **`DMA      [mem 0x0000000048000000-0x0000000063ffffff]`** — THE MEMORY CONTRACT, in one
+/// * **`  DMA      [mem 0x0000000048000000-0x0000000063ffffff]`** (two leading spaces, which are
+///   part of the marker) — THE MEMORY CONTRACT, in one
 ///   string. It is the kernel reporting the window it got from our DTB, and it must equal what the
 ///   emitter maps for **this domain** and the `-device loader` addresses above (where the blobs
 ///   land). Four places that must agree; this is the assertion that goes red when they stop.
@@ -1105,9 +1106,12 @@ const LINUX_MARKERS: &[&str] = &[
     "baleen: tickdefer OK: a FULL list-register bank DEFERS the forwarded timer instead of halting",
     // ⑲-3a — EL2's half of the landing-pad claim: the sentinel it wrote into each guest's reserved
     // range before the first `eret` is still there after both kernels ran to userspace and powered
-    // off. On its own this is only consistent with the reservation being honoured — see the
-    // kernel-side marker below, which is the half that says Linux SAW the range.
-    "baleen: dmapad OK:",
+    // off. On its own this is only consistent with the reservation being honoured — the half that
+    // says Linux SAW the range is the pair of `OF: reserved mem: …nomap…` markers ABOVE, one per
+    // guest. Matched up to the addresses, which are the part that varies.
+    "baleen: dmapad OK: every guest booted an unmodified Linux to userspace and powered off \
+     without writing one byte of the 2048 KiB its device tree reserves no-map at the top of its \
+     own window",
 ];
 
 /// What the **fault-probe** boot must show, and it is the whole rung in five lines.
