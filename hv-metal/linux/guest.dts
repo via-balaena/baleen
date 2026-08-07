@@ -10,11 +10,20 @@
  * (see docs/ARC-5-M5-GUEST-INTERFACE.md). Only the nodes the guest actually drives are present, so
  * Linux probes ONLY what hv-metal passes through in Stage-2 — no peripheral it can't reach.
  *
- * Derived from the QEMU `virt` (gic-version=3, virtualization=on) device tree, with three changes:
+ * Derived from the QEMU `virt` (gic-version=3, virtualization=on) device tree. The THREE ORIGINAL
+ * departures — the ones that make this a baleen guest rather than a QEMU one:
  *   1. psci `method` = "hvc"  (Linux's PSCI HVCs trap to hv-metal's Arc-5c handler; there is no EL3).
  *   2. /memory relocated to 0x4800_0000 (hv-metal owns the low 128 MiB; the guest owns the rest).
  *   3. /chosen carries our bootargs + the initramfs range (initrd-end patched by `cargo xtask
  *      qemu-linux` to start + the initramfs file size).
+ *
+ * ...and the THREE CONTENT EDITS since, each with its rationale at the node itself. Listed here
+ * because ③ earned the property that taking a device AWAY never required touching this file, and an
+ * accurate count is the only way that property stays checkable:
+ *   4. ③-b2b-ii-d — `peer-probe`, a node naming an address in the OTHER guest's RAM. The negative
+ *      test's instrument, and the only node here that exists to fail.
+ *   5. ⑱-4b-ii — `cpu@1`. A guest cannot use a CPU its machine description does not mention.
+ *   6. ⑲-3a — `reserved-memory/dma-pad`, the `no-map` range a bus master may land in.
  *
  * The GICv3 / PL011 / timer reg + interrupt values are the REAL QEMU `virt` addresses, because the
  * guest drives the real hardware (hv-metal maps GICD 0x0800_0000 + GICR 0x080a_0000 + PL011
@@ -81,6 +90,49 @@
 		// (0x64000000..0x80000000). Must match `stage2::LINUX_RAM_SPLIT`; the boot banner
 		// prints both halves and `xtask::LINUX_MARKERS` asserts that line.
 		reg = <0x00 0x48000000 0x00 0x1c000000>;
+	};
+
+	/*
+	 * ⑲-3a — THE DMA LANDING PAD, and the THIRD content edit this file has ever had.
+	 *
+	 * ⑲-2 confined a bus master to a real guest's own Stage-2 map, but it had to take its evidence
+	 * with the guests STOPPED: it ran after the tables were emitted and before the `eret`, precisely
+	 * so a landing DMA could not corrupt a running kernel. ⑲-3 removes that qualification, and the
+	 * moment it does, "aim at somewhere the kernel isn't" stops being available — the kernel IS
+	 * running, and every page of the window above belongs to it.
+	 *
+	 * This node is the answer, and the point is that it is a DECLARATION rather than a guess. The
+	 * range is the top 2 MiB of this guest's own half of the window: inside the memory node above and
+	 * inside Stage-2 (so a DMA here is a transfer to an address the guest genuinely owns, which is
+	 * what makes the permitted arm mean anything), and `no-map` tells Linux to keep it out of the
+	 * linear map entirely. "The kernel does not touch this page" is therefore something the machine
+	 * description SAYS, not something a boot happened to get away with.
+	 *
+	 * It is present in EVERY configuration, including the shipped one. ⑲-1 established that the SMMU
+	 * boot runs byte-identical device trees — the guests must not be able to tell they are on a
+	 * machine with an SMMU — so a pad that appeared only for the DMA boot would break that property
+	 * for the sake of the rung testing it. The cost is that every boot now reserves 2 MiB it may not
+	 * use; the benefit is that the `dmapad` witness (`report_dma_pad`, in `hv-metal/src/linux.rs`)
+	 * runs in all four, so "the kernel never wrote here" is asserted against four different guest
+	 * workloads instead of one.
+	 *
+	 * ⚠ THE WITNESS'S HONEST CEILING, because the two are easy to conflate: EL2 seeds a sentinel here
+	 * before the guests run and checks it at power-off. A surviving sentinel is CONSISTENT with the
+	 * kernel simply never having reached the top of a 448 MiB window, and on its own proves little.
+	 * What makes it a reservation rather than luck is the kernel's OWN log line for this node, which
+	 * `xtask` asserts as a marker: Linux says it saw the range and mapped nothing there.
+	 *
+	 * `xtask` rewrites the address per guest, exactly as it does for peer-probe.
+	 */
+	reserved-memory {
+		#address-cells = <0x02>;
+		#size-cells = <0x02>;
+		ranges;
+
+		dma-pad@63e00000 {
+			reg = <0x00 0x63e00000 0x00 0x200000>;
+			no-map;
+		};
 	};
 
 	apb-pclk {

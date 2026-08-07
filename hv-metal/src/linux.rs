@@ -36,17 +36,23 @@
 //! on QEMU `virt`, and ③-b1 because the emulated distributor reports a `GICD_TYPER` covering the
 //! INTIDs the existing DTB already names.
 //!
-//! **The tree has now gained TWO nodes, and the distinction is worth keeping sharp.** The property
+//! **The tree has now gained THREE nodes, and the distinction is worth keeping sharp.** The property
 //! earned above is that *taking a device away from a guest never required editing its description*;
-//! that is untouched, because neither addition takes anything away.
+//! that is untouched, because no addition takes anything away.
 //!
 //! * **③-b2b-ii-d — the peer probe.** Not an accommodation of our emulation: it is the negative
 //!   test's instrument, the one node in the tree that exists in order to FAIL.
 //! * **⑱-4b-ii — `cpu@1`.** The other direction of the same property, and the honest exception to
 //!   it: a guest cannot USE a CPU its machine description does not mention, so GIVING it one has to
 //!   be said in the tree. Taking away needs no edit; handing over does.
+//! * **⑲-3a — `reserved-memory/dma-pad`.** The top 2 MiB of each window, `no-map`, so that a bus
+//!   master has somewhere to land that the kernel is DECLARED not to touch rather than observed not
+//!   to. See [`dma_pad_ipa`] and [`report_dma_pad`]. This one is closest to an accommodation and
+//!   should be called that: the guest gives up 2 MiB of usable RAM to make a hypervisor-side
+//!   experiment safe, and it pays that cost in every configuration, not only the one that DMAs.
 //!
-//! Say "the DTS gained a probe, and then a second CPU" — not "the DTS is untouched".
+//! Say "the DTS gained a probe, then a second CPU, then a reserved range" — not "the DTS is
+//! untouched".
 //!
 //! So **four** things reach EL2 now: `HVC` (PSCI — Linux's `method = "hvc"`), an `EC=0x24` Stage-2
 //! **data abort**, which [`handle_linux_sync`] routes to the emulated GIC or the emulated PL011 and
@@ -417,6 +423,164 @@ const fn dtb_addr(slot: usize) -> u64 {
 /// Guest `slot`'s initramfs address, i.e. what its DTB's `/chosen` names.
 const fn initrd_addr(slot: usize) -> u64 {
     INITRD_ADDR + window_delta(slot)
+}
+
+/// ⑲-3a — the size of each guest's **DMA landing pad**, the top slice of its own window that its
+/// device tree reserves `no-map`.
+///
+/// One Stage-2 block, so the reservation can neither straddle two blocks nor force the emitter to
+/// split one. Mirrored by `xtask`'s `LINUX_DMA_PAD_SIZE`, and the two are held together by
+/// `render_guest_dtb`'s checked substitution of the `reg` this size appears in.
+const DMA_PAD_SIZE: u64 = 0x20_0000;
+
+/// The IPA of guest `slot`'s DMA landing pad — the top [`DMA_PAD_SIZE`] of the window it owns.
+///
+/// **Derived from the frames the guest actually owns**, not from a literal, so it cannot name a page
+/// outside what the emitter maps for it. `guest.dts` carries the same range as a `reserved-memory`
+/// child with `no-map`, and `xtask` rewrites it per guest.
+const fn dma_pad_ipa(slot: usize) -> u64 {
+    guest_ram_base(slot) + stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES
+        - DMA_PAD_SIZE
+}
+
+/// **The pad must sit above every blob loaded into the window**, or seeding it would overwrite a
+/// guest's kernel, DTB or initramfs — which is precisely the failure the pad exists to make
+/// impossible. Checked for both guests, because the arithmetic is per-slot.
+const _: () = {
+    let mut slot = 0;
+    while slot < NUM_GUESTS {
+        assert!(
+            dma_pad_ipa(slot) > initrd_addr(slot)
+                && dma_pad_ipa(slot) > dtb_addr(slot)
+                && dma_pad_ipa(slot) > kernel_entry(slot),
+            "the DMA landing pad overlaps a blob loaded into that guest's window"
+        );
+        assert!(
+            dma_pad_ipa(slot) + DMA_PAD_SIZE
+                == guest_ram_base(slot)
+                    + stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES,
+            "the DMA landing pad does not end at the top of that guest's window"
+        );
+        slot += 1;
+    }
+};
+
+/// What EL2 writes into every pad before the guests run, and expects to read back unchanged at
+/// power-off. Distinct from `dmawitness`'s own sentinel so a log naming one cannot be mistaken for
+/// the other.
+const DMA_PAD_SENTINEL: u64 = 0xBADD_A7A0_BADD_A7A0;
+
+/// Whether guest `slot`'s pad was found to be mapped, seeded, and read back at seeding time.
+static DMA_PAD_SEEDED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// The physical address guest `slot`'s pad resolves to **through that guest's own live Stage-2
+/// image** — `None` if its image maps nothing there.
+///
+/// Walked rather than assumed. These guests are identity-mapped today, so the answer equals the IPA;
+/// taking that for granted would make the witness a statement about a coincidence of this layout
+/// rather than about the map the guest actually runs under.
+fn dma_pad_pa(slot: usize) -> Option<u64> {
+    let l1 = hv_s2::arm64::vttbr_table(VTTBR.at(slot).load(Ordering::Relaxed));
+    stage2::walk_stage2(l1, dma_pad_ipa(slot)).map(|r| r.pa)
+}
+
+/// **⑲-3a — write the sentinel into every guest's pad, before any guest runs.**
+///
+/// Called after `VTTBR` holds both images (the walk needs them) and before the first `eret` (so the
+/// write cannot race a kernel). Halts rather than continuing on any failure: a pad that is unmapped,
+/// or that does not read back what was just written to it, makes the power-off check vacuous, and a
+/// vacuous witness that prints `OK` is worse than no witness.
+fn seed_dma_pads(uart: &mut Pl011) {
+    for slot in 0..NUM_GUESTS {
+        let ipa = dma_pad_ipa(slot);
+        let Some(pa) = dma_pad_pa(slot) else {
+            let _ = writeln!(
+                uart,
+                "baleen: dmapad FAIL: dom {} maps nothing at its landing pad {ipa:#x}, so \
+                 'the kernel never wrote here' would be a claim about an address that does not \
+                 exist in its image; halting",
+                slot_dom(slot)
+            );
+            crate::park();
+        };
+        // SAFETY: `pa` is a Stage-2 leaf's output address, obtained by decoding the descriptors this
+        // hypervisor itself emitted for `slot`, so it names ordinary DRAM inside that guest's window;
+        // EL2 is identity-mapped and no guest is running yet. Aliases no Rust object — guest RAM is
+        // reached only through raw addresses.
+        unsafe { core::ptr::write_volatile(pa as *mut u64, DMA_PAD_SENTINEL) };
+        // SAFETY: as above, read-only.
+        let back = unsafe { core::ptr::read_volatile(pa as *const u64) };
+        if back != DMA_PAD_SENTINEL {
+            let _ = writeln!(
+                uart,
+                "baleen: dmapad FAIL: dom {}'s landing pad {ipa:#x} (PA {pa:#x}) read back \
+                 {back:#x} immediately after being seeded with {DMA_PAD_SENTINEL:#x} — the pad is \
+                 not plain writable memory, so nothing later can be concluded from its contents; \
+                 halting",
+                slot_dom(slot)
+            );
+            crate::park();
+        }
+        DMA_PAD_SEEDED.at(slot).store(1, Ordering::Relaxed);
+    }
+}
+
+/// **⑲-3a's witness — the reserved pad is byte-for-byte what EL2 left in it.**
+///
+/// Every guest ran a whole Linux boot to userspace and powered off; this reads back the sentinel
+/// seeded before any of them started. Asserted for EVERY slot, including a faulted one: unlike the
+/// per-guest counters `witnesses_assertable` guards, a stopped kernel makes this claim *easier*
+/// rather than legitimately zero, so there is nothing here that a retirement could excuse.
+///
+/// ⚠ **The ceiling, stated because it is the whole difference between this and a lucky boot:** a
+/// surviving sentinel is consistent with the kernel never having reached the top of a 448 MiB
+/// window. What upgrades it from luck to a reservation is the guest's OWN log line for the
+/// `reserved-memory` node, which `xtask` asserts as a marker — Linux saying it saw the range and
+/// mapped nothing there. Neither half is sufficient; the pair is.
+fn report_dma_pad(uart: &mut Pl011) {
+    let mut ok = true;
+    for slot in 0..NUM_GUESTS {
+        let ipa = dma_pad_ipa(slot);
+        let seeded = DMA_PAD_SEEDED.at(slot).load(Ordering::Relaxed);
+        let Some(pa) = dma_pad_pa(slot) else {
+            let _ = writeln!(
+                uart,
+                "baleen: dmapad FAIL: dom {}'s image no longer maps its landing pad {ipa:#x}",
+                slot_dom(slot)
+            );
+            ok = false;
+            continue;
+        };
+        // SAFETY: as `seed_dma_pads`; read-only, and every guest has stopped by now.
+        let held = unsafe { core::ptr::read_volatile(pa as *const u64) };
+        if seeded != 1 || held != DMA_PAD_SENTINEL {
+            let _ = writeln!(
+                uart,
+                "baleen: dmapad FAIL: dom {}'s reserved landing pad {ipa:#x} (PA {pa:#x}) holds \
+                 {held:#x}, not the {DMA_PAD_SENTINEL:#x} EL2 seeded before any guest ran \
+                 (seeded={seeded}) — a kernel wrote inside a range its own device tree reserved \
+                 no-map",
+                slot_dom(slot)
+            );
+            ok = false;
+        }
+    }
+    if ok {
+        let _ = writeln!(
+            uart,
+            "baleen: dmapad OK: every guest booted an unmodified Linux to userspace and powered \
+             off without writing one byte of the {} KiB its device tree reserves no-map at the top \
+             of its own window (dom {} pad {:#x}, dom {} pad {:#x}, both still holding the \
+             {DMA_PAD_SENTINEL:#x} EL2 left there before the first eret) — a DMA landing here \
+             disturbs nothing a kernel can observe",
+            DMA_PAD_SIZE / 1024,
+            slot_dom(SLOT_A),
+            dma_pad_ipa(SLOT_A),
+            slot_dom(1),
+            dma_pad_ipa(1),
+        );
+    }
 }
 
 /// **Every guest's three blobs must land inside that guest's own half of the window**, and the
@@ -2778,6 +2942,7 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     #[cfg(feature = "selftest")]
     report_tick_deferral(uart);
     report_per_guest_state(uart);
+    report_dma_pad(uart);
     if (0..NUM_GUESTS).all(|s| retirement_of(s) == Retirement::PoweredOff) {
         let _ = writeln!(
             uart,
@@ -5359,24 +5524,35 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
     //
     // Here and not earlier: the images must EXIST, and `VTTBR` must hold them, before a device can
     // be pointed at one. Here and not later: nothing is executing yet, so writing the positive
-    // control's sentinel into dom 1's RAM cannot disturb a running kernel — the targets sit above
-    // every blob loaded into each window (see `dmawitness::witness_real_guest`).
+    // control's sentinel into dom 1's RAM cannot disturb a running kernel.
     //
     // ⚠ **This is CONFINEMENT, not SIMULTANEITY.** Honest-ledger item 2(b) stays open: no vCPU runs
     // while this device DMAs. What changes is WHOSE map confines it — a real guest's proven image
     // rather than apparatus built for the test.
+    //
+    // ⑲-3a: both targets are now the guests' **reserved landing pads**. They used to be
+    // `guest_ram_base(slot) + 0x0800_0000` — a hand-picked address chosen for being above the blobs,
+    // which is exactly the guess the pad exists to retire, and which was only safe because nothing
+    // was running. Note that the helper SEEDS the forbidden address too, so the peer's target must
+    // be a page the peer does not mind losing; before the pad, that was an ordinary page of dom 2's
+    // RAM and the safety argument rested entirely on the timing.
     #[cfg(feature = "smmu")]
     crate::dmawitness::witness_real_guest(
         uart,
         vttbr[SLOT_A],
         vttbr[1],
-        // Above dom 1's Image/DTB/initramfs, which end around 0x4c3d_6000.
-        guest_ram_base(SLOT_A) + 0x0800_0000,
-        // Above dom 2's, which end around 0x683d_6000. ⚠ NOT its window base: the helper seeds the
-        // forbidden address before the transfer, so aiming at 0x6400_0000 would write over dom 2's
-        // kernel image.
-        guest_ram_base(1) + 0x0800_0000,
+        dma_pad_ipa(SLOT_A),
+        dma_pad_ipa(1),
     );
+
+    // ★ ⑲-3a — seed each guest's reserved landing pad, and do it LAST.
+    //
+    // After `VTTBR` holds both images, because the seed goes through each guest's own Stage-2 walk;
+    // after ⑲-2, because that witness transfers INTO these same pads and leaves its own values in
+    // them; and before the first `eret`, because the whole claim is that what a guest finds there is
+    // what EL2 put there. Any EL2 write to a pad added below this line silently turns the power-off
+    // check into a check of that write instead.
+    seed_dma_pads(uart);
 
     // ③-b2b-i put guest A's vCPU under hv-core's REAL scheduler before it ever ran, so the
     // preemption at each timer tick is a pair of transitions against a model that already has it
