@@ -1904,7 +1904,9 @@ pub(crate) fn witness_two_masters(
         DOM0,
         HvCall::DeviceRelease {
             dev: DEV_B,
-            from: dom_b,
+            // KILL PROBE — TEMPORARY: matches the probe's assignment above, so the run reaches the
+            // verdict line instead of halting on a refused release.
+            from: dom_a,
         },
     )
     .is_err()
