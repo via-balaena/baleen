@@ -1808,10 +1808,7 @@ pub(crate) fn witness_two_masters(
     }
 
     // ── Assign BOTH, in the model. Two hypercalls; no hardware call at all. ──────────────────────
-    // KILL PROBE — TEMPORARY. Point BOTH devices at dom A, so the derivation publishes ONE
-    // translation for both streams — exactly the "global S2TTB" machine the rung claims it can
-    // exclude. The matrix must collapse: device 1 should stop reaching its own domain.
-    for (dev, to) in [(DEV_A, dom_a), (DEV_B, dom_a)] {
+    for (dev, to) in [(DEV_A, dom_a), (DEV_B, dom_b)] {
         if crate::teardown::dispatch(hv, DOM0, HvCall::DeviceAssign { dev, to }).is_err() {
             fail(uart, "the model refused a DeviceAssign");
         }
@@ -1836,9 +1833,7 @@ pub(crate) fn witness_two_masters(
         && bind_b.vmid == vmid_b
         && bind_a.s2ttb != bind_b.s2ttb
         && bind_a.vmid != bind_b.vmid;
-    // KILL PROBE — TEMPORARY: do not halt here, so the matrix below is observed rather than
-    // short-circuited. The verdict still requires `derived_apart`.
-    if false && !derived_apart {
+    if !derived_apart {
         fail(
             uart,
             "the two published entries are not each their own domain's map",
@@ -1904,9 +1899,7 @@ pub(crate) fn witness_two_masters(
         DOM0,
         HvCall::DeviceRelease {
             dev: DEV_B,
-            // KILL PROBE — TEMPORARY: matches the probe's assignment above, so the run reaches the
-            // verdict line instead of halting on a refused release.
-            from: dom_a,
+            from: dom_b,
         },
     )
     .is_err()
