@@ -476,7 +476,12 @@ static DMA_PAD_SEEDED: PerGuest<AtomicU64, NUM_GUESTS> =
 /// rather than about the map the guest actually runs under.
 fn dma_pad_pa(slot: usize) -> Option<u64> {
     let l1 = hv_s2::arm64::vttbr_table(VTTBR.at(slot).load(Ordering::Relaxed));
-    stage2::walk_stage2(l1, dma_pad_ipa(slot)).map(|r| r.pa)
+    // KILL PROBE B — TEMPORARY. Seed and check 28 MiB into the window instead of the reserved pad.
+    // That lands in the kernel's own .bss, which arm64's `__primary_switched` zeroes on the way up,
+    // so a working witness MUST report `dmapad FAIL`. This is also exactly the shape of the real
+    // defect it has to catch: xtask's DTB address and hv-metal's checked address drifting apart, so
+    // that the range Linux reserves is not the range EL2 inspects.
+    stage2::walk_stage2(l1, guest_ram_base(slot) + 0x01C0_0000).map(|r| r.pa)
 }
 
 /// **⑲-3a — write the sentinel into every guest's pad, before any guest runs.**
