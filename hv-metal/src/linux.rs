@@ -415,16 +415,19 @@ const INITRD_ADDR: u64 = 0x4c00_0000;
 /// below**: the shipped partition is checked against the very predicates `hv-verify` proves total
 /// for a symbolic partition. Without it this crate could deploy a partition the proofs say nothing
 /// about, and the proofs would be true of a shape nothing uses.
-pub(crate) const PARTITION: hv_part::Partition = hv_part::Partition::from_frames(
-    NUM_GUESTS as u64,
-    stage2::LINUX_SUP_FRAMES_PER_GUEST,
-    stage2::SUP_FRAME_BYTES,
-    stage2::LINUX_RAM_BASE,
-    stage2::LINUX_RAM_END,
-    stage2::NUM_SUP_FRAMES,
-    stage2::LINUX_TABLES_PER_GUEST,
-    VCPUS_PER_GUEST as u64,
-);
+pub(crate) const PARTITION: hv_part::Partition = hv_part::Partition {
+    num_guests: NUM_GUESTS as u64,
+    frames_per_guest: stage2::LINUX_SUP_FRAMES_PER_GUEST,
+    window_len: hv_part::window_len_from(
+        stage2::LINUX_SUP_FRAMES_PER_GUEST,
+        stage2::SUP_FRAME_BYTES,
+    ),
+    ram_base: stage2::LINUX_RAM_BASE,
+    ram_end: stage2::LINUX_RAM_END,
+    num_sup_frames: stage2::NUM_SUP_FRAMES,
+    tables_per_guest: stage2::LINUX_TABLES_PER_GUEST,
+    vcpus_per_guest: VCPUS_PER_GUEST as u64,
+};
 
 /// The deployed partition satisfies the predicates proven ∀-partition in `hv-verify::partition`.
 const _: () = {

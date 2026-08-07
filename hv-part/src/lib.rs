@@ -25,7 +25,7 @@
 //! properties below are proven in `hv-verify` for a **symbolic** partition rather than for the one
 //! this board happens to have.
 //!
-//! ⚠ **What this crate is NOT.** It is not [`hv_s2::arm64::Layout`], which describes ONE domain's
+//! ⚠ **What this crate is NOT.** It is not `hv_s2::arm64::Layout` (not linkable — this crate deliberately takes no dependencies), which describes ONE domain's
 //! Stage-2 encoding — table PAs, granule, IPA bases. This is the level above: how the machine is
 //! divided *between* domains, before any of them has an image. The two meet where `hv-metal` builds
 //! a `Layout` per slot from a `Partition`.
@@ -46,6 +46,18 @@ pub type DomId = u16;
 /// The privileged domain. Slot 0 is **not** `DOM0`: guests are numbered from 1, so that a slot
 /// index and a domain id can never be confused by being accidentally equal.
 pub const DOM0: DomId = 0;
+
+/// **The one place `frames_per_guest * frame_bytes` is multiplied** — see
+/// [`Partition::window_len`] for why the product is a definition rather than a theorem.
+///
+/// A free function taking two arguments rather than an eight-argument constructor: `Partition`'s
+/// fields are all `u64`, so a positional constructor would let two of them be transposed with
+/// everything still compiling — in a crate whose entire purpose is to prevent arithmetic mistakes.
+/// Callers write a struct literal with named fields and call this for the one derived field.
+#[must_use]
+pub const fn window_len_from(frames_per_guest: u64, frame_bytes: u64) -> u64 {
+    frames_per_guest * frame_bytes
+}
 
 /// How the machine is divided among guest slots.
 ///
@@ -70,7 +82,7 @@ pub struct Partition {
     /// multiply by a slot index. **And the split is honest**: the isolation property is about
     /// ADDRESSES, while `frames x bytes` is how `hv-metal` computes the length — a definition, not a
     /// theorem, and proving it would be proving that multiplication is multiplication.
-    /// [`Partition::from_frames`] is the one place the product is taken.
+    /// [`window_len_from`] is the one place the product is taken.
     pub window_len: u64,
     /// IPA (and, on an identity-mapped board, PA) where slot 0's window begins.
     pub ram_base: u64,
@@ -85,33 +97,6 @@ pub struct Partition {
 }
 
 impl Partition {
-    /// Build a partition from the frame counts `hv-metal` deploys — **the one place
-    /// `frames_per_guest * frame_bytes` is multiplied.**
-    ///
-    /// `const` so `hv-metal` can build its partition at compile time and keep its `const assert!`s.
-    #[must_use]
-    pub const fn from_frames(
-        num_guests: u64,
-        frames_per_guest: u64,
-        frame_bytes: u64,
-        ram_base: u64,
-        ram_end: u64,
-        num_sup_frames: u64,
-        tables_per_guest: u64,
-        vcpus_per_guest: u64,
-    ) -> Self {
-        Self {
-            num_guests,
-            frames_per_guest,
-            window_len: frames_per_guest * frame_bytes,
-            ram_base,
-            ram_end,
-            num_sup_frames,
-            tables_per_guest,
-            vcpus_per_guest,
-        }
-    }
-
     /// **Whether this partition is one the derivations below are meaningful for.**
     ///
     /// Every property in this crate is stated *given* this. It is not a defensive check but the
