@@ -15,6 +15,15 @@
 //! 448-frame super partition; `DOM_A`/`DOM_B` are the real guests' own ids). The full reasoning, and
 //! the measurement that forced it, is on the `rung3` call in `witness` below.
 //!
+//! ✅ **⑲-2 — and do not read the paragraph above as "no domain-`p2m` confinement under
+//! real-linux". There is; it just is not rungs 3/4.** `witness_real_guest` binds the same bus
+//! master to a REAL guest's own Stage-2 image — `S2TTB` = the table `VTTBR_EL2` carries for a domain
+//! running an unmodified Alpine kernel — and shows it reaches that guest and is ABORTED on its
+//! peer's memory. It is called from `linux::run`, not from [`witness`], because it needs the guests'
+//! emitted images to exist first. So under `real-linux` the module contributes rungs 1–2 **plus**
+//! ⑲-2; what it does not contribute there is rung 3's non-identity translation claim, which its
+//! own doc explains is unreachable on identity-mapped guests.
+//!
 //! ## Why QEMU's `edu` device
 //!
 //! The natural candidate was `virtio-blk-pci`, but driving virtio means a virtqueue, descriptor rings,
