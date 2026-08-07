@@ -62,13 +62,12 @@ fn main() {
             let shipped = qemu_linux(true, LinuxBoot::Shipped);
             let faulted = qemu_linux(true, LinuxBoot::UnmappedFault);
             let looped = qemu_linux(true, LinuxBoot::PeerLoop);
-            shipped && faulted && looped
+            let smmu = qemu_linux(true, LinuxBoot::Smmu);
+            shipped && faulted && looped && smmu
         }
-        // ⑲-1 — **LOCAL ONLY, and deliberately NOT part of `qemu-linux-test`.** See
-        // `LINUX_SMMU_MARKERS`: this boot needs an SMMUv3 that implements STAGE-2, and the CI
-        // runner's QEMU does not (`SMMU_IDR0.S2P = 0`, measured — `idr0=0x0d44101a` on PR #144).
-        // Putting it in the required gate would make that gate report green while proving nothing
-        // about the SMMU, which is worse than not running it.
+        // ⑲-1b — the same boot `qemu-linux-test` now runs as its fourth configuration, kept as a
+        // named task for running it alone during SMMU work. It is NOT a local-only escape hatch:
+        // see `LINUX_SMMU_MARKERS` for why that is no longer needed.
         "qemu-linux-smmu" => qemu_linux(true, LinuxBoot::Smmu),
         "metal-lint" => metal_lint(),
         "doc-markers" => doc_markers(),
@@ -108,7 +107,7 @@ fn main() {
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
-                 qemu-linux-smmu the same boot on a machine WITH an SMMU (LOCAL ONLY — needs SMMUv3 stage-2)\n  \
+                 qemu-linux-smmu just the SMMU boot configuration, run alone\n  \
                  metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)",
                 METAL_LINT_CONFIGS.len()
             );
@@ -361,6 +360,21 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
     // markers would fail for a reason that has nothing to do with the SMMU. `boot-test.sh` learned
     // that the hard way and says so; this is the same line, for the same reason.
     if boot == LinuxBoot::Smmu {
+        // ★★ ⑲-1b — **`arm-smmuv3.stage=2` IS WHAT MAKES THIS BOOT RUNNABLE ON CI, and its absence
+        //    is what made ⑲-1 conclude the opposite.** QEMU's SMMUv3 advertises stage-2 only when
+        //    asked: the property is `"1"` — stage-1 only — BY DEFAULT, and has existed since QEMU
+        //    8.1 (merged to target-arm.next 2023-05). The runner has 8.2.2, so the capability was
+        //    there the whole time and nothing was requesting it.
+        //
+        // ⚠ **⑲-1 read `IDR0.S2P = 0` on CI and concluded "the runner's QEMU cannot do stage-2".**
+        // That inferred a missing CAPABILITY from an unrequested one, on a single register read —
+        // and it nearly bought a staleness tripwire for coverage we could simply have had. MEASURED
+        // with the flag: all five SMMU markers found ON THE RUNNER, `DEFAULT-DENY` included.
+        //
+        // `stage=2` means stage-2 ONLY, which is exactly right here: baleen drives the SMMU from the
+        // same `p2m`-derived Stage-2 tables the CPU walks and wants no stage-1 at all.
+        args.push("-global".into());
+        args.push("arm-smmuv3.stage=2".into());
         args.push("-device".into());
         args.push("edu,dma_mask=0xffffffffff".into());
     }
@@ -1108,31 +1122,31 @@ const LINUX_FAULT_FORBIDDEN: &[&str] = &[
 /// isolated kernels; it does **not** yet show a device confined to a real guest's memory. That is
 /// ⑲-2, and conflating the two would be exactly the altitude error the ledger warns about.
 ///
-/// ## ⚠ LOCAL ONLY, and the reason is a CI CAPABILITY GAP worth recording
+/// ## ★★ THIS RUNS ON CI — and ⑲-1 concluded it could not, from one register read
 ///
-/// **This corpus is asserted by `cargo xtask qemu-linux-smmu`, NOT by `qemu-linux-test`.** It was in
-/// the required gate for exactly one CI run, and that run is the measurement: the boot halted with
+/// ⑲-1 put this boot in the required gate, watched it go red with
 ///
 /// ```text
 /// baleen: smmu rung1 DEFAULT-DENY FAIL (present=true aborting=true stage2=false idr0=0x0d44101a …)
 /// ```
 ///
-/// `SMMU_IDR0` bit 0 is `S2P`; `0x…1a` has it clear, so **the runner's QEMU SMMUv3 does not
-/// implement stage-2 translation**. Locally (QEMU 11.0.3) it does. So this boot cannot run on CI at
-/// all.
+/// and concluded that **the runner's QEMU cannot do SMMUv3 stage-2**, moving the boot to a local-only
+/// task. **That was wrong, and the error is worth more than the fix.** QEMU's SMMUv3 advertises
+/// stage-2 **only when asked**: `arm-smmuv3.stage` is `"1"` — stage-1 only — by DEFAULT, and has
+/// existed since QEMU **8.1** (merged 2023-05). The runner has **8.2.2**. The capability was there
+/// all along; nothing was requesting it. **A missing capability was inferred from an unrequested
+/// one, on a single `IDR0` read** — and it nearly bought a staleness tripwire for coverage that was
+/// available for one command-line flag.
 ///
-/// ★ **AND THE LARGER FACT THE FAILURE EXPOSED: CI HAS NEVER RUN A MACHINE WITH AN SMMU.**
-/// `iommu=smmuv3` appeared exactly ONCE in that entire CI run — this config. `boot-test.sh`'s "smmu"
-/// entry is `boot_and_check "dma-control"`, which passes `-device edu` with **no IOMMU** and asserts
-/// the no-SMMU POSITIVE CONTROL. **Every SMMU result this project has is local-only evidence**, and
-/// that was true before this rung; ⑲-1 is merely the first thing to find out.
+/// MEASURED with `-global arm-smmuv3.stage=2`, on the runner: **all five markers below found**,
+/// `DEFAULT-DENY` included, in a 4-configuration `qemu-linux-test`.
 ///
-/// **Why a separate task and not a capability-gated skip.** A skip inside the required job would let
-/// that job report green on every CI run while proving nothing about the SMMU — a check whose inputs
-/// cannot discriminate, and one that reads as coverage. An explicitly local task says the true
-/// thing. The same call `deep-verify.yml` makes for the ∀-size sweeps.
+/// ★ **So the SMMU rungs (#91–#95) are CI-GATED FOR THE FIRST TIME** — hardware witness as well as
+/// proofs. Before this, `iommu=smmuv3` had never appeared in a CI run at all: `boot-test.sh`'s
+/// `"smmu"` entry passes `-device edu` with **no IOMMU** and asserts the no-SMMU positive control.
+/// The proofs were always required-gated (20 Kani harnesses); it is the *boot* that was missing.
 ///
-/// ## ★ THE PROBE, and it killed harder than predicted
+/// ## ★ THE PROBE, and it killed harder than predicted/// ## ★ THE PROBE, and it killed harder than predicted
 ///
 /// | probe | predicted | measured |
 /// |---|---|---|

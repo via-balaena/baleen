@@ -312,6 +312,20 @@ pub(crate) fn witness(uart: &mut Pl011) {
         // for two rungs, and nothing cared — a check whose result changed nothing (design-lesson
         // #71). The whole arc rests on the SMMU being able to translate through a domain's own
         // Stage-2 tables, so a machine that cannot is a machine this witness must not report on.
+        //
+        // ★★ **⑲-1b — THE OBSERVATION ABOVE IS CORRECT AND ITS EXPLANATION WAS INCOMPLETE, WHICH
+        //    COST NINE DAYS.** `IDR0.S2P = 0` was never a property of the runner's QEMU. QEMU's
+        //    SMMUv3 advertises stage-2 **only when asked**: `arm-smmuv3.stage` is `"1"` — stage-1
+        //    only — BY DEFAULT, and has existed since QEMU 8.1. The runner has 8.2.2. **The
+        //    capability was there the whole time and no invocation was requesting it.**
+        //
+        // Recorded here rather than only at the fix, because this comment is what a reader meets
+        // first and it reads as "CI's machine is incapable". It is not. `xtask` now passes
+        // `-global arm-smmuv3.stage=2` and the SMMU boot is a REQUIRED check; see
+        // `LINUX_SMMU_MARKERS`. **The lesson is not "we measured wrong" — the measurement was
+        // right. It is that a correct observation with a MISSING WHY hardens into a constraint:**
+        // this note is why the SMMU boot was assumed un-CI-gateable for nine days, and why ⑲-1
+        // reached for a staleness tripwire instead of a command-line flag.
         let ok = present && aborting && s2 && device_live && a.aborted();
         if ok {
             let _ = writeln!(
