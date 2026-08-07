@@ -53,7 +53,6 @@
 // VMID-scoping phases, which are written but not yet wired up. They are declared here rather than
 // added later so that the arena layout and the register list are settled in one reviewable place.
 // If this attribute is still present once 2b–2d are running, it is hiding something.
-#![allow(dead_code)]
 
 use core::ptr::{read_volatile, write_volatile};
 

@@ -44,22 +44,24 @@
 //!
 //! ## Status
 //!
-//! **[`probe_main`] is the authoritative list of what this instrument does** — it is a flat
-//! sequence of reports, so reading it takes about as long as reading a summary of it would.
+//! **[`probe_main`] is the authoritative list of what this instrument does.** It is a flat sequence
+//! of calls, so reading it costs about what reading a summary of it would — and unlike a summary it
+//! cannot be wrong. Measured results live in `README.md`, next to the transcripts they came from.
 //!
-//! What holds across all of them, and is the part worth stating in prose: **everything here so far
-//! only OBSERVES.** It reads registers and walks config space; it programs no stream table, drives
-//! no queue, and issues no DMA. The first write to a device register will be milestone 2, and the
-//! order is deliberate — the toolchain, the UART, the SMMU's base address and the presence of a bus
-//! master are each established before anything is built on them.
+//! ⚠ **THREE status paragraphs rotted here before this one, which is why there is nothing else in
+//! this section.** The first said "nothing here touches the SMMU yet" while `probe_main` was already
+//! reading `SMMU_IDR0` — false the day it was written. The second named the SMMU reads and went
+//! stale within the same session, when the PCIe scan landed and became the largest thing in the
+//! file. The third tried to be drift-proof by asserting only a property — "everything here so far
+//! only OBSERVES" — and rotted too, the moment milestone 2 started programming a stream table.
 //!
-//! ⚠ **This section is deliberately NOT a feature list, because two consecutive ones rotted.** It
-//! said "nothing here touches the SMMU yet" while `probe_main` was reading `SMMU_IDR0` — false the
-//! day it was written. That was corrected to name the SMMU reads, and *that* went stale within the
-//! same session when the PCIe scan landed and became the largest thing in the file. **A status
-//! paragraph that enumerates what the code does is a second copy of the code, and the copy is what
-//! drifts.** Both were caught by the standing rule that the full diff is read before every push,
-//! which is evidence for the rule and against the paragraph.
+//! ★ **The third failure is the instructive one.** A property was supposed to survive what a feature
+//! list could not; it did not, because it was anchored on a condition ("the first device-register
+//! write will be milestone 2") that the work was actively heading towards. **Prose that describes
+//! the code is a second copy of the code, and the copy is what drifts — being cleverer about the
+//! wording does not fix it, only having less of it does.** All three were caught by the standing
+//! rule that the full diff is read before every push, which is by now better evidence for that rule
+//! than any argument for it.
 
 mod smmu;
 
@@ -681,10 +683,14 @@ extern "C" fn probe_main() -> ! {
     // `0x2b40_0000` — TF-A's `PLAT_FVP_SMMUV3_BASE`, corroborated by the FVP guide's own table.
     // A wrong base reads as zeroes or faults, and either is worth knowing now rather than in the
     // middle of stream-table bring-up.
-    const SMMU_BASE: usize = 0x2b40_0000;
+    // ⚠ Read through `smmu::id_registers()` rather than a second `SMMU_BASE` declared here. This
+    // function used to carry its own copy of the base address — two declarations of one platform
+    // fact, in a crate whose recurring finding this week is that a fact stated twice drifts. The
+    // duplication was surfaced by removing a temporary `allow(dead_code)`: the accessor was unused
+    // precisely because this code had gone around it.
+    let (idr0, idr1) = smmu::id_registers();
     // SAFETY: SMMUv3 register space on this platform; MMU off, so a direct physical read. `IDR0`
     // is read-only and has no side effects.
-    let idr0 = unsafe { core::ptr::read_volatile(SMMU_BASE as *const u32) };
     puts("@@ SMMU_IDR0   = ");
     puthex(u64::from(idr0));
     puts("\n");
@@ -718,7 +724,6 @@ extern "C" fn probe_main() -> ! {
     // `CMDQS`/`EVTQS` bound its queues. Read now rather than assumed from QEMU's `0x02730010`,
     // because every other number carried across from that platform has so far been wrong.
     // SAFETY: SMMUv3 register space, read-only ID register, no side effects.
-    let idr1 = unsafe { read_volatile((SMMU_BASE + 0x4) as *const u32) };
     puts("@@ SMMU_IDR1   = ");
     puthex_w(u64::from(idr1), 8);
     puts("  SIDSIZE=");
