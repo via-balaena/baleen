@@ -1579,9 +1579,20 @@ pub(crate) fn probe_dump(uart: &mut Pl011, bar0: u64, watch_pa: u64) {
     let _ = writeln!(
         uart,
         "baleen: 19-3b PROBE dump: bar0={bar0:#x} watch_pa={watch_pa:#x} held={held:#x} \
-         cmd={cmd:#x} src={src:#x} dst={dst:#x} cnt={cnt} present={} translating={} event={:?}",
+         cmd={cmd:#x} src={src:#x} dst={dst:#x} cnt={cnt} present={} translating={} \
+         event={}",
         smmu::present(),
         smmu::translating(),
-        ev
+        match ev {
+            Some(e) => e.kind as u64,
+            None => 0xff,
+        }
     );
+    if let Some(e) = ev {
+        let _ = writeln!(
+            uart,
+            "baleen: 19-3b PROBE event: kind={:#x} sid={} addr={:#x} prod={}",
+            e.kind, e.sid, e.addr, e.prod
+        );
+    }
 }
