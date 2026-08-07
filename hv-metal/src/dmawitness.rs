@@ -7,6 +7,14 @@
 //! be a device that actually performs it, so this module builds the smallest possible one and then
 //! observes whether its writes land.
 //!
+//! ⚠ **⑲-1 — "rungs 1–3" IS NOW CONFIGURATION-DEPENDENT, and the title is kept only because the
+//! `smmu` configuration is still where this module is fully exercised.** Rungs 1 and 2 are about the
+//! SMMU itself and run everywhere the feature is on, including alongside real Linux guests. **Rungs 3
+//! and 4 are about a DOMAIN's `p2m` and run only under `not(real-linux)`** — they must own the
+//! machine's domains and frames, and in a real-Linux build both collide (model frames land inside the
+//! 448-frame super partition; `DOM_A`/`DOM_B` are the real guests' own ids). The full reasoning, and
+//! the measurement that forced it, is on the `rung3` call in `witness` below.
+//!
 //! ## Why QEMU's `edu` device
 //!
 //! The natural candidate was `virtio-blk-pci`, but driving virtio means a virtqueue, descriptor rings,
@@ -523,7 +531,40 @@ fn rung2(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
         crate::park();
     }
 
+    // ★★ ⑲-1 — **RUNGS 3 AND 4 ARE SYNTHETIC-CONFIGURATION APPARATUS, AND SAYING SO IS THE RUNG.**
+    //
+    // Rungs 1 and 2 above are about the SMMU ITSELF — it aborts before `SMMUEN`, its stream table
+    // default-denies, its range check denies, and a neighbouring StreamID does not admit this one.
+    // None of that mentions a domain, so it holds in every configuration and now runs in the
+    // real-Linux one too.
+    //
+    // Rungs 3 and 4 are different in kind: they are about a DOMAIN's `p2m`, and to say anything they
+    // must **own the machine's domains and frames**. In a `real-linux` build they cannot, and it is
+    // two collisions rather than one:
+    //
+    //   * **FRAMES.** They place base leaves at model frames 1..6. `NUM_SUP_FRAMES` is 1 by default
+    //     but **448** under `real-linux`, so every one of those falls inside the super partition and
+    //     `build_stage2_from_p2m` refuses — *"frame 2 is a BASE leaf inside the super partition
+    //     [0, 448); its backing and its scrub would disagree"*. MEASURED: that is exactly where the
+    //     combined boot halted, and the emitter's own guard is what caught it. There is nowhere to
+    //     renumber them TO: at `real-linux` the base frames are `[448, 476)` and all 28 are the
+    //     guests' page tables.
+    //   * **DOMAIN IDs.** `DOM_A`/`DOM_B` are 1 and 2 — the same ids `linux::slot_dom` gives the two
+    //     real guests. Rung 4 ends by DESTROYING domain A, which in a combined build would destroy
+    //     an id a real guest is about to be created with.
+    //
+    // ⚠ **This is a SCOPING statement, not a weakening — but the distinction has to be earned, so
+    // here is what is and is not still checked.** Rungs 3 and 4 run in full in the `smmu`
+    // configuration, which `boot-test.sh` boots and gates; nothing they proved has been dropped.
+    // What the real-Linux configuration does NOT yet have is confinement of a device to a REAL
+    // guest's `p2m` — the synthetic apparatus cannot give it, by the two collisions above, and the
+    // honest way to get it is to bind the device to a real guest's own domain and tables. That is
+    // ⑲-2, and this rung exists to make the machine it needs boot at all.
+    #[cfg(not(feature = "real-linux"))]
     rung3(uart, bdf, bar0);
+    // The two parameters are rung 3's alone; under `real-linux` nothing downstream consumes them.
+    #[cfg(feature = "real-linux")]
+    let _ = (bdf, bar0);
 }
 
 // ─── SMMU rung 3 — TRANSLATION: the device walks the DOMAIN's own Stage-2 tables ─────────────────
@@ -790,6 +831,19 @@ fn setup_two_domains(hv: &mut Hypervisor, uart: &mut Pl011) {
 /// built for it: the read-only leaf is the one `hv-s2` emits for a model leaf with `writable: false`,
 /// and the SMMU refuses the write for the same reason the CPU would.
 #[cfg(feature = "smmu")]
+// ⑲-1 — **ALLOW THE ROOT, not the twenty-seven items under it.** Under `real-linux` this function is
+// not called (see `witness`), so it and everything reachable only from it — `DOM_A`/`DOM_B`, the
+// `F_*` model frames, the Stage-2 STE builders in `crate::smmu` — become dead, and `-D warnings`
+// rejects the build. `allow(dead_code)` on an item marks it a live root for reachability, so
+// allowing THIS one silences exactly its subtree and nothing else: dead code elsewhere in this file
+// is still caught. That is `main.rs`'s own idiom for `guest::run`, for the same reason and in the
+// same words — a blanket allow is a lint gate whose inputs cannot discriminate (design-lesson #71),
+// while allowing a displaced entry point says the true thing.
+//
+// ⚠ It is `cfg_attr`-gated so the allow exists ONLY in the configuration where the displacement is
+// real. In the `smmu` configuration this function is called and its subtree is live, so an item that
+// genuinely stopped being used there still fails the build.
+#[cfg_attr(feature = "real-linux", allow(dead_code))]
 fn rung3(uart: &mut Pl011, bdf: pcie::Bdf, bar0: u64) {
     use hv_s2::arm64::{vttbr_table, vttbr_vmid, BALEEN_STAGE2, BALEEN_VMID_BITS};
     use hv_s2::smmu::Stage2Binding;
