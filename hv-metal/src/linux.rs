@@ -2296,9 +2296,6 @@ const CNTHP_CTL_EL2_ENABLE: u64 = 1 << 0;
 /// read-back witness is looking for.
 const CNTHP_CTL_EL2_IMASK: u64 = 1 << 1;
 
-/// Record that EL2 has just been entered from a guest, and charge the interval to whoever held the
-/// pCPU (③-b2b-ii-e). Called first thing in both Linux-mode handlers, which between them are every
-/// entry to EL2 on this path.
 // ── ⑲-3b — a transfer in flight ACROSS guest execution ──────────────────────────────────────────
 //
 // ⚠ **THE HONEST CLAIM, and it is narrower than the words "simultaneous DMA" suggest.** One pCPU,
@@ -2450,6 +2447,12 @@ fn flight_tick() {
     }
 }
 
+/// Record that EL2 has just been entered from a guest, and charge the interval to whoever held the
+/// pCPU (③-b2b-ii-e). Called first thing in both Linux-mode handlers, which between them are every
+/// entry to EL2 on this path.
+///
+/// ⑲-3b hangs its exit-path step here for exactly that reason: this is every entry to EL2, so it is
+/// the one place that can observe a transfer while a guest is the thing running.
 fn note_el2_entry() {
     #[cfg(feature = "smmu")]
     flight_tick();
