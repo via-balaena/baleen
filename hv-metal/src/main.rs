@@ -267,17 +267,19 @@ pub extern "C" fn rust_main() -> ! {
     // ⚠ `text_is_read_only` is a DESCRIPTOR READ-BACK, not a restatement of intent. Without it this
     // line printed "text RO+X" unchanged while a probe that mapped the text writable let the store
     // through — the message asserted a property it never checked (design-lesson #210).
-    // ⚠ BOTH halves are descriptor READ-BACKS, not restatements of intent. The X half was added
-    // after the W half shipped alone: XN was set on every data page and checked by nothing, which is
-    // the same "intent is not evidence" gap the RO+X string had one level up.
-    if mmu::mmu_is_on(sctlr)
-        && mmu::data_cache_still_off(sctlr)
-        && mmu::text_is_read_only()
-        && mmu::data_is_execute_never()
-    {
+    // ⚠ A descriptor SWEEP, not two sampled addresses. The first version of this rung claimed W^X
+    // over three ranges and checked one address in each — an off-by-one at `__text_end` would have
+    // left the last page of text writable with nothing to notice. The counts are reported because a
+    // collapsed region passes every per-page test vacuously.
+    let cov = mmu::coverage();
+    if mmu::mmu_is_on(sctlr) && mmu::data_cache_still_off(sctlr) && cov.ok {
         let _ = writeln!(
             uart,
-            "baleen: EL2 MMU on — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) data RW+XN, C=0 (uncached, unchanged)"
+            "baleen: EL2 MMU on — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) data RW+XN, C=0 (uncached, unchanged); all {} mapped pages match their region ({} text, {} rodata, {} rw)",
+            cov.text_pages + cov.rodata_pages + cov.rw_pages,
+            cov.text_pages,
+            cov.rodata_pages,
+            cov.rw_pages
         );
     } else {
         let _ = writeln!(
