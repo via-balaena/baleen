@@ -79,7 +79,7 @@
 //!   ★ **MEASURED before the fix: TEN offsets did that, and this list named FOUR.** `IGROUPR0`
 //!   `ISENABLER0` `ICENABLER0` `ISPENDR0` `ICPENDR0` `ISACTIVER0` `ICACTIVER0` `ICFGR0` `ICFGR1` and
 //!   `IPRIORITYR` bytes 0..31. **A declaration that understates its own scope is worse than no
-//!   declaration**, because it is read as an inventory. [`DistWord`] is the repair: three answers
+//!   declaration**, because it is read as an inventory. `DistWord` is the repair: three answers
 //!   where there were two.
 //!
 //!   The entry used to end *"Recorded, not changed … deserves its own decision rather than riding
