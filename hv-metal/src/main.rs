@@ -63,6 +63,7 @@ mod guest;
 mod heap;
 #[cfg(feature = "real-linux")]
 mod linux;
+mod mmu;
 mod pcie;
 mod pending;
 mod pl011;
@@ -251,6 +252,38 @@ pub extern "C" fn rust_main() -> ! {
         u8::from(sctlr & el2::SCTLR_EL2_C != 0),
         u8::from(sctlr & el2::SCTLR_EL2_I != 0),
     );
+
+    // (3b) Enable EL2's own stage-1 MMU — identity-mapped, attributes reproducing what MMU-off
+    //      already gives, permissions added. Ledger item 5's first rung; see `mmu`'s module doc for
+    //      why "attributes unchanged" is the constraint that keeps ~50 existing premises true.
+    //
+    //      The report states what was PROTECTED, not merely that something happened: a marker that
+    //      says "MMU on" would be equally true of a mapping that made everything RWX.
+    // SAFETY: we are at EL2 (confirmed above), the MMU is off (`SCTLR_EL2.M == 0`, reported above),
+    // and this is the only call. The mapping is identity, so this code, its stack and its return
+    // address resolve identically after the switch.
+    let sctlr = unsafe { mmu::enable() };
+    let (text_start, text_end) = mmu::text_span();
+    // ⚠ `text_is_read_only` is a DESCRIPTOR READ-BACK, not a restatement of intent. Without it this
+    // line printed "text RO+X" unchanged while a probe that mapped the text writable let the store
+    // through — the message asserted a property it never checked (design-lesson #210).
+    if mmu::mmu_is_on(sctlr) && mmu::data_cache_still_off(sctlr) && mmu::text_is_read_only() {
+        let _ = writeln!(
+            uart,
+            "baleen: EL2 MMU on — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) data RW+XN, C=0 (uncached, unchanged)"
+        );
+    } else {
+        let _ = writeln!(
+            uart,
+            "baleen: EL2 MMU did not take as specified (0x{sctlr:016x}); halting"
+        );
+        park();
+    }
+
+    // (3c) The W^X witness, when built for it. Terminal by design — the store is expected to fault
+    //      and vector 4 reports and halts, so this configuration's boot ends here.
+    #[cfg(feature = "wx-probe")]
+    mmu::wx_probe(&mut uart);
 
     // (4) Realize hv_hal::TimeSource on the ARM generic timer and witness that the count is
     //     monotonic and live (advances, is not frozen at zero) — the fence honored on the metal.
