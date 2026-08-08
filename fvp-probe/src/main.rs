@@ -63,6 +63,7 @@
 //! rule that the full diff is read before every push, which is by now better evidence for that rule
 //! than any argument for it.
 
+mod mmu;
 mod smmu;
 
 use core::arch::global_asm;
@@ -657,6 +658,97 @@ fn milestone_2d() {
     );
 }
 
+/// ★★ MILESTONE 3 — **DOES THIS MODEL ACTUALLY HOLD A DIRTY CACHE LINE?**
+///
+/// ## The question, and why it is worth a milestone
+///
+/// `hv-metal`'s EL2 runs with `SCTLR_EL2.C = 0` — every data access non-cacheable — as a deliberate
+/// structural backstop (rung A1). Turning caches on is rung **A2**, and it was DEFERRED for one
+/// reason recorded in `baleen-diamond-roadmap`: `scrub_frame`'s confidentiality argument and
+/// `smmu::publish`'s ordering obligation would both have to be **re-derived**, and *"the
+/// re-derivation is unwitnessable on QEMU (no cache modelled), so a wrong version and a right one
+/// look identical."*
+///
+/// The same roadmap named the way out: *"Whether the AEM models CPU data caches is UNKNOWN and
+/// cheap to ask now that `fvp-probe`'s harness exists — that would be the instrument."*
+///
+/// **Asked, from the model's own parameter list:**
+///
+/// ```text
+/// cache_state_modelled=1   (bool, init-time) default = '1'
+///     : Enabled d-cache and i-cache state for all components
+/// ```
+///
+/// ⚠ **That is a parameter's DESCRIPTION, not a measurement**, and this repo has been bitten
+/// precisely there before — `arm-smmuv3.stage` advertised stage-2 only when asked, and a docstring
+/// was read as a capability. So this function measures it.
+///
+/// ## The experiment, and why each phase is there
+///
+/// One physical page, two mappings (`mmu.rs`): write-back cacheable, and non-cacheable.
+///
+/// | phase | action | what it establishes |
+/// |---|---|---|
+/// | 1 | write `SEED` through the **non-cacheable** alias | memory now holds a value *this probe chose*, so a stale read is unambiguous rather than "whatever was there" |
+/// | 2 | write `DIRTY` through the **cacheable** mapping, **no maintenance** | the stimulus |
+/// | 3 | read through the non-cacheable alias | ★ `SEED` ⇒ the store is sitting in a dirty line the observer cannot see. `DIRTY` ⇒ this model does not withhold it |
+/// | 3b | bare `dsb sy`, read again | ★ the **negative control**: a barrier orders accesses, it does not clean a line. Still stale ⇒ `DC CVAC` is the operative instruction, not the barrier beside it |
+/// | 4 | `DC CVAC`, then read again | ★ the **positive control**: it must now read `DIRTY`. Without this, a stale phase-3 result could equally mean the alias is simply broken |
+///
+/// ★ **Phase 4 is what makes phase 3 evidence.** A one-sided probe that only showed staleness would
+/// not distinguish "the model holds dirty data" from "this probe mismapped something", and the
+/// second is by far the likelier bug in new code.
+fn milestone_3() {
+    puts("@@ M3-CACHE-BEGIN\n");
+
+    const SEED: u64 = 0x5EED_5EED_5EED_5EED;
+    const DIRTY: u64 = 0xD117_D117_D117_D117;
+
+    puts("@@ M3 dcache line = ");
+    putdec(mmu::dcache_line_bytes());
+    puts(" bytes\n");
+
+    // SAFETY: the MMU is on; both mappings cover `TEST_PA` and neither overlaps the image.
+    let (after_dirty_store, after_barrier, after_clean) = unsafe {
+        mmu::write_noncacheable(SEED);
+        mmu::write_cacheable(DIRTY);
+        // Deliberately NO `dc cvac` here. This read is the question.
+        let observed = mmu::read_noncacheable();
+        // Negative control FIRST: a barrier is not a maintenance operation.
+        mmu::barrier_only();
+        let after_barrier = mmu::read_noncacheable();
+        mmu::clean_line(mmu::TEST_PA);
+        (observed, after_barrier, mmu::read_noncacheable())
+    };
+
+    puts("@@ M3 seed        = ");
+    puthex(SEED);
+    puts("\n@@ M3 nc-read     = ");
+    puthex(after_dirty_store);
+    puts("\n@@ M3 post-dsb    = ");
+    puthex(after_barrier);
+    puts("\n@@ M3 post-clean  = ");
+    puthex(after_clean);
+    puts("\n");
+
+    // The verdict, stated as a marker the host script can assert on.
+    if after_dirty_store == SEED && after_barrier == SEED && after_clean == DIRTY {
+        puts("@@ M3-VERDICT CACHES-MODELLED: the cacheable store was WITHHELD from a \
+              non-cacheable observer across a bare DSB and released only by DC CVAC. A2's \
+              re-derivation is WITNESSABLE here.\n");
+    } else if after_dirty_store == SEED && after_barrier == DIRTY {
+        puts("@@ M3-VERDICT BARRIER-SUFFICED: a bare DSB made the store visible, so this model's \
+              write buffering is not a dirty CACHE line and DC CVAC is not what is being tested.\n");
+    } else if after_dirty_store == DIRTY && after_clean == DIRTY {
+        puts("@@ M3-VERDICT NO-WITHHOLDING: the cacheable store was visible immediately. This \
+              model does not exhibit the hazard, so it cannot witness A2 either.\n");
+    } else {
+        puts("@@ M3-VERDICT INCONCLUSIVE: neither pattern. The aliases or the tables are wrong — \
+              read the three values above before believing anything about caches.\n");
+    }
+    puts("@@ M3-CACHE-END\n");
+}
+
 extern "C" fn probe_main() -> ! {
     uart_init();
     puts("\n@@ FVPPROBE-BEGIN\n");
@@ -735,6 +827,14 @@ extern "C" fn probe_main() -> ! {
     milestone_2b();
     milestone_2c();
     milestone_2d();
+
+    // Milestone 3 turns the MMU on, so it goes LAST: everything above ran with translation off and
+    // stays that way, which keeps a milestone-3 mistake from being mistaken for a regression in 1-2.
+    // SAFETY: boot core, nothing above depends on translation, and every prior address stays
+    // identity-mapped.
+    unsafe { mmu::enable() };
+    puts("@@ MMU on (SCTLR_EL3.M|C|I)\n");
+    milestone_3();
 
     puts("@@ FVPPROBE-END\n");
     semihosting_exit()

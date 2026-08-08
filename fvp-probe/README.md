@@ -220,3 +220,38 @@ isolation from its corrections.** That is a real, recurring cost of this crate's
 the right trade — a rotting instrument must not be able to break the product — but it is paid with
 attention, not avoided. Both bits are now printed, so the reading is falsifiable on a machine where
 they differ.
+
+
+## Milestone 3 — **does this model hold a dirty cache line?** (2026-08-08)
+
+`hv-metal` runs EL2 with `SCTLR_EL2.C = 0` — all data accesses non-cacheable — as a deliberate
+backstop (rung A1). Turning caches on is rung **A2**, and it was deferred for one recorded reason:
+`scrub_frame`'s confidentiality argument and `smmu::publish`'s ordering obligation must be
+*re-derived*, and the re-derivation is **unwitnessable on QEMU**, which models no cache. A wrong
+version and a right one look identical there.
+
+The roadmap named the way out — *"whether the AEM models CPU data caches is UNKNOWN and cheap to ask
+now that `fvp-probe`'s harness exists"*. Asked, and then **measured**, because the model's own
+parameter list saying `cache_state_modelled=1` is a description and not a demonstration:
+
+```text
+@@ M3 dcache line = 64 bytes
+@@ M3 seed        = 0x5eed5eed5eed5eed   written through the NON-cacheable alias
+@@ M3 nc-read     = 0x5eed5eed5eed5eed   ← STALE after a cacheable store of 0xd117…
+@@ M3 post-dsb    = 0x5eed5eed5eed5eed   ← STILL stale: a barrier is not a maintenance op
+@@ M3 post-clean  = 0xd117d117d117d117   ← DC CVAC released it
+@@ M3-VERDICT CACHES-MODELLED
+```
+
+One physical page, two mappings (write-back cacheable and non-cacheable), four phases with **both**
+controls:
+
+* the **positive** control (`DC CVAC` makes the value appear) is what proves the two aliases are the
+  same physical page — without it, a stale read could just mean the probe mismapped something;
+* the **negative** control (a bare `dsb sy` changes nothing) is what proves the maintenance
+  *operation* is doing the work rather than the barrier that accompanies it.
+
+⚠ **What this establishes is narrow and worth stating exactly.** The AEM withholds a dirty line from
+a non-coherent observer until it is cleaned — so a `scrub_frame` that omits its cache maintenance is
+**distinguishable here from one that does not**. That is the property A2 needs and QEMU cannot
+supply. It is *not* a claim that A2 is correct, or that this model matches any particular silicon.
