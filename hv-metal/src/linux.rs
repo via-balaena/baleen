@@ -19,10 +19,12 @@
 //! it is — but read it as history, not as a description of what is asserted here today.
 //!
 //! ★★ **⑱-7 added a THIRD axis, and this file is the only place it exists.** Interrupt confinement
-//! between guests is one `g != slot` guard, in [`handle_linux_sysreg_trap`] and [`deliver_spi`], and
-//! **nothing under the `hv-vdev` proof fence can help**: `vcpu_affinity` takes no guest argument, so
-//! two guests' vCPUs have identical affinities and no decode can tell them apart. See
-//! `docs/INTERRUPT-CONFINEMENT.md`; the guard's live counter is [`AFFINITY_COLLISIONS`].
+//! between guests, and **nothing under the `hv-vdev` proof fence can help**: `vcpu_affinity` takes
+//! no guest argument, so two guests' vCPUs have identical affinities and no decode can tell them
+//! apart. ⑱-7 found it resting on one `g != slot` guard repeated at four call sites; **⑱-8 replaced
+//! that with a role** — [`crate::role::Running::own_vcpus`] yields only this guest's vCPUs, so the
+//! comparison is gone rather than merely correct. See `docs/INTERRUPT-CONFINEMENT.md`.
+//! [`AFFINITY_COLLISIONS`] measures the HAZARD the role removes, not a guard firing.
 //!
 //! ⚠ **THIS PARAGRAPH SAID "a SINGLE EL1 guest that owns the machine" UNTIL ⑱-4b, AND HAD BEEN
 //! FALSE SINCE ③-b2b-ii.** What actually boots today is **two** unmodified kernels, each with
@@ -1871,10 +1873,6 @@ static SPI_WITNESS_FIRED: PerGuest<AtomicU64, NUM_GUESTS> =
 /// from the other side).
 fn deliver_spi(route: hv_vdev::irouter::SpiRoute, running: Running, intid: u32) {
     let slot = running.guest();
-    // The probe below never reads the route — which is the point of it — and the parameter still has
-    // to exist for the real build. Named rather than `_route`d so the ordinary path reads normally.
-    #[cfg(feature = "spi-route-probe")]
-    let _ = &route;
     // ⑱-8 — this guest's vCPUs as a ROLE. There is no peer in this iteration to guard against; see
     // `Running::own_vcpus`. The hazard that makes the role worth having is counted separately,
     // because with the guard gone there is nothing left whose firing could stand in for it.
