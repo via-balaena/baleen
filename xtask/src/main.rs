@@ -889,7 +889,14 @@ const LINUX_MARKERS: &[&str] = &[
     //
     // **Only dom 1 raises the CPU-backtrace IPI** (`sysrq l` in `guest-init.sh`), so dom 1 ends with
     // its own **1** and dom 2 — which nothing in the machine raises this INTID for — must end with
-    // **0**. The `no-irq-confinement` probe makes dom 2 read **1**.
+    // **0**.
+    //
+    // ⚠ **What the `no-irq-confinement` probe actually does to this line is ABSENT it, not flip it,
+    // and the difference is measured rather than predicted.** Dom 2 wedges under the foreign IPI
+    // traffic (`rcu_preempt detected stalls`, no progress for 573 s) and never reaches its own
+    // report. So this marker goes red by the victim's *death*, which is a coarser kill than the
+    // 0-vs-1 it was designed for. The clean counted leak under that probe is `baleen-spi-counts:`
+    // reading `cpu1=2` — see `docs/INTERRUPT-CONFINEMENT.md` §4.
     //
     // ⚠ **One sender, not two, and that is load-bearing rather than tidy.** EL2's cross-vCPU delivery
     // goes through a `PendingSet`, which is a SET: a leaked INTID the victim also raises for itself
