@@ -15,8 +15,25 @@ RAM_START = 0x40080000;
 STACK_SIZE = 0x10000; /* 64 KiB */
 EXC_STACK_SIZE = 0x8000; /* 32 KiB — the EL2 exception stack (Arc 4; grown in M5 Arc 0) */
 
+/*
+ * Page granularity for the EL2 stage-1 mapping (ledger item 5). The permission boundaries below are
+ * aligned to this because a page is the finest granularity a descriptor can carry: two regions that
+ * share a page necessarily share its permissions, so an unaligned .text/.rodata boundary would force
+ * the more permissive of the two across both and silently defeat W^X.
+ */
+PAGE_SIZE = 0x1000;
+
 SECTIONS {
     . = RAM_START;
+
+    /*
+     * ── The EXECUTABLE region: `.text` + `.vectors`, mapped RO+X by `mmu.rs`. ──────────────────
+     *
+     * These symbols exist so the mapping is derived from the LINK, not from constants restated in
+     * Rust. A second declaration of where the text lives is a second thing to drift (the failure
+     * this project keeps finding); here the linker is the single source and `mmu.rs` reads it.
+     */
+    __text_start = .;
 
     .text : {
         KEEP(*(.text.boot))  /* `_start` must lead the image */
@@ -34,7 +51,30 @@ SECTIONS {
     . = ALIGN(0x800);
     .vectors : { KEEP(*(.vectors)) }
 
+    /*
+     * End of the executable region. PAGE_SIZE, not 0x800: `.rodata` must start in a page that
+     * contains no instructions, or mapping it XN would make the tail of `.vectors` non-executable.
+     */
+    . = ALIGN(PAGE_SIZE);
+    __text_end = .;
+
+    /* ── READ-ONLY DATA: RO + XN. Not executable, and not writable. ────────────────────────────── */
+    __rodata_start = .;
     .rodata : { *(.rodata .rodata.*) }
+    . = ALIGN(PAGE_SIZE);
+    __rodata_end = .;
+
+    /*
+     * ── Everything from here is WRITABLE and NON-EXECUTABLE: RW + XN. ─────────────────────────
+     *
+     * `.data`, `.bss`, both stacks and all three guest windows.
+     *
+     * ⚠ Deliberately UNNAMED. `mmu.rs` derives this region by exclusion — a page that is neither
+     * text nor rodata is RW+XN — so a symbol here would be a second definition of the same boundary
+     * with nothing checking the two agree. An earlier draft declared `__rwdata_start` and
+     * `__image_end`; neither was ever read, and an unused symbol invites the belief that something
+     * enforces it.
+     */
     .data   : { *(.data .data.*) }
 
     .bss (NOLOAD) : {
@@ -115,6 +155,18 @@ SECTIONS {
     __guest_sup_start = .;
     . += 0x200000;
     __guest_sup_end = .;
+
+    /*
+     * ⚠ NO `__image_end` SYMBOL, and the reason is worth stating: `mmu.rs` does not bound the mapped
+     * address space by the image. EL2 legitimately touches DRAM outside it — `dmawitness::poke`
+     * takes "a Stage-2 leaf's output address or a guest IPA inside the model's data window", i.e.
+     * `0x8000_0000`+, which is why that boot line needs `-m 2048`. So the whole low 4 GiB is mapped
+     * RW+XN and the text and rodata are merely carved out of it with finer granularity.
+     *
+     * Making "an access past the image faults" true is a SEPARATE property with its own blast
+     * radius, and deliberately not part of this rung: the rung's claim is that nothing changes
+     * except permissions on the image, and a new fault surface is a change.
+     */
 
     /DISCARD/ : { *(.comment) *(.note .note.*) *(.eh_frame*) }
 }

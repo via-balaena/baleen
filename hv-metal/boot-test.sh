@@ -137,6 +137,10 @@ FORBIDDEN_MARKERS=(
     "D3ADTENANT-must-not-survive-rebirth"
     "D3ADSUPER-must-not-survive-rebirth"
     "XVCPU-LEAK-peer-vint-crossed-vcpus"
+    # W^X on EL2's own mapping (ledger item 5). The `wx-probe` build stores to EL2's `.text` and the
+    # hardware must refuse; this string is printed ONLY if the store was permitted, i.e. the mapping
+    # is not read-only. Global rather than per-config on purpose: no configuration may ever reach it.
+    "W^X NOT ENFORCED"
 )
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
@@ -446,5 +450,27 @@ boot_and_check "smmu" "--features smmu" \
     "smmu rung4 REBIRTH OK"
 EXTRA_QEMU=""
 MACHINE_EXTRA=""
+
+# ── W^X on EL2's own stage-1 mapping (ledger item 5) ───────────────────────────────────────────────
+#
+# THIS BOOT IS EXPECTED TO END IN A FAULT. The probe stores to EL2's `.text`, which the mapping makes
+# read-only; vector 4 reports and halts by design ("we report the fault and halt" — `exceptions.rs`),
+# so there is no clean shutdown to assert and the fault report IS the result.
+#
+# The three required markers below are one claim each, and the FORBIDDEN "W^X NOT ENFORCED" (declared
+# globally above) is what makes them mean something: it is printed only if the store was PERMITTED.
+#   - "EL2 MMU on"          -> the mapping was installed and `SCTLR_EL2.C` is still 0 (unchanged
+#                              attributes), so this is testing permissions and nothing else
+#   - "W^X probe: storing"  -> the probe actually ran; without it "no fault" would be vacuous
+#   - "EC=0x25"             -> a DATA ABORT FROM THE SAME EL, i.e. EL2 faulted on its own access —
+#                              not a guest fault, not an external abort
+#
+# ★ The negative control needs no build: with the MMU off — every commit before this rung — the same
+# store succeeds silently. Removing the fix is what the entire history already did.
+boot_and_check "wx-probe" "--features wx-probe" \
+    "hv-metal alive" \
+    "EL2 MMU on" \
+    "W^X probe: storing to EL2 text" \
+    "EC=0x25"
 
 echo "boot-test: OK — all checks passed"

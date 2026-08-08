@@ -67,6 +67,53 @@ pub(crate) fn configure() -> u64 {
     readback
 }
 
+/// Read `SCTLR_EL2` — **the baseline the EL2-MMU arc has to preserve, measured rather than assumed.**
+///
+/// EL2 runs with the MMU off, and ~50 places in this crate cite that as a premise. Enabling the MMU
+/// (ledger item 5) is only safe if the new mappings reproduce what MMU-off already gives, and *what
+/// it gives is not a constant*: with `M == 0` the architecture makes data accesses Device-nGnRnE,
+/// but **instruction accesses follow `SCTLR_EL2.I`** — Non-cacheable when it is 0, Cacheable when it
+/// is 1. The `C` bit matters for the same reason on the other side of the switch: with `M == 1` and
+/// `C == 0`, data accesses to Normal memory are forced Non-cacheable **whatever the page tables
+/// say**.
+///
+/// So the two bits that decide whether "attributes unchanged" is achievable are `I` and `C`, and
+/// this reports them rather than leaving the arc to reason about a register nobody has read. Every
+/// platform assumption this project checked this week turned out to differ from the one it had
+/// carried; this is the same check, made before the code depends on it rather than after.
+///
+/// ## MEASURED on QEMU `virt` `-cpu max`, 2026-08-07: **`SCTLR_EL2 = 0x0` — `M=0 C=0 I=0`**
+///
+/// So MMU-off here means **instruction accesses Normal Non-cacheable** (`I == 0`) and **data
+/// accesses Device-nGnRnE** (`M == 0`). An identity mapping that changes nothing but permissions
+/// must therefore map `.text` Normal-Non-cacheable and everything else Device-nGnRnE — which is what
+/// ledger item 5's first rung will do.
+///
+/// ⚠ **AND THE VALUE ITSELF IS A PLATFORM FACT, NOT AN ARCHITECTURAL ONE.** `SCTLR_EL2` has
+/// **RES1** bits in the architecture; a conforming implementation reads them back as 1. QEMU reports
+/// a flat `0x0`, so it is not enforcing them. **Consequence for the arc: setting `M` must be a
+/// READ-MODIFY-WRITE, never a full-register write of a hand-built value** — the opposite of what
+/// [`configure`] deliberately does for `HCR_EL2`, and for the opposite reason. `HCR_EL2`'s reset is
+/// UNKNOWN, so writing it whole *pins* it; `SCTLR_EL2` has bits the architecture requires to be 1,
+/// so writing it whole would clear them. Getting this backwards would pass on QEMU and be wrong on
+/// silicon — the exact failure class this register was read to avoid.
+pub(crate) fn sctlr_el2() -> u64 {
+    let v: u64;
+    // SAFETY: `SCTLR_EL2` is readable at EL2. Read-only, no memory operand, no side effects.
+    unsafe { asm!("mrs {v}, sctlr_el2", v = out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// `SCTLR_EL2.M` (bit 0) — stage-1 MMU enable. Expected **0** until ledger item 5 lands.
+pub(crate) const SCTLR_EL2_M: u64 = 1 << 0;
+/// `SCTLR_EL2.C` (bit 2) — data cacheability. With `M == 0` this has no effect on data accesses,
+/// which are Device-nGnRnE regardless; it becomes load-bearing the moment `M` is set.
+pub(crate) const SCTLR_EL2_C: u64 = 1 << 2;
+/// `SCTLR_EL2.I` (bit 12) — instruction cacheability. **This one is live even with `M == 0`**: it
+/// selects whether instruction fetches are Normal Cacheable or Normal Non-cacheable, so it is what
+/// an identity mapping must match for `.text` if the arc is to change nothing but permissions.
+pub(crate) const SCTLR_EL2_I: u64 = 1 << 12;
+
 /// Whether `HCR_EL2.RW` is set in a read-back value — the post-condition [`configure`] establishes.
 ///
 /// Checks the single bit rather than exact-equality with `HCR_EL2_RW`, so an implementation that

@@ -19,6 +19,15 @@ publish = false
 # `src/exceptions.rs` and `rust_main`.
 selftest = []
 
+# `wx-probe` builds the **W^X witness** for EL2's own stage-1 mapping (ledger item 5): after the MMU
+# is on, store to EL2's `.text` and require the hardware to refuse. A separate binary rather than a
+# runtime branch because the fault is TERMINAL — vector 4 reports and halts by design — so this boot
+# ENDS in a fault, and its expected transcript is not the normal one.
+#
+# ★ The negative control needs no build of its own: with the MMU off, which is every build before
+# that rung, the same store succeeds silently. Removing the fix is what the whole history already did.
+wx-probe = []
+
 # `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rungs 1–2: `GBPA.ABORT` before any bus
 # master exists, then a stream table whose every entry denies, and the five-phase witness that the
 # device really does reach it). It is a separate binary rather
