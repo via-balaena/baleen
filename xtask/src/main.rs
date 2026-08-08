@@ -74,6 +74,7 @@ fn main() {
         "doc-markers" => doc_markers(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
+        "sweeps" => deep_sweeps(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run(
@@ -90,6 +91,9 @@ fn main() {
                 && run("cargo", &["test", "--workspace"])
                 && doc()
                 && doc_markers()
+                // ⑳-c: ~2 s (`--list` enumerates without running), so unlike the proof-corpus
+                // inventories this one is affordable on EVERY PR rather than only proof-path ones.
+                && deep_sweeps()
         }
         other => {
             if !other.is_empty() {
@@ -108,6 +112,7 @@ fn main() {
                  doc-markers  assert every boot marker a doc QUOTES is still one the gates check\n  \
                  verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  kani-harnesses  run the Kani corpus and assert it contains exactly the expected harnesses\n  \
+                 sweeps assert the deep exhaustive-sweep corpus is exactly the expected one\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
@@ -2047,6 +2052,100 @@ fn run_capturing(program: &str, args: &[&str]) -> Option<(bool, String)> {
     }
     let status = child.wait().ok()?;
     Some((status.success(), text))
+}
+
+/// ★★ ⑳-c — **EVERY DEEP EXHAUSTIVE SWEEP, by test name.** The third and last corpus this project's
+/// evidence rests on, after `VERUS_OBLIGATIONS` (⑳) and `KANI_HARNESSES` (⑳-b).
+///
+/// ⚠ **`cargo test -- --ignored` exits 0 whether it runs 23 sweeps or 22.** These are the Tier A/B
+/// enumerator evidence — `local_respect_holds_deep`, the `step_consistency_holds_*` family,
+/// `write_xor_execute_saturates`, `domain_id_reuse_deep` — and they run **only in the weekly
+/// `deep-verify` job**, so a deleted one would go unnoticed for a week at best.
+///
+/// ★ **Worse than the other two corpora, and the reason is the `#[ignore]` pairing.** Each deep
+/// sweep has a CI-shallow twin (`enumerate.rs`: *"Each has a CI-shallow test … and a deep
+/// `#[ignore]`d twin"*). Delete the twin and the shallow one still passes in `cargo test`, so the
+/// ordinary gate stays green while the exhaustive evidence quietly halves. Removing `#[ignore]` from
+/// one is just as silent in the other direction: it then runs in `ci` (slowly) and **not** in the
+/// `--ignored` sweep at all.
+///
+/// ★ **Checked in `cargo xtask ci`, not only in the proof jobs** — `--list` enumerates without
+/// running, measured at **~2 s** on a warm cache, so unlike ⑳/⑳-b this inventory is verified on
+/// EVERY PR rather than only on proof-path ones.
+const DEEP_SWEEPS: &[&str] = &[
+    "enumerate::tests::all_affinity_deep",
+    "enumerate::tests::delegation_crossed_with_grant_and_evtchn_deep",
+    "enumerate::tests::delegation_forest_deep",
+    "enumerate::tests::device_assignment_saturates",
+    "enumerate::tests::domain_id_reuse_deep",
+    "enumerate::tests::domain_lifecycle_deep",
+    "enumerate::tests::evtchn_and_sched_seam_deep",
+    "enumerate::tests::grant_and_p2m_seams_deep",
+    "enumerate::tests::grant_p2m_over_three_domains_deep",
+    "enumerate::tests::hierarchy_saturates_only_under_symmetry_reduction",
+    "enumerate::tests::integrated_core_deep",
+    "enumerate::tests::symmetry_group_closes_saturated_set_frame_grant",
+    "enumerate::tests::the_four_level_hierarchy_deep",
+    "enumerate::tests::vcpu_affinity_deep",
+    "enumerate::tests::write_xor_execute_saturates",
+    "noninterference::tests::an_unmediated_allocator_breaks_step_consistency",
+    "noninterference::tests::local_respect_holds_deep",
+    "noninterference::tests::local_respect_holds_three_domains",
+    "noninterference::tests::step_consistency_holds_over_the_delegation_forest_deep",
+    "noninterference::tests::step_consistency_holds_over_the_page_table_guards_deep",
+    "noninterference::tests::step_consistency_holds_per_domain_handles_with_destroy",
+    "noninterference::tests::step_consistency_holds_three_domains_deep",
+    "noninterference::tests::step_consistency_holds_with_a_mediated_allocator_deep",
+];
+
+/// **Check the deep-sweep corpus is exactly [`DEEP_SWEEPS`], without running it.**
+///
+/// `--ignored --list` enumerates the ignored tests and exits; the sweeps themselves peak at several
+/// GB each and are `deep-verify`'s job. Both directions, for the reason `verus_counts` gives: a loop
+/// over the table alone would not notice a sweep that exists and is unnamed.
+fn deep_sweeps() -> bool {
+    let Some((success, text)) = run_capturing(
+        "cargo",
+        &["test", "-p", "hv-sim", "--", "--ignored", "--list"],
+    ) else {
+        eprintln!("sweeps: cannot run cargo test");
+        return false;
+    };
+    if !success {
+        eprintln!("sweeps: FAIL — cargo test --list exited non-zero (output above).");
+        return false;
+    }
+    let mut seen: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_suffix(": test"))
+        .map(str::trim)
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+
+    let mut ok = true;
+    for want in DEEP_SWEEPS {
+        if !seen.contains(want) {
+            eprintln!("sweeps: FAIL — expected deep sweep is gone: {want}");
+            ok = false;
+        }
+    }
+    for got in &seen {
+        if !DEEP_SWEEPS.contains(got) {
+            eprintln!(
+                "sweeps: FAIL — deep sweep exists but is not in DEEP_SWEEPS: {got}. Add it, so the \
+                 list cannot fall behind the corpus."
+            );
+            ok = false;
+        }
+    }
+    if ok {
+        eprintln!(
+            "sweeps: OK — {} deep exhaustive sweeps, all named",
+            seen.len()
+        );
+    }
+    ok
 }
 
 /// ★★ ⑳-b — **EVERY KANI HARNESS THIS CORPUS IS EXPECTED TO CONTAIN, by qualified name.**

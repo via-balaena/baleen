@@ -70,6 +70,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      # ⑳-c: the inventory FIRST — `--list` enumerates without running (~2 s), so a deleted sweep
+      # is named here rather than silently reducing the run below. `cargo xtask ci` checks the same
+      # thing on every PR; this keeps the weekly job self-contained.
+      - name: deep-sweep inventory
+        run: cargo xtask sweeps
+
       # ⚠ RETRACTION (#125 got this wrong): an earlier version of this comment claimed
       # `--test-threads=1` was "for readable `--nocapture` output, not for correctness", and that
       # parallelising was "a live option". Both are false, and the refutation was already thirty

@@ -1774,6 +1774,11 @@ mod tests {
     }
 
     // ─── Tier A: larger-scope + cross-invariant + full-hierarchy sweeps ──────────────
+    // ⚠ ⑳-c — **THE DEEP TWINS ARE PINNED BY NAME in `xtask`'s `DEEP_SWEEPS`.** `cargo test --
+    // --ignored` exits 0 whether it runs 23 sweeps or 22, and these run only in the weekly
+    // `deep-verify` job — so deleting a twin leaves the shallow one passing in `ci` while the
+    // exhaustive evidence quietly halves. Adding or removing a deep sweep means editing that list.
+    //
     // Each has a CI-shallow test (closes fast in debug) and a deep `#[ignore]`d twin that
     // closes to a theorem in release. Together they close the bounded gaps the audit left:
     // three-domain scope (the small-scope hypothesis at K+1), the delegate × grant × evtchn
