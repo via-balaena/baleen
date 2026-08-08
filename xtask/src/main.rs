@@ -917,6 +917,10 @@ const LINUX_MARKERS: &[&str] = &[
     // ⚠ This asserts something a guest says about ANOTHER guest's containment, which no EL2 marker
     // can: `baleen: irqconfine OK` is EL2 reporting that it refused, and this is the party that
     // would have been disturbed reporting that it was not.
+    // ⑳-d: the scrub's maintenance stride, measured. Asserted as PRESENT (the OK form) rather than
+    // as a fixed 64, because a core with a finer line is handled CORRECTLY here — the stride simply
+    // gets finer — and pinning the number would fail a machine this code gets right.
+    "baleen: scrubline OK: the frame-scrub maintenance loop strides ",
     "[dom 1] baleen-ipi6-total: 1",
     "[dom 2] baleen-ipi6-total: 0",
     "[dom 1] baleen-spi-intid: 33 ",

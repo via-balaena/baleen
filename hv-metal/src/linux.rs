@@ -704,6 +704,26 @@ fn report_dma_inflight(uart: &mut Pl011) {
 /// window. What upgrades it from luck to a reservation is the guest's OWN log line for the
 /// `reserved-memory` node, which `xtask` asserts as a marker — Linux saying it saw the range and
 /// mapped nothing there. Neither half is sufficient; the pair is.
+/// ⚠ **The scrub's maintenance stride, MEASURED rather than assumed.**
+///
+/// `scrub_frame` strides `dc civac` across a freed frame. A stride **larger** than the core's
+/// minimum data-cache line **skips lines**, leaving a dead tenant's data behind — so the number is
+/// isolation-relevant, and it used to be a constant justified as *"64 bytes on every AArch64 core
+/// this targets"*. It is now `min(64, CTR_EL0.DminLine)`, and this marker is what makes the value
+/// visible on whatever platform is actually running rather than asserted about a target set.
+///
+/// Reported, not asserted against a fixed number: a core with a finer line is CORRECT here (the
+/// stride simply gets finer), so pinning 64 would fail a machine this code handles properly.
+fn report_scrub_line(uart: &mut Pl011) {
+    let bytes = crate::stage2::scrub_line_bytes();
+    let _ = writeln!(
+        uart,
+        "baleen: scrubline OK: the frame-scrub maintenance loop strides {bytes} bytes, taken as \
+         min(64, CTR_EL0.DminLine) on this machine — a stride WIDER than the true line would skip \
+         lines and leave a dead tenant's data behind, so it is measured, not assumed"
+    );
+}
+
 fn report_dma_pad(uart: &mut Pl011) {
     let mut ok = true;
     for slot in 0..NUM_GUESTS {
@@ -3545,6 +3565,7 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     #[cfg(feature = "selftest")]
     report_tick_deferral(uart);
     report_per_guest_state(uart);
+    report_scrub_line(uart);
     report_dma_pad(uart);
     #[cfg(feature = "smmu")]
     report_dma_inflight(uart);
