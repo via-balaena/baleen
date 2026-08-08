@@ -104,6 +104,7 @@ fn main() {
                  doc    build docs, denying broken links\n  \
                  ci     fmt --check, clippy -D warnings, test, doc, then doc-markers\n  \
                  doc-markers  assert every boot marker a doc QUOTES is still one the gates check\n  \
+                 verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
