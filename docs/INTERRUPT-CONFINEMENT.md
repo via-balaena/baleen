@@ -163,9 +163,11 @@ wedged probe boot runs until killed.
   `baleen: irqconfine OK` counts) and reaches none.
 * **One pCPU, one machine.** Both guests time-slice a single physical CPU. Nothing here is a
   statement about interrupt confinement under real concurrency.
-* **Only the two routing loops.** Every other path by which EL2 injects (the forwarded timer PPI, the
-  ⑱-6 witness, the overflow probes) names its target directly rather than by affinity, and so has no
-  confinement to lose. That is an argument, not a witness.
+* **Only the two routing loops** — SGI delivery and SPI delivery. (The role fence covers *four*
+  sites; the other two, `PSCI CPU_ON` and the poweroff sweep, are not injection paths. Four guards,
+  two of them routing an interrupt.) Every other path by which EL2 injects — the forwarded timer PPI,
+  the ⑱-6 witness, the overflow probes — names its target directly rather than by affinity, and so
+  has no confinement to lose. That is an argument, not a witness.
 
 ---
 
