@@ -885,6 +885,30 @@ const LINUX_MARKERS: &[&str] = &[
     //   * `baleen-spi-affinity: 2` says the kernel ACCEPTED the affinity write. A write that silently
     //     failed would leave the route on CPU0, and `cpu0=0 cpu1=1` would then be unreachable for a
     //     reason that has nothing to do with routing — a red gate blaming the wrong mechanism.
+    // ★★ ⑱-7 — **THE VICTIM'S ACCOUNT, and the interrupt axis's counterpart to the peer probe.**
+    //
+    // **Only dom 1 raises the CPU-backtrace IPI** (`sysrq l` in `guest-init.sh`), so dom 1 ends with
+    // its own **1** and dom 2 — which nothing in the machine raises this INTID for — must end with
+    // **0**.
+    //
+    // ⚠ **What the `no-irq-confinement` probe actually does to this line is ABSENT it, not flip it,
+    // and the difference is measured rather than predicted.** Dom 2 wedges under the foreign IPI
+    // traffic (`rcu_preempt detected stalls`, no progress for 573 s) and never reaches its own
+    // report. So this marker goes red by the victim's *death*, which is a coarser kill than the
+    // 0-vs-1 it was designed for. The clean counted leak under that probe is `baleen-spi-counts:`
+    // reading `cpu1=2` — see `docs/INTERRUPT-CONFINEMENT.md` §4.
+    //
+    // ⚠ **One sender, not two, and that is load-bearing rather than tidy.** EL2's cross-vCPU delivery
+    // goes through a `PendingSet`, which is a SET: a leaked INTID the victim also raises for itself
+    // coalesces into one entry and vanishes. With both guests sending, the discriminator would be
+    // 1-vs-2 on a quantity that cannot reliably reach 2 — MEASURED, probe armed, both sending: dom 1
+    // read 0 and dom 2 read 1. `[dom 2] … : 0` is the assertion that carries the property.
+    //
+    // ⚠ This asserts something a guest says about ANOTHER guest's containment, which no EL2 marker
+    // can: `baleen: irqconfine OK` is EL2 reporting that it refused, and this is the party that
+    // would have been disturbed reporting that it was not.
+    "[dom 1] baleen-ipi6-total: 1",
+    "[dom 2] baleen-ipi6-total: 0",
     "[dom 1] baleen-spi-intid: 33 ",
     "[dom 2] baleen-spi-intid: 33 ",
     "[dom 1] baleen-spi-affinity: 2",
@@ -1350,6 +1374,12 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // vCPU: either it went where the pCPU happened to be — `GICD_IROUTER` recorded and ignored, the
     // behaviour this rung removed — or the routing named no vCPU at all and it went nowhere.
     "baleen: vspi FAIL",
+    // ⑱-7's negative half, and it fires for a reason worth distinguishing from a leak: not "an
+    // interrupt crossed" but "**no interrupt target ever named a peer's affinity**", i.e. the guard
+    // was never exercised and the confinement witness is vacuous. That would mean the guests had
+    // stopped colliding — `vcpu_affinity` gaining a guest argument would do it — and the whole
+    // argument for why this guard is load-bearing would need re-reading.
+    "baleen: irqconfine FAIL",
     // ③-b1's negative half: the guest's GIC accesses did not reach the emulator, i.e. the
     // distributor is being passed through again.
     "baleen: vgic FAIL",
@@ -1622,6 +1652,8 @@ const METAL_LINT_CONFIGS: &[&[&str]] = &[
     // day it is needed, which is the day its evidence is least replaceable. ⚠ Design-lesson #212 —
     // a fix, or a probe, that is never wired into anything is indistinguishable from its absence.
     &["--features", "real-linux,selftest,spi-route-probe"],
+    // ⑱-7's removed-fix probe, linted for the same reason as ⑱-6's above.
+    &["--features", "real-linux,selftest,no-irq-confinement"],
 ];
 
 fn metal_lint() -> bool {

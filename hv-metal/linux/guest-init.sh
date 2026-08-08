@@ -21,6 +21,14 @@
 #                            `LINUX_RAM_BASE..LINUX_RAM_END` in linux.rs until ③-b2b-ii-b; ③-b2a had
 #                            already halved the window and moved the constants, and this outlived
 #                            both — which is why the marker itself carries the values.)
+#   * baleen-ipi6-total:     ★★ ⑱-7, and the one marker here a guest produces about ANOTHER guest's
+#                            behaviour. **Only dom 1 raises the CPU-backtrace IPI** (`sysrq l`), so
+#                            dom 1 ends with its own **1** and dom 2 must end with **0** — nothing
+#                            else in the machine raises this INTID for it. A dom 2 reading anything
+#                            but 0 received its peer's: the interrupt axis of isolation broken,
+#                            reported by the victim. The memory axis has had this since ③-b2b-ii-d;
+#                            this is its counterpart. (See the block that sends it for why ONE sender
+#                            and not two — with both, the leak coalesces in a pending SET and hides.)
 #   * baleen-spi-intid:      ⑱-6. The GIC INTID the GUEST says its UART uses, bound by the gate to
 #                            `WITNESS_SPI` in linux.rs — two artifacts naming one interrupt, with
 #                            neither taking the other's word for which.
@@ -85,6 +93,49 @@ echo "baleen-spi-intid: $(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/b
 echo 2 > /proc/irq/${baleen_irq}/smp_affinity
 echo "baleen-spi-affinity: $(/bin/busybox cat /proc/irq/${baleen_irq}/smp_affinity)"
 
+# ★★ ⑱-7 — **SEND A CROSS-CPU IPI, SO THE PEER GUEST CAN REPORT IT NEVER ARRIVED.**
+#
+# The memory axis of isolation has had a victim-observed witness since ③-b2b-ii-d: dom 1 reaches for
+# dom 2's RAM and the hardware refuses. The interrupt axis had none — confinement rested on one
+# `g != slot` guard in EL2, argued in a comment and exhibited by nothing.
+#
+# This is that witness's other half. `sysrq l` makes Linux send the CPU-backtrace IPI to its OTHER
+# CPU — a real `ICC_SGI1R_EL1` write, trapped and routed by EL2 — and the peer guest's own
+# `/proc/interrupts` is what says the IPI did not land there too.
+#
+# ⚠ **IPI6 is the choice because its baseline is ZERO and it is the only zero-baseline IPI a guest
+# can raise on demand.** MEASURED across a whole boot: IPI0/1/5 (rescheduling, function call, IRQ
+# work) run constantly; IPI2/3 (CPU stop) fire at poweroff; IPI4 needs a broadcast timer and IPI7
+# needs kgdb. Only IPI6 is both idle and reachable from userspace.
+#
+# ★★ **ONLY ONE GUEST SENDS, and the first version of this had BOTH send — which could not have
+# worked.** EL2's cross-vCPU delivery goes through `PendingSet`, and a pending set is a **SET**: an
+# INTID leaked from the peer that the victim ALSO raises for itself **coalesces into one entry and
+# becomes invisible**. Two senders meant the discriminator was 1-vs-2 on a quantity that cannot
+# reliably reach 2. MEASURED with the probe armed and both sending: dom 1 read **0** and dom 2 read
+# **1** — noise, not a signal, in both directions.
+#
+# With one sender the victim's baseline is **structurally zero** — nothing else in the machine raises
+# this INTID for it — so 0-vs-1 needs no set to hold two of anything.
+#
+# The sender is picked by RAM window, the same string the `baleen-guest-ram:` marker already asserts
+# per dom, so a window that moved would go red there first rather than silently disarming this.
+#
+# ⚠ **The TOTAL is what the gate asserts, not the per-CPU split.** Which CPU runs this shell decides
+# which CPU is *targeted*, and that is not ours to fix.
+#
+# MEASURED before this was written (design-lesson #186): `sysrq = 1` already, `/proc/sysrq-trigger`
+# present, and `IPI6: 0 0` → `0 1` on the guest that triggers. Suppressing printk keeps the backtrace
+# itself off the console — the IPI still fires and is still counted, and the boot log gains one line
+# instead of a hundred.
+case "$(/bin/busybox grep -m1 'System RAM' /proc/iomem | /bin/busybox tr -d ' ')" in
+  48000000*)
+    echo "1 4 1 7" > /proc/sys/kernel/printk
+    echo l > /proc/sysrq-trigger
+    echo "8 4 1 7" > /proc/sys/kernel/printk
+    ;;
+esac
+
 # ★★ ⑱-4b-i — **GO IDLE ON PURPOSE, and this line is a WITNESS-ENABLING MECHANISM, not padding.**
 #
 # Every other line here prints a marker. This one produces a *scheduler state* instead: with PID 1
@@ -119,6 +170,14 @@ echo "########## BALEEN-IDLE-END ##########"
 # EL2 asserts about itself. `cpu0=0 cpu1=1` is the property; `cpu0=1 cpu1=0` is precisely what
 # ignoring `GICD_IROUTER` looks like, which is what the removed-fix probe produces.
 echo "baleen-spi-counts: $(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox awk '{print "cpu0=" $2 " cpu1=" $3}')"
+
+# ⑱-7, the victim's half: **how many CPU-backtrace IPIs THIS guest received, from any source.**
+#
+# Reported at the very end, so a leak sent by the peer at any point in the boot has had the whole
+# idle window and every context switch since to be delivered. The sending guest reads **1** (its
+# own); the other reads **0**, and reads it because nothing in the machine raises this INTID for it
+# — which is exactly what the `no-irq-confinement` build changes.
+echo "baleen-ipi6-total: $(/bin/busybox grep IPI6 /proc/interrupts | /bin/busybox awk '{print $2 + $3}')"
 
 echo "########## poweroff ##########"
 
