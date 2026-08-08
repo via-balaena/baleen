@@ -1826,6 +1826,21 @@ static SPIS_ROUTED: PerGuest<AtomicU64, NUM_GUESTS> =
 static SPIS_UNROUTABLE: PerGuest<AtomicU64, NUM_GUESTS> =
     PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
+/// ★★ ⑱-7 — **interrupt targets that named a PEER's vCPU and were refused.** Per ISSUING guest, and
+/// counted for both routing axes (`ICC_SGI1R_EL1` in [`handle_linux_sysreg_trap`], `GICD_IROUTER` in
+/// [`deliver_spi`]).
+///
+/// **This is a live mechanism witness, not a precaution counter.** It is non-zero on every boot, in
+/// the hundreds, because `vcpu_affinity` **takes no guest argument** — dom 1's vCPU 1 and dom 2's
+/// vCPU 1 have identical affinity, so every IPI Linux sends names an affinity that a peer's vCPU
+/// also has. A zero here would not mean "nothing tried"; it would mean the guests had somehow
+/// stopped colliding, and the confinement argument would need re-reading.
+///
+/// ⚠ **Refusing is the ONLY thing that confines an interrupt to its guest.** No decode under the
+/// `hv-vdev` fence can help: the collision is in `vcpu_affinity`'s signature, not its arithmetic.
+static SGIS_FOREIGN_REFUSED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
 /// ⑱-6 — set when the guest has re-aimed [`WITNESS_SPI`] away from its boot vCPU. See
 /// [`maybe_fire_spi_witness`] for why arming and firing are two moments and not one.
 static SPI_WITNESS_ARMED: PerGuest<AtomicU64, NUM_GUESTS> =
@@ -1854,14 +1869,26 @@ fn deliver_spi(route: hv_vdev::irouter::SpiRoute, running: Running, intid: u32) 
     // to exist for the real build. Named rather than `_route`d so the ordinary path reads normally.
     #[cfg(feature = "spi-route-probe")]
     let _ = &route;
-    for (_, target) in crate::role::census(NUM_GUESTS).filter(|&(g, _)| g == slot) {
+    // ⑱-7: iterated over the WHOLE census with an explicit guest guard, for the reason written out
+    // at the `ICC_SGI1R_EL1` loop — `vcpu_affinity` takes no guest argument, so a peer's vCPU can
+    // and does match the affinity a route names, and this guard is the only thing that refuses it.
+    for (g, target) in crate::role::census(NUM_GUESTS) {
         // ⑱-6's REMOVE-THE-FIX probe: ignore the routing and take whichever vCPU is on the pCPU —
-        // the behaviour this rung replaces. See `docs/VGIC-SPI-ROUTING.md` for the measured result.
+        // the behaviour that rung replaced. See `docs/VGIC-SPI-ROUTING.md` for the measured result.
         #[cfg(feature = "spi-route-probe")]
         let names_it = target == running.vcpu();
         #[cfg(not(feature = "spi-route-probe"))]
         let names_it = route.targets(vcpu_affinity(target.get()));
         if !names_it {
+            continue;
+        }
+        if g != slot {
+            SGIS_FOREIGN_REFUSED
+                .at(slot)
+                .fetch_add(1, Ordering::Relaxed);
+            // ⑱-7's REMOVE-THE-FIX probe, on the SPI axis.
+            #[cfg(feature = "no-irq-confinement")]
+            let _ = LINUX_PENDING.at(g, target).mark(intid);
             continue;
         }
         if target == running.vcpu() {
@@ -4593,12 +4620,40 @@ fn handle_linux_sysreg_trap(
         let slot = running.guest();
         let decoded = hv_vdev::sgi::decode(value, vcpu_affinity(running.vcpu().get()));
         let intid = decoded.intid();
-        // Offer the decode every vCPU of the ISSUING guest and no others. That is what confines an
-        // SGI to its own guest: the affinity a guest names is checked against `vcpu_affinity`, but
-        // even a value that matched a peer's would never be asked about, because the peer's vCPUs are
-        // not in this iteration. Two independent reasons, and the loop is the stronger one.
-        for (_, target) in crate::role::census(NUM_GUESTS).filter(|&(g, _)| g == slot) {
+        // ★★ ⑱-7 — **THIS GUARD IS THE WHOLE OF INTERRUPT CONFINEMENT BETWEEN GUESTS.**
+        //
+        // ⚠ **It used to read "Two independent reasons, and the loop is the stronger one" — and
+        // there are NOT two.** The first was said to be the affinity comparison: a value naming a
+        // peer's vCPU would still have to match. **It always matches.** `guest_mpidr` is
+        // `MPIDR_RES1 | vcpu_affinity(vcpu)` and `vcpu_affinity` **takes no guest argument at all**,
+        // so dom 1's vCPU 1 and dom 2's vCPU 1 have *identical* affinity. The collision is in the
+        // function's SIGNATURE, not in its arithmetic — it cannot be fixed by choosing better
+        // numbers, and no decode under the fence can ever distinguish two guests.
+        //
+        // So the reason count is **one**, and it is this iteration bound. Written as an explicit
+        // guard with a counter rather than a `.filter()` for exactly that reason: a mechanism this
+        // load-bearing should be visible in the source and **countable in the boot**, not a
+        // combinator a reader has to notice.
+        //
+        // ★ **`SGIS_FOREIGN_REFUSED` is non-zero on every boot, in the hundreds** — every IPI Linux
+        // sends names an affinity that some peer vCPU also has. That count IS the demonstration that
+        // the collision above is real and that this guard does work continuously, rather than being
+        // a precaution against something that never happens.
+        for (g, target) in crate::role::census(NUM_GUESTS) {
             if !decoded.targets(vcpu_affinity(target.get())) {
+                continue;
+            }
+            if g != slot {
+                // A PEER's vCPU, named by an affinity that genuinely matches. Refused here and
+                // nowhere else.
+                SGIS_FOREIGN_REFUSED
+                    .at(slot)
+                    .fetch_add(1, Ordering::Relaxed);
+                // ⑱-7's REMOVE-THE-FIX probe: honour the match instead of refusing it, which is
+                // what this loop would do if the guest bound were ever dropped. The victim guest's
+                // own `/proc/interrupts` is what reports the difference.
+                #[cfg(feature = "no-irq-confinement")]
+                let _ = LINUX_PENDING.at(g, target).mark(intid);
                 continue;
             }
             if target == running.vcpu() {
@@ -4834,6 +4889,24 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
                  ({named} named, {delivered} delivered, {deferred} deferred, {routed} routed, \
                  {unroutable} unroutable) — either the guest never re-aimed INTID {WITNESS_SPI}, or \
                  GICD_IROUTER is being recorded and ignored again"
+            );
+        }
+
+        // ★★ ⑱-7 — the interrupt axis of ISOLATION, reported beside the two routing axes it guards.
+        let foreign = SGIS_FOREIGN_REFUSED.at(slot).load(Ordering::Relaxed);
+        if foreign > 0 {
+            let _ = writeln!(
+                uart,
+                "baleen: irqconfine OK: {foreign} interrupt target(s) named by dom {dom} matched a \
+                 PEER vCPU's affinity and were REFUSED — vcpu_affinity() takes no guest argument, so \
+                 the match is genuine and the guest bound is the only thing that confines them"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: irqconfine FAIL: dom {dom} never named a peer vCPU's affinity, so the \
+                 guest bound in the SGI and IROUTER loops was never exercised — the confinement \
+                 witness is vacuous and the guests are no longer colliding as the argument assumes"
             );
         }
     }

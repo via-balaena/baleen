@@ -28,6 +28,13 @@ selftest = []
 # that rung, the same store succeeds silently. Removing the fix is what the whole history already did.
 wx-probe = []
 
+# `no-irq-confinement` is ⑱-7's REMOVE-THE-FIX probe: the SGI and IROUTER delivery loops HONOUR a
+# match against a peer guest's vCPU instead of refusing it. That is not a contrived mutation — a
+# peer's vCPU genuinely has the same affinity (`vcpu_affinity` takes no guest argument), so the match
+# is real on every boot and only the guest bound refuses it. The victim guest's own `/proc/interrupts`
+# reports the difference. Run by hand; the measured result is in `docs/INTERRUPT-CONFINEMENT.md`.
+no-irq-confinement = []
+
 # `spi-route-probe` is ⑱-6's REMOVE-THE-FIX probe: `deliver_spi` ignores `GICD_IROUTER` and puts the
 # SPI wherever the pCPU happens to be — the pre-⑱-6 behaviour, restored on purpose. It is a probe
 # rather than a permanent gate configuration because it costs a whole real-Linux boot (~40 s) to
