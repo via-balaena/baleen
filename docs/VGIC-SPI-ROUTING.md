@@ -144,6 +144,14 @@ Two accounts, produced by two different parties, neither taking the other's word
 | EL2 | `baleen: vspi OK` / `baleen: vspi FAIL` (forbidden) | its own routing decision and the one-disposition identity `named == delivered + deferred + routed` |
 | the kernel | `baleen-spi-counts: cpu0=0 cpu1=1` (required, per dom) | which of **its** CPUs ran the handler, counted by its own interrupt path |
 
+Plus the two preconditions, asserted rather than assumed — both are ways that last line could go
+green for the wrong reason, or red while blaming the wrong mechanism:
+
+| marker | what it rules out |
+|---|---|
+| `baleen-spi-intid: 33` | EL2 injecting an INTID the guest never re-aimed. It binds the INTID the **guest** reports for its UART to `WITNESS_SPI` in `linux.rs`, so changing one without the other is red. Linux's own IRQ number follows in parentheses, outside the asserted prefix, because that allocation may legitimately move |
+| `baleen-spi-affinity: 2` | an affinity write that silently failed. That would leave the route on CPU0 and make `cpu0=0 cpu1=1` unreachable for a reason with nothing to do with routing |
+
 ## 6. The removed-fix probe
 
 `--features spi-route-probe` makes `deliver_spi` ignore the route and take whichever vCPU is on the

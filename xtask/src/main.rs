@@ -875,6 +875,20 @@ const LINUX_MARKERS: &[&str] = &[
     // word for where the interrupt went.
     "[dom 1] baleen-spi-counts: cpu0=0 cpu1=1",
     "[dom 2] baleen-spi-counts: cpu0=0 cpu1=1",
+    // ⑱-6's two preconditions, asserted rather than assumed — both are ways the line above could go
+    // green for the wrong reason.
+    //
+    //   * `baleen-spi-intid: 33` binds the INTID the GUEST reports for its UART to `WITNESS_SPI` in
+    //     `linux.rs`. Change one without the other and EL2 would be injecting an interrupt the guest
+    //     never re-aimed. Only the INTID is asserted; Linux's own IRQ number follows it in
+    //     parentheses because that allocation may legitimately move.
+    //   * `baleen-spi-affinity: 2` says the kernel ACCEPTED the affinity write. A write that silently
+    //     failed would leave the route on CPU0, and `cpu0=0 cpu1=1` would then be unreachable for a
+    //     reason that has nothing to do with routing — a red gate blaming the wrong mechanism.
+    "[dom 1] baleen-spi-intid: 33 ",
+    "[dom 2] baleen-spi-intid: 33 ",
+    "[dom 1] baleen-spi-affinity: 2",
+    "[dom 2] baleen-spi-affinity: 2",
     // ③-b2b-ii-a's own witness, and the only assertion here that can tell an INDEXED per-guest state
     // from a shared one. Everything else this rung changed is structural: with one guest running,
     // eight arrays-of-one behave exactly like the eight globals they replaced. What cannot survive a

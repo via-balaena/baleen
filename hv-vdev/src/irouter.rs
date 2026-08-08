@@ -69,8 +69,14 @@ const AFF_LOW_MASK: u64 = 0x00ff_ffff;
 /// `Aff3`, bits `[39:32]`.
 const AFF3_SHIFT: u32 = 32;
 const AFF_BYTE: u64 = 0xff;
-/// Where `Aff3` lands once repacked into [`vcpu_affinity`]'s layout — one byte per level, `Aff0`
-/// lowest, so `Aff3` is the fourth byte.
+/// Where `Aff3` lands once repacked into [`vcpu_affinity`](crate::gicv3::vcpu_affinity)'s layout —
+/// one byte per level, `Aff0` lowest, so `Aff3` is the fourth byte.
+///
+/// ⚠ The path is spelled out because **the doc gate cannot check this link.** `cargo doc` does not
+/// render private items, so `RUSTDOCFLAGS=-D warnings` never sees a doc comment on a private const —
+/// MEASURED with a deliberately broken link here (passed) and on the public `decode` beside it
+/// (failed, `-D rustdoc::broken-intra-doc-links`). Every link on a private item in this workspace is
+/// therefore unverified, which is worth knowing before trusting one.
 const PACKED_AFF3_SHIFT: u32 = 24;
 
 /// **Which vCPU one `GICD_IROUTER<n>` value names**, decoded once and then asked about.

@@ -21,6 +21,15 @@
 #                            `LINUX_RAM_BASE..LINUX_RAM_END` in linux.rs until ③-b2b-ii-b; ③-b2a had
 #                            already halved the window and moved the constants, and this outlived
 #                            both — which is why the marker itself carries the values.)
+#   * baleen-spi-intid:      ⑱-6. The GIC INTID the GUEST says its UART uses, bound by the gate to
+#                            `WITNESS_SPI` in linux.rs — two artifacts naming one interrupt, with
+#                            neither taking the other's word for which.
+#   * baleen-spi-affinity:   ⑱-6. That the kernel ACCEPTED the affinity change, so a failed write
+#                            cannot masquerade as a routing that was never honoured.
+#   * baleen-spi-counts:     ⑱-6, and the property itself: which of the guest's OWN CPUs ran the
+#                            handler for the INTID it re-aimed. `cpu0=0 cpu1=1` is honoured routing;
+#                            `cpu0=1 cpu1=0` is what ignoring `GICD_IROUTER` produces, which is
+#                            exactly what the `spi-route-probe` build measures.
 #   * BALEEN-IDLE-START/END  ⑱-4b-i, and the ODD ONE OUT: this pair brackets a second of deliberate
 #                            idleness, so what it witnesses is not the printing but what happens
 #                            BETWEEN the two lines — the kernel running out of work and executing
@@ -44,29 +53,6 @@ echo "########## BALEEN-STEP0-OK ##########"
 echo "baleen-guest-ram: $(/bin/busybox grep -m1 'System RAM' /proc/iomem | /bin/busybox tr -d ' ')"
 echo "cmdline: $(/bin/busybox cat /proc/cmdline)"
 
-# ★★ ⑱-4b-i — **GO IDLE ON PURPOSE, and this line is a WITNESS-ENABLING MECHANISM, not padding.**
-#
-# Every other line here prints a marker. This one produces a *scheduler state* instead: with PID 1
-# asleep and nothing else runnable, the kernel has no work, so it idles into `wfi` — the trap
-# `HCR_EL2.TWI` routes to EL2 and the whole reason `handle_linux_wfi` exists.
-#
-# ⚠ **Without it that path is very nearly untested, which was MEASURED before this line was added.**
-# Six boots of the previous init on `main`: dom 1 / dom 2 trapped (1,0) (0,0) (0,0) (1,1) (0,1)
-# (1,1) `wfi`s — **two of the six trapped ZERO across both guests**, and the most any boot managed
-# was two. A witness over that is vacuous a third of the time and a kill probe over it cannot kill.
-#
-# With one second of sleep the guests idle **hundreds of times each**, reliably, every boot. That is
-# what makes the ⑱-4b-i witness an assertion rather than a coin flip, and it is what let the
-# ping-pong that rung fixes be measured on `main` instead of argued about — with this sleep and
-# `SchedPreempt` still in place, the same boot produced **8,735 yields per guest**; with `SchedBlock`
-# it produced 81. ⚠ That "after" figure is ⑱-4b-i's, at one vCPU per guest; once ⑱-4b-ii started a
-# second one the same boot blocks ~465 times across four vCPUs, because there is far more idling to
-# do. The 8,735 is the number that matters and it is a statement about `main`.
-# See `report_idle` in hv-metal/src/linux.rs for the current split and what it means.
-#
-# One second, not more. The trap count scales roughly linearly with the sleep — the guests idle at
-# their own tick rate — so a longer sleep buys proportionally more of a signal that is already large
-# enough, at ~1 s of gate time per boot configuration.
 # ★★ ⑱-6 — **THE GUEST AIMS ITS OWN INTERRUPT AT ITS SECOND CPU, and the hypervisor obeys.**
 #
 # This is the only block here that asks the kernel to *decide* something rather than report it, and
@@ -91,10 +77,37 @@ echo "cmdline: $(/bin/busybox cat /proc/cmdline)"
 # emulated PL011 never raises. So a count appearing here is EL2's injection and can be nothing else,
 # and WHICH COLUMN it appears in is the entire property.
 baleen_irq=$(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox cut -d: -f1 | /bin/busybox tr -d ' ')
-echo "baleen-spi-irq: irq=${baleen_irq} intid=$(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox awk '{print $5}')"
+# ⚠ **INTID FIRST, Linux's own IRQ number in parentheses, and the order is what makes this
+# assertable.** The gate requires `baleen-spi-intid: 33`, which binds the GIC INTID the GUEST reports
+# to `WITNESS_SPI` in linux.rs — so changing one without the other goes red. The Linux IRQ number is
+# an allocation detail that may legitimately move, so it is deliberately outside the asserted prefix.
+echo "baleen-spi-intid: $(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox awk '{print $5}') (linux irq ${baleen_irq})"
 echo 2 > /proc/irq/${baleen_irq}/smp_affinity
-echo "baleen-spi-routed-to: $(/bin/busybox cat /proc/irq/${baleen_irq}/smp_affinity)"
+echo "baleen-spi-affinity: $(/bin/busybox cat /proc/irq/${baleen_irq}/smp_affinity)"
 
+# ★★ ⑱-4b-i — **GO IDLE ON PURPOSE, and this line is a WITNESS-ENABLING MECHANISM, not padding.**
+#
+# Every other line here prints a marker. This one produces a *scheduler state* instead: with PID 1
+# asleep and nothing else runnable, the kernel has no work, so it idles into `wfi` — the trap
+# `HCR_EL2.TWI` routes to EL2 and the whole reason `handle_linux_wfi` exists.
+#
+# ⚠ **Without it that path is very nearly untested, which was MEASURED before this line was added.**
+# Six boots of the previous init on `main`: dom 1 / dom 2 trapped (1,0) (0,0) (0,0) (1,1) (0,1)
+# (1,1) `wfi`s — **two of the six trapped ZERO across both guests**, and the most any boot managed
+# was two. A witness over that is vacuous a third of the time and a kill probe over it cannot kill.
+#
+# With one second of sleep the guests idle **hundreds of times each**, reliably, every boot. That is
+# what makes the ⑱-4b-i witness an assertion rather than a coin flip, and it is what let the
+# ping-pong that rung fixes be measured on `main` instead of argued about — with this sleep and
+# `SchedPreempt` still in place, the same boot produced **8,735 yields per guest**; with `SchedBlock`
+# it produced 81. ⚠ That "after" figure is ⑱-4b-i's, at one vCPU per guest; once ⑱-4b-ii started a
+# second one the same boot blocks ~465 times across four vCPUs, because there is far more idling to
+# do. The 8,735 is the number that matters and it is a statement about `main`.
+# See `report_idle` in hv-metal/src/linux.rs for the current split and what it means.
+#
+# One second, not more. The trap count scales roughly linearly with the sleep — the guests idle at
+# their own tick rate — so a longer sleep buys proportionally more of a signal that is already large
+# enough, at ~1 s of gate time per boot configuration.
 echo "########## BALEEN-IDLE-START ##########"
 /bin/busybox sleep 1
 echo "########## BALEEN-IDLE-END ##########"
