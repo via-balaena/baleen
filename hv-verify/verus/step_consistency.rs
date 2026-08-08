@@ -40,6 +40,27 @@
 //! it) is a bounded next arc, *scoped here rather than papered over*; the integrity property the
 //! tier set out to prove (`Theorem A`) stands complete without it.
 //!
+//! ## ✅ THAT ARC HAPPENED — and this file did not say so for four arcs
+//!
+//! ⚠ **Everything above describes the state BEFORE ②′, and a reader landing here was told the
+//! project's deepest claim is weaker than it is.** The read-closure refinement was built:
+//!
+//! * [`read_closure.rs`](../read_closure.rs) discharges the residual generically — `obs⁺(a)` is
+//!   `obs(a)` plus the partner state `a` holds a read-capability for, and `read_outcome_factors`
+//!   shows the cross-domain read factors through it.
+//! * `noninterference_instantiation.rs` carries it **concretely**: `ObsPlus`, `step_consistent()`
+//!   over `obs_plus`, and `step_consistent_holds()` — a discharged `proof fn`, not a premise.
+//! * `ni_theorem_b` there is the **premise-free** confidentiality theorem over `Sys`/`ObsPlus`. It
+//!   takes no `step_consistent()` hypothesis; it invokes the discharged one.
+//!
+//! MEASURED on the pinned release: `noninterference_instantiation.rs` → **20 verified, 0 errors**.
+//!
+//! ★ **So the residual below is CLOSED, and this file remains the generic reduction that located
+//! it.** Kept rather than rewritten because the reduction is what makes the closure legible — but
+//! the "bounded next arc" sentence above must be read as history. ⚠ The project's own
+//! `baleen-status` ledger carried the same stale reading; a caveat outlives its cause unless
+//! something points at the thing that removed it.
+//!
 //! ## Output consistency
 //!
 //! Identical shape: a domain's own hypercall **result** (`HvOutcome`/`HvError`) is a function of

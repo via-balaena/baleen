@@ -58,6 +58,24 @@
 //! genuinely rests on the per-step conditions, which is the whole content of an unwinding theorem.
 //!
 //! Run: `verus --crate-type=lib hv-verify/verus/noninterference_theorem.rs` (exit 0 = all proven).
+//!
+//! ## ⚠ THIS IS THE GENERIC STATEMENT. THE CONCRETE CHAIN IS ELSEWHERE, AND IT IS CLOSED.
+//!
+//! The theorems here are proven over **uninterpreted** `obs`/`step`/`actor`/`interferes` and take
+//! `local_respect()` / `step_consistent()` as **premises** — so on its own this file says "if the
+//! unwinding conditions hold, non-interference follows", which is a real theorem about nothing in
+//! particular. A reader who stops here would reasonably conclude the instantiation is prose.
+//!
+//! **It is not.** `noninterference_instantiation.rs` re-proves the whole chain over the concrete
+//! `Sys`/`Trans`/`Obs`/`ObsPlus`: `local_respect_holds()` and `step_consistent_holds()` are
+//! discharged `proof fn`s, and `ni_theorem_a` / `ni_theorem_b` are **premise-free** — they invoke
+//! the discharged conditions rather than assuming them. MEASURED: **20 verified, 0 errors**.
+//!
+//! ★ Why both exist: the generic file is where the unwinding argument is *legible* (206 lines, no
+//! domain detail); the concrete file is where it is *true of Baleen*. Verus cannot instantiate one
+//! with the other — separate crates, and `obs` returns `int` here and a struct there — so the
+//! concrete file repeats the induction rather than importing it. **That repetition is the price of
+//! legibility, and `xtask verus-counts` is what stops either copy quietly disappearing.**
 
 use vstd::prelude::*;
 
