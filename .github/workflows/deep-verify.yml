@@ -124,8 +124,10 @@ jobs:
       # In lockstep with proofs.yml's PR gate, which carries the measurement: `-j 4` (the runner's
       # vCPU count) took the same 65 harnesses from 975 s to 435 s locally, and `--output-format=
       # terse` is what `-j` requires — no diagnostics lost, every per-harness time still printed.
-      - name: cargo kani -p hv-verify (preservation proofs)
-        run: cargo kani -p hv-verify -j 4 --output-format=terse
+      # ⑳-b: same gate as the REQUIRED `kani proofs (PR)` job, deliberately — a weekly backstop
+      # weaker than the PR gate it backs up would let a deleted harness through.
+      - name: cargo kani -p hv-verify + harness inventory (preservation proofs)
+        run: cargo xtask kani-harnesses
 
   # Tier C, the ∀-N step: the Verus preservation proofs in hv-verify/verus. Where Kani makes a
   # refcount symbolic and proves over all 2^32 MAGNITUDES on the real code (bounded on Vec

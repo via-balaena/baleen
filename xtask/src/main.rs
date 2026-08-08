@@ -6,7 +6,8 @@
 //! Deliberately tiny for M1 — it grows to cover `hv-metal` cross-builds and the
 //! `hv-fuzz` targets as those milestones land.
 
-use std::process::{exit, Command};
+use std::io::{BufRead, BufReader};
+use std::process::{exit, Command, Stdio};
 
 fn main() {
     let task = std::env::args().nth(1).unwrap_or_default();
@@ -72,6 +73,7 @@ fn main() {
         "metal-lint" => metal_lint(),
         "doc-markers" => doc_markers(),
         "verus-counts" => verus_counts(),
+        "kani-harnesses" => kani_harnesses(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run(
@@ -105,6 +107,7 @@ fn main() {
                  ci     fmt --check, clippy -D warnings, test, doc, then doc-markers\n  \
                  doc-markers  assert every boot marker a doc QUOTES is still one the gates check\n  \
                  verus-counts assert every Verus file discharges the obligations it is expected to\n  \
+                 kani-harnesses  run the Kani corpus and assert it contains exactly the expected harnesses\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
@@ -1993,6 +1996,291 @@ fn flush_paragraph(para: &[&str], start: usize, out: &mut Vec<(usize, String)>) 
     }
 }
 
+/// **Run a command, ECHOING its output line by line while also returning it.**
+///
+/// ⚠ **Exists because a gate that captures where the command it replaced STREAMED is worse on two
+/// axes at once**, and both were nearly shipped: a proof failure's diagnostics vanish unless
+/// reprinted, and a 16-minute step goes silent, which reads as hung. Streaming keeps the behaviour
+/// `cargo kani …` and `verus …` had when CI invoked them directly; the returned copy is what the
+/// inventory checks parse.
+///
+/// Merges stderr into stdout so the ordering a reader sees matches the ordering the tool produced.
+fn run_capturing(program: &str, args: &[&str]) -> Option<(bool, String)> {
+    eprintln!("$ {program} {}", args.join(" "));
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    // ⚠ **stderr is drained on its OWN THREAD, and that is not tidiness — it is the difference
+    // between this working and hanging a REQUIRED gate.** Reading stdout to completion first and
+    // stderr afterwards deadlocks the moment a child writes more to stderr than the pipe buffer
+    // holds (~64 KiB): the child blocks writing stderr, this blocks reading stdout, and neither
+    // moves. `cargo` puts every `Compiling …` line and every warning on stderr, so the volume is
+    // not hypothetical — it is merely small enough today.
+    let err = child.stderr.take().map(|e| {
+        std::thread::spawn(move || {
+            let mut acc = String::new();
+            for line in BufReader::new(e).lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                acc.push_str(&line);
+                acc.push('\n');
+            }
+            acc
+        })
+    });
+
+    let mut text = String::new();
+    if let Some(o) = child.stdout.take() {
+        for line in BufReader::new(o).lines().map_while(Result::ok) {
+            eprintln!("{line}");
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    if let Some(h) = err {
+        if let Ok(acc) = h.join() {
+            text.push_str(&acc);
+        }
+    }
+    let status = child.wait().ok()?;
+    Some((status.success(), text))
+}
+
+/// ★★ ⑳-b — **EVERY KANI HARNESS THIS CORPUS IS EXPECTED TO CONTAIN, by qualified name.**
+///
+/// ⚠ **Same hole ⑳ found in the Verus gate, in the LARGER corpus.** The required `kani proofs (PR)`
+/// job runs `cargo kani -p hv-verify -j 4 --output-format=terse` and checks **exit status only** —
+/// which is blind to a harness being DELETED. 135 harnesses passing is `0 failures` just as 136 is.
+///
+/// A **count** would catch a deletion; a **name set** also catches a rename, a harness moved out of
+/// `#[cfg(kani)]`, and a delete-one-add-one refactor. Kani's terse output prints
+/// `Checking harness <module>::<name>...` for every harness it runs, so the stronger check costs
+/// nothing over the weaker one — which is why this is a list where `VERUS_OBLIGATIONS` is a count
+/// (verus reports no per-obligation names to pin).
+///
+/// ⚠ **Adding a harness means adding a line here, deliberately — that is the feature**, and the same
+/// bargain `LINUX_MARKERS` makes. **Removing one is a claim that a property no longer needs
+/// proving, and belongs in the commit message.**
+const KANI_HARNESSES: &[&str] = &[
+    "device_assignment::an_assignment_moves_exactly_one_device",
+    "device_assignment::assign_is_total_and_a_refusal_changes_nothing",
+    "device_assignment::destroying_a_domain_leaves_no_device_naming_it",
+    "device_assignment::no_domain_can_assign_itself_a_device",
+    "device_assignment::release_is_total_and_only_moves_the_named_holders_device",
+    "device_assignment::the_sweep_takes_exactly_the_holders_devices",
+    "device_models::a_broadcast_names_every_vcpu_but_the_sender",
+    "device_models::a_failed_write_changes_nothing",
+    "device_models::a_foreign_cluster_names_no_vcpu",
+    "device_models::a_foreign_cluster_route_names_no_vcpu",
+    "device_models::a_guest_can_name_a_vcpu_that_is_not_itself",
+    "device_models::a_guest_can_route_an_spi_to_a_second_vcpu",
+    "device_models::a_layout_valid_for_two_has_room_for_two",
+    "device_models::a_route_names_at_most_one_vcpu",
+    "device_models::a_target_list_names_exactly_the_bits_it_sets",
+    "device_models::a_valid_layout_decodes_within_the_frame_it_names",
+    "device_models::a_write_changes_only_the_enables_it_names",
+    "device_models::a_write_to_one_redistributor_changes_nothing_another_reads",
+    "device_models::an_address_past_the_last_redistributor_is_in_no_frame",
+    "device_models::an_any_of_n_route_names_no_vcpu",
+    "device_models::an_sgi_intid_is_always_in_the_sgi_range",
+    "device_models::enabling_an_intid_for_one_vcpu_does_not_enable_it_for_another",
+    "device_models::gic_mmio_is_total_for_every_guest_offset",
+    "device_models::gic_mmio_is_total_for_every_layout",
+    "device_models::gic_mmio_is_total_with_two_redistributors",
+    "device_models::only_an_spi_has_a_route",
+    "device_models::only_the_writable_registers_can_change_the_pl011",
+    "device_models::pl011_mmio_is_total_for_every_guest_offset",
+    "device_models::pl011_reports_a_transmit_byte_only_for_dr",
+    "device_models::the_decode_is_a_partition_across_redistributors",
+    "device_models::the_decode_is_reached_and_does_something",
+    "device_models::the_distributor_cannot_reach_a_redistributor_banked_intid",
+    "device_models::the_distributor_declares_one_of_n_unsupported",
+    "device_models::the_distributor_frame_cannot_change_anything_the_sgi_frame_reads",
+    "device_models::the_last_redistributor_is_the_only_one_that_says_so",
+    "device_models::the_needle_matcher_fires",
+    "device_models::the_needle_matcher_never_runs_off_its_needle",
+    "device_models::the_second_redistributor_is_reached_and_is_its_own",
+    "device_models::the_sgi_frame_cannot_reach_an_spi",
+    "device_models::the_typer_reports_the_vcpu_affinity",
+    "device_models::two_redistributors_are_total_for_every_layout",
+    "device_path_composition::a_device_never_reaches_an_unauthorized_frame",
+    "device_path_composition::a_device_reaches_exactly_the_memory_its_domain_reaches",
+    "device_path_composition::binding_the_wrong_domain_reaches_the_wrong_memory",
+    "device_path_composition::the_composition_is_not_vacuous",
+    "device_path_composition::the_two_consumers_are_pointed_at_one_table",
+    "device_path_composition::the_walk_lands_where_the_windows_say",
+    "foreign_link_state_machine::real_link_preserves_the_seam_invariant",
+    "foreign_link_state_machine::real_revoke_under_a_live_foreign_link_preserves_the_seam_invariant",
+    "gic_declared_residues::a_redistributor_banked_copy_reads_zero_in_the_distributor",
+    "gic_declared_residues::a_res0_write_enables_nothing",
+    "gic_declared_residues::an_unmodelled_distributor_register_is_still_refused",
+    "gic_declared_residues::exactly_one_redistributor_and_it_reports_last",
+    "gic_declared_residues::redistributor_pending_and_active_read_zero",
+    "gic_declared_residues::routing_an_spi_is_recorded_and_changes_no_enable",
+    "gic_declared_residues::spi_pending_and_active_are_accepted_and_read_zero",
+    "grant_refcount::map_then_unmap_restores_counts",
+    "grant_refcount::writable_exceeds_maps_preserved_under_map",
+    "grant_refcount::writable_exceeds_maps_preserved_under_unmap",
+    "grant_state_machine::real_map_preserves_first_violation_bounded",
+    "p2m_write_xor_execute::a_writable_frame_refuses_an_executable_leaf",
+    "p2m_write_xor_execute::executable_frame_stays_wx_under_a_symbolic_leaf",
+    "p2m_write_xor_execute::writable_frame_stays_wx_under_a_symbolic_leaf",
+    "partition::a_window_top_reservation_fits_4_slots",
+    "partition::an_in_window_address_belongs_to_that_slot_2_slots",
+    "partition::an_in_window_address_belongs_to_that_slot_4_slots",
+    "partition::domain_ids_are_injective_and_never_dom0",
+    "partition::frame_and_table_runs_are_disjoint_2_slots",
+    "partition::frame_and_table_runs_are_disjoint_3_slots",
+    "partition::frame_and_table_runs_are_disjoint_4_slots",
+    "partition::owner_of_is_exactly_the_containing_window_2_slots",
+    "partition::owner_of_is_exactly_the_containing_window_4_slots",
+    "partition::windows_are_pairwise_disjoint_2_slots",
+    "partition::windows_are_pairwise_disjoint_3_slots",
+    "partition::windows_are_pairwise_disjoint_4_slots",
+    "partition::windows_stay_inside_the_backed_ram_2_slots",
+    "partition::windows_stay_inside_the_backed_ram_3_slots",
+    "partition::windows_stay_inside_the_backed_ram_4_slots",
+    "pending_set_algebra::a_bit_round_trips_and_is_exactly_one_bit",
+    "pending_set_algebra::lowest_set_is_the_minimum_member_and_none_only_when_empty",
+    "pending_set_algebra::the_word_index_of_any_nameable_intid_is_in_range",
+    "smmu_stream_binding::a_binding_that_cannot_be_named_exactly_is_refused_and_writes_nothing",
+    "smmu_stream_binding::a_bound_stream_names_exactly_the_domain_it_was_given",
+    "smmu_stream_binding::binding_a_stream_to_a_domain_leaves_every_other_denied",
+    "smmu_stream_binding::no_entry_decodes_as_a_binding_unless_it_is_a_stage2_ste",
+    "smmu_stream_binding::rebinding_a_stream_leaves_no_trace_of_the_previous_domain",
+    "smmu_stream_binding::the_device_and_the_cpu_walk_under_one_regime",
+    "smmu_stream_binding::the_vttbr_seam_recovers_the_table_and_the_vmid",
+    "smmu_stream_binding::unbinding_a_domain_binding_restores_the_deny",
+    "smmu_stream_derivation::a_map_that_aliases_two_devices_onto_one_entry_is_refused",
+    "smmu_stream_derivation::a_refused_derivation_leaves_the_table_denying_every_stream",
+    "smmu_stream_derivation::a_swept_holder_leaves_no_stream_bound_and_spares_the_others",
+    "smmu_stream_derivation::the_derivation_is_a_function_of_the_relation_alone",
+    "smmu_stream_derivation::the_derived_table_binds_exactly_the_assigned_streams",
+    "smmu_stream_derivation::the_refinement_check_is_the_property_and_can_fail",
+    "smmu_stream_table::a_bind_touches_only_its_own_entry",
+    "smmu_stream_table::an_out_of_range_bind_changes_no_word",
+    "smmu_stream_table::an_ste_permits_iff_valid_and_not_configured_to_abort",
+    "smmu_stream_table::an_under_allocated_table_denies_every_streamid",
+    "smmu_stream_table::binding_one_stream_leaves_every_other_denied",
+    "smmu_stream_table::the_constructors_decode_to_their_names",
+    "smmu_stream_table::the_deployed_stream_table_denies_every_streamid",
+    "smmu_stream_table::the_register_encodings_match_the_table_they_describe",
+    "smmu_stream_table::unbind_restores_deny_for_every_streamid",
+    "smmu_stream_table::zeroed_stream_table_denies_every_streamid",
+    "stage2_device_region::device_block_encodes_as_device_ngnrne_xn_identity",
+    "stage2_device_region::normal_memory_never_decodes_as_a_device_block",
+    "stage2_device_region::validate_ok_implies_device_disjoint_from_ram_leaves",
+    "stage2_device_region::validate_ok_implies_regions_pairwise_disjoint",
+    "stage2_encoding::data_leaves_are_always_execute_never",
+    "stage2_encoding::encode_leaf_descriptors_follow_the_seam",
+    "stage2_encoding::image_block_is_always_readonly_and_executable",
+    "stage2_encoding::page_encoding_round_trips",
+    "stage2_encoding::readonly_never_decodes_as_writable",
+    "stage2_encoding::rx_leaf_decodes_executable_and_read_only",
+    "stage2_encoding::table_encoding_round_trips",
+    "stage2_encoding::the_exemption_is_the_sole_writable_and_executable_leaf",
+    "stage2_refinement::a_constructed_span_conflict_is_rejected",
+    "stage2_refinement::a_reported_span_conflict_is_real",
+    "stage2_refinement::a_span_conflict_state_maps_only_authorized_frames",
+    "stage2_refinement::a_writable_leaf_is_never_backed_by_a_readonly_grant",
+    "stage2_refinement::an_accepted_map_has_no_span_conflict",
+    "stage2_refinement::an_unauthorized_frame_is_never_mapped",
+    "stage2_refinement::emitted_leaf_map_is_always_authorized",
+    "stage2_refinement::without_the_foreign_link_premise_the_checker_fires",
+    "vgic_active_lr::an_active_list_register_is_occupied_but_not_pending",
+    "vgic_cpu_interface::a_free_list_register_is_left_exactly_as_it_was",
+    "vgic_cpu_interface::a_physical_intid_is_refused_exactly_when_it_cannot_be_named",
+    "vgic_cpu_interface::a_purely_virtual_injection_carries_no_physical_claim",
+    "vgic_cpu_interface::a_release_demotes_and_disturbs_nothing_else",
+    "vgic_cpu_interface::a_release_is_idempotent",
+    "vgic_cpu_interface::a_surviving_hardware_mapping_can_only_be_in_a_free_slot",
+    "vgic_cpu_interface::an_encoded_hardware_mapping_decodes_to_exactly_what_was_asked",
+    "vgic_cpu_interface::an_encoded_list_register_is_never_free",
+    "vgic_cpu_interface::release_demotes_exactly_the_occupied_hardware_mappings",
+    "vgic_cpu_interface::the_properties_hold_for_any_live_bank_length",
+];
+
+/// **Run the Kani corpus and check it contains EXACTLY [`KANI_HARNESSES`].**
+///
+/// Replaces the bare `cargo kani …` CI step rather than adding to it, so the count costs no extra
+/// run. Checks three things, and the middle one is what a count alone would miss:
+///
+/// * every expected harness was actually checked — a deletion is red;
+/// * no unexpected harness was checked — a harness added without a line here is red, so the list
+///   cannot silently fall behind the corpus it claims to describe;
+/// * Kani's own tally reports zero failures and a total matching the list.
+fn kani_harnesses() -> bool {
+    let Some((success, text)) = run_capturing(
+        "cargo",
+        &[
+            "kani",
+            "-p",
+            "hv-verify",
+            "-j",
+            "4",
+            "--output-format=terse",
+        ],
+    ) else {
+        eprintln!("kani-harnesses: cannot run cargo kani");
+        return false;
+    };
+    if !success {
+        eprintln!("kani-harnesses: FAIL — cargo kani exited non-zero (its output is above).");
+        return false;
+    }
+
+    let mut seen: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.split("Checking harness ").nth(1))
+        .filter_map(|r| r.split("...").next())
+        .map(str::trim)
+        .collect();
+    seen.sort_unstable();
+    seen.dedup();
+
+    let mut ok = true;
+    for want in KANI_HARNESSES {
+        if !seen.contains(want) {
+            eprintln!("kani-harnesses: FAIL — expected harness never ran: {want}");
+            ok = false;
+        }
+    }
+    for got in &seen {
+        if !KANI_HARNESSES.contains(got) {
+            eprintln!(
+                "kani-harnesses: FAIL — harness ran but is not in KANI_HARNESSES: {got}. Add it, \
+                 so the list cannot fall behind the corpus."
+            );
+            ok = false;
+        }
+    }
+    // `Complete - N successfully verified harnesses, M failures, T total.`
+    match text.split("Complete - ").last().and_then(|t| {
+        let mut it = t.split_whitespace();
+        let n = it.next()?.parse::<usize>().ok()?;
+        Some(n)
+    }) {
+        Some(n) if n == KANI_HARNESSES.len() => {
+            eprintln!("kani-harnesses: OK — {n} harnesses, all named in KANI_HARNESSES");
+        }
+        Some(n) => {
+            eprintln!(
+                "kani-harnesses: FAIL — Kani verified {n} harnesses, KANI_HARNESSES names {}",
+                KANI_HARNESSES.len()
+            );
+            ok = false;
+        }
+        None => {
+            eprintln!("kani-harnesses: FAIL — no `Complete - N successfully verified` tally found");
+            ok = false;
+        }
+    }
+    ok
+}
+
 /// ★★ ⑳ — **HOW MANY OBLIGATIONS EACH VERUS FILE DISCHARGES, pinned.**
 ///
 /// ⚠ **The gate this closes: `proofs.yml`'s Verus job checks EXIT STATUS ONLY.** It runs
@@ -2080,30 +2368,25 @@ fn verus_counts() -> bool {
             ok = false;
             continue;
         }
-        eprintln!("$ {verus} --crate-type=lib {}", path.display());
-        let out = match Command::new(&verus)
-            .args(["--crate-type=lib", &path.to_string_lossy()])
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("verus-counts: cannot run `{verus}`: {e} (set $VERUS or put it on PATH)");
-                return false;
-            }
+        let Some((success, text)) =
+            run_capturing(&verus, &["--crate-type=lib", &path.to_string_lossy()])
+        else {
+            eprintln!("verus-counts: cannot run `{verus}` (set $VERUS or put it on PATH)");
+            return false;
         };
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
         // `verification results:: N verified, M errors`
         let got = text
             .split("verification results::")
             .nth(1)
             .and_then(|t| t.split_whitespace().next())
             .and_then(|n| n.parse::<u32>().ok());
+        if !success {
+            eprintln!("verus-counts: FAIL — {name}: verus exited non-zero (output above).");
+            ok = false;
+            continue;
+        }
         match got {
-            Some(n) if n == *want && out.status.success() => {
+            Some(n) if n == *want => {
                 eprintln!("verus-counts: OK — {name}: {n} verified");
             }
             Some(n) => {
