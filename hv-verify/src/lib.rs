@@ -4075,6 +4075,196 @@ mod device_models {
         );
     }
 
+    // ─── H4c · ⑱-6, `GICD_IROUTER<n>`: which vCPU does a guest's SPI go to? ──────────────────────
+    //
+    // The OTHER routing axis, and the last of the three residues ⑱-2 pinned. H4b decides where a
+    // guest's own IPI lands; this decides where a *device* interrupt lands, and the guest chose that
+    // too — it wrote the routing table on boot (the measured trace shows `0x6100..=0x68f8`, INTIDs
+    // 32..=287, every SPI).
+    //
+    // ★ **Read these against H4b's.** The rung deliberately reuses ⑱-5's shape — a pure decode of a
+    // guest-written `u64`, a `targets` predicate over a PACKED AFFINITY so the vCPU→affinity mapping
+    // keeps its single derivation, isolation falling out of the equality rather than being checked.
+    // What is NOT reused is the target *set*: `IROUTER` names exactly one PE, so
+    // `a_route_names_at_most_one_vcpu` is about a property H4b could not have (an SGI legitimately
+    // names many).
+    //
+    // ★ THE KILL PROBES. Same discipline as H4b — one harness at a time, and P0 is the control that
+    // catches a rig which cannot distinguish "held" from "never ran".
+    //
+    // | probe (applied to `hv_vdev::irouter`) | cluster | any-of-N | at-most-one | non-vac | recorded |
+    // |---|---|---|---|---|---|
+    // | **P0** unmodified — the CONTROL | PASS | PASS | PASS | PASS | PASS |
+    // | **P1** ignore `Aff1`/`Aff2`/`Aff3` (route on `Aff0` alone) | **RED** | PASS | PASS | PASS | PASS |
+    // | **P2** ignore `IRM` (decode the affinity fields anyway) | PASS | **RED** | PASS | PASS | PASS |
+    // | **P3** `targets` ignores the recorded affinity (always true) | **RED** | **RED** | **RED** | PASS | PASS |
+    // | **P4** `targets` always false | PASS | PASS | PASS | **RED** | PASS |
+    // | **P5** `spi_route` drops the `Aff3` repack | **RED** | PASS | PASS | PASS | PASS |
+    //
+    // ⚠ **P1 is the one that matters most**, because it is not a hypothetical defect: routing on
+    // `Aff0` alone is what a decode written without thinking about clusters looks like, and it is
+    // the exact shape ⑱-5 found in `hv-metal`'s SGI path (bits `[27:24]` only). It is also the
+    // probe that a `targets` comparing whole affinities kills for free.
+    //
+    // ⚠ **`only_an_spi_has_a_route` is killed by NO probe above** — none perturbs the range test.
+    // Said out loud rather than left to be inferred from a column of PASSes, which is H4b's lesson
+    // about `an_sgi_intid_is_always_in_the_sgi_range` reappearing here.
+
+    /// `GICD_IROUTER<n>` sits at `0x6000 + 8n`. Written out here rather than imported, for the same
+    /// reason `sgi1r` is (design-lesson #36): a harness that asked the model where its own registers
+    /// are would check nothing.
+    const IROUTER: u64 = 0x6000;
+
+    /// **The routing-value encoder, from the GICv3 register layout.** `Aff0` `[7:0]` · `Aff1`
+    /// `[15:8]` · `Aff2` `[23:16]` · `IRM` `[31]` · `Aff3` `[39:32]`.
+    ///
+    /// ⚠ Note `Aff3`'s offset: `IRM` interrupts the byte-per-level run at bit 31, so `Aff3` is at
+    /// `[39:32]` and **not** at `[31:24]`. That discontinuity is the one piece of arithmetic in the
+    /// decode with somewhere to go wrong, which is why P5 probes exactly it.
+    fn irouter_value(irm: bool, aff0: u64, aff1: u64, aff2: u64, aff3: u64) -> u64 {
+        (aff3 << 32) | ((irm as u64) << 31) | (aff2 << 16) | (aff1 << 8) | aff0
+    }
+
+    /// ★ **THE ISOLATION PROPERTY, and it is the same one H4b states for SGIs.**
+    ///
+    /// Every vCPU baleen gives a guest has affinity `vcpu_affinity(v)` — `Aff0 = v`, every higher
+    /// level zero. So a routing value naming any non-zero `Aff1`/`Aff2`/`Aff3` describes no vCPU
+    /// that exists and must select none, rather than falling back to `Aff0` and delivering the
+    /// interrupt to a vCPU the guest did not name.
+    #[kani::proof]
+    fn a_foreign_cluster_route_names_no_vcpu() {
+        let value: u64 = kani::any();
+        // Not 1-of-N — `IRM` makes the affinity fields meaningless, and is the next harness.
+        kani::assume(value & (1 << 31) == 0);
+        let (aff1, aff2, aff3) = (
+            (value >> 8) & 0xff,
+            (value >> 16) & 0xff,
+            (value >> 32) & 0xff,
+        );
+        kani::assume(aff1 != 0 || aff2 != 0 || aff3 != 0);
+        kani::cover!(true, "a foreign-cluster route is expressible");
+        let r = hv_vdev::irouter::decode(value);
+        let v: usize = kani::any();
+        kani::assume(v < 16);
+        assert!(
+            !r.targets(vcpu_affinity(v)),
+            "a route naming a cluster none of this guest's vCPUs is in must name no vCPU"
+        );
+    }
+
+    /// **`IRM` (1-of-N) names no vCPU — and that is a DECLARATION, not a policy.**
+    ///
+    /// `GICD_TYPER.No1N` tells the guest 1-of-N is unsupported, so a conforming kernel never sets
+    /// this bit; the harness below (`the_distributor_declares_one_of_n_unsupported`) is what ties
+    /// the two together, and without it this one would merely describe a behaviour rather than
+    /// justify it.
+    ///
+    /// The `is_any_of_n()` assertion is not redundant: it forces the decode to have **recognised**
+    /// the mode before the harness asserts what it means, so a decode that never read bit 31 at all
+    /// could not satisfy this vacuously. Same guard as `a_broadcast_names_every_vcpu_but_the_sender`.
+    #[kani::proof]
+    fn an_any_of_n_route_names_no_vcpu() {
+        let value: u64 = kani::any();
+        kani::assume(value & (1 << 31) != 0);
+        let r = hv_vdev::irouter::decode(value);
+        assert!(r.is_any_of_n(), "the routing mode must be recognised");
+        let v: usize = kani::any();
+        kani::assume(v < 16);
+        assert!(
+            !r.targets(vcpu_affinity(v)),
+            "a mode this port declares unsupported must not be given a guessed target"
+        );
+    }
+
+    /// **∀ value: a route names AT MOST ONE vCPU.**
+    ///
+    /// The property H4b has no analogue of — an SGI names a set on purpose, an SPI must not. It is
+    /// what makes "this interrupt was delivered once, to the vCPU the guest asked for" a statement
+    /// about the type rather than about the caller's loop: `hv-metal` iterates its vCPUs asking
+    /// `targets`, and two `true`s would inject the same SPI twice.
+    #[kani::proof]
+    fn a_route_names_at_most_one_vcpu() {
+        let value: u64 = kani::any();
+        let r = hv_vdev::irouter::decode(value);
+        let (a, b): (usize, usize) = (kani::any(), kani::any());
+        kani::assume(a < 256 && b < 256 && a != b);
+        assert!(
+            !(r.targets(vcpu_affinity(a)) && r.targets(vcpu_affinity(b))),
+            "one IROUTER value must never name two different vCPUs"
+        );
+    }
+
+    /// **Only an SPI has a route.** INTIDs 0..31 are redistributor-banked and have no `IROUTER`
+    /// entry at all, and anything past the modelled INTID space has no entry either.
+    ///
+    /// Fail-closed in the same direction as `is_enabled`: the caller gets `None` and must not invent
+    /// a target. The bound also protects the subtraction inside `spi_route`, which is the only
+    /// indexing arithmetic this rung adds.
+    #[kani::proof]
+    fn only_an_spi_has_a_route() {
+        let g = Gic2::new(deployed());
+        let intid: u32 = kani::any();
+        assert!(
+            g.spi_route(intid).is_some() == (intid >= 32 && (intid as usize) < NUM_INTIDS),
+            "a route exists for exactly the distributor's SPIs"
+        );
+    }
+
+    /// **The declaration `an_any_of_n_route_names_no_vcpu` rests on is actually MADE.**
+    ///
+    /// Design-lesson #202 — prefer a declaration to a guess — but a declaration nothing states is a
+    /// guess with better prose. `GICD_TYPER.No1N` (bit 25) is what the guest reads, so this asserts
+    /// the guest is told, through the register it would look in, the thing the decode assumes.
+    ///
+    /// ⚠ This is the harness that would go red if someone "simplified" `GICD_TYPER_VALUE` back,
+    /// leaving the decode silently refusing a mode the guest had been told it could use.
+    #[kani::proof]
+    fn the_distributor_declares_one_of_n_unsupported() {
+        let g = Gic2::new(deployed());
+        // `.ok()` rather than `.expect()`: `Unhandled` is deliberately not `Debug` (it crosses into
+        // `no_std` metal), and asserting the `Some` separately says the register is modelled at all.
+        let typer = g.mmio_read(GICD_BASE + 0x0004, 4).ok();
+        assert!(typer.is_some(), "GICD_TYPER must be modelled");
+        assert!(
+            typer.unwrap_or(0) & (1 << 25) != 0,
+            "the guest must be told 1-of-N is unsupported, since the decode refuses it"
+        );
+    }
+
+    /// **Non-vacuity, end to end, and it is the property the rung exists for.**
+    ///
+    /// Everything above is of the form "nothing wrong is named", which a decode naming NOTHING AT
+    /// ALL satisfies — and naming nothing is exactly the failure that would leave `hv-metal`
+    /// delivering every SPI to whichever vCPU happens to be running, which is the pre-⑱-6 behaviour
+    /// this rung removes.
+    ///
+    /// So this goes through the **MMIO seam** rather than calling `decode` directly: the guest
+    /// writes a routing value the way a kernel does, and the vCPU it named is the one `spi_route`
+    /// reports. That makes it the one harness here that would catch `irouter_index` and the decode
+    /// disagreeing about which register is which.
+    #[kani::proof]
+    fn a_guest_can_route_an_spi_to_a_second_vcpu() {
+        let mut g = Gic2::new(deployed());
+        let spi: u64 = kani::any();
+        kani::assume(spi >= 32 && spi < NUM_INTIDS as u64);
+        let ok = g.mmio_write(
+            GICD_BASE + IROUTER + 8 * spi,
+            8,
+            irouter_value(false, 1, 0, 0, 0),
+        );
+        assert!(ok.is_ok(), "a kernel's routing write must be accepted");
+
+        let r = g.spi_route(spi as u32).expect("an SPI has a route");
+        assert!(
+            r.targets(vcpu_affinity(1)),
+            "the SPI must be routed to the vCPU the guest named"
+        );
+        assert!(
+            !r.targets(vcpu_affinity(0)),
+            "and must NOT also go to the vCPU that happens to be running"
+        );
+    }
+
     // ─── H5 · the PL011 ──────────────────────────────────────────────────────────────────────────
 
     /// **∀ (offset, width, value): the PL011 model is total.**
@@ -4681,15 +4871,24 @@ mod gic_declared_residues {
         );
     }
 
-    /// **Residue 3, pinned: `IROUTER` is RECORDED and HONOURED BY NOTHING.**
+    /// **Was residue 3 — `IROUTER` recorded and honoured by nothing. ⑱-6 CLOSED THE SECOND HALF, and
+    /// this harness is what is left once it did.**
     ///
-    /// Two halves, and the second is the one prose could not hold still. *Recorded*: the value reads
-    /// back. *Not honoured*: writing any routing, for any SPI, changes **no INTID's enable** — the
-    /// only guest-observable thing routing could plausibly disturb. With one vCPU that is the correct
-    /// behaviour; the theorem is what stops it drifting into a partial implementation that routes
-    /// some interrupts and not others.
+    /// ⚠ **The name and the claim both had to change, and the harness did not.** It used to assert
+    /// *"routing is honoured by nothing"* via the only guest-observable proxy available at the time:
+    /// writing any routing changes no INTID's enable. That assertion is **still true and still worth
+    /// having** — routing and enabling are independent axes, and an implementation that let a
+    /// routing write enable an interrupt would be a real defect — but it never meant what its old
+    /// name said. It meant "routing does not disturb *enables*", which a fully honoured `IROUTER`
+    /// satisfies just as well as an ignored one.
+    ///
+    /// ★ **That gap is the transferable part** (design-lesson #205's shape, from the other side): a
+    /// theorem pinning a residue can outlive the residue completely, because what it actually
+    /// constrains is narrower than the sentence it was filed under. The routing *is* now honoured —
+    /// `a_guest_can_route_an_spi_to_a_second_vcpu` in `device_models` is the theorem for that — and
+    /// nothing here had to be weakened to make room for it.
     #[kani::proof]
-    fn irouter_is_recorded_and_honoured_by_nothing() {
+    fn routing_an_spi_is_recorded_and_changes_no_enable() {
         let mut g = Gic1::new(deployed());
 
         let probe: u32 = kani::any();
@@ -4711,7 +4910,7 @@ mod gic_declared_residues {
         assert_eq!(
             g.is_enabled(0, probe),
             before,
-            "routing must change no INTID's enable — it is recorded, not honoured"
+            "routing and enabling are independent axes — a routing write must enable nothing"
         );
     }
 

@@ -857,6 +857,24 @@ const LINUX_MARKERS: &[&str] = &[
     // probe produces.
     "[dom 1] ########## BALEEN-IDLE-END ##########",
     "[dom 2] ########## BALEEN-IDLE-END ##########",
+    // ★★ ⑱-6 — **THE GUEST'S OWN ACCOUNT OF WHICH OF ITS CPUs TOOK AN INTERRUPT IT RE-AIMED.**
+    //
+    // `guest-init.sh` writes CPU1's mask to the `uart-pl011` IRQ's `smp_affinity`, which makes
+    // arm64 Linux write `GICD_IROUTER<33>` into hv-metal's emulated distributor. EL2 then injects
+    // INTID 33 **from a vCPU the routing does not name**, so honouring the register and ignoring it
+    // lead to different CPUs — and this line is the kernel saying which one actually ran the
+    // handler.
+    //
+    // ⚠ **`cpu0=0` carries as much of the property as `cpu1=1`.** The removed-fix probe
+    // (`spi-route-probe`) produces `cpu0=1 cpu1=0`: same one interrupt, same guest, delivered where
+    // the pCPU was instead of where the guest aimed it. Asserting the whole string is what makes
+    // this a discriminator rather than a count.
+    //
+    // ⚠ And note what this is NOT: `baleen: vspi OK` is EL2's account of its own routing decision.
+    // These are the *kernels'*, produced by their interrupt paths, and neither takes the other's
+    // word for where the interrupt went.
+    "[dom 1] baleen-spi-counts: cpu0=0 cpu1=1",
+    "[dom 2] baleen-spi-counts: cpu0=0 cpu1=1",
     // ③-b2b-ii-a's own witness, and the only assertion here that can tell an INDEXED per-guest state
     // from a shared one. Everything else this rung changed is structural: with one guest running,
     // eight arrays-of-one behave exactly like the eight globals they replaced. What cannot survive a
@@ -1314,6 +1332,10 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // no `ICC_SGI1R_EL1` write ever trapped, i.e. the guest reached its own SGI generation register.
     "baleen: vtimer FAIL",
     "baleen: vsgi FAIL",
+    // ⑱-6's negative half. `vspi FAIL` means the SPI the guest re-aimed did NOT reach a non-running
+    // vCPU: either it went where the pCPU happened to be — `GICD_IROUTER` recorded and ignored, the
+    // behaviour this rung removed — or the routing named no vCPU at all and it went nowhere.
+    "baleen: vspi FAIL",
     // ③-b1's negative half: the guest's GIC accesses did not reach the emulator, i.e. the
     // distributor is being passed through again.
     "baleen: vgic FAIL",
@@ -1580,6 +1602,12 @@ const METAL_LINT_CONFIGS: &[&[&str]] = &[
     // so by this list's own stated invariant it must be linted; before this rung it was a config
     // that compiled and that no gate ever looked at, which is ⑭b's finding one rung along.
     &["--features", "real-linux,selftest,smmu"],
+    // ⑱-6 — the removed-fix probe. It is NOT booted by any gate (it is run by hand and its result is
+    // tabulated in `docs/VGIC-SPI-ROUTING.md`), so this is the list's invariant read the other way:
+    // a probe nothing lints is a probe that can stop compiling without anyone finding out until the
+    // day it is needed, which is the day its evidence is least replaceable. ⚠ Design-lesson #212 —
+    // a fix, or a probe, that is never wired into anything is indistinguishable from its absence.
+    &["--features", "real-linux,selftest,spi-route-probe"],
 ];
 
 fn metal_lint() -> bool {

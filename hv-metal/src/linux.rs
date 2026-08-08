@@ -1708,7 +1708,7 @@ static SGIS_DEFERRED: PerGuest<AtomicU64, NUM_GUESTS> =
 /// ⚠ **It counts DISPOSITIONS, not decodes, and the distinction was forced by the witness itself.**
 /// The obvious wording — "pairs the `ICC_SGI1R_EL1` decode named" — was what this doc said first, and
 /// it was wrong in the configuration the REQUIRED gate boots: the `selftest` overflow probe calls
-/// [`deliver_or_defer_sgi`] directly to manufacture a full bank, which is a disposition no decode
+/// [`deliver_or_defer_vint`] directly to manufacture a full bank, which is a disposition no decode
 /// named. Counting at the decode left the identity one short and the marker went red on its first
 /// run. **Counted where the disposition happens, it holds for every caller** — including callers
 /// this rung did not think of, which is the point.
@@ -1729,11 +1729,18 @@ static SGIS_DRAINED: PerGuest<AtomicU64, NUM_GUESTS> =
 static MAINT_TAKEN: PerGuest<AtomicU64, NUM_GUESTS> =
     PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
 
-/// **Deliver a guest-generated SGI, or record it as pending if the bank is full.**
+/// **Deliver a vINT to the RUNNING vCPU, or record it as pending if the list-register bank is full.**
 ///
 /// Total by construction: there is no failure to report, which is what removes the `park()` this
 /// replaces. The two outcomes are "in a list register now" and "in the set until one frees".
-fn deliver_or_defer_sgi(
+///
+/// ⚠ **Was `deliver_or_defer_sgi` until ⑱-6, and the rename is the whole of what that rung changed
+/// here.** Nothing in this function was ever about SGIs — it is the running vCPU's bank, its pending
+/// set, and the `UIE` discipline over both — but the name said otherwise, and ⑱-6 needed exactly
+/// this behaviour for a *routed SPI*. Copying it under a second name would have given the subtlest
+/// rule in the file (arm `UIE` only for the running vCPU, and only over a non-empty set) two
+/// derivations to drift apart. One encoder, as with `encode_lr` (#55).
+fn deliver_or_defer_vint(
     set: &crate::pending::PendingSet,
     named: &AtomicU64,
     delivered: &AtomicU64,
@@ -1757,9 +1764,206 @@ fn deliver_or_defer_sgi(
         // `gic::set_underflow_interrupt` for why arming it over an empty set livelocks EL2.
         gic::set_underflow_interrupt(true);
     }
-    // `mark` refuses only an INTID the emulated distributor cannot name. A guest SGI comes from a
-    // FOUR-BIT field (`gic::sgi1r_intid`), so it is at most 15 and this cannot happen; it is written
-    // as a condition rather than an assert because a panic here would be the halt coming back.
+    // `mark` refuses only an INTID the emulated distributor cannot name, and neither caller can
+    // produce one: an SGI comes from a FOUR-BIT field (`hv_vdev::sgi`), so it is at most 15, and a
+    // routed SPI reached here through `VirtGic::spi_route`, which answers `None` for anything
+    // outside the distributor's INTID space. Written as a condition rather than an assert because a
+    // panic here would be the halt coming back.
+}
+
+// ─── ⑱-6: which vCPU a routed SPI goes to ────────────────────────────────────────────────────────
+
+/// **The SPI the ⑱-6 witness routes — and it is the guest's OWN UART interrupt, not a number
+/// invented here.**
+///
+/// `guest.dts` gives `pl011@9000000` `interrupts = <0x00 0x01 0x04>` — SPI 1, so INTID 33 — and the
+/// guest names it straight back in `/proc/interrupts`:
+///
+/// ```text
+///  13:          0          0    GICv3  33 Level     uart-pl011
+/// ```
+///
+/// ★ **Measured on `main` before this witness was designed** (design-lesson #186), and two
+/// properties of that one line are what make it the right choice over an SPI EL2 picked for itself:
+///
+/// * The kernel prints **its own IRQ number and the GIC INTID side by side**, so "the interrupt the
+///   guest routed" and "the interrupt EL2 delivered" are demonstrably the same object rather than
+///   two numbers that happen to match.
+/// * The count is **zero on both CPUs across an entire boot** — the emulated PL011 never raises —
+///   so the baseline is not merely low, it is empty, and anything appearing in that row is EL2's
+///   injection and can be nothing else.
+const WITNESS_SPI: u32 = 33;
+
+/// ⑱-6 — `(SPI, target vCPU)` pairs EL2 undertook to deliver. Same identity as
+/// [`SGI_TARGETS_NAMED`]: `named == delivered + deferred + routed`, one disposition each.
+static SPI_TARGETS_NAMED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-6 — routed SPIs that went into the running vCPU's list registers.
+static SPIS_DELIVERED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-6 — routed SPIs that went into the running vCPU's pending set because its bank was full.
+static SPIS_DEFERRED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-6 — **SPIs marked for a vCPU that was NOT the one running.** The rung's whole point: before
+/// this, an SPI went wherever the pCPU happened to be.
+static SPIS_ROUTED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-6 — SPIs whose routing named **no vCPU this guest has**: a foreign cluster, or `IRM` (1-of-N),
+/// which `GICD_TYPER.No1N` tells the guest is unsupported.
+///
+/// ⚠ **Counted and reported, never a halt.** An undelivered interrupt is the guest's problem and
+/// stays inside the guest; a `park()` here would be a halt a guest could reach by writing one
+/// register, taking its peer down with it — which is exactly the defect ⑱-5 removed from the SGI
+/// path and must not be reintroduced on this one.
+static SPIS_UNROUTABLE: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-6 — set when the guest has re-aimed [`WITNESS_SPI`] away from its boot vCPU. See
+/// [`maybe_fire_spi_witness`] for why arming and firing are two moments and not one.
+static SPI_WITNESS_ARMED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// ⑱-6 — whether this guest's witness injection has already been made. Fires at most once.
+static SPI_WITNESS_FIRED: PerGuest<AtomicU64, NUM_GUESTS> =
+    PerGuest::new([const { AtomicU64::new(0) }; NUM_GUESTS]);
+
+/// **Deliver an SPI to the vCPU the GUEST routed it to.**
+///
+/// The ⑱-6 seam, and structurally the `ICC_SGI1R_EL1` loop in [`handle_linux_sysreg_trap`] with the
+/// decode swapped: offer the route every vCPU of **this** guest and no others, and give the one it
+/// names the same two dispositions the SGI path uses. The confinement argument is inherited verbatim
+/// — a routing value matching a peer's affinity would still never be asked about, because the peer's
+/// vCPUs are not in this iteration.
+///
+/// ⚠ **The `UIE` asymmetry is the subtle half, and it is why this calls
+/// [`deliver_or_defer_vint`] rather than open-coding the running case.** A sibling's bank is not
+/// live, so there is nothing to inject into and `UIE` must NOT be armed: arming it here would make
+/// EL2 take a maintenance interrupt about a bank that is already empty (III-1's livelock, reached
+/// from the other side).
+fn deliver_spi(route: hv_vdev::irouter::SpiRoute, running: Running, intid: u32) {
+    let slot = running.guest();
+    // The probe below never reads the route — which is the point of it — and the parameter still has
+    // to exist for the real build. Named rather than `_route`d so the ordinary path reads normally.
+    #[cfg(feature = "spi-route-probe")]
+    let _ = &route;
+    for (_, target) in crate::role::census(NUM_GUESTS).filter(|&(g, _)| g == slot) {
+        // ⑱-6's REMOVE-THE-FIX probe: ignore the routing and take whichever vCPU is on the pCPU —
+        // the behaviour this rung replaces. See `docs/VGIC-SPI-ROUTING.md` for the measured result.
+        #[cfg(feature = "spi-route-probe")]
+        let names_it = target == running.vcpu();
+        #[cfg(not(feature = "spi-route-probe"))]
+        let names_it = route.targets(vcpu_affinity(target.get()));
+        if !names_it {
+            continue;
+        }
+        if target == running.vcpu() {
+            deliver_or_defer_vint(
+                LINUX_PENDING.of(running),
+                SPI_TARGETS_NAMED.at(slot),
+                SPIS_DELIVERED.at(slot),
+                SPIS_DEFERRED.at(slot),
+                intid,
+            );
+        } else if LINUX_PENDING.at(slot, target).mark(intid) {
+            SPI_TARGETS_NAMED.at(slot).fetch_add(1, Ordering::Relaxed);
+            SPIS_ROUTED.at(slot).fetch_add(1, Ordering::Relaxed);
+        }
+        // `spi_route` names AT MOST ONE vCPU — proven ∀-value by
+        // `a_route_names_at_most_one_vcpu` — so there is nothing after the first match, and this
+        // return is what makes that theorem load-bearing rather than decorative.
+        return;
+    }
+    SPIS_UNROUTABLE.at(slot).fetch_add(1, Ordering::Relaxed);
+}
+
+/// **Arm the ⑱-6 witness when the GUEST moves [`WITNESS_SPI`] off the vCPU it booted on.**
+///
+/// ★ **The trigger is the guest's own routing write, and that is what orders the witness.** Nothing
+/// here tells the guest when to act and no new EL2↔guest channel exists: arm64 Linux writes the
+/// whole routing table at `gic_dist_init` (the measured trace shows `0x6100..=0x68f8`, every SPI),
+/// pointing every SPI at the boot CPU, and later writes one entry when something changes an IRQ's
+/// affinity. So "the route names a non-boot vCPU" cannot be true before the guest has *chosen* it,
+/// and the injection cannot race ahead of the decision it is meant to honour.
+///
+/// Arms rather than delivers — see [`maybe_fire_spi_witness`] for why the moment of the write is
+/// the one moment the injection must NOT be made.
+fn arm_spi_witness(running: Running, route: Option<hv_vdev::irouter::SpiRoute>) {
+    let Some(route) = route else {
+        return;
+    };
+    // Still on the boot vCPU — the guest has not made a routing decision worth witnessing yet. NOT
+    // `route.targets(some non-boot vCPU)`: a foreign cluster or an `IRM` write names no vCPU at all,
+    // and the rung wants those armed too, so `SPIS_UNROUTABLE` is exercised rather than reasoned
+    // about.
+    if route.targets(vcpu_affinity(crate::role::VcpuIdx::boot().get())) {
+        return;
+    }
+    SPI_WITNESS_ARMED
+        .at(running.guest())
+        .store(1, Ordering::Relaxed);
+}
+
+/// **Fire the armed ⑱-6 witness — and ONLY from a vCPU that is not the one the guest named.**
+///
+/// ★★ **That condition is the entire witness, and the first version of this rung did not have it.**
+///
+/// ⚠ **MEASURED, and it is design-lesson #198 walked straight into.** The injection was originally
+/// made at the routing write itself. The gate went green and the guest's own `/proc/interrupts`
+/// said `cpu0=0 cpu1=1` — the interrupt had landed on CPU1, exactly as asked. **It proved nothing.**
+/// The `smp_affinity` write is executed by whatever CPU is running PID 1, which was *CPU1*, so the
+/// vCPU the guest routed to and the vCPU that happened to be on the pCPU were the same one — and
+/// EL2 reported `1 delivered, 0 routed`, i.e. it had taken the running-vCPU path. **An
+/// implementation that ignored `GICD_IROUTER` entirely would have produced an identical log.** The
+/// discriminator was a property of the fixture, not of the fix.
+///
+/// So the injection is deferred to a moment where the two answers *differ*: armed at the write,
+/// fired from a `WFI` trap taken on a **different** vCPU. Then the sibling path is the only one that
+/// can run, "delivered to the running vCPU" becomes structurally impossible, and the verdict can
+/// assert `routed == 1 && delivered == 0` rather than merely counting.
+///
+/// The `WFI` path is the right place for the second half: the guest's one-second idle window
+/// (`guest-init.sh`) produces hundreds of these on **both** vCPUs, so a moment satisfying the
+/// condition is reached reliably rather than hoped for.
+///
+/// Gated on [`is_enabled`](crate::vgic::DeployedGic::is_enabled) as well, so the witness goes
+/// through **both** halves of the mediation seam rather than around one: EL2 forwards this interrupt
+/// only because the guest asked for it, and to the vCPU the guest named.
+fn maybe_fire_spi_witness(running: Running) {
+    let slot = running.guest();
+    if SPI_WITNESS_ARMED.at(slot).load(Ordering::Relaxed) == 0
+        || SPI_WITNESS_FIRED.at(slot).load(Ordering::Relaxed) != 0
+    {
+        return;
+    }
+    // `try_` because this runs on an interrupt-adjacent path: a contended borrow means try again on
+    // the next `WFI`, of which there are hundreds — never a halt.
+    let Some(mut dev) = VGIC.try_borrow_mut() else {
+        return;
+    };
+    let route = dev.at_mut(slot).spi_route(WITNESS_SPI);
+    let enabled = dev.at_mut(slot).is_enabled(running.vcpu(), WITNESS_SPI);
+    drop(dev);
+
+    let Some(route) = route else {
+        return;
+    };
+    if !enabled {
+        return;
+    }
+    // ★ THE DISCRIMINATOR. Deliver only from a vCPU the route does NOT name, so that honouring the
+    // routing and ignoring it lead to different vCPUs — and the guest's own per-CPU interrupt
+    // counts can tell which happened.
+    if route.targets(vcpu_affinity(running.vcpu().get())) {
+        return;
+    }
+    if SPI_WITNESS_FIRED.at(slot).swap(1, Ordering::Relaxed) != 0 {
+        return;
+    }
+    deliver_spi(route, running, WITNESS_SPI);
 }
 
 /// **Drain `slot`'s pending set into free list registers, then re-arm `UIE` to match what is left.**
@@ -1860,7 +2064,7 @@ fn probe_lr_overflow(g: Outgoing) {
     }
     let bank_refuses = !gic::inject(PROBE_FILL_BASE + n as u32);
 
-    deliver_or_defer_sgi(
+    deliver_or_defer_vint(
         LINUX_PENDING.out(g),
         SGI_TARGETS_NAMED.out(g),
         SGIS_DELIVERED.out(g),
@@ -4062,9 +4266,14 @@ fn handle_vgic_access(
     let timer_enabled = dev
         .at_mut(slot)
         .is_enabled(running.vcpu(), gic::VTIMER_INTID);
+    // ⑱-6. Read where the guest has routed the witness SPI while the borrow is held, and act after
+    // the drop. This ARMS the witness; the delivery happens elsewhere, and `maybe_fire_spi_witness`
+    // is where the reason is written down.
+    let spi_route = dev.at_mut(slot).spi_route(WITNESS_SPI);
     drop(dev);
     if a.wnr {
         gic::set_ppi_enabled(gic::VTIMER_INTID, timer_enabled);
+        arm_spi_witness(running, spi_route);
     }
 
     if let Err(u) = outcome {
@@ -4244,6 +4453,10 @@ fn handle_linux_wfi(frame: &mut LinuxFrame) {
     let cur = running.guest();
     WFI_TRAPS[cur].fetch_add(1, Ordering::Relaxed);
 
+    // ⑱-6 — the routed-SPI witness fires from here, and only from a vCPU the guest's routing does
+    // NOT name. Before the yield, so the interrupt is waiting when its vCPU is next switched in.
+    maybe_fire_spi_witness(running);
+
     // A trapped `WFI`'s preferred return is the `WFI` ITSELF. Advance FIRST: this edits the live
     // `ELR_EL2`, which still belongs to the OUTGOING guest — doing it after the switch would move
     // the *incoming* guest's resume point by one instruction.
@@ -4348,12 +4561,12 @@ fn handle_linux_sysreg_trap(
         let rt = ((iss >> 5) & 0x1f) as usize;
         let value = if rt < 31 { frame.x[rt] } else { 0 };
         // ★ This used to `park()` when the bank was full — a halt a guest could REACH, taking the
-        //   peer domain with it. Delivery is now total: see `deliver_or_defer_sgi` and
+        //   peer domain with it. Delivery is now total: see `deliver_or_defer_vint` and
         //   `LINUX_PENDING`. There is no `false` left to branch on, which is what makes the halt
         //   unwritable rather than merely unwritten.
         //
         // ⑱-3b-i put the pending set on the **running vCPU**, because the list-register bank
-        // `deliver_or_defer_sgi` tries first is the running vCPU's — the set is where a vINT waits
+        // `deliver_or_defer_vint` tries first is the running vCPU's — the set is where a vINT waits
         // for *that* bank to free a slot.
         //
         // ★★ ⑱-5 — **AND NOW THE OTHER AXIS: WHICH vCPU AN SGI IS AIMED AT.**
@@ -4387,7 +4600,7 @@ fn handle_linux_sysreg_trap(
             if target == running.vcpu() {
                 // The target is on the pCPU: its list registers are the live ones, so this is ③-a2's
                 // path unchanged — inject, or defer into its own set and arm `UIE`.
-                deliver_or_defer_sgi(
+                deliver_or_defer_vint(
                     LINUX_PENDING.of(running),
                     SGI_TARGETS_NAMED.at(slot),
                     SGIS_DELIVERED.at(slot),
@@ -4584,6 +4797,39 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
                 uart,
                 "baleen: vsgi FAIL: EL2 mediated no SGI for dom {dom} — it reached its own SGI \
                  generation register, which HCR_EL2.IMO=1 is supposed to make impossible"
+            );
+        }
+
+        // ⑱-6 — the routed-SPI witness. Reported per guest beside `vsgi`, because the two are the
+        // two halves of the same question: an SGI is routed by the register the guest writes to
+        // *raise* it, an SPI by the register it writes to *aim* it.
+        let named = SPI_TARGETS_NAMED.at(slot).load(Ordering::Relaxed);
+        let routed = SPIS_ROUTED.at(slot).load(Ordering::Relaxed);
+        let delivered = SPIS_DELIVERED.at(slot).load(Ordering::Relaxed);
+        let deferred = SPIS_DEFERRED.at(slot).load(Ordering::Relaxed);
+        let unroutable = SPIS_UNROUTABLE.at(slot).load(Ordering::Relaxed);
+        // The same one-disposition identity `vsgi` asserts. It is a property of the mechanism, not
+        // of the workload, so it holds whatever the guest did with its routing table.
+        let accounted = named == delivered + deferred + routed;
+        // ★ `delivered == 0` is an assertion, not an observation. The witness fires only from a vCPU
+        // the route does NOT name, so the running-vCPU path is unreachable for it — a non-zero
+        // `delivered` would mean the SPI went where the pCPU was rather than where the guest aimed
+        // it, which is the pre-⑱-6 behaviour this rung removes.
+        if routed > 0 && delivered == 0 && unroutable == 0 && accounted {
+            let _ = writeln!(
+                uart,
+                "baleen: vspi OK: dom {dom} re-aimed INTID {WITNESS_SPI} away from its boot vCPU \
+                 and EL2 HONOURED it — {routed} SPI(s) placed in a NON-RUNNING vCPU's pending set \
+                 ({named} named = {delivered} delivered + {deferred} deferred + {routed} routed, \
+                 {unroutable} unroutable), from GICD_IROUTER the guest wrote itself"
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: vspi FAIL: dom {dom} routed no SPI to a non-running vCPU \
+                 ({named} named, {delivered} delivered, {deferred} deferred, {routed} routed, \
+                 {unroutable} unroutable) — either the guest never re-aimed INTID {WITNESS_SPI}, or \
+                 GICD_IROUTER is being recorded and ignored again"
             );
         }
     }

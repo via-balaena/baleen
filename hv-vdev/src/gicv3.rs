@@ -56,9 +56,14 @@
 //!
 //! ## Declared residue — read before extending
 //!
-//! **All three are now PINNED BY KANI** (`hv-verify`'s `gic_declared_residues`), because a prose
-//! residue drifts: someone half-implements pending state, the docs still say "reads as zero", and no
-//! boot can tell because the shipped guest never looks. As theorems they cannot drift.
+//! Three were declared here; **two are now closed** (⑱-2, ⑱-6) and the remaining one is **PINNED BY
+//! KANI** (`hv-verify`'s `gic_declared_residues`), because a prose residue drifts: someone
+//! half-implements pending state, the docs still say "reads as zero", and no boot can tell because
+//! the shipped guest never looks. As a theorem it cannot drift.
+//!
+//! ★ The closed entries are kept, struck through, with what closed them — a residue list that
+//! deleted its discharged items would read as if it had never been wrong, and the *shape* of how
+//! each one closed is the transferable part.
 //!
 //! * **Pending/active state is write-accepted and reads as zero — FOR SPIs.** The trace shows the
 //!   kernel never reads `ISPENDR`/`ISACTIVER` on this path, so modelling them would be untested code
@@ -90,15 +95,16 @@
 //!   `PSCI CPU_ON` matches its own `MPIDR_EL1` against each `GICR_TYPER` affinity in
 //!   `gic_populate_rdist`, and boots only if it finds ITS OWN frame. Corrected by ⑱-4b-ii; the
 //!   proofs below remain the ∀-value evidence, but they are no longer the ONLY evidence.
-//! * **`IROUTER` is recorded, not honoured** — every SPI can only land in one place. Pinned as both
-//!   halves: the value reads back, and writing any routing for any SPI changes no INTID's enable.
-//!   **Still open after ⑱-2**, and now the only one of the three that is: the model can *describe*
-//!   more than one vCPU, but SPI routing still does not choose between them. That is ⑱-6, and it
-//!   needs a scheduler that can run the vCPU an SPI would be routed to (⑱-3).
+//! * ~~**`IROUTER` is recorded, not honoured**~~ **CLOSED BY ⑱-6.** [`VirtGic::spi_route`] reads the
+//!   routing the guest wrote and [`irouter::SpiRoute::targets`](crate::irouter::SpiRoute::targets)
+//!   says which vCPU it names; `hv-metal` delivers there rather than to whichever vCPU is running.
 //!
-//! **Why `IROUTER` is not CLOSED here:** it needs a second vCPU per guest to *matter*, so
-//! implementing it now would add unexercised code to the guest's device surface — the thing
-//! design-lesson #71 and III-2's "deferred for want of a consumer" both warn against.
+//!   ★ **The deferral expired on schedule, and that is why it was written with a condition
+//!   attached.** This entry used to end: *"it needs a second vCPU per guest to matter, so
+//!   implementing it now would add unexercised code to the guest's device surface"* — design-lesson
+//!   #71 and III-2's "deferred for want of a consumer". `VCPUS_PER_GUEST` is 2 and both run, so the
+//!   same rule that justified waiting now requires the opposite. A bare "later" could not have been
+//!   discharged; a named condition could.
 //!
 //! ## ⑱-2 — what proves the multi-redistributor model, given that no boot can
 //!
@@ -209,9 +215,19 @@ const CTLR_ARE_NS: u32 = 1 << 4;
 /// returns, so there is never anything pending to report.
 const CTLR_WRITABLE: u32 = 0b11;
 
+/// `GICD_TYPER.No1N`, bit 25 — **1 = 1-of-N distribution is not supported.**
+///
+/// ⑱-6. This is a *declaration*, and it is what makes [`irouter`](crate::irouter)'s decode total
+/// over everything a conforming guest can ask for: told 1-of-N is unavailable, a guest never sets
+/// `GICD_IROUTER<n>.IRM`, so every routing value names exactly one PE. The alternative was for the
+/// hypervisor to invent a policy for "any PE" that no guest asked for and no artifact could check.
+/// See that module's docs for the full argument (design-lesson #202).
+const GICD_TYPER_NO_1_OF_N: u32 = 1 << 25;
+
 /// `GICD_TYPER`: `ITLinesNumber` in bits `[4:0]` such that `(N+1) * 32 == NUM_INTIDS`; `IDbits`
-/// (bits `[23:19]`) = 9 ⇒ 10-bit INTIDs. No LPIs, no security extensions, no message-based SPIs.
-const GICD_TYPER_VALUE: u32 = ((NUM_INTIDS / 32 - 1) as u32) | (9 << 19);
+/// (bits `[23:19]`) = 9 ⇒ 10-bit INTIDs; `No1N` (bit 25). No LPIs, no security extensions, no
+/// message-based SPIs.
+const GICD_TYPER_VALUE: u32 = ((NUM_INTIDS / 32 - 1) as u32) | (9 << 19) | GICD_TYPER_NO_1_OF_N;
 
 /// `GICD_IIDR` / `GICR_IIDR` — **deliberately Baleen's own, not QEMU's `0x43b`.** The guest is not
 /// talking to the machine's distributor any more, and the identification register is the one place
@@ -572,6 +588,25 @@ impl<const VCPUS: usize> VirtGic<VCPUS> {
             };
         }
         self.enabled[i / 32] & (1 << (i % 32)) != 0
+    }
+
+    /// **Where the guest routed `intid`** — the second mediation seam, beside [`Self::is_enabled`].
+    ///
+    /// ⑱-6. `is_enabled` answers *whether* EL2 forwards an interrupt; this answers *to which vCPU*.
+    /// Both read state the guest itself wrote, which is the point: the routing is the guest's
+    /// decision, and EL2's job is to honour it rather than to have a policy of its own.
+    ///
+    /// `None` for anything that is not an SPI — INTIDs 0..31 are redistributor-banked and have no
+    /// `IROUTER` entry at all, so there is nothing here to consult and the caller already knows
+    /// which vCPU a banked interrupt belongs to. Fail-closed in the same direction as `is_enabled`:
+    /// a caller handed `None` must not invent a target.
+    #[must_use]
+    pub fn spi_route(&self, intid: u32) -> Option<crate::irouter::SpiRoute> {
+        let i = intid as usize;
+        if !(FIRST_SPI..NUM_INTIDS).contains(&i) {
+            return None;
+        }
+        Some(crate::irouter::decode(self.irouter[i - FIRST_SPI]))
     }
 
     /// `GICR_TYPER` as vCPU `n` sees it — affinity, processor number, and **`Last` on exactly the

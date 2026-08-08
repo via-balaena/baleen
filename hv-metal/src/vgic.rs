@@ -147,6 +147,19 @@ impl DeployedGic {
         self.dev.is_enabled(vcpu.get(), intid)
     }
 
+    /// **Where the guest routed `intid`** — ⑱-6's half of the mediation seam, beside
+    /// [`Self::is_enabled`]: that one says *whether* to forward an interrupt, this says *to which
+    /// vCPU*.
+    ///
+    /// Hands back the [`SpiRoute`](hv_vdev::irouter::SpiRoute) rather than a
+    /// [`VcpuIdx`](crate::role::VcpuIdx), and that is deliberate on both counts. A `VcpuIdx` cannot
+    /// be built outside [`crate::role`] — which is ⑱-3b-i's fence and must stay shut — so the caller
+    /// runs the census and asks this predicate about each vCPU it is *given*, exactly as the
+    /// `ICC_SGI1R_EL1` path does with `SgiTargets`. Two routing axes, one shape.
+    pub(crate) fn spi_route(&self, intid: u32) -> Option<hv_vdev::irouter::SpiRoute> {
+        self.dev.spi_route(intid)
+    }
+
     /// `(register traps, INTIDs ever newly enabled)` — the ③-b1 witness.
     pub(crate) fn witness(&self) -> (u64, u64) {
         (self.traps, self.enables)

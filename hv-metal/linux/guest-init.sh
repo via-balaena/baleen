@@ -67,9 +67,45 @@ echo "cmdline: $(/bin/busybox cat /proc/cmdline)"
 # One second, not more. The trap count scales roughly linearly with the sleep — the guests idle at
 # their own tick rate — so a longer sleep buys proportionally more of a signal that is already large
 # enough, at ~1 s of gate time per boot configuration.
+# ★★ ⑱-6 — **THE GUEST AIMS ITS OWN INTERRUPT AT ITS SECOND CPU, and the hypervisor obeys.**
+#
+# This is the only block here that asks the kernel to *decide* something rather than report it, and
+# the decision is the witness. Writing an affinity mask makes arm64 Linux's `gic_set_affinity` write
+# `GICD_IROUTER<n>` — a trap into hv-metal's emulated distributor — after which EL2 delivers that
+# INTID to the vCPU the guest named instead of to whichever vCPU happens to be on the pCPU.
+#
+# Until ⑱-6 the routing was **recorded and honoured by nothing**, which was correct while a guest had
+# one vCPU and silently wrong once it had two.
+#
+# ⚠ **The IRQ number is LOOKED UP, not hardcoded.** `/proc/interrupts` prints the kernel's own IRQ
+# number beside the GIC INTID, so this resolves `uart-pl011` to whatever Linux numbered it and the
+# marker below carries the INTID that EL2 independently names (`WITNESS_SPI` in linux.rs). Two
+# artifacts, one interrupt, neither taking the other's word for which.
+#
+# ⚠ **`2` is CPU1's mask, and the choice is load-bearing**: Linux points every SPI at the boot CPU
+# during `gic_dist_init`, so routing to CPU0 would be indistinguishable from EL2 ignoring the
+# register entirely. The `sleep 1` below is what gives CPU1 the pCPU to take it.
+#
+# MEASURED baseline on `main` before this was written (design-lesson #186): this row is
+# `13:  0  0  GICv3  33 Level  uart-pl011` — **zero on both CPUs across a whole boot**, because the
+# emulated PL011 never raises. So a count appearing here is EL2's injection and can be nothing else,
+# and WHICH COLUMN it appears in is the entire property.
+baleen_irq=$(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox cut -d: -f1 | /bin/busybox tr -d ' ')
+echo "baleen-spi-irq: irq=${baleen_irq} intid=$(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox awk '{print $5}')"
+echo 2 > /proc/irq/${baleen_irq}/smp_affinity
+echo "baleen-spi-routed-to: $(/bin/busybox cat /proc/irq/${baleen_irq}/smp_affinity)"
+
 echo "########## BALEEN-IDLE-START ##########"
 /bin/busybox sleep 1
 echo "########## BALEEN-IDLE-END ##########"
+
+# ⑱-6, the other half: **the guest's own accounting of where the interrupt landed.**
+#
+# `/proc/interrupts` counts per CPU, so this row is the kernel saying which of ITS processors took
+# the INTID it re-aimed above — an answer produced by the guest's interrupt path, not by anything
+# EL2 asserts about itself. `cpu0=0 cpu1=1` is the property; `cpu0=1 cpu1=0` is precisely what
+# ignoring `GICD_IROUTER` looks like, which is what the removed-fix probe produces.
+echo "baleen-spi-counts: $(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox awk '{print "cpu0=" $2 " cpu1=" $3}')"
 
 echo "########## poweroff ##########"
 
