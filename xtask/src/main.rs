@@ -2013,9 +2013,26 @@ fn run_capturing(program: &str, args: &[&str]) -> Option<(bool, String)> {
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+
+    // ⚠ **stderr is drained on its OWN THREAD, and that is not tidiness — it is the difference
+    // between this working and hanging a REQUIRED gate.** Reading stdout to completion first and
+    // stderr afterwards deadlocks the moment a child writes more to stderr than the pipe buffer
+    // holds (~64 KiB): the child blocks writing stderr, this blocks reading stdout, and neither
+    // moves. `cargo` puts every `Compiling …` line and every warning on stderr, so the volume is
+    // not hypothetical — it is merely small enough today.
+    let err = child.stderr.take().map(|e| {
+        std::thread::spawn(move || {
+            let mut acc = String::new();
+            for line in BufReader::new(e).lines().map_while(Result::ok) {
+                eprintln!("{line}");
+                acc.push_str(&line);
+                acc.push('\n');
+            }
+            acc
+        })
+    });
+
     let mut text = String::new();
-    // stderr is drained after stdout closes; both tools put their results on stdout, and a pipe
-    // this short cannot deadlock on the volumes these produce.
     if let Some(o) = child.stdout.take() {
         for line in BufReader::new(o).lines().map_while(Result::ok) {
             eprintln!("{line}");
@@ -2023,11 +2040,9 @@ fn run_capturing(program: &str, args: &[&str]) -> Option<(bool, String)> {
             text.push('\n');
         }
     }
-    if let Some(e) = child.stderr.take() {
-        for line in BufReader::new(e).lines().map_while(Result::ok) {
-            eprintln!("{line}");
-            text.push_str(&line);
-            text.push('\n');
+    if let Some(h) = err {
+        if let Ok(acc) = h.join() {
+            text.push_str(&acc);
         }
     }
     let status = child.wait().ok()?;
