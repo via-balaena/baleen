@@ -24,6 +24,18 @@
 //! refcount invariants are inductive inequalities "insensitive to magnitude" (§1.4); this
 //! crate begins discharging that argument as a **machine-checked theorem**.
 //!
+//! ## ⚠ THE CORPUS IS PINNED BY NAME — adding a harness means adding a line to `xtask`
+//!
+//! `cargo kani -p hv-verify` reports `0 failures` whether it runs 136 harnesses or 135, so **exit
+//! status alone cannot see a harness being deleted.** ⑳-b closed that: `xtask`'s `KANI_HARNESSES`
+//! names every harness this crate is expected to contain, and `cargo xtask kani-harnesses` — which
+//! is what CI runs, in place of the bare command — fails if any expected harness did not run, if
+//! any harness ran that is not named, or if Kani's own tally disagrees with the list.
+//!
+//! **So a new `#[kani::proof]` needs a matching line in `KANI_HARNESSES`, and the gate will tell you
+//! so by name.** That is the same bargain `LINUX_MARKERS` makes for boot markers, and it is
+//! deliberate: a proof corpus nothing counts is a corpus that can shrink without a diff saying so.
+//!
 //! ## The bridge: Kani first, Verus next
 //!
 //! [Kani](https://github.com/model-checking/kani) symbolically executes **real** hv-core

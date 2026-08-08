@@ -205,9 +205,13 @@ jobs:
       # `-j 4` matches the runner's 4 vCPUs; `--output-format=terse` is REQUIRED by `-j` (Kani
       # refuses the combination otherwise) and costs no diagnostics — every harness name and every
       # per-harness `Verification Time` still appears. See the timeout comment for the measurement.
-      - name: cargo kani -p hv-verify (preservation proofs)
+      # ⑳-b: runs exactly that command and additionally checks the corpus contains exactly the
+      # harnesses `xtask`'s KANI_HARNESSES names. Exit status alone is blind to a harness being
+      # DELETED — 135 passing is `0 failures` just as 136 is, which is the same defect ⑳ measured
+      # in the Verus job.
+      - name: cargo kani -p hv-verify + harness inventory (preservation proofs)
         if: needs.changes.outputs.run == 'true'
-        run: cargo kani -p hv-verify -j 4 --output-format=terse
+        run: cargo xtask kani-harnesses
 
   # Tier C, the ∀-N step: the Verus preservation proofs in hv-verify/verus — preservation over
   # ARBITRARY table size (the scalar↔Vec-length axis Kani can only `unwind`). ALWAYS runs so the
