@@ -1383,6 +1383,11 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // ⚠ ⑱-8 changed what the OK line counts: collisions, not refusals. A refusal counter would now
     // read zero and pass, because there is no longer a guard to fire.
     "baleen: irqconfine FAIL",
+    // ⑲'s negative half, and it fires for two distinguishable reasons the message separates: a
+    // banked RES0 copy that still RETIRES a conforming guest for a legal read, or a sweep that
+    // collapsed (zero offsets checked, or nothing refused at all) and so proves nothing — the
+    // vacuity trap the EL2-MMU page sweep needed for the same reason (design-lesson #214).
+    "baleen: gicdsurface FAIL",
     // ③-b1's negative half: the guest's GIC accesses did not reach the emulator, i.e. the
     // distributor is being passed through again.
     "baleen: vgic FAIL",

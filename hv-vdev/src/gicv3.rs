@@ -68,19 +68,29 @@
 //! * **Pending/active state is write-accepted and reads as zero — FOR SPIs.** The trace shows the
 //!   kernel never reads `ISPENDR`/`ISACTIVER` on this path, so modelling them would be untested code
 //!   on a live path (design-lesson #71's shape). A guest that polls them gets zeros, which is wrong;
-//!   it is declared here rather than half-built.
+//!   it is declared here rather than half-built. **This half is still open.**
 //!
-//!   ⚠ **This used to say "reads as zero" flatly, and that was WRONG — the proof found it.** Word 0
-//!   of those distributor banks is INTIDs 0..31, which are banked in the REDISTRIBUTOR and excluded
-//!   from the distributor's decode (`ARE_NS` makes the distributor's copies RES0 — see the bank-
-//!   overlap note below). So word 0 is **refused**, not zeroed. **And a refusal is no longer inert:**
-//!   since the retire rung an unmodelled register stops the guest, so a guest reading `GICD_ISPENDR0`
-//!   — architecturally a RES0 read that should return zero — is retired. The redistributor's own
-//!   copies, where 0..31 legitimately live, do read zero.
+//!   ⚠ **The word-0 half said "reads as zero" flatly, that was WRONG, and ⑲ FIXED IT rather than
+//!   re-declaring it.** INTIDs 0..31 are banked in the REDISTRIBUTOR, so the distributor's copies are
+//!   RES0 under `ARE_NS` — but the decode collapsed *"banked, therefore RES0"* and *"not a register
+//!   I know"* into one `None`, and the caller turns `None` into a **retirement**. So a guest reading
+//!   `GICD_ISPENDR0` — an architecturally legal RES0 read — was killed.
 //!
-//!   **Recorded, not changed.** Making word 0 read zero would be architecturally right and would
-//!   remove a guest-triggerable retirement; it also changes the guest's device surface, so it is a
-//!   decision of its own rather than a detail of pinning a declaration.
+//!   ★ **MEASURED before the fix: TEN offsets did that, and this list named FOUR.** `IGROUPR0`
+//!   `ISENABLER0` `ICENABLER0` `ISPENDR0` `ICPENDR0` `ISACTIVER0` `ICACTIVER0` `ICFGR0` `ICFGR1` and
+//!   `IPRIORITYR` bytes 0..31. **A declaration that understates its own scope is worse than no
+//!   declaration**, because it is read as an inventory. [`DistWord`] is the repair: three answers
+//!   where there were two.
+//!
+//!   The entry used to end *"Recorded, not changed … deserves its own decision rather than riding
+//!   along in a rung about pinning declarations."* ⑲ is that decision. Reads return zero, writes are
+//!   **ignored, never applied** — proven by `a_res0_write_enables_nothing`, which is what keeps this
+//!   a conformance fix and not a widening of what a guest can reach.
+//!
+//!   ⚠ **`GICD_SGIR` is RES0 under `ARE_NS` too and is deliberately still REFUSED.** It is an
+//!   *action* register: silently ignoring a write drops an interrupt the guest believes it sent,
+//!   which is worse than a loud refusal. The RES0 treatment covers the **state** copies only, and
+//!   that boundary is the interesting part of the decision.
 //! * ~~**One redistributor, `Last` set.**~~ **CLOSED BY ⑱-2.** The model presents one redistributor
 //!   **per vCPU** — [`VirtGic`] is generic over `VCPUS` — each with its own banked INTIDs 0..31, its
 //!   own `GICR_WAKER` handshake, and a `GICR_TYPER` carrying its own affinity and processor number
@@ -690,6 +700,12 @@ impl<const VCPUS: usize> VirtGic<VCPUS> {
 
     /// The banked per-INTID registers of the distributor, which all index by INTID off a base.
     fn dist_bank_read(&self, off: u64, _size: u64) -> Option<u64> {
+        // ⑲ — FIRST, because it is the case every bank below shares. A redistributor-banked copy is
+        // RES0 in this frame (`ARE_NS` forced on), so it reads zero. Before this it fell through
+        // every arm to `None`, which the caller turns into a retirement.
+        if dist_banked_res0(off) {
+            return Some(0);
+        }
         if let Some(w) = dist_word_index(off, GICD_IGROUPR, WORDS, 32) {
             return Some(self.group[w] as u64);
         }
@@ -730,6 +746,12 @@ impl<const VCPUS: usize> VirtGic<VCPUS> {
     fn dist_write(&mut self, off: u64, _size: u64, value: u64) -> Option<u32> {
         if let Some(i) = irouter_index(off) {
             self.irouter[i] = value;
+            return Some(0);
+        }
+        // ⑲ — RES0 writes are IGNORED, not refused, and not applied. Accepting them changes no
+        // state: that is what keeps `the_distributor_cannot_reach_a_redistributor_banked_intid`
+        // true, and it is why this is a conformance fix rather than a widening of the guest's reach.
+        if dist_banked_res0(off) {
             return Some(0);
         }
         let v = value as u32;
@@ -913,15 +935,80 @@ fn irouter_index(off: u64) -> Option<usize> {
 /// `GICD_IPRIORITYR` writes at `0x420` (INTID 32) — it never touches the distributor's copies of
 /// 0..31, because Linux knows they are reserved too.
 fn dist_word_index(off: u64, base: u64, count: usize, intids_per_word: usize) -> Option<usize> {
+    match dist_word(off, base, count, intids_per_word) {
+        DistWord::Spi(w) => Some(w),
+        DistWord::BankedRes0 | DistWord::Elsewhere => None,
+    }
+}
+
+/// ★★ **What a distributor-bank offset names — THREE answers, not two.** (⑲)
+///
+/// ⚠ **This enum exists because the distinction was collapsed into an `Option` and the two `None`s
+/// meant different things.** `dist_word_index` returned `None` both for *"a redistributor-banked
+/// copy, which the architecture makes RES0 here"* and for *"not a word of this bank at all"* — and
+/// the caller, correctly for the second meaning, turned `None` into a **refusal that RETIRES the
+/// guest**. So a guest reading `GICD_ISENABLER0` — an architecturally legal RES0 read — was killed.
+///
+/// MEASURED before the fix, on the deployed shape: **ten** offsets took a conforming guest down that
+/// way (`IGROUPR0` `ISENABLER0` `ICENABLER0` `ISPENDR0` `ICPENDR0` `ISACTIVER0` `ICACTIVER0`
+/// `ICFGR0` `ICFGR1`, and `IPRIORITYR` bytes 0..31), of which the declared residue named **four**.
+///
+/// ★ The general shape is worth more than the fix: **an `Option` returned by a decode is a two-way
+/// answer, and a decode with three cases will quietly borrow one of them.** The tell is a caller
+/// that gives `None` a *policy* meaning — here "retire" — which is only correct for one of the two
+/// things `None` stood for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DistWord {
+    /// A word of SPI state this frame owns, by index.
+    Spi(usize),
+    /// A **redistributor-banked** copy — INTIDs 0..31. `GICD_CTLR.ARE_NS` is forced on by this
+    /// model, and the architecture then makes the distributor's copies of those INTIDs **RES0**:
+    /// reads return zero, writes are ignored. ⚠ ASSERTED from the architecture, not measured here.
+    BankedRes0,
+    /// Not a word of this bank at all — the caller should keep looking, and refuse if nothing
+    /// claims it. **This is the only `None` that ever meant "refuse".**
+    Elsewhere,
+}
+
+/// Classify an offset against one `count`-word bank based at `base`.
+fn dist_word(off: u64, base: u64, count: usize, intids_per_word: usize) -> DistWord {
     // How many whole words the redistributor-banked INTIDs occupy. **`intids_per_word` is not always
     // 32**: the `*ENABLER`/`*PENDR`/`*ACTIVER`/`IGROUPR` banks are one bit per INTID (32 per word),
     // but `ICFGR` is TWO bits (16 per word) — so INTIDs 0..31 span its words 0 AND 1. Excluding only
     // word 0, as the first cut of this guard did, left `GICD_ICFGR1` still aliasing `GICR_ICFGR1`.
     let banked_words = FIRST_SPI / intids_per_word;
     match word_index(off, base, count) {
-        Some(w) if w >= banked_words => Some(w),
-        _ => None,
+        Some(w) if w >= banked_words => DistWord::Spi(w),
+        Some(_) => DistWord::BankedRes0,
+        None => DistWord::Elsewhere,
     }
+}
+
+/// Is `off` a redistributor-banked copy in **any** of the distributor's banks — i.e. RES0 here?
+///
+/// One place, so a bank added to the read path but not the write path cannot disagree about what is
+/// RES0. `IPRIORITYR` is byte-addressed rather than word-indexed and so is tested directly.
+fn dist_banked_res0(off: u64) -> bool {
+    let banks = [
+        (GICD_IGROUPR, WORDS, 32),
+        (GICD_ISENABLER, WORDS, 32),
+        (GICD_ICENABLER, WORDS, 32),
+        (GICD_ISPENDR, WORDS, 32),
+        (GICD_ICPENDR, WORDS, 32),
+        (GICD_ISACTIVER, WORDS, 32),
+        (GICD_ICACTIVER, WORDS, 32),
+        (GICD_ICFGR, NUM_INTIDS / 16, 16),
+    ];
+    let mut i = 0;
+    while i < banks.len() {
+        let (base, count, per) = banks[i];
+        if matches!(dist_word(off, base, count, per), DistWord::BankedRes0) {
+            return true;
+        }
+        i += 1;
+    }
+    // Priority is byte-addressed: INTIDs 0..31 are the first 32 bytes of the bank.
+    off >= GICD_IPRIORITYR && off < GICD_IPRIORITYR + FIRST_SPI as u64
 }
 
 /// If `off` names a word of a `count`-word register bank based at `base`, its index.

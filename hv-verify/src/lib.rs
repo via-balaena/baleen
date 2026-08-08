@@ -4851,33 +4851,145 @@ mod gic_declared_residues {
     /// **Residue 1b: word 0 of those banks is REFUSED, not zero — and the prose used to say
     /// otherwise.**
     ///
-    /// ⚠ **This is what the rung actually found.** `hv_vdev::gicv3`'s residue read *"pending/active
-    /// state is write-accepted and reads as zero"*, flatly. It is not: INTIDs 0..31 are banked in the
-    /// redistributor and excluded from the distributor's decode (`ARE_NS` makes the distributor's
-    /// copies RES0 — the property #108 had to repair), so word 0 falls through to `Unhandled`.
+    // ─── H4d · ⑲, the RES0 copies: a conforming guest must not be RETIRED for a legal read ──────
+    //
+    // ★ THE KILL PROBES — **MEASURED, five probes × four harnesses.** One harness at a time; P0 is
+    // the control that catches a rig which cannot tell "held" from "never ran".
+    //
+    // | probe (applied to `hv_vdev::gicv3`) | reads-zero | write-inert | still-refuses | partition |
+    // |---|---|---|---|---|
+    // | **P0** unmodified — the CONTROL | PASS | PASS | PASS | PASS |
+    // | **P1** `dist_banked_res0` always false (the pre-⑲ behaviour) | **RED** | PASS | PASS | PASS |
+    // | **P2** `dist_banked_res0` always true | PASS | PASS | **RED** | PASS |
+    // | **P3** no banked exclusion at all (the `ARE_NS` aliasing bug) | **RED** | PASS | PASS | PASS |
+    // | **P4** `ICFGR` treated as 1 bit/INTID (so `ICFGR1` is not RES0) | **RED** | PASS | PASS | PASS |
+    //
+    // ⚠ **`a_res0_write_enables_nothing` and the partition harness are killed by NOTHING here, and
+    // the reason is worth more than the table.** P3 restores the exact historical defect —
+    // `GICD_ISENABLER0` reaching `enabled[0]` — and both still pass, because ⑱-2 gave each
+    // redistributor its own bank and `is_enabled` reads *that* for INTIDs 0..31. The distributor's
+    // word 0 is write-only dead storage. **The storage split is what protects that property; the
+    // decode never was.** The doc on that harness said otherwise until this run.
+    //
+    // ⚠ **P4 is the one that is not hypothetical.** `ICFGR` is two bits per INTID, so INTIDs 0..31
+    // span words 0 AND 1 — and the model's own decode shipped with only word 0 excluded once
+    // already, leaving `GICD_ICFGR1` aliasing `GICR_ICFGR1`. The same off-by-one in the RES0 set
+    // would leave a conforming guest retired on exactly one register.
+
+    /// **Which distributor offsets the GICv3 layout makes RES0 when `GICD_CTLR.ARE_NS` is set** —
+    /// written out from the register map, NOT asked of the model (design-lesson #36).
     ///
-    /// **And a refusal is no longer inert.** Since #129 an unmodelled register RETIRES the guest, so
-    /// a guest reading `GICD_ISPENDR0` — architecturally a RES0 read that should return zero — is
-    /// stopped. The shipped kernel never does it, which is why it went unnoticed for three arcs.
+    /// INTIDs 0..31 are banked per redistributor. Their copies in the distributor frame are RES0,
+    /// and the three encodings put them in different places:
     ///
-    /// **Recorded, not changed.** Making word 0 read zero would be architecturally right and would
-    /// remove a guest-triggerable retirement, but it changes the guest's device surface and deserves
-    /// its own decision rather than riding along in a rung about pinning declarations.
+    /// | bank | bits per INTID | INTIDs 0..31 occupy |
+    /// |---|---|---|
+    /// | `IGROUPR` `ISENABLER` `ICENABLER` `ISPENDR` `ICPENDR` `ISACTIVER` `ICACTIVER` | 1 | word 0 |
+    /// | `ICFGR` | 2 | words 0 **and 1** |
+    /// | `IPRIORITYR` | 8 | bytes 0..31, and byte-addressable |
+    ///
+    /// ⚠ The middle row is the one that bites: excluding only word 0 leaves `GICD_ICFGR1` aliasing
+    /// `GICR_ICFGR1`, which is a defect the model's own decode had and fixed once already.
+    fn banked_res0_by_the_spec(off: u64) -> bool {
+        let one_bit_bank = |base: u64| off >= base && off < base + 4 && off % 4 == 0;
+        one_bit_bank(0x0080)                       // IGROUPR0
+            || one_bit_bank(0x0100)                // ISENABLER0
+            || one_bit_bank(0x0180)                // ICENABLER0
+            || one_bit_bank(0x0200)                // ISPENDR0
+            || one_bit_bank(0x0280)                // ICPENDR0
+            || one_bit_bank(0x0300)                // ISACTIVER0
+            || one_bit_bank(0x0380)                // ICACTIVER0
+            || (off >= 0x0c00 && off < 0x0c08 && off % 4 == 0)   // ICFGR0..1, two bits each
+            || (off >= 0x0400 && off < 0x0420) // IPRIORITYR bytes 0..31
+    }
+
+    /// **∀ offset: a redistributor-banked copy in the DISTRIBUTOR frame reads ZERO.** (⑲)
+    ///
+    /// ⚠ **This harness replaces `distributor_pending_and_active_are_refused_for_redistributor_
+    /// banked_intids`, which pinned the OPPOSITE — and said so.** Its own doc read: *"Making word 0
+    /// read zero would be architecturally right and would remove a guest-triggerable retirement, but
+    /// it changes the guest's device surface and deserves its own decision rather than riding along
+    /// in a rung about pinning declarations."* ⑲ is that decision, and the deferral is discharged by
+    /// reading the condition it named (design-lesson #219, a third time).
+    ///
+    /// MEASURED before the change: **ten** offsets refused a conforming guest's read and so RETIRED
+    /// it — `IGROUPR0` `ISENABLER0` `ICENABLER0` `ISPENDR0` `ICPENDR0` `ISACTIVER0` `ICACTIVER0`
+    /// `ICFGR0` `ICFGR1` and `IPRIORITYR` bytes 0..31. The residue named four of them.
+    ///
+    /// The RES0 classification is **written out here from the register layout**, not asked of the
+    /// model (design-lesson #36): a harness that called `dist_banked_res0` would agree with the
+    /// decode by construction and check nothing.
+    ///
+    /// ⚠ *That these offsets are RES0 when `GICD_CTLR.ARE_NS` is set is ASSERTED from the
+    /// architecture, not measured here* — the honest column, per `docs/QEMU-AND-METAL.md` §5.
     #[kani::proof]
-    fn distributor_pending_and_active_are_refused_for_redistributor_banked_intids() {
+    fn a_redistributor_banked_copy_reads_zero_in_the_distributor() {
         let mut g = Gic1::new(deployed());
+        let off: u64 = kani::any();
+        kani::assume(off < GICD_LEN);
+        kani::assume(banked_res0_by_the_spec(off));
+        kani::cover!(true, "a banked-RES0 offset is expressible");
 
-        let bank: u64 = kani::any();
-        kani::assume(
-            bank == D_ISPENDR || bank == D_ICPENDR || bank == D_ISACTIVER || bank == D_ICACTIVER,
-        );
         let value: u64 = kani::any();
-
-        let _ = g.mmio_write(GICD_BASE + bank, 4, value);
+        let _ = g.mmio_write(GICD_BASE + off, 4, value);
         assert_eq!(
-            g.mmio_read(GICD_BASE + bank, 4).ok(),
-            None,
-            "the distributor's copy of INTIDs 0..31 is redistributor-banked and refused"
+            g.mmio_read(GICD_BASE + off, 4).ok(),
+            Some(0),
+            "the distributor's copy of INTIDs 0..31 is RES0: it reads zero, it is not refused"
+        );
+    }
+
+    /// ★ **∀ offset, ∀ value: a RES0 write ENABLES NOTHING.** The half that makes the read-zero
+    /// change a conformance fix rather than a widening of what a guest can reach.
+    ///
+    /// ⚠ **PROVEN, NOT PROBED — and the probe run is what corrected this doc.** It first claimed
+    /// this harness is what stops `GICD_ISENABLER0` writes reaching a guest's PPI enables. It is
+    /// not. **P3 removes the banked exclusion entirely — the historical `ARE_NS` aliasing bug — and
+    /// this harness still PASSES**, because ⑱-2 gave each redistributor its own [`RedistBank`] and
+    /// `is_enabled` reads *that* for INTIDs 0..31. The distributor's `enabled[0]` is write-only dead
+    /// storage, so polluting it is unobservable.
+    ///
+    /// So the protection is the **storage split**, and this pins it against a future re-merge rather
+    /// than against a decode slip. Worth keeping and worth stating correctly: claiming a guard is
+    /// load-bearing when something else is carrying it is exactly the "two independent reasons"
+    /// error ⑱-7 found one arc ago (design-lesson #222).
+    #[kani::proof]
+    fn a_res0_write_enables_nothing() {
+        let mut g = Gic1::new(deployed());
+        let probe: u32 = kani::any();
+        kani::assume((probe as usize) < NUM_INTIDS);
+        let before = g.is_enabled(0, probe);
+
+        let off: u64 = kani::any();
+        kani::assume(off < GICD_LEN);
+        kani::assume(banked_res0_by_the_spec(off));
+        let value: u64 = kani::any();
+        let _ = g.mmio_write(GICD_BASE + off, 4, value);
+
+        assert_eq!(
+            g.is_enabled(0, probe),
+            before,
+            "a write to a RES0 copy must be ignored, never applied"
+        );
+    }
+
+    /// **Non-vacuity, and it is the policy this rung must NOT have relaxed.** Since the retire rung
+    /// an unmodelled register stops the guest, deliberately: a silently-ignored write leaves a guest
+    /// believing something took effect. Making RES0 reads return zero must not turn that off.
+    ///
+    /// `GICD_SGIR` is the sharp case and the reason the RES0 treatment stops where it does. It is
+    /// *also* RES0 under `ARE_NS` — but it is an **action** register, so silently ignoring a write
+    /// drops an interrupt the guest believes it sent, which is worse than a loud refusal. The RES0
+    /// set here is deliberately the **state** copies only.
+    #[kani::proof]
+    fn an_unmodelled_distributor_register_is_still_refused() {
+        let mut g = Gic1::new(deployed());
+        let off: u64 = kani::any();
+        // `GICD_SGIR` (0x0f00) and the unallocated words just past it.
+        kani::assume(off >= 0x0f00 && off < 0x0f40 && off % 4 == 0);
+        assert!(
+            g.mmio_read(GICD_BASE + off, 4).is_err(),
+            "a register this model does not have must still retire the guest, not read as zero"
         );
     }
 

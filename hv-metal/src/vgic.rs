@@ -160,6 +160,64 @@ impl DeployedGic {
         self.dev.spi_route(intid)
     }
 
+    /// ★★ ⑲ — **HOW BIG IS THE SURFACE A GUEST CAN RETIRE ITSELF ON?** Sweeps every word offset of
+    /// the deployed `GICD` frame through the live model and counts the answers.
+    ///
+    /// Since the retire rung, a register this model does not have **stops the guest**. That is the
+    /// right policy — a silently-ignored write leaves a guest believing something took effect — but
+    /// it makes the refusal set a guest-reachable availability surface, and until ⑲ nobody had
+    /// counted it. `(answered, refused)` is that count.
+    ///
+    /// ⚠ **Deliberately does NOT go through [`Self::mmio_read`]**, which bumps `traps` — the ③-b1
+    /// witness counts *the guest's* accesses, and a survey inflating it would make that number a
+    /// statement about EL2 instead. Same reason the survey is read-only.
+    ///
+    /// ⚠ **This is EL2 measuring its own model, not a guest witness.** No guest can produce one:
+    /// MEASURED that `/dev/mem` reads of the GIC window return `EFAULT` before ever reaching EL2, so
+    /// the shipped kernel has no way to touch these registers. The ∀-offset evidence is Kani's
+    /// (`a_redistributor_banked_copy_reads_zero_in_the_distributor`); this is the deployed-layout
+    /// count beside it, and a tripwire if the decode is ever re-collapsed.
+    pub(crate) fn survey_gicd(&self) -> (u32, u32) {
+        let (mut answered, mut refused) = (0, 0);
+        let mut off = 0;
+        while off < LAYOUT.gicd_len() {
+            if self.dev.mmio_read(LAYOUT.gicd_base() + off, 4).is_ok() {
+                answered += 1;
+            } else {
+                refused += 1;
+            }
+            off += 4;
+        }
+        (answered, refused)
+    }
+
+    /// ⑲ — do the **redistributor-banked RES0 copies** all read zero, as the architecture says they
+    /// must? Returns `(checked, all_zero)`.
+    ///
+    /// The count is returned and reported because a predicate alone passes vacuously if the set it
+    /// walks collapses to nothing (design-lesson #214, from the EL2-MMU sweep that had the same
+    /// shape). Offsets are written out here rather than imported from `hv-vdev`, so the metal and
+    /// the model do not agree by construction.
+    pub(crate) fn banked_res0_read_zero(&self) -> (u32, bool) {
+        let (mut checked, mut all_zero) = (0, true);
+        // One bit per INTID → word 0; `ICFGR` two bits → words 0..1; `IPRIORITYR` one byte → 0..31.
+        let mut probe = |off: u64| {
+            checked += 1;
+            all_zero &= matches!(self.dev.mmio_read(LAYOUT.gicd_base() + off, 4), Ok(0));
+        };
+        for base in [0x0080, 0x0100, 0x0180, 0x0200, 0x0280, 0x0300, 0x0380] {
+            probe(base);
+        }
+        probe(0x0c00);
+        probe(0x0c04);
+        let mut b = 0x0400;
+        while b < 0x0420 {
+            probe(b);
+            b += 4;
+        }
+        (checked, all_zero)
+    }
+
     /// `(register traps, INTIDs ever newly enabled)` — the ③-b1 witness.
     pub(crate) fn witness(&self) -> (u64, u64) {
         (self.traps, self.enables)
