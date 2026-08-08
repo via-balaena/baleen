@@ -4751,25 +4751,51 @@ mod vgic_active_lr {
     }
 }
 
-/// # ③-b1's three declared residues, turned from PROSE into THEOREMS
+/// # ③-b1's three declared residues, turned from PROSE into THEOREMS — **and two have since CLOSED**
 ///
-/// `hv_vdev::gicv3`'s module docs declare three things the emulated distributor deliberately does not
-/// do. **Each of the three needs a SECOND vCPU per guest to matter** — `IROUTER` can only route one
-/// way with one vCPU, one redistributor is the whole set, and the shipped kernel never reads
-/// pending/active. So closing them would add unexercised code to the guest's device surface, which is
-/// what design-lesson #71 and III-2's "deferred for want of a consumer" both warn against.
+/// `hv_vdev::gicv3`'s module docs declared three things the emulated distributor deliberately did not
+/// do. **Each needed a SECOND vCPU per guest to matter** — `IROUTER` can only route one way with one
+/// vCPU, one redistributor is the whole set, and the shipped kernel never reads pending/active — so
+/// closing them then would have added unexercised code to the guest's device surface, which is what
+/// design-lesson #71 and III-2's "deferred for want of a consumer" both warn against.
 ///
 /// **What was worth doing instead: making the declarations machine-checked.** A prose residue drifts
 /// — someone half-implements pending state, the docs still say "reads as zero", and the boot cannot
-/// tell because the shipped guest never looks. As theorems they cannot: the model is now pinned to
+/// tell because the shipped guest never looks. As theorems they cannot: the model is pinned to
 /// exactly the behaviour the ledger claims for it, and a half-implementation fails the gate rather
 /// than the reader.
+///
+/// ★ **The condition those deferrals named has since expired, and both discharged against it.**
+/// `VCPUS_PER_GUEST` is 2 and both vCPUs run, so ⑱-2 closed the redistributor entry and ⑱-6 closed
+/// `IROUTER` — the same rule that justified waiting is what then required the opposite. **Only
+/// pending/active is still a residue here**, and it is the one whose condition was never about vCPU
+/// count: the shipped kernel does not read those registers, so there is nothing yet to be right or
+/// wrong for.
+///
+/// ⚠ **A residue-pinning theorem can outlive the residue.** `routing_an_spi_is_recorded_and_changes_
+/// no_enable` was filed as *"`IROUTER` is honoured by nothing"* and survived ⑱-6 unweakened, because
+/// what it actually constrains — that routing disturbs no INTID's *enable* — is narrower than the
+/// sentence it was filed under and is true either way. Read each of these for what it asserts, not
+/// for the heading it sits below.
 #[cfg(kani)]
 mod gic_declared_residues {
     use hv_vdev::gicv3::{GicLayout, VirtGic, NUM_INTIDS};
 
-    /// The deployed shape — one vCPU, one redistributor. These residues are statements about what
-    /// the model does NOT implement, so they are pinned at the configuration that actually boots.
+    /// One vCPU, one redistributor.
+    ///
+    /// ⚠ **This used to say "the deployed shape … pinned at the configuration that actually boots",
+    /// and that is FALSE — it went false at ⑱-3b-ii and nothing noticed until ⑱-6 read it.**
+    /// `hv-metal` deploys `VirtGic<{ VCPUS_PER_GUEST }>` and that constant is **2**. Corrected
+    /// rather than deleted, because the wrong half is the interesting half: a fixture comment
+    /// claiming to track the deployment is a claim no gate checks, and this one drifted two rungs
+    /// before a reader arrived.
+    ///
+    /// The remaining residue here — pending/active reading zero — is about **distributor** banks and
+    /// is independent of `VCPUS`, so pinning it at 1 costs nothing. But note what that means for
+    /// `exactly_one_redistributor_and_it_reports_last` below: it is a theorem about a shape the
+    /// machine no longer boots, kept because ⑱-2's *closure* of that residue is what `Gic2`'s
+    /// harnesses in `device_models` assert. Read it as "the model is still correct at one vCPU", not
+    /// as a statement about this machine.
     type Gic1 = VirtGic<1>;
 
     const GICD_BASE: u64 = 0x0800_0000;

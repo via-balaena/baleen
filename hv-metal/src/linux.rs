@@ -115,8 +115,12 @@
 //!
 //! **③-a2 left the GICD/GICR pass-through and ③-b1 closed that** — see [`crate::vgic`], which also
 //! carries the mediation seam this file now consults before forwarding ([`handle_linux_irq`]).
-//! The emulated UART is still transmit-only: its RX path needs a forwarded SPI, which ③-a2's
-//! machinery supports but nothing yet wires (see [`crate::vpl011`]'s module docs).
+//! The emulated UART is still transmit-only, but ⑱-6 changed *why*. This used to end "its RX path
+//! needs a forwarded SPI, which ③-a2's machinery supports but nothing yet wires" — and the wiring
+//! now exists: [`deliver_spi`] routes an SPI to the vCPU the guest aimed it at, and the INTID its
+//! witness uses is **the UART's own** (33, from `guest.dts`). What is missing is no longer a
+//! delivery path but a **source**: [`crate::vpl011`] never asserts an interrupt, because nothing
+//! feeds it input. An RX path would supply that and use `deliver_spi` unchanged.
 //!
 //! ## ③-b2b-ii-a: everything per-guest becomes an INDEX
 //!
