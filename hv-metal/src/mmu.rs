@@ -360,6 +360,21 @@ pub(crate) fn is_execute_never(va: u64) -> bool {
     l3_descriptor(va).is_some_and(|d| d & 0b11 == DESC_PAGE && d & XN != 0)
 }
 
+/// The X half of the boot-time structural check: **the first writable page is execute-never.**
+///
+/// `__rodata_end` is exactly the boundary, so the page at it is the first `RW+XN` one — the most
+/// representative single address for "EL2's data is not executable".
+///
+/// ⚠ **This wrapper exists because the first version of the X check was dead code.** I wrote
+/// [`is_execute_never`] precisely so `XN` would be verified on EVERY configuration, then called it
+/// only from inside the `xn-probe`'s self-validation — leaving the default, selftest, smmu and
+/// real-Linux boots checking nothing, which is the exact gap the whole change set out to close.
+/// `-D dead-code` in `metal-lint` is what caught it. Diagnosing a hole correctly and then not wiring
+/// the fix into the path that needed it is its own failure mode, and worth naming.
+pub(crate) fn data_is_execute_never() -> bool {
+    is_execute_never(sym(core::ptr::addr_of!(__rodata_end)))
+}
+
 /// Whether `SCTLR_EL2.C` is still clear — **the property that keeps this rung's blast radius small**.
 ///
 /// With `C == 0` every data access to Normal memory is Non-cacheable regardless of the descriptors,
