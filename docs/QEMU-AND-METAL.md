@@ -99,11 +99,18 @@ microarchitectural. It does **not** model:
    are things QEMU permits that hardware forbids, so **a wrong implementation passes here**, and no
    amount of green makes it right. Three found in one day, each while building something else:
 
-   | prohibition | QEMU | consequence |
+   ⚠ **Read the two columns differently.** *"QEMU"* is **measured on this machine**. *"expected of
+   hardware"* is **asserted from the architecture and NOT verified against a primary source in the
+   session that wrote this row** — it is the reason each divergence matters, not itself a
+   measurement. Marked because a doc about the limits of evidence is the worst possible place to
+   blur that line, and the temptation to state both halves in the same voice is exactly the failure
+   this whole section is about.
+
+   | expected of hardware (asserted) | QEMU (MEASURED) | consequence |
    |---|---|---|
-   | `SCTLR_EL2` **RES1** bits — a conforming implementation reads them back as 1 | reads a flat **`0x0`**; not enforced | a full-register write of a hand-built value **clears bits the architecture requires** and passes here. Setting `SCTLR_EL2.M` must be a **read-modify-write** (`hv-metal/src/mmu.rs`) |
-   | **instruction fetch from Device memory** is prohibited independently of `XN` | permitted — measured: clear `XN` on a `Device-nGnRnE` page and the jump **succeeds** | the `xn-probe` witness isolates `XN` *here* and would not on silicon, where the property is doubly held. **The witness is strongest exactly where the model is weakest** |
-   | the **SMMU caches** translations and configuration, so invalidation is load-bearing | models **no SMMU caching at all** | "the TLBI made no difference" and "there is nothing to invalidate" are **the same observation**. This is why honest-ledger 2(d) was unwitnessable here and needed Arm's AEM (`fvp-probe`) |
+   | `SCTLR_EL2` has **RES1** bits a conforming implementation reads back as 1 | reads a flat **`0x0`** | a full-register write of a hand-built value would clear them and **passes here**. Setting `SCTLR_EL2.M` is a **read-modify-write** (`hv-metal/src/mmu.rs`) — which is correct practice whether or not the RES1 claim holds, so the guard does not rest on the unverified half |
+   | **instruction fetch from Device memory** is prohibited independently of `XN` | **permitted** — clear `XN` on a `Device-nGnRnE` page and the jump succeeds | the `xn-probe` witness isolates `XN` *here*; if the assertion holds, it would not on silicon, where the property is doubly held. **The witness is strongest exactly where the model is weakest** |
+   | the **SMMU caches** translations and configuration, so invalidation is load-bearing | models **no SMMU caching at all** (long-established in this repo) | "the TLBI made no difference" and "there is nothing to invalidate" are **the same observation**. This is why honest-ledger 2(d) was unwitnessable here and needed Arm's AEM (`fvp-probe`), where both were then measured directly |
 
    ★ **The reusable form: when a remove-the-fix probe will not go red, ask whether the PLATFORM can
    express the failure at all before concluding the guard is inert.** SMMU rungs 3 and 4b both hit
