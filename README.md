@@ -91,7 +91,7 @@ and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot
 | `hv-vdev`   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets | 860 |
 | `hv-part`   | how the machine is **partitioned among guest slots** — windows, frame runs, domain ids — as `const fn` arithmetic proven ∀-partition rather than `const assert!`-ed at the two slots this board deploys | 187 |
 | `hv-sim`    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps | 5 653 |
-| `hv-verify` | the **Kani harnesses** (128) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) | 2 897 + 3 560 |
+| `hv-verify` | the **Kani harnesses** (134) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) | 2 897 + 3 560 |
 | `hv-metal`  | the bare-metal AArch64/EL2 binary: boot, Stage-2, vGIC, the real-Linux path              | 10 946 |
 | `hv-fuzz`   | `cargo-fuzz` targets against the hypercall dispatcher                                    | —      |
 | `fvp-probe` | ⚠ **not part of the hypervisor** — a standalone bare-metal instrument for Arm's AEM FVP, measuring SMMU translation caching and invalidation (honest-ledger 2(d)), which QEMU structurally cannot show. Workspace-excluded and deliberately **not** CI-gated; see its README | 214 |

@@ -141,6 +141,7 @@
 //! `hv-metal`, where the rest of the `unsafe` already lives.
 
 pub mod gicv3;
+pub mod irouter;
 pub mod pending;
 pub mod pl011;
 pub mod sgi;

@@ -21,6 +21,15 @@
 #                            `LINUX_RAM_BASE..LINUX_RAM_END` in linux.rs until ③-b2b-ii-b; ③-b2a had
 #                            already halved the window and moved the constants, and this outlived
 #                            both — which is why the marker itself carries the values.)
+#   * baleen-spi-intid:      ⑱-6. The GIC INTID the GUEST says its UART uses, bound by the gate to
+#                            `WITNESS_SPI` in linux.rs — two artifacts naming one interrupt, with
+#                            neither taking the other's word for which.
+#   * baleen-spi-affinity:   ⑱-6. That the kernel ACCEPTED the affinity change, so a failed write
+#                            cannot masquerade as a routing that was never honoured.
+#   * baleen-spi-counts:     ⑱-6, and the property itself: which of the guest's OWN CPUs ran the
+#                            handler for the INTID it re-aimed. `cpu0=0 cpu1=1` is honoured routing;
+#                            `cpu0=1 cpu1=0` is what ignoring `GICD_IROUTER` produces, which is
+#                            exactly what the `spi-route-probe` build measures.
 #   * BALEEN-IDLE-START/END  ⑱-4b-i, and the ODD ONE OUT: this pair brackets a second of deliberate
 #                            idleness, so what it witnesses is not the printing but what happens
 #                            BETWEEN the two lines — the kernel running out of work and executing
@@ -43,6 +52,38 @@ echo "########## BALEEN-STEP0-OK ##########"
 /bin/busybox uname -a
 echo "baleen-guest-ram: $(/bin/busybox grep -m1 'System RAM' /proc/iomem | /bin/busybox tr -d ' ')"
 echo "cmdline: $(/bin/busybox cat /proc/cmdline)"
+
+# ★★ ⑱-6 — **THE GUEST AIMS ITS OWN INTERRUPT AT ITS SECOND CPU, and the hypervisor obeys.**
+#
+# This is the only block here that asks the kernel to *decide* something rather than report it, and
+# the decision is the witness. Writing an affinity mask makes arm64 Linux's `gic_set_affinity` write
+# `GICD_IROUTER<n>` — a trap into hv-metal's emulated distributor — after which EL2 delivers that
+# INTID to the vCPU the guest named instead of to whichever vCPU happens to be on the pCPU.
+#
+# Until ⑱-6 the routing was **recorded and honoured by nothing**, which was correct while a guest had
+# one vCPU and silently wrong once it had two.
+#
+# ⚠ **The IRQ number is LOOKED UP, not hardcoded.** `/proc/interrupts` prints the kernel's own IRQ
+# number beside the GIC INTID, so this resolves `uart-pl011` to whatever Linux numbered it and the
+# marker below carries the INTID that EL2 independently names (`WITNESS_SPI` in linux.rs). Two
+# artifacts, one interrupt, neither taking the other's word for which.
+#
+# ⚠ **`2` is CPU1's mask, and the choice is load-bearing**: Linux points every SPI at the boot CPU
+# during `gic_dist_init`, so routing to CPU0 would be indistinguishable from EL2 ignoring the
+# register entirely. The `sleep 1` below is what gives CPU1 the pCPU to take it.
+#
+# MEASURED baseline on `main` before this was written (design-lesson #186): this row is
+# `13:  0  0  GICv3  33 Level  uart-pl011` — **zero on both CPUs across a whole boot**, because the
+# emulated PL011 never raises. So a count appearing here is EL2's injection and can be nothing else,
+# and WHICH COLUMN it appears in is the entire property.
+baleen_irq=$(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox cut -d: -f1 | /bin/busybox tr -d ' ')
+# ⚠ **INTID FIRST, Linux's own IRQ number in parentheses, and the order is what makes this
+# assertable.** The gate requires `baleen-spi-intid: 33`, which binds the GIC INTID the GUEST reports
+# to `WITNESS_SPI` in linux.rs — so changing one without the other goes red. The Linux IRQ number is
+# an allocation detail that may legitimately move, so it is deliberately outside the asserted prefix.
+echo "baleen-spi-intid: $(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox awk '{print $5}') (linux irq ${baleen_irq})"
+echo 2 > /proc/irq/${baleen_irq}/smp_affinity
+echo "baleen-spi-affinity: $(/bin/busybox cat /proc/irq/${baleen_irq}/smp_affinity)"
 
 # ★★ ⑱-4b-i — **GO IDLE ON PURPOSE, and this line is a WITNESS-ENABLING MECHANISM, not padding.**
 #
@@ -70,6 +111,14 @@ echo "cmdline: $(/bin/busybox cat /proc/cmdline)"
 echo "########## BALEEN-IDLE-START ##########"
 /bin/busybox sleep 1
 echo "########## BALEEN-IDLE-END ##########"
+
+# ⑱-6, the other half: **the guest's own accounting of where the interrupt landed.**
+#
+# `/proc/interrupts` counts per CPU, so this row is the kernel saying which of ITS processors took
+# the INTID it re-aimed above — an answer produced by the guest's interrupt path, not by anything
+# EL2 asserts about itself. `cpu0=0 cpu1=1` is the property; `cpu0=1 cpu1=0` is precisely what
+# ignoring `GICD_IROUTER` looks like, which is what the removed-fix probe produces.
+echo "baleen-spi-counts: $(/bin/busybox grep uart-pl011 /proc/interrupts | /bin/busybox awk '{print "cpu0=" $2 " cpu1=" $3}')"
 
 echo "########## poweroff ##########"
 

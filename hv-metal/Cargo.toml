@@ -28,6 +28,14 @@ selftest = []
 # that rung, the same store succeeds silently. Removing the fix is what the whole history already did.
 wx-probe = []
 
+# `spi-route-probe` is ⑱-6's REMOVE-THE-FIX probe: `deliver_spi` ignores `GICD_IROUTER` and puts the
+# SPI wherever the pCPU happens to be — the pre-⑱-6 behaviour, restored on purpose. It is a probe
+# rather than a permanent gate configuration because it costs a whole real-Linux boot (~40 s) to
+# reproduce a result that is stable and tabulated in `docs/VGIC-SPI-ROUTING.md`; the property it
+# kills is guarded on every gate run by the `baleen: vspi FAIL` forbidden marker and by the guest's
+# own `baleen-spi-counts:` line, both of which this probe flips.
+spi-route-probe = []
+
 # `xn-probe` is the OTHER half of W^X: jump into EL2's own data and require the hardware to refuse.
 # Separate from `wx-probe` because both faults are terminal — vector 4 reports and halts — so only
 # one can run per boot. Two configurations, not two phases.
