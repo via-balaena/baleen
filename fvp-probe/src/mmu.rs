@@ -246,3 +246,46 @@ pub unsafe fn write_noncacheable(value: u64) {
         asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
+
+/// `DC CIVAC` — clean **and** invalidate to the Point of Coherency. This is the operation
+/// `hv-metal`'s `scrub_frame` issues today.
+///
+/// ⚠ **"Clean" means write the dirty line back.** If a stale dirty line still holds a dead tenant's
+/// data when this runs, this instruction *publishes* it before dropping it. Whether that defeats a
+/// preceding non-cacheable zeroing is milestone 4's question.
+///
+/// # Safety
+///
+/// `va` must be mapped.
+pub unsafe fn clean_invalidate_line(va: u64) {
+    // SAFETY: caller guarantees the mapping.
+    unsafe {
+        asm!(
+            "dc civac, {va}",
+            "dsb ish",
+            va = in(reg) va,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// `DC IVAC` — invalidate **without** cleaning: discard the line, do not write it back.
+///
+/// The operation that *discards* a dead tenant's dirty data rather than publishing it. Dangerous in
+/// general (it can lose legitimate writes); exactly right when the intent is that the data must not
+/// survive.
+///
+/// # Safety
+///
+/// `va` must be mapped, and any data in that line that matters must already be in memory.
+pub unsafe fn invalidate_line(va: u64) {
+    // SAFETY: caller guarantees the mapping and that discarding is intended.
+    unsafe {
+        asm!(
+            "dc ivac, {va}",
+            "dsb ish",
+            va = in(reg) va,
+            options(nostack, preserves_flags),
+        );
+    }
+}

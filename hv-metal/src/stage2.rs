@@ -746,18 +746,29 @@ const CACHE_LINE: u64 = 64;
 /// non-inheritance is therefore a **metal obligation the fence assigns downward** (design-lesson
 /// #14e), and this is where it is discharged.
 ///
-/// **Why the cache maintenance is not optional.** EL2 runs MMU-off/identity, so *these* stores are
-/// non-cacheable, while the dying guest wrote through cacheable EL1 mappings. Without maintenance a
-/// dirty line from the dead tenant can be evicted **after** this zeroing and resurrect the secret in
-/// DRAM. `dc civac` (clean **and** invalidate to the point of coherency) over the frame kills both
-/// directions: it flushes any dirty line the dead tenant left, and invalidates any stale clean line
-/// so the next tenant's first read cannot hit pre-scrub data. The `dsb ish` orders the maintenance
-/// against the zero stores and against the guest's subsequent accesses.
+/// **Why the cache maintenance is not optional, and why its ORDER is the whole of it.** EL2 runs
+/// MMU-off/identity, so *these* stores are non-cacheable, while the dying guest wrote through
+/// cacheable EL1 mappings. A dirty line the dead tenant left is therefore untouched by the zeroing
+/// and can resurrect the secret in DRAM. `dc civac` (clean **and** invalidate to the point of
+/// coherency) over the frame kills both directions — it writes back any dirty line and invalidates
+/// any stale clean one — and the `dsb ish` orders it against the zero stores.
 ///
-/// **Honestly labelled: reasoned, not witnessed.** QEMU/TCG models no cache, so no boot-test can
-/// distinguish this from a bare `write_bytes`. The maintenance is here because a scrub without it is
-/// *wrong on silicon while passing every test we own* — the same standing of the VMID-tagging
-/// argument (design-lesson #23, `docs/AUDIT-4-CONCURRENT-STAGE2.md`).
+/// ⚠ **It runs BEFORE the zeroing as well as after, and that is a 2026-08-08 CORRECTION.** This
+/// doc used to describe only the after-pass, preventing an eviction that happens *later*. But
+/// `DC CIVAC` **cleans before it invalidates**, and clean means write the dirty line back — so with
+/// the tenant's line still live, the after-pass published the secret straight over the zeroing. The
+/// maintenance meant to prevent a resurrection performed one. The before-pass is the fix; see
+/// `scrub_maintenance`'s call sites for the measured table.
+///
+/// **No longer "reasoned, not witnessed" — WITNESSED, on Arm's AEM.** QEMU/TCG models no cache, so
+/// no boot-test here can distinguish this from a bare `write_bytes`; that much is unchanged, and it
+/// is why the defect above survived. What changed is that `fvp-probe` milestone 3 established the
+/// AEM *does* withhold dirty lines, and milestone 4 then reproduced this exact sequence on it and
+/// measured the secret surviving the shipped order and erased by this one.
+/// ⚠ **The witness is the PROBE's, not this code's** — `fvp-probe` shares no source with
+/// `hv-metal` and `hv-metal` has never run on the FVP. The same standing as the SMMU TLBI argument:
+/// the mechanism is witnessed, this call site is not (design-lesson #23,
+/// `docs/AUDIT-4-CONCURRENT-STAGE2.md`).
 pub fn scrub_frame(mfn: Mfn) {
     // **The span partition.** A frame's SPAN is a property of the parent it is later LINKED under,
     // so it does not exist at `P2mAllocate` — which is where the scrub must hook, because allocate
@@ -789,13 +800,59 @@ pub fn scrub_frame(mfn: Mfn) {
     // window (`frame_addr` is the single shared derivation the emitter uses, and `mfn < NUM_FRAMES`
     // is a model invariant the caller is downstream of). EL2 runs identity/MMU-off, so the PA is
     // directly addressable. `FRAME_SIZE` bytes starting there are exactly this frame and no other.
+    let end = pa + size;
+
+    // ★★★ **THE DEAD TENANT'S LINES ARE DROPPED BEFORE THE ZEROING, NOT AFTER — and this ordering
+    // is a CORRECTION, measured on Arm's AEM (`fvp-probe` milestone 4).**
+    //
+    // ⚠ **What this code did until then, and why it did not work.** It zeroed first and issued
+    // `dc civac` afterwards, explaining the maintenance as preventing a *later* eviction: *"without
+    // maintenance a dirty line from the dead tenant can be evicted after this zeroing and resurrect
+    // the secret."* The intent was right. The instruction was not: **`DC CIVAC` CLEANS BEFORE IT
+    // INVALIDATES, and "clean" means write the dirty line back.** EL2's zero stores are
+    // non-cacheable (MMU-off, and `SCTLR_EL2.C = 0` under A1), so they never touch the tenant's
+    // dirty line — which was therefore still live when the `civac` ran, and got published straight
+    // over the zeroing. The maintenance meant to prevent a resurrection *performed* one.
+    //
+    // **MEASURED, not argued** — one PA, a cacheable "tenant" write, a non-cacheable zeroing, on a
+    // model that withholds dirty lines (milestone 3 established that it does):
+    //
+    // | sequence | result |
+    // |---|---|
+    // | zero → `civac` (as shipped) | **the secret SURVIVED** |
+    // | `civac` → zero | erased |
+    // | zero → `ivac` (discard, no write-back) | erased |
+    // | **`civac` → zero → `civac`** (this code) | **erased** |
+    //
+    // ⚠ **Latent, not live.** QEMU models no cache, so nothing that has ever run in CI could exhibit
+    // it — which is exactly what the old comment meant by *"the half QEMU cannot witness and silicon
+    // requires"*, and exactly why it took an instrument on a cache-modelling platform to find.
+    //
+    // The BEFORE pass is what fixes it: the tenant's line is written back and dropped while the
+    // frame still holds its old contents, so the zeroing that follows is the last word.
+    scrub_maintenance(pa, end);
+
+    // SAFETY: `pa` is the base of model frame `mfn`'s machine frame, inside the reserved in-DRAM data
+    // window (`frame_addr` is the single shared derivation the emitter uses, and `mfn < NUM_FRAMES`
+    // is a model invariant the caller is downstream of). EL2 runs identity/MMU-off, so the PA is
+    // directly addressable. `FRAME_SIZE` bytes starting there are exactly this frame and no other.
     unsafe {
         core::ptr::write_bytes(pa as *mut u8, 0, size as usize);
     }
-    // Clean+invalidate the frame to the point of coherency, then fence. See the doc comment: this is
-    // the half QEMU cannot witness and silicon requires.
+
+    // The AFTER pass is retained and is **not** redundant: it is a no-op while EL2's own stores are
+    // non-cacheable, and becomes load-bearing the moment ledger A2 makes them cacheable — at which
+    // point it is what pushes the zeroing itself out to the point of coherency. Keeping both means
+    // A2 changes an attribute and not this argument.
+    scrub_maintenance(pa, end);
+}
+
+/// Clean+invalidate `[pa, end)` to the point of coherency, then fence.
+///
+/// Extracted so the before- and after-passes of [`scrub_frame`] are visibly the *same* operation —
+/// two hand-written loops would be two places for the line-stride to drift.
+fn scrub_maintenance(pa: u64, end: u64) {
     let mut addr = pa;
-    let end = pa + size;
     while addr < end {
         // SAFETY: `dc civac` takes a VA in a mapped region; EL2 is identity-mapped so the PA is that
         // VA. Cache maintenance has no architectural memory effect beyond coherency.

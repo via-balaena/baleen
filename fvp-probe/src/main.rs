@@ -749,6 +749,109 @@ fn milestone_3() {
     puts("@@ M3-CACHE-END\n");
 }
 
+/// ★★★ MILESTONE 4 — **DOES `scrub_frame`'s MAINTENANCE ACTUALLY ERASE THE SECRET?**
+///
+/// Milestone 3 established the model exhibits the hazard. This asks the question that matters:
+/// **reproduce `hv-metal`'s shipped scrub sequence exactly, and see whether a dead tenant's secret
+/// survives it.**
+///
+/// `hv-metal/src/stage2.rs::scrub_frame` does, in this order:
+///
+/// ```ignore
+/// core::ptr::write_bytes(pa as *mut u8, 0, size);   // EL2 is MMU-off: NON-CACHEABLE stores
+/// for line in frame { asm!("dc civac, {a}") }       // clean AND invalidate
+/// asm!("dsb ish");
+/// ```
+///
+/// and its own doc explains the maintenance as preventing a *later* eviction: *"Without maintenance
+/// a dirty line from the dead tenant can be evicted **after** this zeroing and resurrect the
+/// secret."*
+///
+/// ⚠ **`DC CIVAC` cleans before it invalidates, and "clean" means WRITE THE DIRTY LINE BACK.** So if
+/// the tenant's line is still dirty when the scrub runs, the maintenance that was meant to prevent a
+/// later resurrection may *perform* one immediately. That is a hypothesis about ordering, not a
+/// finding — which is why it is measured here rather than argued.
+///
+/// Three sequences, same starting state, on the model that exhibits the hazard:
+///
+/// | variant | sequence | question |
+/// |---|---|---|
+/// | **A — as shipped** | zero (NC) → `DC CIVAC` | does the secret survive? |
+/// | **B — maintenance first** | `DC CIVAC` → zero (NC) | does ordering fix it? |
+/// | **C — discard, don't publish** | zero (NC) → `DC IVAC` | does invalidate-without-clean fix it? |
+fn milestone_4() {
+    puts("@@ M4-SCRUB-BEGIN\n");
+    const SECRET: u64 = 0x5EC8_E735_EC8E_7350;
+
+    // Variant A — exactly `scrub_frame`'s order.
+    // SAFETY: MMU on; both mappings cover TEST_PA.
+    let a = unsafe {
+        mmu::write_cacheable(SECRET); // the dying guest, through its cacheable EL1 mapping
+        mmu::write_noncacheable(0); // EL2's MMU-off scrub: non-cacheable zero stores
+        mmu::clean_invalidate_line(mmu::TEST_PA); // scrub_frame's `dc civac`
+        mmu::read_noncacheable() // what a new tenant would find in memory
+    };
+
+    // Variant B — the same operations, maintenance BEFORE the zeroing.
+    // SAFETY: as above.
+    let b = unsafe {
+        mmu::write_cacheable(SECRET);
+        mmu::clean_invalidate_line(mmu::TEST_PA);
+        mmu::write_noncacheable(0);
+        mmu::read_noncacheable()
+    };
+
+    // Variant C — zero first, then DISCARD the dirty line instead of publishing it.
+    // SAFETY: as above; discarding is the intent.
+    let c = unsafe {
+        mmu::write_cacheable(SECRET);
+        mmu::write_noncacheable(0);
+        mmu::invalidate_line(mmu::TEST_PA);
+        mmu::read_noncacheable()
+    };
+
+    // Variant D — the PROPOSED FIX, in exactly the form `scrub_frame` would ship it: maintenance
+    // BEFORE the zeroing (to drop the dead tenant's line) and the existing pass retained AFTER (a
+    // no-op while EL2's own stores are non-cacheable, load-bearing the moment A2 makes them
+    // cacheable). Measured rather than reasoned, because shipping an approximation of the fix and
+    // calling the measurement evidence for it is the exact move this probe exists to prevent.
+    // SAFETY: as above.
+    let d = unsafe {
+        mmu::write_cacheable(SECRET);
+        mmu::clean_invalidate_line(mmu::TEST_PA);
+        mmu::write_noncacheable(0);
+        mmu::clean_invalidate_line(mmu::TEST_PA);
+        mmu::read_noncacheable()
+    };
+
+    puts("@@ M4 secret            = ");
+    puthex(SECRET);
+    puts("\n@@ M4 A zero-then-civac = ");
+    puthex(a);
+    puts(if a == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)\n" });
+    puts("@@ M4 B civac-then-zero = ");
+    puthex(b);
+    puts(if b == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)\n" });
+    puts("@@ M4 C zero-then-ivac  = ");
+    puthex(c);
+    puts(if c == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)\n" });
+
+    puts("@@ M4 D civac-zero-civac= ");
+    puthex(d);
+    puts(if d == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)  <-- the proposed fix\n" });
+
+    if a == SECRET {
+        puts("@@ M4-VERDICT SHIPPED-ORDER-LEAKS: hv-metal's zero-then-CIVAC republished the dead \
+              tenant's line over the zeroing. The maintenance meant to prevent a later resurrection \
+              performed one.\n");
+    } else {
+        puts("@@ M4-VERDICT SHIPPED-ORDER-ERASES: the shipped sequence left zero. The ordering \
+              hypothesis is REFUTED on this model — read the three values before concluding \
+              anything about silicon.\n");
+    }
+    puts("@@ M4-SCRUB-END\n");
+}
+
 extern "C" fn probe_main() -> ! {
     uart_init();
     puts("\n@@ FVPPROBE-BEGIN\n");
@@ -835,6 +938,7 @@ extern "C" fn probe_main() -> ! {
     unsafe { mmu::enable() };
     puts("@@ MMU on (SCTLR_EL3.M|C|I)\n");
     milestone_3();
+    milestone_4();
 
     puts("@@ FVPPROBE-END\n");
     semihosting_exit()
