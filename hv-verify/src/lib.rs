@@ -4089,26 +4089,38 @@ mod device_models {
     // `a_route_names_at_most_one_vcpu` is about a property H4b could not have (an SGI legitimately
     // names many).
     //
-    // ★ THE KILL PROBES. Same discipline as H4b — one harness at a time, and P0 is the control that
-    // catches a rig which cannot distinguish "held" from "never ran".
+    // ★ THE KILL PROBES — **MEASURED, six probes × seven harnesses, not predicted.** Same discipline
+    // as H4b, and P0 is the control that catches a rig which cannot distinguish "held" from "never
+    // ran".
     //
-    // | probe (applied to `hv_vdev::irouter`) | cluster | any-of-N | at-most-one | non-vac | recorded |
-    // |---|---|---|---|---|---|
-    // | **P0** unmodified — the CONTROL | PASS | PASS | PASS | PASS | PASS |
-    // | **P1** ignore `Aff1`/`Aff2`/`Aff3` (route on `Aff0` alone) | **RED** | PASS | PASS | PASS | PASS |
-    // | **P2** ignore `IRM` (decode the affinity fields anyway) | PASS | **RED** | PASS | PASS | PASS |
-    // | **P3** `targets` ignores the recorded affinity (always true) | **RED** | **RED** | **RED** | PASS | PASS |
-    // | **P4** `targets` always false | PASS | PASS | PASS | **RED** | PASS |
-    // | **P5** `spi_route` drops the `Aff3` repack | **RED** | PASS | PASS | PASS | PASS |
+    // | probe (applied to `hv_vdev::irouter`) | cluster | any-of-N | at-most-one | non-vac | only-spi | No1N | recorded |
+    // |---|---|---|---|---|---|---|---|
+    // | **P0** unmodified — the CONTROL | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+    // | **P1** ignore `Aff1`/`Aff2`/`Aff3` (route on `Aff0` alone) | **RED** | PASS | PASS | PASS | PASS | PASS | PASS |
+    // | **P2** ignore `IRM` (decode the affinity fields anyway) | PASS | **RED** | PASS | PASS | PASS | PASS | PASS |
+    // | **P3** `targets` always true | **RED** | **RED** | **RED** | **RED** | PASS | PASS | PASS |
+    // | **P4** `targets` always false | PASS | PASS | PASS | **RED** | PASS | PASS | PASS |
+    // | **P5** drop the `Aff3` repack in `decode` | **RED** | PASS | PASS | PASS | PASS | PASS | PASS |
+    //
+    // ⚠ **P3's `non-vac` cell was written PASS before the probes were RUN, and it is RED.** The
+    // reasoning behind the wrong prediction was "a decode naming everything satisfies a
+    // non-vacuity property, which is about naming *something*" — but
+    // `a_guest_can_route_an_spi_to_a_second_vcpu` asserts BOTH halves, and its second is
+    // `!targets(vcpu_affinity(0))`. A table of predictions and a table of measurements are
+    // different documents; this one is the second (design-lesson #215's direction — the reassuring
+    // answer is the one that goes unchecked).
     //
     // ⚠ **P1 is the one that matters most**, because it is not a hypothetical defect: routing on
     // `Aff0` alone is what a decode written without thinking about clusters looks like, and it is
     // the exact shape ⑱-5 found in `hv-metal`'s SGI path (bits `[27:24]` only). It is also the
     // probe that a `targets` comparing whole affinities kills for free.
     //
-    // ⚠ **`only_an_spi_has_a_route` is killed by NO probe above** — none perturbs the range test.
-    // Said out loud rather than left to be inferred from a column of PASSes, which is H4b's lesson
-    // about `an_sgi_intid_is_always_in_the_sgi_range` reappearing here.
+    // ⚠ **THREE harnesses are killed by NO probe above** — `only_an_spi_has_a_route` (none perturbs
+    // the range test), `the_distributor_declares_one_of_n_unsupported` (it is about `GICD_TYPER`,
+    // which no probe touches) and `routing_an_spi_is_recorded_and_changes_no_enable` (about the
+    // register file, not the decode). They are proven, not probed. Said out loud rather than left to
+    // be inferred from three columns of PASSes — H4b's lesson about
+    // `an_sgi_intid_is_always_in_the_sgi_range`, and it applies to three here rather than one.
 
     /// `GICD_IROUTER<n>` sits at `0x6000 + 8n`. Written out here rather than imported, for the same
     /// reason `sgi1r` is (design-lesson #36): a harness that asked the model where its own registers
