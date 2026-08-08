@@ -285,6 +285,10 @@ pub extern "C" fn rust_main() -> ! {
     #[cfg(feature = "wx-probe")]
     mmu::wx_probe(&mut uart);
 
+    // (3d) The other half of W^X. Also terminal, hence a separate configuration from `wx-probe`.
+    #[cfg(feature = "xn-probe")]
+    mmu::xn_probe(&mut uart);
+
     // (4) Realize hv_hal::TimeSource on the ARM generic timer and witness that the count is
     //     monotonic and live (advances, is not frozen at zero) — the fence honored on the metal.
     let timer = GenericTimer;

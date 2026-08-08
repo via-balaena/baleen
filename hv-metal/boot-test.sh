@@ -141,6 +141,8 @@ FORBIDDEN_MARKERS=(
     # hardware must refuse; this string is printed ONLY if the store was permitted, i.e. the mapping
     # is not read-only. Global rather than per-config on purpose: no configuration may ever reach it.
     "W^X NOT ENFORCED"
+    # The X half. Printed only if a jump INTO EL2's data returned, i.e. the fetch was permitted.
+    "XN NOT ENFORCED"
 )
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
@@ -472,5 +474,25 @@ boot_and_check "wx-probe" "--features wx-probe" \
     "EL2 MMU on" \
     "W^X probe: storing to EL2 text" \
     "EC=0x25"
+
+# ── The X half of W^X: EL2's own data must not be executable ──────────────────────────────────────
+#
+# ALSO EXPECTED TO END IN A FAULT, and a DIFFERENT one: an instruction abort (EC=0x21), not the data
+# abort (EC=0x25) the `wx-probe` config takes. The two syndromes are what keep the halves from being
+# mistaken for one another.
+#
+# ⚠ ATTRIBUTION, measured rather than assumed: the fault LOOKED over-determined (the page is
+# Device-nGnRnE as well as XN, and Arm prohibits instruction fetch from Device memory on its own),
+# but a probe that cleared XN while keeping Device found the jump SUCCEEDS. QEMU does not model that
+# prohibition, so here XN alone refuses and this witness is sharp. On silicon the property would be
+# doubly held and the probe would no longer isolate XN — a fidelity gap, recorded in `mmu::xn_probe`.
+#
+# The probe self-validates: it reads the descriptor back and refuses to run if its target is not
+# actually mapped XN, so "it faulted" cannot come from having jumped somewhere else.
+boot_and_check "xn-probe" "--features xn-probe" \
+    "hv-metal alive" \
+    "EL2 MMU on" \
+    "XN probe: jumping into EL2 data" \
+    "EC=0x21"
 
 echo "boot-test: OK — all checks passed"
