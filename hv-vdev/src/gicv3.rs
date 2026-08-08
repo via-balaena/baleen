@@ -39,6 +39,14 @@
 //! accesses: they are **reported and parked**, never quietly zeroed. A guest that starts using a
 //! register this model does not have is a guest whose expectations we are silently violating.
 //!
+//! ⚠ **⑲ CARVED ONE EXCEPTION OUT OF THAT, and it is an exception with a principle.** The
+//! distributor's copies of INTIDs 0..31 are **RES0** under the `ARE_NS` this model forces on — so
+//! zero is not a quiet lie, it is *the architecturally specified answer*, and parking on them killed
+//! conforming guests for a legal read. The rule above is unchanged for everything else, including
+//! registers that are RES0 but **act** when written (`GICD_SGIR`): silently ignoring those drops an
+//! interrupt the guest believes it sent, which is worse than a refusal. **State copies answer;
+//! action registers stay loud.** See `docs/GICD-RES0-SURFACE.md`.
+//!
 //! ## What the model is FOR — mediation, not just answering
 //!
 //! Recording the guest's writes is the easy half. The half with the isolation content is that the
