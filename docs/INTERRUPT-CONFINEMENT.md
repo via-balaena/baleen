@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: Apache-2.0 OR MIT -->
 <!-- Copyright (c) 2026 Via Balaena -->
 
-# ⑱-7 — the peer probe, for interrupts
+# ⑱-7 / ⑱-8 — the peer probe for interrupts, and the role that made the guard unnecessary
 
 *The memory axis of isolation has had a victim-observed witness since ③-b2b-ii-d: dom 1 reaches for*
 *dom 2's RAM and the hardware refuses, on a guest that survives to report it. The interrupt axis had*
@@ -39,27 +39,44 @@ So the reason count is **one**: a single `g != slot` guard, in two loops, in `hv
 `hv-metal` is not a Kani target, so it has no theorem either. Before this rung it had no boot witness
 and no probe — the entire interrupt axis of guest isolation rested on an unexhibited comparison.
 
-## 2. Making the guard visible, and countable
+## 1a. ⑱-8 — and then the guard stopped being a guard
 
-The `.filter(|&(g, _)| g == slot)` combinator is now an explicit guard with a counter, in both the
-SGI path and ⑱-6's `deliver_spi`:
+⑱-7 wrote the bound out as an explicit `g != slot` comparison so the mechanism was at least visible.
+**⑱-8 removed the need for it.** `Running::own_vcpus()` yields a role — `OwnVcpu` — obtainable only
+from the running vCPU, and `PerVcpu::own` is the only accessor that takes one. All four filters are
+gone because **there is no peer in the iteration to filter out**.
 
-```rust
-if g != slot {
-    SGIS_FOREIGN_REFUSED.at(slot).fetch_add(1, Ordering::Relaxed);
-    continue;
-}
-```
+The fourth site is the sharpest and was the least obvious: **`PSCI CPU_ON`**. `target_mpidr` is `x1`
+of a guest-issued PSCI call, and `guest_mpidr` is `MPIDR_RES1 | vcpu_affinity(vcpu)` — no guest
+argument — so a peer's vCPU with the same index has the *same MPIDR* and matches exactly. A
+guest-chosen register value reaching a cross-guest capability, with one `.filter()` in between.
 
-★ **`baleen: irqconfine OK` is non-zero on every boot, in the hundreds** — MEASURED **249** for dom 1
-and **394** for dom 2 on one run, varying with workload. That number is not a precaution counter. It
-is the demonstration that §1's collision is real and continuous: *every* IPI Linux sends names an
-affinity that some peer vCPU also has, and this guard is the only thing standing between that match
-and a delivery.
+★ **What the fence buys, stated narrowly: it is against ACCIDENT.** `PerVcpu::at` still exists and
+still reaches peers — reports need it, and `wake_blocked_vcpus` spans guests on purpose. A future
+author can still deliver across guests; they must now *name a guest index* to do it, which is a
+deliberate act visible in a diff rather than the default behaviour of an accessor taking a `usize`.
+The removed-fix probe in §4 does exactly that, on purpose.
 
-A **zero** here is the `baleen: irqconfine FAIL` case, and it means something specific and worth
-distinguishing from a leak: not "an interrupt crossed" but "**the guard was never exercised**" — the
-guests would have stopped colliding, and §1's argument would need re-reading.
+⚠ **The witness had to change with the mechanism.** ⑱-7's marker counted *refusals*; with no guard
+there is nothing to refuse, so that counter would have read **zero while passing** — a witness
+measuring nothing (#199, #215). It now counts the **hazard**, which is the number that justifies the
+fence existing at all.
+
+## 2. Counting the hazard
+
+⑱-7 made the bound an explicit guard with a counter of **refusals**; ⑱-8 removed the guard, so the
+same counter now measures the **hazard** instead — how often an affinity a guest named also described
+a peer's vCPU. Both are `baleen: irqconfine OK`, and it is non-zero on every boot, in the hundreds:
+MEASURED **249 / 394** (⑱-7, refusals) and **205 / 191** (⑱-8, collisions), varying with workload.
+
+That number is the demonstration that §1's collision is real and continuous — *every* IPI Linux sends
+names an affinity some peer vCPU also has — and it is the only thing that would tell a future reader
+the hazard is real rather than theoretical.
+
+A **zero** is the `baleen: irqconfine FAIL` case, and it means something worth distinguishing from a
+leak: not "an interrupt crossed" but "**the hazard never occurred**". The guests would have stopped
+colliding — `vcpu_affinity` gaining a guest argument would do it — and §1's argument would need
+re-reading.
 
 ## 3. The victim's witness
 
@@ -102,28 +119,26 @@ run as a confinement failure, because it is also *how the probe in §4 actually 
 is not a contrived mutation: per §1 the match is genuine on every boot, so this is exactly what the
 code would do if the guest bound were dropped.
 
-| | unmodified | `no-irq-confinement` |
+| | unmodified | `no-irq-confinement` (two runs) |
 |---|---|---|
-| `[dom 1] baleen-spi-counts:` | `cpu0=0 cpu1=1` | **`cpu0=0 cpu1=2`** — dom 1 also took **dom 2's** SPI |
+| `[dom 2] baleen-ipi6-total:` | `0` | **never printed**, both runs |
+| dom 2 | powers off cleanly | **wedged — `rcu_preempt detected stalls`, `Offline CPU 1 blocking current GP`** — both runs |
+| dom 1's `baleen-spi-counts` row | `cpu0=0 cpu1=1` | run 1 read **cpu1=2**, run 2 read cpu1=1 — see below |
 | `[dom 1] baleen-ipi6-total:` | `1` | `1` (dom 1 is the sender; its own) |
-| `[dom 2] baleen-ipi6-total:` | `0` | **never printed** |
-| dom 2 | powers off cleanly | **wedged — `rcu_preempt detected stalls`, `Offline CPU 1 blocking current GP`, no progress for 573 s** |
-| gate | green | **red, and times out** |
+| gate | green | **red, and times out** — both runs |
 
-★ **Two things in that table matter more than the red.**
+★ **The reliable kill is the victim's DEATH, not a flipped count, and that is the honest reading.**
+Dom 2 never reaches its own report, so the designed `ipi6-total` discriminator never prints. Losing
+interrupt confinement is an **availability** failure of one guest caused by another's ordinary IPI
+traffic — not just an information-flow one.
 
-**The SPI row is a clean, counted, victim-observed cross-guest interrupt leak.** Dom 1's UART INTID
-count reads **2**: one from its own ⑱-6 witness, one from dom 2's — an interrupt raised for one guest
-and delivered to another, reported by the guest that received it. That is precisely the thing the
-memory axis's peer probe exhibits, on the interrupt axis, and it is what ⑱-6's marker turns out to
-guard as a side effect.
-
-**The victim does not merely receive a stray interrupt — it stops working.** Dom 2 never reaches its
-own report, so the designed `ipi6-total: 1` discriminator never prints. Said plainly because the
-honest reading is narrower than "the probe flipped the witness": the probe kills the gate through the
-victim's *death*, and the finer count is unavailable at that point. Losing interrupt confinement is
-an **availability** failure of one guest caused by another's ordinary IPI traffic, not just an
-information-flow one.
+⚠ **CORRECTION, and it is the kind this document exists to make.** The first version of this table
+gave dom 1's `baleen-spi-counts` row reading **cpu1=2** as *"a clean, counted, victim-observed leak"* —
+dom 1 having received dom 2's ⑱-6 witness SPI as well as its own. **That was one run.** A second
+probe run read `cpu1=1`: dom 2 wedges under the foreign IPI traffic, and whether it survives long
+enough to fire its own SPI witness is a race. The leak is real when it appears, but **the signal is
+timing-dependent and must not be quoted as a discriminator** (design-lesson #214 — a point inside a
+range is not a witness for the range). What is stable across runs is the row above it.
 
 ⚠ Run by hand. `cargo xtask qemu-linux-test` reuses **one** log file per process
 (`baleen-qemu-linux-<pid>.log`) across its four boot configurations, so only the last survives — use

@@ -1374,11 +1374,14 @@ const LINUX_FORBIDDEN: &[&str] = &[
     // vCPU: either it went where the pCPU happened to be — `GICD_IROUTER` recorded and ignored, the
     // behaviour this rung removed — or the routing named no vCPU at all and it went nowhere.
     "baleen: vspi FAIL",
-    // ⑱-7's negative half, and it fires for a reason worth distinguishing from a leak: not "an
-    // interrupt crossed" but "**no interrupt target ever named a peer's affinity**", i.e. the guard
-    // was never exercised and the confinement witness is vacuous. That would mean the guests had
-    // stopped colliding — `vcpu_affinity` gaining a guest argument would do it — and the whole
-    // argument for why this guard is load-bearing would need re-reading.
+    // ⑱-7/⑱-8's negative half, and it fires for a reason worth distinguishing from a leak: not "an
+    // interrupt crossed" but "**no interrupt target ever named a peer's affinity**", i.e. the HAZARD
+    // the role fence exists for did not occur even once. That would mean the guests had stopped
+    // colliding — `vcpu_affinity` gaining a guest argument would do it — and the whole argument for
+    // why the fence is load-bearing would need re-reading.
+    //
+    // ⚠ ⑱-8 changed what the OK line counts: collisions, not refusals. A refusal counter would now
+    // read zero and pass, because there is no longer a guard to fire.
     "baleen: irqconfine FAIL",
     // ③-b1's negative half: the guest's GIC accesses did not reach the emulator, i.e. the
     // distributor is being passed through again.

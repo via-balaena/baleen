@@ -105,6 +105,37 @@
 //! does not change that, and does not make a *wrong* vCPU index a build error either — only a
 //! *missing* axis. Same shape as ⑰-a: forgotten → impossible, wrong → still compiles.
 //!
+//! ## ★★ ⑱-8 — THE THIRD AXIS: *WHICH GUEST*, ON THE PATHS WHERE IT IS ISOLATION AND NOT BOOKKEEPING
+//!
+//! ⑱-3a closed *which axis*, ⑱-3b-i closed *which vCPU*. **Which GUEST stayed a `usize`** — and
+//! [`PerVcpu::at`]'s own doc records the moment that became load-bearing: ⑱-5 needed to reach a
+//! vCPU that is not the one running, found "no role at all" for it, and brought back the
+//! arbitrary-index accessor. That accessor reaches **siblings and peers alike**.
+//!
+//! ⚠ **⑱-7 then measured what stood between a guest and its peer's vCPUs: one hand-written
+//! `census(...).filter(g == mine)`, repeated at four call sites** — SGI delivery, SPI delivery,
+//! `PSCI CPU_ON`, and the poweroff offline sweep. Not a redundancy, a single mechanism, in a module
+//! that is not a Kani target. And it could not be helped from under the proof fence:
+//! `vcpu_affinity` **takes no guest argument**, so a peer's vCPU has the same affinity and genuinely
+//! matches whatever a guest names — hundreds of times per boot.
+//!
+//! [`Running::own_vcpus`] is the role that was missing, and [`PerVcpu::own`] the accessor. The four
+//! filters are gone because **there is no peer in the iteration to filter out**.
+//!
+//! ### What this buys, stated narrowly
+//!
+//! **The fence is against ACCIDENT.** [`PerVcpu::at`] still exists and still reaches peers — reports
+//! need it, and `wake_blocked_vcpus` spans guests on purpose. A future author can still deliver
+//! across guests; they just have to name a guest index to do it, which is a deliberate act visible
+//! in a diff rather than the default behaviour of an accessor that takes a `usize`.
+//!
+//! ### The witness had to change with it
+//!
+//! ⑱-7's boot marker counted *refusals*. With no guard there is nothing to refuse, and that counter
+//! would have read **zero while passing** — a witness measuring nothing (#199, #215). It now counts
+//! the **hazard**: how often an affinity a guest named also described a peer's vCPU. Same number,
+//! different claim, and the new one is what justifies the fence existing at all.
+//!
 //! ## What this does NOT do
 //!
 //! [`PerGuest::at`] takes a plain slot, for the report and handler code where only one guest is in
@@ -335,6 +366,28 @@ pub(crate) fn census(num_guests: usize) -> impl Iterator<Item = (usize, VcpuIdx)
     (0..num_guests).flat_map(|g| (0..VCPUS_PER_GUEST).map(move |v| (g, VcpuIdx(v))))
 }
 
+/// **A vCPU belonging to the guest that is running** — obtainable only from
+/// [`Running::own_vcpus`], which is what makes "this guest's own" a fact about the type rather than
+/// a comparison somebody remembered to write.
+///
+/// Deliberately carries the guest slot and does **not** expose it. A caller that could read it back
+/// out would be able to index per-guest state with it, and then the next rung's version of ⑱-7's
+/// defect would be written with a role instead of a `usize` — which reads *more* trustworthy while
+/// being exactly as forgeable. The only thing it can do is reach [`PerVcpu::own`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnVcpu {
+    guest: usize,
+    vcpu: VcpuIdx,
+}
+
+impl OwnVcpu {
+    /// Which vCPU of the guest this is — for the affinity comparison a routing decode needs, and
+    /// for telling the running vCPU from its siblings.
+    pub(crate) const fn vcpu(self) -> VcpuIdx {
+        self.vcpu
+    }
+}
+
 /// The vCPU that is leaving the pCPU.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Outgoing {
@@ -479,6 +532,37 @@ impl Running {
         self.guest
     }
 
+    /// ★★ **EVERY vCPU OF THIS GUEST — and no way to name a peer's.** (⑱-8)
+    ///
+    /// This is the role ⑱-5 needed and did not have. Its own record is on [`PerVcpu::at`]: *"an SGI
+    /// names a target vCPU that is not the one running, so its pending set is reachable through no
+    /// role at all"* — true, and the conclusion drawn was to bring back the arbitrary-index
+    /// accessor. **That accessor reaches PEERS as well as siblings**, so from ⑱-5 onward the only
+    /// thing confining an interrupt to its guest was a `census(...).filter(g == mine)` written out
+    /// at each call site.
+    ///
+    /// ⚠ **⑱-7 measured what that rested on: NOTHING ELSE.** `vcpu_affinity` takes no guest
+    /// argument, so a peer's vCPU has the *same* affinity and genuinely matches whatever a guest
+    /// names — hundreds of times per boot. The filter was the sole confinement, on four separate
+    /// paths (SGI delivery, SPI delivery, `PSCI CPU_ON`, and offlining at poweroff), in a module
+    /// that is not a Kani target.
+    ///
+    /// ★ So it is a **role**, not a filter. `census` still lets anyone *look* at every vCPU in the
+    /// machine — reports need that — but [`PerVcpu::own`] is the only way to reach a pending set or
+    /// a context from a delivery path, and it cannot be handed a peer. **You may look at peers; you
+    /// may not deliver to them.** That is this module's own stated criterion applied where it had
+    /// not been: *structural where a mistake is silent and isolation-relevant.*
+    ///
+    /// Yields the running vCPU too. Callers that must distinguish it compare
+    /// `own.vcpu() == running.vcpu()`, which is the same test they made before.
+    pub(crate) fn own_vcpus(self) -> impl Iterator<Item = OwnVcpu> {
+        let guest = self.guest;
+        (0..VCPUS_PER_GUEST).map(move |v| OwnVcpu {
+            guest,
+            vcpu: VcpuIdx(v),
+        })
+    }
+
     /// Fold the pair into the single word `CURRENT` stores, and back. **The packing is here, once**,
     /// because a second encoding of "which vCPU is running" is the defect ⑭ spent a rung removing —
     /// and because keeping it inside the module is what stops `linux.rs` reconstructing a role from
@@ -609,6 +693,20 @@ impl<T: PerVcpuState, const G: usize, const V: usize> PerVcpu<T, G, V> {
     /// ⚠ Note what the type still costs an attacker of this code: the `VcpuIdx` has to come from
     /// somewhere, and the only somewhere is [`census`] or a role. `at(slot, BOOT_VCPU)` remains
     /// unwritable because `BOOT_VCPU` is not in `linux.rs`'s scope.
+    ///
+    /// ★★ **⑱-8 — AND THE PARAGRAPH ABOVE IS WHERE THE HOLE WAS.** *"Exactly what a plain-index
+    /// accessor is for"* was wrong: ⑱-5 needed a **sibling**, and a plain-index accessor gives
+    /// siblings **and peers**. From that rung until ⑱-8 the only thing confining an interrupt to its
+    /// guest was a `census(...).filter(g == mine)` re-written at four call sites — and ⑱-7 measured
+    /// that it was the *sole* confinement, because `vcpu_affinity` takes no guest argument and a
+    /// peer's vCPU genuinely matches. [`Running::own_vcpus`] + [`Self::own`] is the role that was
+    /// missing.
+    ///
+    /// **This accessor stays, and its remaining callers are the ones this doc always described**:
+    /// reports summing across the machine, and `wake_blocked_vcpus`, which spans guests *on purpose*
+    /// (a spurious `WFI` wake is sound). Delivery paths no longer use it. ⚠ It is still reachable —
+    /// the fence is against ACCIDENT, not against a deliberate cross-guest write, which now has to
+    /// name a guest index and is therefore visible in a diff.
     pub(crate) fn at(&self, guest: usize, vcpu: VcpuIdx) -> &T {
         &self.0[guest][vcpu.get()]
     }
@@ -626,5 +724,23 @@ impl<T: PerVcpuState, const G: usize, const V: usize> PerVcpu<T, G, V> {
     /// An arbitrary vCPU, mutably — setup code only.
     pub(crate) fn at_mut(&mut self, guest: usize, vcpu: VcpuIdx) -> &mut T {
         &mut self.0[guest][vcpu.get()]
+    }
+
+    /// ★★ **A vCPU OF THE RUNNING GUEST — the accessor a delivery path should use.** (⑱-8)
+    ///
+    /// [`Self::of`] reaches the running vCPU; this reaches its **siblings** as well, and reaches
+    /// nothing else. The difference from [`Self::at`] is the whole rung: `at` takes a `usize` guest
+    /// and will happily index a peer, which is how an SGI, an SPI, a `PSCI CPU_ON` and a poweroff
+    /// sweep all came to depend on a hand-written `g == mine` filter for their confinement.
+    ///
+    /// See [`Running::own_vcpus`] for what ⑱-7 measured about that.
+    pub(crate) fn own(&self, o: OwnVcpu) -> &T {
+        &self.0[o.guest][o.vcpu.get()]
+    }
+
+    /// A vCPU of the running guest, mutably — the seeding half of [`Self::own`], used by
+    /// `PSCI CPU_ON` to give a sibling its boot context.
+    pub(crate) fn own_mut(&mut self, o: OwnVcpu) -> &mut T {
+        &mut self.0[o.guest][o.vcpu.get()]
     }
 }
