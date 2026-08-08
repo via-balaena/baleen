@@ -302,6 +302,32 @@ pub(crate) fn mmu_is_on(sctlr: u64) -> bool {
     sctlr & el2::SCTLR_EL2_M != 0
 }
 
+/// The L3 descriptor covering `va`, if `va` is inside the 4 KiB-mapped region.
+///
+/// Gated to `xn-probe` because that is its only consumer: the boot-time verdict uses the
+/// whole-range [`coverage`] sweep, and this single-address lookup exists solely so the execute-never
+/// probe can confirm the page it is about to jump into really is mapped `XN`.
+#[cfg(feature = "xn-probe")]
+fn l3_descriptor(va: u64) -> Option<u64> {
+    if !(0x4000_0000..0x4020_0000).contains(&va) {
+        return None;
+    }
+    // SAFETY: a shared reference to a table written once before the MMU was enabled and never
+    // mutated after; this runs afterwards, so no `&mut` to it is live.
+    let l3 = unsafe { &*core::ptr::addr_of!(L3_IMAGE) };
+    Some(l3.0[((va - 0x4000_0000) / PAGE) as usize])
+}
+
+/// Whether one specific `va` is mapped execute-never — the [`xn_probe`]'s self-validation.
+///
+/// ⚠ Not the boot-time check. [`coverage`] is, and it sweeps every page; this answers the narrower
+/// question "is the address I am about to jump into actually `XN`", without which a fault would be
+/// consistent with having jumped somewhere else entirely.
+#[cfg(feature = "xn-probe")]
+pub(crate) fn is_execute_never(va: u64) -> bool {
+    l3_descriptor(va).is_some_and(|d| d & 0b11 == DESC_PAGE && d & XN != 0)
+}
+
 /// What a sweep of the whole 4 KiB-mapped range found: how many pages fell in each permission
 /// region, and whether every one of them carried the permissions that region requires.
 #[derive(Clone, Copy)]
@@ -341,7 +367,12 @@ pub(crate) fn coverage() -> Coverage {
     // mutated after; this runs afterwards, so no `&mut` to it is live.
     let l3 = unsafe { &*core::ptr::addr_of!(L3_IMAGE) };
 
-    let mut c = Coverage { text_pages: 0, rodata_pages: 0, rw_pages: 0, ok: true };
+    let mut c = Coverage {
+        text_pages: 0,
+        rodata_pages: 0,
+        rw_pages: 0,
+        ok: true,
+    };
     for (i, &desc) in l3.0.iter().enumerate() {
         let va = 0x4000_0000 + (i as u64) * PAGE;
         let ap = desc & (0b11 << 6);
