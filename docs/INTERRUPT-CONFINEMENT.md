@@ -35,9 +35,15 @@ better numbers, and **no decode under the `hv-vdev` fence can ever confine an in
 Their "isolation falls out" arguments are true, but they are about *clusters* (an `Aff1`/`Aff2`/`Aff3`
 no vCPU has), and every guest's vCPUs live in cluster 0 together.
 
-So the reason count is **one**: a single `g != slot` guard, in two loops, in `hv-metal`. And
-`hv-metal` is not a Kani target, so it has no theorem either. Before this rung it had no boot witness
-and no probe — the entire interrupt axis of guest isolation rested on an unexhibited comparison.
+So the reason count is **one**: a single `g != slot` guard, in `hv-metal`. And `hv-metal` is not a
+Kani target, so it has no theorem either. Before this rung it had no boot witness and no probe — the
+entire interrupt axis of guest isolation rested on an unexhibited comparison.
+
+⚠ **This paragraph said "in two loops" until the composite review of the session that produced it.**
+⑱-7 knew of two — SGI delivery and SPI delivery. **⑱-8 found four**, the extra pair being `PSCI
+CPU_ON` and the poweroff offline sweep (§1a). The undercount is left recorded rather than quietly
+corrected because it is the same failure as the residue list ⑲ found: *the number you write down is
+the number you happened to look for*, and nothing distinguishes it from the number there are.
 
 ## 1a. ⑱-8 — and then the guard stopped being a guard
 
@@ -147,22 +153,26 @@ wedged probe boot runs until killed.
 
 ## 5. What this rung does **not** claim
 
-* **No theorem.** `hv-metal` is not a Kani target, so the guard has a boot witness and a probe, not a
-  proof. The decodes it sits above *are* proven — and §1 is the statement that those proofs cannot
-  reach this property, which is the point.
+* **No theorem.** `hv-metal` is not a Kani target, so the confinement has a boot witness, a probe
+  and (since ⑱-8) a type — not a proof. The decodes it sits above *are* proven, and §1 is the
+  statement that those proofs cannot reach this property, which is the point.
 * **Nothing about a malicious guest choosing affinities.** A guest can write any affinity it likes;
-  the guard does not care what it names, only which guest asked. That is the right shape, but it
-  means the property is "EL2 offers a decode only its own guest's vCPUs", not "a guest cannot name a
-  peer" — it names them constantly, and is refused.
+  the delivery path does not care what it names, only which guest asked. That is the right shape, but
+  it means the property is "EL2 offers a decode only its own guest's vCPUs", not "a guest cannot name
+  a peer" — it names them constantly (hundreds of times a boot, which is what
+  `baleen: irqconfine OK` counts) and reaches none.
 * **One pCPU, one machine.** Both guests time-slice a single physical CPU. Nothing here is a
   statement about interrupt confinement under real concurrency.
-* **Only the two routing loops.** Every other path by which EL2 injects (the forwarded timer PPI, the
-  ⑱-6 witness, the overflow probes) names its target directly rather than by affinity, and so has no
-  guard to lose. That is an argument, not a witness.
+* **Only the two routing loops** — SGI delivery and SPI delivery. (The role fence covers *four*
+  sites; the other two, `PSCI CPU_ON` and the poweroff sweep, are not injection paths. Four guards,
+  two of them routing an interrupt.) Every other path by which EL2 injects — the forwarded timer PPI,
+  the ⑱-6 witness, the overflow probes — names its target directly rather than by affinity, and so
+  has no confinement to lose. That is an argument, not a witness.
 
 ---
 
 *See also: `hv-metal/src/linux.rs` (`handle_linux_sysreg_trap`, `deliver_spi`,
-`SGIS_FOREIGN_REFUSED`), `hv-metal/linux/guest-init.sh` (the sender and the victim's report),
+`AFFINITY_COLLISIONS`, `Running::own_vcpus`), `hv-metal/linux/guest-init.sh` (the sender and the
+victim's report),
 `hv-vdev/src/gicv3.rs` (`vcpu_affinity` — the signature §1 rests on), `docs/VGIC-SPI-ROUTING.md`
 (⑱-6, whose marker turns out to guard the same property on the SPI axis).*

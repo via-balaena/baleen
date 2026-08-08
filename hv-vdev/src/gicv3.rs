@@ -756,12 +756,6 @@ impl<const VCPUS: usize> VirtGic<VCPUS> {
             self.irouter[i] = value;
             return Some(0);
         }
-        // ⑲ — RES0 writes are IGNORED, not refused, and not applied. Accepting them changes no
-        // state: that is what keeps `the_distributor_cannot_reach_a_redistributor_banked_intid`
-        // true, and it is why this is a conformance fix rather than a widening of the guest's reach.
-        if dist_banked_res0(off) {
-            return Some(0);
-        }
         let v = value as u32;
         match off {
             GICD_CTLR => {
@@ -771,6 +765,19 @@ impl<const VCPUS: usize> VirtGic<VCPUS> {
             // The identification registers are read-only; a write to them is a guest bug, not ours.
             GICD_TYPER | GICD_IIDR | GICD_TYPER2 | GICD_PIDR2 => return Some(0),
             _ => {}
+        }
+        // ⑲ — RES0 writes are IGNORED, not refused, and not applied. Accepting them changes no
+        // state: that is what keeps `the_distributor_cannot_reach_a_redistributor_banked_intid`
+        // true, and it is why this is a conformance fix rather than a widening of the guest's reach.
+        //
+        // ⚠ **Placed here, after the named registers and before the banks, to MIRROR the read path**
+        // (where the same test opens `dist_bank_read`). It sat before the `match` until the
+        // composite review of the session that added it: the two orders are equivalent only because
+        // no named register is also RES0 — true today, asserted nowhere, and exactly the kind of
+        // coincidence a decode should not be resting on. Same order, both directions, no coincidence
+        // required.
+        if dist_banked_res0(off) {
+            return Some(0);
         }
         if let Some(w) = dist_word_index(off, GICD_IGROUPR, WORDS, 32) {
             self.group[w] = v;
@@ -942,6 +949,11 @@ fn irouter_index(off: u64) -> Option<usize> {
 /// trace shows the kernel's `GICD_ISENABLER`/`IGROUPR`/`ICFGR` writes starting at word 1 and its
 /// `GICD_IPRIORITYR` writes at `0x420` (INTID 32) — it never touches the distributor's copies of
 /// 0..31, because Linux knows they are reserved too.
+///
+/// ⚠ **Since ⑲ this function no longer decides what a banked offset ANSWERS** — `dist_banked_res0`
+/// runs first in both the read and the write path and returns zero, so the `BankedRes0` arm below is
+/// unreachable from either. It is kept because the exclusion is this function's job and a caller
+/// added later must still not reach `enabled[0]` through it.
 fn dist_word_index(off: u64, base: u64, count: usize, intids_per_word: usize) -> Option<usize> {
     match dist_word(off, base, count, intids_per_word) {
         DistWord::Spi(w) => Some(w),
