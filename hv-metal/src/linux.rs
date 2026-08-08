@@ -4957,6 +4957,28 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
             );
         }
 
+        // ★★ ⑲ — the guest-reachable RETIREMENT SURFACE of this guest's distributor, counted.
+        let (answered, refused) = VGIC.borrow_mut().at_mut(slot).survey_gicd();
+        let (checked, all_zero) = VGIC.borrow_mut().at_mut(slot).banked_res0_read_zero();
+        if all_zero && checked > 0 && answered > 0 && refused > 0 {
+            let _ = writeln!(
+                uart,
+                "baleen: gicdsurface OK: of {} word offsets in dom {dom}'s GICD frame, {answered} \
+                 are answered and {refused} RETIRE the guest — and all {checked} \
+                 redistributor-banked RES0 copies read ZERO rather than retiring it, which before \
+                 ⑲ they did not",
+                answered + refused
+            );
+        } else {
+            let _ = writeln!(
+                uart,
+                "baleen: gicdsurface FAIL: dom {dom} — {checked} banked RES0 copies checked, all \
+                 zero = {all_zero}, {answered} answered, {refused} refused. A zero in `checked` or \
+                 `refused` means the sweep collapsed and proves nothing; a false `all_zero` means a \
+                 conforming guest can still be retired by a legal read"
+            );
+        }
+
         // ★★ ⑱-7 — the interrupt axis of ISOLATION, reported beside the two routing axes it guards.
         let collisions = AFFINITY_COLLISIONS.at(slot).load(Ordering::Relaxed);
         if collisions > 0 {
