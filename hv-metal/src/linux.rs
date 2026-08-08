@@ -18,6 +18,12 @@
 //! kept because it is true of the arc's ORIGINAL scope and explains why the file is shaped the way
 //! it is — but read it as history, not as a description of what is asserted here today.
 //!
+//! ★★ **⑱-7 added a THIRD axis, and this file is the only place it exists.** Interrupt confinement
+//! between guests is one `g != slot` guard, in [`handle_linux_sysreg_trap`] and [`deliver_spi`], and
+//! **nothing under the `hv-vdev` proof fence can help**: `vcpu_affinity` takes no guest argument, so
+//! two guests' vCPUs have identical affinities and no decode can tell them apart. See
+//! `docs/INTERRUPT-CONFINEMENT.md`; the guard's live counter is [`SGIS_FOREIGN_REFUSED`].
+//!
 //! ⚠ **THIS PARAGRAPH SAID "a SINGLE EL1 guest that owns the machine" UNTIL ⑱-4b, AND HAD BEEN
 //! FALSE SINCE ③-b2b-ii.** What actually boots today is **two** unmodified kernels, each with
 //! **two vCPUs** (⑱-4b-ii's `PSCI CPU_ON`), time-slicing one physical CPU — four vCPUs in total,

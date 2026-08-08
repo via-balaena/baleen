@@ -91,6 +91,11 @@ With one sender the victim's baseline is **structurally zero**, so 0-vs-1 never 
 two of anything. (The sender is picked by RAM window, the same string `baleen-guest-ram:` already
 asserts per dom, so a moved window goes red there first rather than silently disarming this.)
 
+⚠ **One other thing can make `[dom 2] baleen-ipi6-total: 0` go red, and it is not a leak:** Linux
+raises the CPU-backtrace IPI itself when it detects an RCU stall or a hung task. A dom 2 sick enough
+to do that fails this assertion. That is the right outcome — and worth knowing before debugging a red
+run as a confinement failure, because it is also *how the probe in §4 actually kills*.
+
 ## 4. The removed-fix probe — and it kills harder than the witness measures
 
 `--features no-irq-confinement` makes both loops **honour** a peer match instead of refusing it. That
