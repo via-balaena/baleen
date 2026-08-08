@@ -267,7 +267,14 @@ pub extern "C" fn rust_main() -> ! {
     // ⚠ `text_is_read_only` is a DESCRIPTOR READ-BACK, not a restatement of intent. Without it this
     // line printed "text RO+X" unchanged while a probe that mapped the text writable let the store
     // through — the message asserted a property it never checked (design-lesson #210).
-    if mmu::mmu_is_on(sctlr) && mmu::data_cache_still_off(sctlr) && mmu::text_is_read_only() {
+    // ⚠ BOTH halves are descriptor READ-BACKS, not restatements of intent. The X half was added
+    // after the W half shipped alone: XN was set on every data page and checked by nothing, which is
+    // the same "intent is not evidence" gap the RO+X string had one level up.
+    if mmu::mmu_is_on(sctlr)
+        && mmu::data_cache_still_off(sctlr)
+        && mmu::text_is_read_only()
+        && mmu::data_is_execute_never()
+    {
         let _ = writeln!(
             uart,
             "baleen: EL2 MMU on — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) data RW+XN, C=0 (uncached, unchanged)"
@@ -284,6 +291,10 @@ pub extern "C" fn rust_main() -> ! {
     //      and vector 4 reports and halts, so this configuration's boot ends here.
     #[cfg(feature = "wx-probe")]
     mmu::wx_probe(&mut uart);
+
+    // (3d) The other half of W^X. Also terminal, hence a separate configuration from `wx-probe`.
+    #[cfg(feature = "xn-probe")]
+    mmu::xn_probe(&mut uart);
 
     // (4) Realize hv_hal::TimeSource on the ARM generic timer and witness that the count is
     //     monotonic and live (advances, is not frozen at zero) — the fence honored on the metal.

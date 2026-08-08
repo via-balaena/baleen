@@ -28,6 +28,11 @@ selftest = []
 # that rung, the same store succeeds silently. Removing the fix is what the whole history already did.
 wx-probe = []
 
+# `xn-probe` is the OTHER half of W^X: jump into EL2's own data and require the hardware to refuse.
+# Separate from `wx-probe` because both faults are terminal — vector 4 reports and halts — so only
+# one can run per boot. Two configurations, not two phases.
+xn-probe = []
+
 # `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rungs 1–2: `GBPA.ABORT` before any bus
 # master exists, then a stream table whose every entry denies, and the five-phase witness that the
 # device really does reach it). It is a separate binary rather

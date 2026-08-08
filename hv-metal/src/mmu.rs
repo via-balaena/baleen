@@ -339,6 +339,42 @@ pub(crate) fn text_is_read_only() -> bool {
     desc & 0b11 == DESC_PAGE && desc & (0b11 << 6) == AP_RO
 }
 
+/// The L3 descriptor covering `va`, if `va` is inside the 4 KiB-mapped region.
+fn l3_descriptor(va: u64) -> Option<u64> {
+    if !(0x4000_0000..0x4020_0000).contains(&va) {
+        return None;
+    }
+    // SAFETY: a shared reference to a table written once before the MMU was enabled and never
+    // mutated after; this runs afterwards, so no `&mut` to it is live.
+    let l3 = unsafe { &*core::ptr::addr_of!(L3_IMAGE) };
+    Some(l3.0[((va - 0x4000_0000) / PAGE) as usize])
+}
+
+/// **Read the descriptor back and report whether `va` really is mapped execute-never.**
+///
+/// The counterpart to [`text_is_read_only`], and it exists for the same reason: the rung claims
+/// **W^X**, and until this was written *nothing checked the X at all* — `XN` was set on every data
+/// page and never read back or exercised. A property that only appears in the descriptor-building
+/// code is intent, not evidence, which is precisely the gap the `text RO+X` boot line had.
+pub(crate) fn is_execute_never(va: u64) -> bool {
+    l3_descriptor(va).is_some_and(|d| d & 0b11 == DESC_PAGE && d & XN != 0)
+}
+
+/// The X half of the boot-time structural check: **the first writable page is execute-never.**
+///
+/// `__rodata_end` is exactly the boundary, so the page at it is the first `RW+XN` one — the most
+/// representative single address for "EL2's data is not executable".
+///
+/// ⚠ **This wrapper exists because the first version of the X check was dead code.** I wrote
+/// [`is_execute_never`] precisely so `XN` would be verified on EVERY configuration, then called it
+/// only from inside the `xn-probe`'s self-validation — leaving the default, selftest, smmu and
+/// real-Linux boots checking nothing, which is the exact gap the whole change set out to close.
+/// `-D dead-code` in `metal-lint` is what caught it. Diagnosing a hole correctly and then not wiring
+/// the fix into the path that needed it is its own failure mode, and worth naming.
+pub(crate) fn data_is_execute_never() -> bool {
+    is_execute_never(sym(core::ptr::addr_of!(__rodata_end)))
+}
+
 /// Whether `SCTLR_EL2.C` is still clear — **the property that keeps this rung's blast radius small**.
 ///
 /// With `C == 0` every data access to Normal memory is Non-cacheable regardless of the descriptors,
@@ -394,6 +430,83 @@ pub(crate) fn wx_probe(uart: &mut crate::pl011::Pl011) {
     let _ = writeln!(
         uart,
         "baleen: W^X NOT ENFORCED — the store to EL2 text SUCCEEDED"
+    );
+    crate::park();
+}
+
+/// A page of `.bss` used only as the execute-never probe's target. In the RW+XN region by
+/// construction — `.bss` starts well past `__rodata_end`.
+#[cfg(feature = "xn-probe")]
+static mut XN_PROBE_SLOT: [u32; 2] = [0; 2];
+
+/// **The X half of W^X: jump into EL2's own data and require the hardware to refuse.**
+///
+/// ## Why this is a separate boot from the W probe
+///
+/// Both faults are terminal — vector 4 reports and halts — so only one can run per boot. They are
+/// two configurations, not two phases.
+///
+/// ## ATTRIBUTION — predicted over-determined, MEASURED not, and the measurement is what counts
+///
+/// EL2's data pages are `Device-nGnRnE` **and** `XN`, and Arm prohibits instruction fetch from
+/// Device memory *independently of* `XN`. So this fault looked like it would be over-determined —
+/// witnessing the property ("EL2's data is not executable") without attributing which mechanism
+/// refused, the inputs-cannot-discriminate shape this project keeps finding.
+///
+/// ★ **Probed rather than assumed, and the prediction was wrong: mapping the page `Device-nGnRnE`
+/// with `XN` CLEARED, the jump SUCCEEDS.** QEMU/TCG does not model the Device-memory instruction
+/// fetch prohibition, so on this platform **`XN` alone is what refuses**, and this witness is sharp
+/// rather than confounded.
+///
+/// ⚠ **That is a QEMU FIDELITY fact, not an architectural one.** Real hardware is expected to refuse
+/// on the memory type as well, so on silicon the property would be doubly held and this probe would
+/// no longer isolate `XN`. The witness is strongest exactly where the model is weakest — worth
+/// knowing before anyone reads a green run here as a statement about hardware.
+///
+/// The probe self-validates before jumping: it reads the descriptor back and refuses to run if the
+/// page it is about to jump into is not actually mapped `XN`. Without that, "it faulted" would be
+/// consistent with having jumped somewhere else entirely.
+#[cfg(feature = "xn-probe")]
+pub(crate) fn xn_probe(uart: &mut crate::pl011::Pl011) {
+    use core::fmt::Write;
+
+    let slot = core::ptr::addr_of_mut!(XN_PROBE_SLOT) as u64;
+    if !is_execute_never(slot) {
+        let _ = writeln!(
+            uart,
+            "baleen: XN probe ABORTED — 0x{slot:08x} is not mapped execute-never; nothing to test"
+        );
+        crate::park();
+    }
+
+    // `ret` (0xd65f03c0). If the fetch is permitted, this returns cleanly and execution continues to
+    // the failure report below — the same fail-loud shape the W probe uses.
+    // SAFETY: `XN_PROBE_SLOT` is a static this probe exclusively owns, in the RW+XN region. The
+    // stores are ordinary data writes; `dsb`/`isb` publish them to the instruction stream, which is
+    // meaningful here only because `SCTLR_EL2.I == 0` and the page is non-cacheable, so there is no
+    // I-cache to maintain.
+    unsafe {
+        core::ptr::write_volatile(slot as *mut u32, 0xd65f_03c0);
+        core::ptr::write_volatile((slot + 4) as *mut u32, 0xd65f_03c0);
+        asm!("dsb sy", "isb", options(nostack, preserves_flags));
+    }
+
+    let _ = writeln!(
+        uart,
+        "baleen: XN probe: jumping into EL2 data at 0x{slot:08x} — the hardware must refuse"
+    );
+
+    // SAFETY: transmuting a data address to a function pointer and calling it is EXPECTED to fault.
+    // If it does not, the target holds `ret`, so control returns here and the failure is reported
+    // rather than running off into arbitrary bytes.
+    unsafe {
+        let f: extern "C" fn() = core::mem::transmute::<u64, extern "C" fn()>(slot);
+        f();
+    }
+
+    let _ = writeln!(
+        uart,
+        "baleen: XN NOT ENFORCED — the jump into EL2 data RETURNED"
     );
     crate::park();
 }
