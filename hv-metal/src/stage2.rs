@@ -731,10 +731,45 @@ pub fn seed_sup_frame(m: Mfn, buf: &[u8]) {
 /// 4 KiB granule). Derived, so it cannot drift from the base granule (design-lesson #14c).
 const SUPER_SIZE: u64 = hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE;
 
-/// The cache line size assumed for the scrub's maintenance loop. 64 bytes on every AArch64 core this
-/// targets; using a value **smaller** than the true line size is always safe (it merely repeats
-/// `dc civac` within a line), so this is a conservative constant rather than a `CTR_EL0` read.
+/// The **ceiling** on the scrub's maintenance stride, not the stride itself.
+///
+/// The safety argument is one-directional and worth stating in the direction that bites: a stride
+/// **smaller** than the true line is always safe — it merely repeats `dc civac` within a line — while
+/// a stride **larger** than the true line **SKIPS LINES**, leaving a dead tenant's data behind. So
+/// the only dangerous case is a core whose minimum line is under 64 bytes.
+///
+/// ⚠ **This used to be the stride, justified as "64 bytes on every AArch64 core this targets".**
+/// That is an assertion about the target set, and the architecture does not require it —
+/// `CTR_EL0.DminLine` may report less. [`scrub_line_bytes`] now MEASURES it and takes the smaller of
+/// the two, so the assumption is gone rather than documented.
 const CACHE_LINE: u64 = 64;
+
+/// The stride the scrub's maintenance loop actually uses: **the smaller of [`CACHE_LINE`] and the
+/// minimum data-cache line this core reports**.
+///
+/// `CTR_EL0.DminLine` is log2 of the number of 4-byte words in the smallest data cache line, so the
+/// size is `4 << DminLine`. Taking the minimum means the stride can only ever get *finer* than the
+/// old constant — never coarser — so this cannot skip a line on any core, and does no extra work on
+/// the ones the old constant was right about.
+///
+/// **MEASURED on both platforms this project runs on: 64 bytes** — QEMU `virt` (reported by the
+/// `scrubline` marker on every boot) and Arm's AEM (`fvp-probe` milestone 3 prints the same
+/// derivation). So the change is behaviour-neutral where it has been observed, which is exactly the
+/// standing an assumption-removal should have: it buys correctness on cores nobody here has run,
+/// and costs nothing on the ones we have.
+pub(crate) fn scrub_line_bytes() -> u64 {
+    let ctr: u64;
+    // SAFETY: `CTR_EL0` is a read-only ID register, readable at EL2. No memory operand.
+    unsafe {
+        asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+    }
+    let dmin = 4u64 << ((ctr >> 16) & 0xf);
+    if dmin < CACHE_LINE {
+        dmin
+    } else {
+        CACHE_LINE
+    }
+}
 
 /// Zero the machine frame backing model frame `mfn`, and make the zeroing visible to a guest that
 /// will read it through *cacheable* Stage-2 mappings.
@@ -852,6 +887,7 @@ pub fn scrub_frame(mfn: Mfn) {
 /// Extracted so the before- and after-passes of [`scrub_frame`] are visibly the *same* operation —
 /// two hand-written loops would be two places for the line-stride to drift.
 fn scrub_maintenance(pa: u64, end: u64) {
+    let stride = scrub_line_bytes();
     let mut addr = pa;
     while addr < end {
         // SAFETY: `dc civac` takes a VA in a mapped region; EL2 is identity-mapped so the PA is that
@@ -859,7 +895,7 @@ fn scrub_maintenance(pa: u64, end: u64) {
         unsafe {
             asm!("dc civac, {a}", a = in(reg) addr, options(nostack, preserves_flags));
         }
-        addr += CACHE_LINE;
+        addr += stride;
     }
     // SAFETY: a barrier; no memory operand.
     unsafe {
