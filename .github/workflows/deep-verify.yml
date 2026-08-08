@@ -70,6 +70,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      # ⑳-c: the inventory FIRST — `--list` enumerates without running (~2 s), so a deleted sweep
+      # is named here rather than silently reducing the run below. `cargo xtask ci` checks the same
+      # thing on every PR; this keeps the weekly job self-contained.
+      - name: deep-sweep inventory
+        run: cargo xtask sweeps
+
       # ⚠ RETRACTION (#125 got this wrong): an earlier version of this comment claimed
       # `--test-threads=1` was "for readable `--nocapture` output, not for correctness", and that
       # parallelising was "a live option". Both are false, and the refutation was already thirty
@@ -83,12 +89,6 @@ jobs:
       # parallelism could ever buy if the memory ceiling were lifted (longest test 12m20s vs the
       # 32m52s sum), NOT as a suggestion. There is nothing to gain regardless: this job is weekly and
       # asynchronous, and it now completes in 68m20s against a 120-minute wall.
-      # ⑳-c: the inventory FIRST — `--list` enumerates without running (~2 s), so a deleted sweep
-      # is named here rather than silently reducing the run below. `cargo xtask ci` checks the same
-      # thing on every PR; this keeps the weekly job self-contained.
-      - name: deep-sweep inventory
-        run: cargo xtask sweeps
-
       - name: cargo test --release --ignored (deep sweeps)
         run: cargo test --release -p hv-sim -- --ignored --nocapture --test-threads=1
 
