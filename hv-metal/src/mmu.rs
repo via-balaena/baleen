@@ -58,8 +58,16 @@ extern "C" {
     static __rodata_end: u8;
 }
 
-fn sym(s: &u8) -> u64 {
-    core::ptr::from_ref::<u8>(s) as u64
+/// The address of a linker symbol.
+///
+/// Takes a raw pointer rather than a reference on purpose: `&*addr_of!(EXTERN_STATIC)` would
+/// materialise a `&u8` to memory this code never reads, which is a stronger claim than needed and
+/// an `unsafe` block per call site. Only the ADDRESS is wanted, and forming it is safe.
+///
+/// Not `const`: a pointer cannot be cast to an integer during const evaluation, and the addresses
+/// are link-time values anyway.
+fn sym(p: *const u8) -> u64 {
+    p as u64
 }
 
 /// 4 KiB granule, and the only granule this emits — matching `hv_s2`, which refuses the others
@@ -135,7 +143,9 @@ static mut L3_IMAGE: Table = Table([0; ENTRIES]);
 /// subsequent access is resolved; the mapping is identity, so the caller's own code, stack and
 /// return address stay valid across the switch.
 pub(crate) unsafe fn enable() -> u64 {
-    build_tables();
+    // SAFETY: caller's contract — called exactly once, so the `&mut` references `build_tables`
+    // forms to the three static tables cannot alias any other live reference to them.
+    unsafe { build_tables() };
     // SAFETY: caller's contract — EL2, MMU off, called once.
     unsafe { switch_on() }
 }
@@ -159,15 +169,30 @@ const fn page(pa: u64, attr_idx: u64, ap: u64, xn: u64) -> u64 {
 
 /// Populate the three tables. Split out so the mapping is readable on its own, and so a future
 /// reader can see that nothing here touches a system register.
-fn build_tables() {
-    let text_start = sym(unsafe { &*core::ptr::addr_of!(__text_start) });
-    let text_end = sym(unsafe { &*core::ptr::addr_of!(__text_end) });
-    let rodata_start = sym(unsafe { &*core::ptr::addr_of!(__rodata_start) });
-    let rodata_end = sym(unsafe { &*core::ptr::addr_of!(__rodata_end) });
+///
+/// # Safety
+///
+/// Must be called at most once. It forms `&mut` references to the three `static mut` tables, and a
+/// second concurrent or re-entrant call would alias them. `unsafe` rather than a comment because
+/// this crate's whole discipline is that the obligation is carried by the signature where it can be:
+/// a safe function that hands out `&mut` to a `static mut` is unsound no matter how it is used, and
+/// the fact that the single caller is correct is not a property of THIS function.
+unsafe fn build_tables() {
+    let text_start = sym(core::ptr::addr_of!(__text_start));
+    let text_end = sym(core::ptr::addr_of!(__text_end));
+    let rodata_start = sym(core::ptr::addr_of!(__rodata_start));
+    let rodata_end = sym(core::ptr::addr_of!(__rodata_end));
 
-    let l1 = unsafe { &mut *core::ptr::addr_of_mut!(L1) };
-    let l2 = unsafe { &mut *core::ptr::addr_of_mut!(L2_IMAGE) };
-    let l3 = unsafe { &mut *core::ptr::addr_of_mut!(L3_IMAGE) };
+    // SAFETY: caller's contract (at most one call), and these are three DISTINCT statics, so the
+    // three `&mut` do not alias each other. Nothing else in the crate touches them — they exist
+    // only to be walked by the hardware, which reads memory rather than Rust references.
+    let (l1, l2, l3) = unsafe {
+        (
+            &mut *core::ptr::addr_of_mut!(L1),
+            &mut *core::ptr::addr_of_mut!(L2_IMAGE),
+            &mut *core::ptr::addr_of_mut!(L3_IMAGE),
+        )
+    };
 
     // ── L1: 1 GiB per entry, 39-bit VA (512 entries). ──────────────────────────────────────────
     //
@@ -300,7 +325,9 @@ pub(crate) fn mmu_is_on(sctlr: u64) -> bool {
 /// running at all — a text mapping that did not resolve would fault on the next instruction fetch —
 /// and, end to end, the `wx-probe` config, whose fault arrives with `FAR` equal to `__text_start`.
 pub(crate) fn text_is_read_only() -> bool {
-    let text_start = sym(unsafe { &*core::ptr::addr_of!(__text_start) });
+    let text_start = sym(core::ptr::addr_of!(__text_start));
+    // SAFETY: a shared reference to a table that is written once, before the MMU is enabled, and
+    // never mutated again — this runs after `enable`, so no `&mut` to it is live.
     let l3 = unsafe { &*core::ptr::addr_of!(L3_IMAGE) };
     // The L3 index of `text_start` within the 2 MiB region `L2_IMAGE[0]` covers.
     let idx = ((text_start - 0x4000_0000) / PAGE) as usize;
@@ -375,7 +402,7 @@ pub(crate) fn wx_probe(uart: &mut crate::pl011::Pl011) {
 /// states what it protected rather than merely that it protected something.
 pub(crate) fn text_span() -> (u64, u64) {
     (
-        sym(unsafe { &*core::ptr::addr_of!(__text_start) }),
-        sym(unsafe { &*core::ptr::addr_of!(__text_end) }),
+        sym(core::ptr::addr_of!(__text_start)),
+        sym(core::ptr::addr_of!(__text_end)),
     )
 }
