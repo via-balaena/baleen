@@ -264,13 +264,17 @@ pub extern "C" fn rust_main() -> ! {
     // address resolve identically after the switch.
     let sctlr = unsafe { mmu::enable() };
     let (text_start, text_end) = mmu::text_span();
-    // ⚠ `text_is_read_only` is a DESCRIPTOR READ-BACK, not a restatement of intent. Without it this
-    // line printed "text RO+X" unchanged while a probe that mapped the text writable let the store
-    // through — the message asserted a property it never checked (design-lesson #210).
-    // ⚠ A descriptor SWEEP, not two sampled addresses. The first version of this rung claimed W^X
-    // over three ranges and checked one address in each — an off-by-one at `__text_end` would have
-    // left the last page of text writable with nothing to notice. The counts are reported because a
-    // collapsed region passes every per-page test vacuously.
+    // ⚠ `coverage()` is a descriptor SWEEP, and this line has now been wrong in TWO distinct ways,
+    // both caught only because something read the descriptors back rather than trusting the text:
+    //
+    //   1. it printed "text RO+X" as a hardcoded string while a probe that mapped the text writable
+    //      let the store through — asserting a property it never checked (design-lesson #210);
+    //   2. the read-back that fixed that sampled ONE address per region, so an off-by-one at
+    //      `__text_end` would have left the last page of text writable with nothing to notice.
+    //
+    // Hence every mapped page is checked against the region its VA falls in, and the COUNTS are
+    // printed: a collapsed region passes every per-page test vacuously, so `text_pages == 0` has to
+    // be visible rather than silently fine.
     let cov = mmu::coverage();
     if mmu::mmu_is_on(sctlr) && mmu::data_cache_still_off(sctlr) && cov.ok {
         let _ = writeln!(
