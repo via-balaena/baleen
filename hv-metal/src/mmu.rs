@@ -302,44 +302,12 @@ pub(crate) fn mmu_is_on(sctlr: u64) -> bool {
     sctlr & el2::SCTLR_EL2_M != 0
 }
 
-/// **Read the descriptor back and report whether EL2's text really is read-only.**
-///
-/// ⚠ **This exists because the boot line was caught lying.** The report used to state "text RO+X" as
-/// a literal string, and a remove-the-fix probe that mapped the text `AP_RW` — changing nothing
-/// else — printed *exactly the same line* while the store to text succeeded. A message that asserts
-/// a property it does not read is a second copy of the intent, and the copy is what drifts
-/// (design-lesson #210). The witness caught it; nothing else would have.
-///
-/// So the claim is now derived from the same words the hardware walks: find the L3 entry covering
-/// `__text_start` and check its `AP[2:1]`. This is the decode direction of `build_tables`'s emit,
-/// the `hv-s2` emit-seam/decode-seam idiom applied to a table this crate writes itself.
-///
-/// ★ It also moves the evidence into EVERY configuration. The `wx-probe` build proves enforcement by
-/// taking the fault; this proves the descriptor says so on the default, selftest, smmu and
-/// real-Linux boots too — where deliberately faulting would be a terrible idea.
-///
-/// ⚠ **What it does NOT check, stated because the two checks are complementary and neither alone is
-/// the property:** this reads the descriptor *this module wrote*, not the one the hardware walked.
-/// A broken `L1[1] → L2_IMAGE → L3_IMAGE` chain would leave this returning `true` while the walker
-/// resolved something else entirely. What rules that out is not this function but the machine
-/// running at all — a text mapping that did not resolve would fault on the next instruction fetch —
-/// and, end to end, the `wx-probe` config, whose fault arrives with `FAR` equal to `__text_start`.
-pub(crate) fn text_is_read_only() -> bool {
-    let text_start = sym(core::ptr::addr_of!(__text_start));
-    // SAFETY: a shared reference to a table that is written once, before the MMU is enabled, and
-    // never mutated again — this runs after `enable`, so no `&mut` to it is live.
-    let l3 = unsafe { &*core::ptr::addr_of!(L3_IMAGE) };
-    // The L3 index of `text_start` within the 2 MiB region `L2_IMAGE[0]` covers.
-    let idx = ((text_start - 0x4000_0000) / PAGE) as usize;
-    if idx >= ENTRIES {
-        return false;
-    }
-    let desc = l3.0[idx];
-    // A page descriptor whose AP[2:1] is `AP_RO`, and which really is a page rather than absent.
-    desc & 0b11 == DESC_PAGE && desc & (0b11 << 6) == AP_RO
-}
-
 /// The L3 descriptor covering `va`, if `va` is inside the 4 KiB-mapped region.
+///
+/// Gated to `xn-probe` because that is its only consumer: the boot-time verdict uses the
+/// whole-range [`coverage`] sweep, and this single-address lookup exists solely so the execute-never
+/// probe can confirm the page it is about to jump into really is mapped `XN`.
+#[cfg(feature = "xn-probe")]
 fn l3_descriptor(va: u64) -> Option<u64> {
     if !(0x4000_0000..0x4020_0000).contains(&va) {
         return None;
@@ -350,29 +318,84 @@ fn l3_descriptor(va: u64) -> Option<u64> {
     Some(l3.0[((va - 0x4000_0000) / PAGE) as usize])
 }
 
-/// **Read the descriptor back and report whether `va` really is mapped execute-never.**
+/// Whether one specific `va` is mapped execute-never — the [`xn_probe`]'s self-validation.
 ///
-/// The counterpart to [`text_is_read_only`], and it exists for the same reason: the rung claims
-/// **W^X**, and until this was written *nothing checked the X at all* — `XN` was set on every data
-/// page and never read back or exercised. A property that only appears in the descriptor-building
-/// code is intent, not evidence, which is precisely the gap the `text RO+X` boot line had.
+/// ⚠ Not the boot-time check. [`coverage`] is, and it sweeps every page; this answers the narrower
+/// question "is the address I am about to jump into actually `XN`", without which a fault would be
+/// consistent with having jumped somewhere else entirely.
+#[cfg(feature = "xn-probe")]
 pub(crate) fn is_execute_never(va: u64) -> bool {
     l3_descriptor(va).is_some_and(|d| d & 0b11 == DESC_PAGE && d & XN != 0)
 }
 
-/// The X half of the boot-time structural check: **the first writable page is execute-never.**
+/// What a sweep of the whole 4 KiB-mapped range found: how many pages fell in each permission
+/// region, and whether every one of them carried the permissions that region requires.
+#[derive(Clone, Copy)]
+pub(crate) struct Coverage {
+    pub(crate) text_pages: usize,
+    pub(crate) rodata_pages: usize,
+    pub(crate) rw_pages: usize,
+    /// Every page matched the region it falls in.
+    pub(crate) ok: bool,
+}
+
+/// **Check EVERY page in the mapped range against the region it belongs to.**
 ///
-/// `__rodata_end` is exactly the boundary, so the page at it is the first `RW+XN` one — the most
-/// representative single address for "EL2's data is not executable".
+/// ## ⚠ Why this replaced two single-address checks
 ///
-/// ⚠ **This wrapper exists because the first version of the X check was dead code.** I wrote
-/// [`is_execute_never`] precisely so `XN` would be verified on EVERY configuration, then called it
-/// only from inside the `xn-probe`'s self-validation — leaving the default, selftest, smmu and
-/// real-Linux boots checking nothing, which is the exact gap the whole change set out to close.
-/// `-D dead-code` in `metal-lint` is what caught it. Diagnosing a hole correctly and then not wiring
-/// the fix into the path that needed it is its own failure mode, and worth naming.
-pub(crate) fn data_is_execute_never() -> bool {
-    is_execute_never(sym(core::ptr::addr_of!(__rodata_end)))
+/// The first version of this rung claimed **W^X over three ranges** and tested **one address each**:
+/// `text_is_read_only()` read the descriptor for `__text_start`, `data_is_execute_never()` the one
+/// for `__rodata_end`, and the two boot probes faulted at one address apiece. Four checks, four
+/// addresses, three ranges.
+///
+/// ★ **An off-by-one at `__text_end` would have left the last page of text WRITABLE and nothing
+/// would have noticed** — not the read-backs, not the probes, not the gates. That is the same shape
+/// as every other defect this rung produced: coverage narrower than the claim. A range is not
+/// witnessed by a point inside it.
+///
+/// So this sweeps all [`ENTRIES`] descriptors and classifies each by the region its VA falls in.
+/// The counts are returned as well as the verdict, because a mis-sized region is a *wrong count*
+/// long before it is a wrong permission — `text_pages == 0` would mean the text range collapsed,
+/// and a point-check at `__text_start` would still pass.
+pub(crate) fn coverage() -> Coverage {
+    let text_start = sym(core::ptr::addr_of!(__text_start));
+    let text_end = sym(core::ptr::addr_of!(__text_end));
+    let rodata_start = sym(core::ptr::addr_of!(__rodata_start));
+    let rodata_end = sym(core::ptr::addr_of!(__rodata_end));
+
+    // SAFETY: a shared reference to a table written once, before the MMU was enabled, and never
+    // mutated after; this runs afterwards, so no `&mut` to it is live.
+    let l3 = unsafe { &*core::ptr::addr_of!(L3_IMAGE) };
+
+    let mut c = Coverage {
+        text_pages: 0,
+        rodata_pages: 0,
+        rw_pages: 0,
+        ok: true,
+    };
+    for (i, &desc) in l3.0.iter().enumerate() {
+        let va = 0x4000_0000 + (i as u64) * PAGE;
+        let ap = desc & (0b11 << 6);
+        let xn = desc & XN != 0;
+        let is_page = desc & 0b11 == DESC_PAGE;
+
+        // Executable and read-only; XN must NOT be set or the text would not be fetchable.
+        let want = if va >= text_start && va < text_end {
+            c.text_pages += 1;
+            is_page && ap == AP_RO && !xn
+        } else if va >= rodata_start && va < rodata_end {
+            c.rodata_pages += 1;
+            is_page && ap == AP_RO && xn
+        } else {
+            c.rw_pages += 1;
+            is_page && ap == AP_RW && xn
+        };
+        c.ok &= want;
+    }
+    // A collapsed region passes every per-page test vacuously, so the counts are part of the
+    // verdict rather than decoration: text and rodata are non-empty by construction of the link.
+    c.ok &= c.text_pages > 0 && c.rodata_pages > 0 && c.rw_pages > 0;
+    c
 }
 
 /// Whether `SCTLR_EL2.C` is still clear — **the property that keeps this rung's blast radius small**.

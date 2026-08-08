@@ -264,20 +264,26 @@ pub extern "C" fn rust_main() -> ! {
     // address resolve identically after the switch.
     let sctlr = unsafe { mmu::enable() };
     let (text_start, text_end) = mmu::text_span();
-    // ⚠ `text_is_read_only` is a DESCRIPTOR READ-BACK, not a restatement of intent. Without it this
-    // line printed "text RO+X" unchanged while a probe that mapped the text writable let the store
-    // through — the message asserted a property it never checked (design-lesson #210).
-    // ⚠ BOTH halves are descriptor READ-BACKS, not restatements of intent. The X half was added
-    // after the W half shipped alone: XN was set on every data page and checked by nothing, which is
-    // the same "intent is not evidence" gap the RO+X string had one level up.
-    if mmu::mmu_is_on(sctlr)
-        && mmu::data_cache_still_off(sctlr)
-        && mmu::text_is_read_only()
-        && mmu::data_is_execute_never()
-    {
+    // ⚠ `coverage()` is a descriptor SWEEP, and this line has now been wrong in TWO distinct ways,
+    // both caught only because something read the descriptors back rather than trusting the text:
+    //
+    //   1. it printed "text RO+X" as a hardcoded string while a probe that mapped the text writable
+    //      let the store through — asserting a property it never checked (design-lesson #210);
+    //   2. the read-back that fixed that sampled ONE address per region, so an off-by-one at
+    //      `__text_end` would have left the last page of text writable with nothing to notice.
+    //
+    // Hence every mapped page is checked against the region its VA falls in, and the COUNTS are
+    // printed: a collapsed region passes every per-page test vacuously, so `text_pages == 0` has to
+    // be visible rather than silently fine.
+    let cov = mmu::coverage();
+    if mmu::mmu_is_on(sctlr) && mmu::data_cache_still_off(sctlr) && cov.ok {
         let _ = writeln!(
             uart,
-            "baleen: EL2 MMU on — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) data RW+XN, C=0 (uncached, unchanged)"
+            "baleen: EL2 MMU on — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) data RW+XN, C=0 (uncached, unchanged); all {} mapped pages match their region ({} text, {} rodata, {} rw)",
+            cov.text_pages + cov.rodata_pages + cov.rw_pages,
+            cov.text_pages,
+            cov.rodata_pages,
+            cov.rw_pages
         );
     } else {
         let _ = writeln!(
