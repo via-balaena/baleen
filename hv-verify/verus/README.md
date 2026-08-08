@@ -60,26 +60,27 @@ curl -sL -o verus.zip \
 unzip -q verus.zip -d ~/.local/verus
 VERUS=~/.local/verus/verus-arm64-macos/verus
 
-# Verify each proof (exit 0 = every proof discharged):
-$VERUS --crate-type=lib hv-verify/verus/refcount_mismatch.rs        # → 8 verified, 0 errors
-$VERUS --crate-type=lib hv-verify/verus/frame_lemma.rs              # → 5 verified, 0 errors
-$VERUS --crate-type=lib hv-verify/verus/control_forest_acyclic.rs   # → 8 verified, 0 errors
-$VERUS --crate-type=lib hv-verify/verus/unwinding_signal.rs         # → 2 verified, 0 errors  (Tier D)
-$VERUS --crate-type=lib hv-verify/verus/unwinding_control.rs        # → 3 verified, 0 errors  (Tier D)
-$VERUS --crate-type=lib hv-verify/verus/unwinding_create.rs         # → 2 verified, 0 errors  (Tier D)
-$VERUS --crate-type=lib hv-verify/verus/unwinding_destroy.rs        # → 7 verified, 0 errors  (Tier D)
-$VERUS --crate-type=lib hv-verify/verus/noninterference_theorem.rs  # → 5 verified, 0 errors  (Tier D capstone)
-$VERUS --crate-type=lib hv-verify/verus/step_consistency.rs        # → 3 verified, 0 errors  (Tier D)
-$VERUS --crate-type=lib hv-verify/verus/read_closure.rs            # → 2 verified, 0 errors  (Tier D)
-$VERUS --crate-type=lib hv-verify/verus/noninterference_instantiation.rs # → 19 verified, 0 errors  (Tier D — closes GAP-C, all 5 classes; +⑦ the Obs/ObsPlus split)
-$VERUS --crate-type=lib hv-verify/verus/stage2_leaf_authorized.rs  # → 7 verified, 0 errors  (the metal refinement)
-$VERUS --crate-type=lib hv-verify/verus/foreign_link_preservation.rs # → 9 verified, 0 errors  (Arc 3b — discharges T's premise)
+# Verify every proof AND check each discharges the expected number of obligations:
+cargo xtask verus-counts                 # finds verus via $VERUS, else PATH
+
+# Or one file at a time while iterating (exit 0 = every proof in it discharged):
+$VERUS --crate-type=lib hv-verify/verus/noninterference_instantiation.rs
+$VERUS --crate-type=lib hv-verify/verus/read_closure.rs
+$VERUS --crate-type=lib hv-verify/verus/<any other file in this directory>
 ```
 
-CI runs exactly this in the `verus preservation proofs` job of
-`.github/workflows/deep-verify.yml` (scheduled + dispatch, **not** a required PR check — same
-class as the Kani job and the enumerator sweeps), on the `x86-linux` build, pinned to the same
-release tag so a Verus release cannot silently change proof semantics.
+CI runs `cargo xtask verus-counts` in the **required** `verus proofs (PR)` job of
+`.github/workflows/proofs.yml` (① made the deductive proofs a merge gate), and again in
+`deep-verify.yml`'s scheduled backstop — both on the `x86-linux` build, pinned to the same release
+tag so a Verus release cannot silently change proof semantics.
+
+⚠ **THE PER-FILE COUNTS USED TO BE LISTED HERE AND ARE NOT ANY MORE, because they were a second
+derivation and they had DRIFTED.** Measured when the gate was written: this file said
+`noninterference_instantiation.rs → 19` (it is **20**, since SMMU rung 4a added the device axis) and
+`stage2_leaf_authorized.rs → 7` (it is **8**), and it listed **13** of the **15** files on disk —
+`device_assignment_preservation.rs` and `mislevelled_link_preservation.rs` were never added. The
+authority is now `xtask`'s `VERUS_OBLIGATIONS`, which a gate checks; a number in prose is a number
+nothing checks (design-lesson #74).
 
 ## Fidelity — how the mirror provably tracks shipped code
 

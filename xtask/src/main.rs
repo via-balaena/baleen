@@ -71,6 +71,7 @@ fn main() {
         "qemu-linux-smmu" => qemu_linux(true, LinuxBoot::Smmu),
         "metal-lint" => metal_lint(),
         "doc-markers" => doc_markers(),
+        "verus-counts" => verus_counts(),
         "ci" => {
             run("cargo", &["fmt", "--all", "--", "--check"])
                 && run(
@@ -103,6 +104,7 @@ fn main() {
                  doc    build docs, denying broken links\n  \
                  ci     fmt --check, clippy -D warnings, test, doc, then doc-markers\n  \
                  doc-markers  assert every boot marker a doc QUOTES is still one the gates check\n  \
+                 verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  qemu   boot hv-metal under QEMU (AArch64/EL2, interactive)\n  \
                  qemu-test  headless QEMU boot smoke-test (the metal CI check)\n  \
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
@@ -1989,6 +1991,144 @@ fn flush_paragraph(para: &[&str], start: usize, out: &mut Vec<(usize, String)>) 
             out.push((start, collapse(piece)));
         }
     }
+}
+
+/// ★★ ⑳ — **HOW MANY OBLIGATIONS EACH VERUS FILE DISCHARGES, pinned.**
+///
+/// ⚠ **The gate this closes: `proofs.yml`'s Verus job checks EXIT STATUS ONLY.** It runs
+/// `verus --crate-type=lib` over every file and fails if one does not discharge — which is
+/// necessary and, on its own, blind to a proof being **deleted**. Removing `ni_theorem_b`, the
+/// confidentiality half of the Tier-D headline, leaves its file verifying `19 verified, 0 errors`
+/// and the job **green**. MEASURED, not supposed: see the kill probe in
+/// `docs/TIER-D-NONINTERFERENCE.md`.
+///
+/// That is design-lesson #212's shape at the gate layer — a theorem nothing counts is
+/// indistinguishable from a theorem that is gone — and #215's — a checker that reports success when
+/// it has nothing to check.
+///
+/// **The counts were MEASURED on the pinned release** (`0.2026.07.12.0b42f4c`, the same build
+/// `proofs.yml` and `deep-verify.yml` install), and total **117**, which is the number
+/// `hv-verify/verus/README.md` and the project's own records have tracked by hand.
+///
+/// ⚠ **Raising a number here is a normal part of adding a proof; LOWERING one is a claim that a
+/// proof should no longer exist, and belongs in the commit message.**
+const VERUS_OBLIGATIONS: &[(&str, u32)] = &[
+    ("control_forest_acyclic", 8),
+    ("device_assignment_preservation", 6),
+    ("foreign_link_preservation", 9),
+    ("frame_lemma", 5),
+    ("mislevelled_link_preservation", 29),
+    ("noninterference_instantiation", 20),
+    ("noninterference_theorem", 5),
+    ("read_closure", 2),
+    ("refcount_mismatch", 8),
+    ("stage2_leaf_authorized", 8),
+    ("step_consistency", 3),
+    ("unwinding_control", 3),
+    ("unwinding_create", 2),
+    ("unwinding_destroy", 7),
+    ("unwinding_signal", 2),
+];
+
+/// **Check every Verus file discharges EXACTLY the obligations [`VERUS_OBLIGATIONS`] expects.**
+///
+/// Finds `verus` via `$VERUS` or `PATH`. Both directions are checked, and the second is the one a
+/// soundness-only version would miss:
+///
+/// * every file in the table verifies, with the expected count — a deleted or weakened proof is red;
+/// * every `.rs` in `hv-verify/verus/` is IN the table — so deleting a whole file is red too, which
+///   a per-entry loop over the table alone would sail straight past.
+fn verus_counts() -> bool {
+    let verus = std::env::var("VERUS").unwrap_or_else(|_| "verus".to_string());
+    let dir = std::path::Path::new("hv-verify/verus");
+
+    let mut on_disk: Vec<String> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "rs"))
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("verus-counts: cannot read {}: {e}", dir.display());
+            return false;
+        }
+    };
+    on_disk.sort();
+
+    let mut ok = true;
+    for name in &on_disk {
+        if !VERUS_OBLIGATIONS.iter().any(|(n, _)| n == name) {
+            eprintln!(
+                "verus-counts: FAIL — hv-verify/verus/{name}.rs is not in VERUS_OBLIGATIONS. A \
+                 proof file the table does not name is a proof file nothing counts."
+            );
+            ok = false;
+        }
+    }
+
+    for (name, want) in VERUS_OBLIGATIONS {
+        let path = dir.join(format!("{name}.rs"));
+        if !path.exists() {
+            eprintln!(
+                "verus-counts: FAIL — {} is in the table and MISSING on disk",
+                path.display()
+            );
+            ok = false;
+            continue;
+        }
+        eprintln!("$ {verus} --crate-type=lib {}", path.display());
+        let out = match Command::new(&verus)
+            .args(["--crate-type=lib", &path.to_string_lossy()])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("verus-counts: cannot run `{verus}`: {e} (set $VERUS or put it on PATH)");
+                return false;
+            }
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // `verification results:: N verified, M errors`
+        let got = text
+            .split("verification results::")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .and_then(|n| n.parse::<u32>().ok());
+        match got {
+            Some(n) if n == *want && out.status.success() => {
+                eprintln!("verus-counts: OK — {name}: {n} verified");
+            }
+            Some(n) => {
+                eprintln!(
+                    "verus-counts: FAIL — {name}: {n} verified, expected {want}. A LOWER count \
+                     means a proof was deleted or weakened; the exit-status-only gate cannot see it."
+                );
+                ok = false;
+            }
+            None => {
+                eprintln!(
+                    "verus-counts: FAIL — {name}: no `verification results::` line; verus \
+                           did not complete. Output:\n{text}"
+                );
+                ok = false;
+            }
+        }
+    }
+    let total: u32 = VERUS_OBLIGATIONS.iter().map(|(_, n)| n).sum();
+    eprintln!(
+        "verus-counts: {} — {} files, {total} obligations",
+        if ok { "OK" } else { "FAIL" },
+        VERUS_OBLIGATIONS.len()
+    );
+    ok
 }
 
 /// Run a command inheriting stdio, returning whether it succeeded.

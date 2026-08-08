@@ -748,6 +748,33 @@ give `local_respect()`; §5e+§5f give `step_consistent()`") lived only in these
 was a bare `requires` never discharged for any concrete system. This is the adversarial review's
 **GAP-C** ("a paper composition").
 
+### ⑳ — and what nothing was checking about any of it
+
+⚠ **The Verus gate checked EXIT STATUS ONLY, per file, and that is blind to a proof being DELETED.**
+MEASURED, by removing `ni_theorem_b` — the confidentiality half of this document's headline — from
+`noninterference_instantiation.rs`:
+
+| | result |
+|---|---|
+| `verus --crate-type=lib …` (what the required job ran) | **exit 0**, `19 verified, 0 errors` — **GREEN** |
+| `cargo xtask verus-counts` (the gate ⑳ adds) | **exit 1** — *"19 verified, expected 20. A LOWER count means a proof was deleted or weakened"* |
+
+`xtask`'s `VERUS_OBLIGATIONS` pins the count per file (**117** across **15** files, measured on the
+pinned release) and checks **both directions**: every file in the table verifies with its expected
+count, *and* every `.rs` on disk is in the table — so deleting a whole file is red too, which a loop
+over the table alone would sail past.
+
+★ **The hand-tracked inventory had already drifted, which is the argument for the gate rather than a
+prediction of what it will catch.** `hv-verify/verus/README.md` listed
+`noninterference_instantiation.rs → 19` (it is **20**, since SMMU rung 4a added the device axis),
+`stage2_leaf_authorized.rs → 7` (it is **8**), and **13 of the 15** files — two had never been added.
+Those inline counts are gone; the table is the single derivation.
+
+⚠ **Two module docs were also stale in the direction of UNDERSTATING this result**, and are
+corrected: `step_consistency.rs` still called the read-closure "a bounded next arc" four arcs after
+②′ built it, and `noninterference_theorem.rs` gave no sign that the premise-free concrete chain
+exists. A reader landing on either was told the deepest claim in the repo is weaker than it is.
+
 `hv-verify/verus/noninterference_instantiation.rs` closes it. It defines a **concrete** transition
 system — a composite `Sys` state and *interpreted* `obs`/`step`/`actor`/`interferes` — and proves
 `local_respect()` **and** `step_consistent()` as **theorems** (`local_respect_holds`,

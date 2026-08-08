@@ -181,16 +181,15 @@ jobs:
           echo "$HOME/.local/verus/verus-x86-linux" >> "$GITHUB_PATH"
 
       # Verify every proof file in hv-verify/verus/ (RefcountMismatch preservation over
-      # arbitrary table size; the projection frame-lemma / grant-summation owner-locality; …).
-      # `set -e` fails the job if any single proof does not discharge.
-      - name: verus --crate-type=lib (Tier C ∀-N preservation proofs)
-        run: |
-          set -euo pipefail
-          for proof in hv-verify/verus/*.rs; do
-            echo "::group::verus $proof"
-            verus --crate-type=lib "$proof"
-            echo "::endgroup::"
-          done
+      # arbitrary table size; the projection frame-lemma / grant-summation owner-locality; …) AND
+      # check each discharges the number of obligations `xtask`'s VERUS_OBLIGATIONS expects.
+      #
+      # ⚠ Same gate as the REQUIRED `verus proofs (PR)` job in proofs.yml, deliberately — a weekly
+      # backstop weaker than the PR gate would let a deleted proof through on any path that skips
+      # the PR job. Exit status alone is blind to a deleted proof: MEASURED, removing `ni_theorem_b`
+      # leaves verus reporting `19 verified, 0 errors` and this step green.
+      - name: verus proofs + obligation counts (Tier C ∀-N, Tier D)
+        run: cargo xtask verus-counts
 
   # A bounded run of every fuzz target on nightly. No persisted corpus yet, so this is a
   # continuous smoke-fuzz (regression catcher), not a deep campaign — still far better than

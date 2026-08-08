@@ -253,14 +253,13 @@ jobs:
           unzip -q /tmp/verus.zip -d "$HOME/.local/verus"
           echo "$HOME/.local/verus/verus-x86-linux" >> "$GITHUB_PATH"
 
-      # Verify every proof file in hv-verify/verus/. `set -e` fails the job if any single proof does
-      # not discharge.
-      - name: verus --crate-type=lib (Tier C ∀-N preservation proofs)
+      # Verify every proof file in hv-verify/verus/ AND check each discharges the number of
+      # obligations `xtask`'s VERUS_OBLIGATIONS expects.
+      #
+      # ⚠ This replaced a bare `for proof in ...; do verus "$proof"; done`, and the reason is
+      # MEASURED, not supposed: exit status alone is blind to a proof being DELETED. Removing
+      # `ni_theorem_b` — the confidentiality half of the Tier-D headline — left verus reporting
+      # `19 verified, 0 errors` and this job GREEN. The count is what notices.
+      - name: verus proofs + obligation counts (Tier C ∀-N, Tier D)
         if: needs.changes.outputs.run == 'true'
-        run: |
-          set -euo pipefail
-          for proof in hv-verify/verus/*.rs; do
-            echo "::group::verus $proof"
-            verus --crate-type=lib "$proof"
-            echo "::endgroup::"
-          done
+        run: cargo xtask verus-counts
