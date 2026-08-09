@@ -2215,18 +2215,30 @@ fn help_covers_tasks() -> bool {
         eprintln!("help-covers-tasks: FAIL — the usage text is gone; this gate measures nothing.");
         return false;
     };
+    let Some(usage_region) = me.find("let ok = match task") else {
+        eprintln!("help-covers-tasks: FAIL — the dispatch `match` is gone; nothing to enumerate.");
+        return false;
+    };
     let help = &me[usage..me[usage..].find(");").map_or(me.len(), |e| usage + e)];
 
-    // The dispatch arms, taken from the file itself: `"name" => f(),` at one indent level.
+    // The dispatch arms, read from the dispatch `match` ITSELF — bounded to that region rather
+    // than scanned file-wide, so a string arm in some other `match` cannot masquerade as a task.
+    //
+    // ⚠⚠ **The first version required the arm body to contain `(`, and that silently dropped every
+    // BLOCK-BODIED arm** — `ci`, `qemu` and `qemu-linux-test`, which are `=> {`. It collected 16 of
+    // 19 and reported "all 16 tasks", so the gate ensuring the help names every task **could not
+    // see the three that matter most, `ci` among them**. An extraction that under-collects reports
+    // success over a smaller universe; that is #275's failure in its partial form, and a floor does
+    // not catch it because 16 clears any floor.
+    let region = me[usage_region..].split("_ =>").next().unwrap_or("");
     let mut tasks: Vec<&str> = Vec::new();
-    for line in me.lines() {
+    for line in region.lines() {
         let t = line.trim();
         let Some(rest) = t.strip_prefix('"') else {
             continue;
         };
         let Some(end) = rest.find('"') else { continue };
-        let after = rest[end + 1..].trim_start();
-        if after.starts_with("=>") && after.contains('(') && !rest[..end].is_empty() {
+        if rest[end + 1..].trim_start().starts_with("=>") && !rest[..end].is_empty() {
             tasks.push(&rest[..end]);
         }
     }
@@ -2234,7 +2246,7 @@ fn help_covers_tasks() -> bool {
     tasks.dedup();
 
     // ⚠⚠ THE FLOOR — #275 again. No arms parsed => nothing to check => vacuously green.
-    const MIN_TASKS: usize = 12;
+    const MIN_TASKS: usize = 18;
     if tasks.len() < MIN_TASKS {
         eprintln!(
             "help-covers-tasks: FAIL — only {} dispatch arms parsed, expected at least {MIN_TASKS}.",
@@ -2243,9 +2255,14 @@ fn help_covers_tasks() -> bool {
         return false;
     }
 
+    // ⚠⚠ **Bounded by spaces, NOT `contains`** — the same collision that made `doc_modules` need a
+    // leading `/`. `doc` is a substring of `doc-markers`, `qemu` of `qemu-test`, `ci` of nothing
+    // today but of anything tomorrow: a plain `contains` would report a DELETED help entry as
+    // present because a longer sibling still spells it. ★ I fixed this in `doc_modules` and did not
+    // carry the reasoning across until the diff read — the same defect, twice, in one commit.
     let mut ok = true;
     for t in &tasks {
-        if !help.contains(t) {
+        if !help.contains(&format!(" {t} ")) && !help.contains(&format!(" {t}\\n")) {
             eprintln!(
                 "help-covers-tasks: FAIL — `cargo xtask {t}` exists but the usage text never"
             );
