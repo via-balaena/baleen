@@ -312,6 +312,36 @@ fn submit(word0: u64, word1: u64) {
     let idx = u64::from(prod & ((1 << CMDQ_LOG2SIZE) - 1));
     mem_w64(CMDQ + idx * 16, word0);
     mem_w64(CMDQ + idx * 16 + 8, word1);
+
+    // ★★ **PUBLISH THE COMMAND BEFORE RINGING THE DOORBELL — and this is milestone 6's finding,
+    // not a detail.**
+    //
+    // The doorbell (`CMDQ_PROD`) is an MMIO register write: Device memory, always visible. The
+    // command *bytes* are DRAM, and once [`crate::mmu::enable`] has run they are written through a
+    // **cacheable** mapping while the SMMU fetches them non-cacheably (`CR1 = 0`). So without this
+    // the SMMU is told "there is a new command" and then reads whatever stale bytes that ring slot
+    // last held — with 16 slots, usually a real command from an earlier round, which is worse than
+    // garbage because it completes and `CMD_SYNC` reports success.
+    //
+    // ⚠ **This is why milestone 6 could not isolate the STE hazard at first.** The queue is how the
+    // experiment *steers* — `CMD_CFGI_STE` is what tells the SMMU to re-read a table — so the
+    // control mechanism was under the very hazard being measured. Memory held the new STE
+    // (`DC IVAC` + re-read proved it) and the SMMU still answered the old binding, because the
+    // invalidation it was supposed to act on never really arrived.
+    //
+    // ★ **The transferable part is for `hv-metal`, not this probe.** `smmu::publish()` cleans the
+    // tables it is about to point the SMMU at; under ledger 5's **A2** it must also publish **every
+    // command it submits**, and in this order — bytes, then maintenance, then doorbell. A `publish`
+    // that covers only the tables leaves the SMMU acting on stale commands.
+    //
+    // Harmless before the MMU is on: EL3 is then Device-nGnRnE, nothing is cached, and the
+    // maintenance has nothing to do.
+    // SAFETY: the command slot is inside the identity-mapped arena; cache maintenance has no
+    // architectural memory effect beyond coherency.
+    unsafe {
+        crate::mmu::clean_range(CMDQ + idx * 16, 16);
+    }
+
     // Wrap is the bit above the index, which the SMMU compares against CONS's.
     let next = (prod + 1) & ((1 << (CMDQ_LOG2SIZE + 1)) - 1);
     w32(CMDQ_PROD, next);
