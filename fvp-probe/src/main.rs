@@ -981,12 +981,24 @@ fn milestone_5() {
     /// Enough retries that "the monitor never tags" is not confused with ordinary contention.
     /// Nothing else is running on this core, so a correct implementation succeeds on attempt 1.
     const LIMIT: u32 = 10_000;
-    const SEED: u64 = 0x4141_4141_0000_0000;
+    /// ⚠ **DISTINCT seeds per arm, and this is not cosmetic.** With one shared seed both arms
+    /// read back the same value, so "the Device arm incremented the Device cell" and "the Device
+    /// arm accidentally incremented the CONTROL cell" are the same observation — and the outcome
+    /// this probe is most likely to report is the null one, which is exactly what a mis-addressed
+    /// probe also reports. Distinct seeds make the read-back name which cell was touched.
+    const WB_SEED: u64 = 0x4141_4141_0000_0000;
+    const DEV_SEED: u64 = 0xD2D2_D2D2_0000_0000;
+
+    // The descriptor is printed BEFORE the arms, so a reader can see what was programmed even if
+    // an arm never returns.
+    puts("@@ M5 dev-page descriptor = ");
+    puthex(mmu::dev_page_descriptor());
+    puts(" (AttrIndx = bits[4:2]; 0 = Device-nGnRnE)\n");
 
     // SAFETY: the MMU is on; both cells are mapped writable and 8-byte aligned, and neither
     // overlaps the image, its stack, or milestone 3/4's page.
     let (wb_ok, wb_att, wb_val) = unsafe {
-        mmu::poke64(mmu::ATOMIC_WB_PA, SEED);
+        mmu::poke64(mmu::ATOMIC_WB_PA, WB_SEED);
         puts("@@ M5 wb-arm  : LDXR/STXR on Normal-WB (the control) ...\n");
         let (ok, att) = mmu::bounded_exclusive_add(mmu::ATOMIC_WB_PA, LIMIT);
         (ok, att, mmu::peek64(mmu::ATOMIC_WB_PA))
@@ -1009,7 +1021,7 @@ fn milestone_5() {
     );
     // SAFETY: as above; `DEV_ALIAS_VA` is the sole mapping of `ATOMIC_DEV_PA`.
     let (dev_ok, dev_att, dev_val) = unsafe {
-        mmu::poke64(mmu::DEV_ALIAS_VA, SEED);
+        mmu::poke64(mmu::DEV_ALIAS_VA, DEV_SEED);
         let (ok, att) = mmu::bounded_exclusive_add(mmu::DEV_ALIAS_VA, LIMIT);
         (ok, att, mmu::peek64(mmu::DEV_ALIAS_VA))
     };
@@ -1024,13 +1036,19 @@ fn milestone_5() {
     // The verdict. The control is checked FIRST and can refuse to interpret the other arm —
     // without it, "the Device arm failed" is indistinguishable from "the probe cannot do an
     // exclusive at all" (design-lesson #211).
-    if !wb_ok || wb_val != SEED + 1 {
+    if !wb_ok || wb_val != WB_SEED + 1 {
         puts(
             "@@ M5-VERDICT CONTROL-FAILED: the exclusive did not work on NORMAL write-back \
              memory, so this probe measures nothing about Device memory. Read the wb-arm line \
              above before believing anything else here.\n",
         );
-    } else if dev_ok && dev_val == SEED + 1 {
+    } else if dev_val >> 32 != DEV_SEED >> 32 {
+        puts(
+            "@@ M5-VERDICT MIS-ADDRESSED: the Device arm read back a value that is not derived \
+             from its own seed, so it did not touch the cell it was supposed to. Nothing here is \
+             a statement about Device memory — fix the mapping first.\n",
+        );
+    } else if dev_ok && dev_val == DEV_SEED + 1 {
         puts(
             "@@ M5-VERDICT PERMITS: the model executed LDXR/STXR on Device-nGnRnE normally and \
              the value incremented. The AEM picks a benign CONSTRAINED-UNPREDICTABLE choice, so \

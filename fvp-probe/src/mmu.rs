@@ -175,6 +175,21 @@ pub unsafe fn enable() {
     }
 }
 
+/// The descriptor milestone 5's `Device-nGnRnE` page was **actually programmed with**.
+///
+/// Printed so the attribute index is in the TRANSCRIPT rather than asserted by this file's prose.
+/// Bits `[4:2]` are `AttrIndx`; `0` selects [`ATTR_DEVICE`] in `MAIR_EL3`. This still only proves
+/// what was *programmed* — a model is free to honour it or not — but it separates "the probe built
+/// the wrong descriptor" from "the model ignored the right one", which the arm's result alone
+/// cannot.
+pub fn dev_page_descriptor() -> u64 {
+    // SAFETY: single-core; `L3` is written once by `enable` and only read here.
+    unsafe {
+        let l3 = &raw const L3;
+        (*l3).0[1]
+    }
+}
+
 const fn tcr_el3() -> u64 {
     // 39-bit VA — enough to reach the 4 GiB alias at L1 entry 4.
     const T0SZ: u64 = 25;
