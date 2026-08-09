@@ -63,6 +63,7 @@
 //! rule that the full diff is read before every push, which is by now better evidence for that rule
 //! than any argument for it.
 
+mod layout;
 mod mmu;
 mod smmu;
 
@@ -925,6 +926,7 @@ extern "C" fn probe_main() -> ! {
     putdec(u64::from(idr1 & 0x3f));
     puts("\n");
 
+    report_layout();
     pcie_scan();
     milestone_2a();
     milestone_2b();
@@ -944,6 +946,35 @@ extern "C" fn probe_main() -> ! {
 
     puts("@@ FVPPROBE-END\n");
     semihosting_exit()
+}
+
+/// Print the probe's physical address map, and **force the compile-time disjointness check**.
+///
+/// ⚠ **The forcing is the load-bearing half.** `layout::ASSERT_DISJOINT` is a free `const`, and a
+/// `const` nothing names is dead code — the build warned exactly that when this module was added.
+/// Naming it here is what makes the overlap check part of the build rather than decoration
+/// (design-lesson #212: a correct fix never wired in is indistinguishable from no fix).
+///
+/// Printing the map costs nothing and follows this repo's standing preference for evidence over
+/// assertion: a reader of the transcript can see which addresses the run actually claimed, instead
+/// of trusting a table in a doc comment.
+fn report_layout() {
+    // Forces const-evaluation of both checks at build time.
+    let () = layout::ASSERT_DISJOINT;
+    let () = layout::ASSERT_TARGETS_ALIGNED;
+
+    puts("@@ layout: ");
+    putdec(layout::REGIONS.len() as u64);
+    puts(" regions, checked pairwise-disjoint at COMPILE time\n");
+    for (base, size, name) in layout::REGIONS {
+        puts("@@   ");
+        puthex_w(*base, 8);
+        puts(" +");
+        puthex_w(*size, 8);
+        puts("  ");
+        puts(name);
+        puts("\n");
+    }
 }
 
 /// ★★★ MILESTONE 5 — **ARE EL2's ATOMICS ARCHITECTURALLY DEFINED ON THE MEMORY TYPE IT USES?**

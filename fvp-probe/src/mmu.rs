@@ -104,9 +104,13 @@ static mut L1: Table = Table([0; ENTRIES]);
 static mut L2: Table = Table([0; ENTRIES]);
 static mut L3: Table = Table([0; ENTRIES]);
 
-/// The physical page the experiment is about — 16 MiB into DRAM, clear of the image (loaded at
-/// `0x8000_0000`) and its 64 KiB stack.
-pub const TEST_PA: u64 = 0x8100_0000;
+/// The physical page milestones 3 and 4 are about.
+///
+/// ⚠ **This used to be `0x8100_0000`, which is `smmu`'s `ARENA` — i.e. the stream table.** The cache
+/// experiment was seeding and "leaking secrets" onto the SMMU's own structures, and it never showed
+/// because the SMMU milestones all finish before the MMU is enabled. Now taken from
+/// [`crate::layout`], where the whole map is declared and checked disjoint at compile time.
+pub const TEST_PA: u64 = crate::layout::CACHE_CELL;
 
 /// The virtual address that reaches [`TEST_PA`] **non-cacheably**. 4 GiB, so it lands in L1 entry
 /// 4 — an index nothing else uses, which keeps every non-identity mapping in one subtree.
@@ -120,7 +124,9 @@ pub const NC_ALIAS_VA: u64 = 0x1_0000_0000;
 /// Milestone 5's **control** cell — reached identity, through the same Normal write-back 1 GiB
 /// block the image runs from. An exclusive here must simply work; if it does not, nothing the
 /// Device arm reports means anything.
-pub const ATOMIC_WB_PA: u64 = 0x8200_0000;
+///
+/// ⚠ **This used to be `0x8200_0000`, which is `smmu`'s `TARGET_A`.** See [`crate::layout`].
+pub const ATOMIC_WB_PA: u64 = crate::layout::ATOMIC_WB_CELL;
 
 /// Milestone 5's cell **under test**, reached ONLY through [`DEV_ALIAS_VA`] as `Device-nGnRnE`.
 ///
@@ -129,7 +135,10 @@ pub const ATOMIC_WB_PA: u64 = 0x8200_0000;
 /// Milestone 5's question is what an exclusive does to a *memory type*, so mapping one page with
 /// mismatched attributes would add a second architectural hazard (a mismatched-attribute alias is
 /// itself CONSTRAINED UNPREDICTABLE) and make a failure ambiguous between the two.
-pub const ATOMIC_DEV_PA: u64 = 0x8201_0000;
+///
+/// ⚠ **This used to be `0x8201_0000`, inside `smmu`'s `TARGET_A` 2 MiB block.** See
+/// [`crate::layout`].
+pub const ATOMIC_DEV_PA: u64 = crate::layout::ATOMIC_DEV_CELL;
 
 /// The virtual address that reaches [`ATOMIC_DEV_PA`] as **`Device-nGnRnE`** — L3 entry 1, the page
 /// after milestone 3's alias.
