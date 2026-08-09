@@ -6,7 +6,7 @@
 
 [package]
 name = "board-probe"
-description = "A standalone bare-metal AArch64 instrument that MEASURES the platform facts hv-metal currently assumes from QEMU `virt` — exception level, SCTLR_EL2's reset value, cache line size, ICH_VTR_EL2, granule/PA/VMID support. Run it on a candidate board BEFORE porting anything. NOT part of the hypervisor and NOT gated by CI — see README.md."
+description = "A standalone bare-metal AArch64 instrument that MEASURES the platform facts hv-metal currently assumes from QEMU `virt` — exception level, SCTLR_EL2's reset value, cache line size, ICH_VTR_EL2, granule/PA/VMID support. Run it on a candidate board BEFORE porting anything. NOT part of the hypervisor; its VERDICTS are local evidence and are not gated, though its HEALTH is (cargo xtask fvp-lint builds and lints it) — see README.md."
 publish = false
 version = "0.0.0"
 edition = "2021"
