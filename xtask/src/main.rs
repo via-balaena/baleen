@@ -103,6 +103,7 @@ fn main() {
         "fvp-lint" => fvp_lint(),
         "doc-markers" => doc_markers(),
         "doc-counts" => doc_counts(),
+        "doc-paths" => doc_paths(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -129,6 +130,8 @@ fn main() {
                 // file read) and it belongs beside `doc_markers`, which polices the same file for
                 // the same reason — prose quoting the gates must stay true to them.
                 && doc_counts()
+                // ⑳-h: every repo path the docs cite must still resolve.
+                && doc_paths()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -1859,6 +1862,144 @@ fn fvp_lint() -> bool {
                 &[("RUSTDOCFLAGS", "-D warnings")],
             )
     })
+}
+
+/// ★ ⑳-h — **every repo path the docs CITE must resolve.**
+///
+/// The prose in `docs/`, the root `README.md` and every crate README points at the code constantly —
+/// **235 backtick-quoted paths across 38 documents** when this was written — and a codebase that
+/// moves as much as this one does will eventually point at something that is not there.
+///
+/// A dead pointer is worse than no pointer: it reads as a discharged reference, so a reader stops
+/// looking (design-lesson #263, and #259's sharper form where the reference is live but names the
+/// wrong thing).
+///
+/// ⚠ The crate READMEs were missing from the first version, and they are the ones where that costs
+/// most: they are the front doors of the two INSTRUMENTS, whose whole value is that a reader can
+/// find and RUN them. A pointer that dies where someone is trying to *execute* something costs more
+/// than one in a design doc, not less.
+///
+/// ## The resolution rule, stated because it is the part that could be wrong
+///
+/// A citation passes if it resolves **either** from the repo root **or** relative to any one crate
+/// directory. The second arm is not laxity — it is how the docs actually cite `hv-metal`'s modules
+/// (`` `src/stage2.rs` `` inside a document that is entirely about `hv-metal`), and a checker that
+/// rejected those would have produced **eight false positives on its first run** and been switched
+/// off. ⚠ It was written naively first and did exactly that; the eight were real files.
+///
+/// What it therefore does NOT catch: a path that resolves under the *wrong* crate. That is a real
+/// gap, and it is the honest trade for a check that does not cry wolf — the same partial-guard
+/// bargain ㉔ made, stated rather than glossed.
+fn doc_paths() -> bool {
+    eprintln!("$ xtask doc-paths");
+
+    // Backtick-quoted tokens containing `/` and ending in an extension the repo uses. Deliberately
+    // NOT a general path matcher: prose is full of things that look like paths (`hv-core/src`,
+    // `0x40_1000_0000`), and a matcher that guessed would spend its life being tuned.
+    const EXTS: &[&str] = &[".rs", ".sh", ".toml", ".yml", ".ld", ".md", ".dts"];
+    let crates: Vec<String> = match std::fs::read_dir(".") {
+        Ok(d) => d
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.') && n != "target" && n != "docs")
+            .collect(),
+        Err(e) => {
+            eprintln!("doc-paths: cannot list the repo root: {e}");
+            return false;
+        }
+    };
+
+    // ⚠ The crate READMEs are here too, and they were the first thing this check missed. They cite
+    // paths as heavily as `docs/` does — `board-probe/README.md` alone names `link.ld`,
+    // `src/main.rs` and `qemu-probe.sh` — and they are the front door for the two INSTRUMENTS,
+    // whose whole value is that a reader can find and run them. A dead pointer there costs more
+    // than one in a design doc, not less.
+    let mut sources: Vec<String> = vec!["README.md".to_string()];
+    for c in &crates {
+        let readme = format!("{c}/README.md");
+        if std::path::Path::new(&readme).exists() {
+            sources.push(readme);
+        }
+    }
+    match std::fs::read_dir("docs") {
+        Ok(d) => sources.extend(
+            d.flatten()
+                .filter_map(|e| e.path().to_str().map(str::to_string))
+                .filter(|p| p.ends_with(".md")),
+        ),
+        Err(e) => {
+            eprintln!("doc-paths: cannot list docs/: {e}");
+            return false;
+        }
+    }
+
+    let mut cited = 0usize;
+    let mut dead: Vec<(String, String)> = Vec::new();
+    for src in &sources {
+        let Ok(text) = std::fs::read_to_string(src) else {
+            eprintln!("doc-paths: cannot read {src}");
+            return false;
+        };
+        for chunk in text.split('`').skip(1).step_by(2) {
+            if !chunk.contains('/') || !EXTS.iter().any(|e| chunk.ends_with(e)) {
+                continue;
+            }
+            // Reject anything with whitespace or markup: those are prose, not citations.
+            if chunk
+                .chars()
+                .any(|c| c.is_whitespace() || c == '*' || c == '(')
+            {
+                continue;
+            }
+            cited += 1;
+            let resolves = std::path::Path::new(chunk).exists()
+                || crates
+                    .iter()
+                    .any(|c| std::path::Path::new(c).join(chunk).exists());
+            if !resolves {
+                dead.push((src.clone(), chunk.to_string()));
+            }
+        }
+    }
+
+    // ⚠⚠ **THE FLOOR, and it exists because the naive version passed VACUOUSLY.** With the matcher
+    // broken — an edit to `EXTS`, a change in quoting convention — `cited` falls to 0, `dead` is
+    // empty, and this reported "0 cited repo paths … all resolve" with exit 0: a gate green on no
+    // evidence. Design-lesson #215, and the THIRD time this project has needed the same fix
+    // (`BOOT_TEST_CONFIGS` in ㉓, `EXPECTED_CASES` in its test suite, now this).
+    //
+    // ★ A FLOOR rather than an exact pin, deliberately. The citation count moves whenever anyone
+    // writes a sentence, so an exact number would fire constantly and be bumped without thought —
+    // the failure mode that makes a gate furniture. A floor fires only when the matcher has
+    // genuinely stopped working, which is the failure being guarded. Same reasoning as the
+    // proof-to-code ratio's two decimals: the granularity that catches the failure without crying
+    // wolf.
+    //
+    // ⚠ Lowering this is a claim that the docs cite substantially less code than they did, and
+    // belongs in a commit message.
+    const MIN_CITATIONS: usize = 150;
+    if cited < MIN_CITATIONS {
+        eprintln!(
+            "doc-paths: FAIL — only {cited} cited repo paths found, expected at least \
+             {MIN_CITATIONS}. The matcher has probably stopped matching (EXTS? quoting?), which \
+             would make every later check pass on nothing."
+        );
+        return false;
+    }
+
+    if dead.is_empty() {
+        eprintln!(
+            "doc-paths: OK — {cited} cited repo paths across {} docs all resolve",
+            sources.len()
+        );
+        return true;
+    }
+    for (src, c) in &dead {
+        eprintln!("doc-paths: FAIL — {src} cites `{c}`, which resolves neither from the repo root");
+        eprintln!("                  nor under any crate directory. Renamed, moved, or deleted?");
+    }
+    false
 }
 
 /// Non-comment, non-blank lines under `paths` — the measure the README's proof-to-code ratio uses.
