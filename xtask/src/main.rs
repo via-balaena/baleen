@@ -1780,6 +1780,21 @@ const METAL_LINT_CONFIGS: &[&[&str]] = &[
 /// The measurement instrument, and — like `hv-metal` — a crate **no `--workspace` gate reaches**.
 const FVP_DIR: &str = "fvp-probe";
 
+/// The board-bring-up instrument (⑯-hw phase 0): measures the platform facts `hv-metal` assumes
+/// from QEMU `virt`, so a port is scoped from numbers rather than from guesses. Same exclusion and
+/// the same reason as [`FVP_DIR`].
+const BOARD_PROBE_DIR: &str = "board-probe";
+
+/// Every standalone instrument crate this task keeps healthy.
+///
+/// ⚠ **`board-probe` was added here in the SAME commit that created it, and that ordering is the
+/// point.** `fvp-probe` existed for four milestones before anything built it — #176's finding was
+/// literally "the instrument A2 will rest on was built by nothing at all". Adding a second probe
+/// without adding it here would have reproduced that exactly, one crate along, which is
+/// design-lesson **#262**: extending a rule to a new case is the moment to re-derive it, because
+/// the person adding the case is the last one who will re-check the rule's base.
+const PROBE_DIRS: &[&str] = &[FVP_DIR, BOARD_PROBE_DIR];
+
 /// **Lint and build `fvp-probe`: `fmt --check` + `clippy -D warnings` + `build` + `doc -D warnings`.**
 ///
 /// ## Why this exists, and it is the same hole [`metal_lint`] was dug for
@@ -1807,20 +1822,38 @@ const FVP_DIR: &str = "fvp-probe";
 /// the probe and checks its health, and the milestone **verdicts remain local evidence**, exactly as
 /// they were. What becomes gated is that the code compiles, lints, formats, documents — and that its
 /// compile-time assertions are actually evaluated.
+///
+/// ⚠ **⑯-hw phase 0 generalised it over [`PROBE_DIRS`]** rather than one hardcoded crate, because
+/// `board-probe` arrived and a second instrument gated by nothing would have been #176's finding
+/// again, one crate along.
+///
+/// ★ It checks the probes' **health**, never their **results**. A probe's verdicts come from
+/// hardware or a model CI does not have, so those stay LOCAL evidence — what this guarantees is that
+/// the instrument still compiles, which is the thing that rots silently between uses.
+///
+/// ⚠ These crates are **workspace-excluded**, so `cargo xtask ci`'s workspace-scoped gates never
+/// touch them (design-lesson #173: excluding a crate to escape one gate silently excuses it from
+/// all of them). This task is the only thing holding them to any bar.
+///
+/// ★ It checks their **health**, never their **results**. A probe's verdicts come from hardware or
+/// a model CI does not have, so they are LOCAL evidence — what this can guarantee is that the
+/// instrument still compiles, which is the thing that rots silently between uses.
 fn fvp_lint() -> bool {
-    run_in(FVP_DIR, "cargo", &["fmt", "--", "--check"])
-        && run_in(
-            FVP_DIR,
-            "cargo",
-            &["clippy", "--release", "--", "-D", "warnings"],
-        )
-        && run_in(FVP_DIR, "cargo", &["build", "--release"])
-        && run_in_env(
-            FVP_DIR,
-            "cargo",
-            &["doc", "--no-deps"],
-            &[("RUSTDOCFLAGS", "-D warnings")],
-        )
+    PROBE_DIRS.iter().all(|dir| {
+        run_in(dir, "cargo", &["fmt", "--", "--check"])
+            && run_in(
+                dir,
+                "cargo",
+                &["clippy", "--release", "--", "-D", "warnings"],
+            )
+            && run_in(dir, "cargo", &["build", "--release"])
+            && run_in_env(
+                dir,
+                "cargo",
+                &["doc", "--no-deps"],
+                &[("RUSTDOCFLAGS", "-D warnings")],
+            )
+    })
 }
 
 /// How many `boot_and_check` invocations [`BOOT_TEST`] is expected to contain.
