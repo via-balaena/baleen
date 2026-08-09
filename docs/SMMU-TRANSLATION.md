@@ -213,8 +213,13 @@ platform, and the guard has to move somewhere the platform is not.
    `CMD_CFGI_STE` may already drop that stream's cached translations, or nothing is cached across
    these operations — and this repo has established neither.~~ **The first explanation is now
    REFUTED and the second is the live one — see §5a.** The command stays because the
-   architecture requires it when the tables a stream reaches change; it is **reasoned, not witnessed**,
-   the same standing as the cache maintenance in `scrub_frame`.
+   architecture requires it when the tables a stream reaches change; the mechanism is witnessed on
+   the AEM and this call site is not — the same standing as the cache maintenance in `scrub_frame`.
+   ⚠ **That cross-reference changed on 2026-08-08 and the analogy is worth following now**: both
+   used to be labelled *reasoned, not witnessed*, and when an instrument was finally pointed at
+   `scrub_frame` it did not merely confirm the reasoning — **it found the sequence defective**
+   (PR #168, `docs/ARC5-CONTENT-NON-INHERITANCE.md` correction 3). This entry has had no equivalent
+   pass.
 
 ## 5a. Both of those, measured on a platform that caches — Arm's AEM FVP (2026-08-07)
 
