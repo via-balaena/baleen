@@ -22,14 +22,35 @@
 //! | everything else | data, Device-nGnRnE | Device-nGnRnE, **RW + XN** |
 //!
 //! **So the only thing that changes is permissions.** `scrub_frame`'s confidentiality argument —
-//! which depends explicitly on EL2's stores being non-cacheable — is untouched, and `smmu::publish`'s
-//! barrier stays a no-op for the same reason it is today.
+//! which depends explicitly on EL2's stores being non-cacheable — is untouched by *this rung*, and
+//! `smmu::publish`'s barrier stays a no-op for the same reason it is today.
 //!
-//! ⚠ **Making EL2's memory CACHEABLE is a separate rung and is deliberately not done here.** That is
-//! where those arguments must be re-derived, and the re-derivation is unwitnessable on QEMU (which
-//! models no cache), so a wrong version and a right one look identical. `smmu::publish` names the
-//! hazard in its own words: the obligation *"would bite on silicon the moment the EL2 MMU brings
-//! normal cacheable mappings with it"*.
+//! ⚠ **"Untouched" is a claim about A1, not a clean bill of health, and the distinction stopped
+//! being academic three weeks later.** That argument was subsequently found **defective on its own
+//! terms** — `scrub_frame` zeroed and *then* issued `DC CIVAC`, which cleans before it invalidates
+//! and so republished the dead tenant's line over the zeroing (measured on Arm's AEM; fixed in
+//! #168). A1 did not cause it and does not fix it; the sentence above only ever said the former.
+//!
+//! ⚠ **Making EL2's memory CACHEABLE is a separate rung (ledger 5's A2) and is deliberately not done
+//! here.** That is where those arguments must be re-derived. `smmu::publish` names the hazard in its
+//! own words: the obligation *"would bite on silicon the moment the EL2 MMU brings normal cacheable
+//! mappings with it"*.
+//!
+//! ★★ **THIS USED TO ADD "and the re-derivation is unwitnessable on QEMU, so a wrong version and a
+//! right one look identical". THAT IS NOW REFUTED FOR BOTH RE-DERIVATIONS, AND `fvp-probe` IS THE
+//! INSTRUMENT** — the sentence was true of QEMU and taken to mean *no platform*, which is a
+//! different claim and nobody had tested it (design-lesson #238/#245):
+//!
+//! | A2 re-derivation | graded by | result |
+//! |---|---|---|
+//! | `scrub_frame` | `fvp-probe` m3 → **m4** | the SHIPPED order **published the secret** — a real defect, fixed in #168 |
+//! | `smmu::publish` | `fvp-probe` **m6** | a bare `dsb sy` left the SMMU reading the **stale** table; `DC CVAC` released it. And a second requirement nobody had recorded: **every submitted COMMAND must be published too**, silently, because `CMD_SYNC` succeeds either way |
+//!
+//! **What is still true** is the narrower sentence: *no gate this repository runs* can grade them.
+//! `fvp-probe` shares no source with `hv-metal` and `hv-metal` has never run on the FVP, so the
+//! mechanism is witnessed and the call site is not — the standing of honest-ledger 2(d). ⚠ **A2's
+//! ATOMICS half is a different matter and remains unwitnessable anywhere available**: m5 measured
+//! the AEM resolving `LDXR`/`STXR` on Device memory benignly, so silicon is its only oracle.
 //!
 //! ★ **`SCTLR_EL2.C` is left at 0 as a structural backstop.** With `C == 0` every data access to
 //! Normal memory is forced Non-cacheable *whatever the tables say*, so "nothing became cacheable"
