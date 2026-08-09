@@ -145,15 +145,29 @@ an own adversarial re-read + ELF disassembly, plus **three independent auditors 
 ### Real-hardware readiness — the EL2-MMU gap (named, deferred)
 
 The real-silicon auditor found a genuine gap the per-mechanism QEMU-vs-metal lines did not close, and
-it is worth stating plainly: **the hypervisor runs the entire time with its own stage-1 MMU off**
-(`SCTLR_EL2.M=0`, never enabled), so on real silicon *every EL2 data access is Device-nGnRnE*. That
+it is worth stating plainly: ~~**the hypervisor runs the entire time with its own stage-1 MMU off**
+(`SCTLR_EL2.M=0`, never enabled), so~~ on real silicon *every EL2 data access is Device-nGnRnE*. That
 has two consequences, **both invisible under QEMU/TCG** (which ignores memory type — the reason the
 gap was invisible):
+
+> ⚠ **CORRECTED 2026-08-09 — the struck clause is false since #156, and the CONCLUSION SURVIVES IT.**
+> Rung A1 turned EL2's stage-1 MMU **on**. But it deliberately reproduced the MMU-off attributes:
+> `hv-metal`'s `MAIR_EL2` attr 0 is `Device-nGnRnE` and `SCTLR_EL2.C` is left 0 as a structural
+> backstop. So the *memory type* is unchanged and **both consequences below still apply verbatim** —
+> which is exactly why this section must say why it survives rather than be quietly deleted. Read
+> "the MMU is off" as "EL2's data is Device-nGnRnE", which is the property that actually matters.
 
 1. **Atomics are architecturally UNPREDICTABLE.** `LDXR/STXR` (and LSE atomics) on Device memory are
    CONSTRAINED UNPREDICTABLE; the common outcome is a perpetually-failing `STXR` — a livelock. This
    reaches `IN_GUEST_HANDLER` (Arc 4) and, pre-existing since Arc 3, the bump allocator's
    `compare_exchange`.
+   ⚠ **The exposure is larger than those two sites — MEASURED 2026-08-09 on the shipped binary, not
+   read off this list.** `hv-metal`'s release build contains **244 exclusive-monitor instructions
+   and zero LSE** (`ldaxr`/`stlxr` throughout), from RMW atomics in **six** modules: `cell.rs`,
+   `heap.rs`, `linux.rs`, `pending.rs`, `guest.rs`, `role.rs`. Plain atomic loads and stores are
+   fine; it is the read-modify-writes that take the exclusive. **This entry named two sites and was
+   read for years as if that were the inventory** — declare how you enumerated, or a list is taken
+   for a census.
 2. **Caches are unmanaged.** Freshly-copied guest code is written (uncached) then fetched (cacheable)
    with no I-cache maintenance; the Stage-2 walker is programmed cacheable while its descriptors are
    written by uncached stores. On silicon either can read stale lines out of the UNKNOWN reset cache
@@ -177,6 +191,24 @@ precisely here *is* the diamond for it now**, in the exact spirit of `docs/TIER-
 full diamond the moment real silicon joins the oracle set. It does not block Arc 5 (fully diamondable
 on QEMU — Stage-2 fault semantics are the one thing QEMU is faithful about) since the EL2 stage-1 MMU
 is orthogonal to Arc 5's guest Stage-2 work.
+
+> ★★ **THAT "NO ORACLE" CLAIM HAS NOW BEEN TESTED, HALF AND HALF — 2026-08-09.** It was one sentence
+> covering two consequences, and the two came apart:
+>
+> | half | oracle? | evidence |
+> |---|---|---|
+> | **caches** | ✅ **REFUTED — an oracle exists** | `fvp-probe` m3: Arm's AEM withholds a dirty line from a non-cacheable observer and releases it only on `DC CVAC`. m4 then used it to find a real defect in `scrub_frame` (PR #168) |
+> | **atomics** | ❌ **UPHELD — but now MEASURED, not assumed** | `fvp-probe` m5: the AEM executes `LDXR`/`STXR` on `Device-nGnRnE` **normally** — succeeded first attempt, value incremented, against a descriptor printed as `AttrIndx 0` with a Normal-WB control succeeding alongside. It picks a benign CONSTRAINED-UNPREDICTABLE choice, so it cannot grade this hazard either |
+>
+> **So the deferral stands for atomics, on better grounds than it was made** — "the oracle set is
+> QEMU plus silicon" is now a measurement, and the AEM has been struck off it for this hazard
+> specifically. ⚠ Read m5 for what it says: *"this model does not exhibit the hazard"* is **not**
+> *"the hazard is benign"* — CONSTRAINED UNPREDICTABLE lets implementations differ, so a real core
+> may still livelock.
+>
+> ★ The reusable part: **"no oracle" is a claim about instruments you have looked for, and it decays
+> the moment someone builds one.** Half of this sentence was already false when it was quoted in a
+> next-move discussion; nobody had checked because it read as settled.
 
 ### Other below-bar items named by the review
 

@@ -255,3 +255,45 @@ controls:
 a non-coherent observer until it is cleaned — so a `scrub_frame` that omits its cache maintenance is
 **distinguishable here from one that does not**. That is the property A2 needs and QEMU cannot
 supply. It is *not* a claim that A2 is correct, or that this model matches any particular silicon.
+
+## Milestone 4 — the scrub defect
+
+**Not written up here**, because its result is load-bearing where the code is: see
+`hv-metal/src/stage2.rs::scrub_frame` for the measured four-sequence table and PR #168 for the fix.
+In one line: milestone 3 said the model *can* grade a scrub, and milestone 4 asked it to — the
+shipped `zero → civac` order **republished** the dead tenant's line over the zeroing.
+
+## Milestone 5 — **are EL2's atomics defined on the memory type it uses?** (2026-08-09)
+
+```
+@@ M5 dev-page descriptor = 0x0040000082010443  (PA 0x82010000, AttrIndx 0 = Device-nGnRnE, AF|RW|XN)
+@@ M5 wb-arm  : ok=1 attempts=1 value=0x4141414100000001   ← control: Normal-WB, succeeds first try
+@@ M5 dev-arm : ok=1 attempts=1 value=0xd2d2d2d200000001   ← Device-nGnRnE, ALSO succeeds first try
+@@ M5-VERDICT PERMITS
+```
+
+**The question.** `docs/ARC-4-TRAP-AND-SERVICE.md` records that EL2's data accesses are
+`Device-nGnRnE`, on which `LDXR`/`STXR` are **CONSTRAINED UNPREDICTABLE** and typically livelock.
+It deferred the fix with *"no oracle but real EL2 hardware."* Milestone 3 refuted that same sentence
+for caches, so it was worth asking here. **`hv-metal`'s release binary contains 244
+exclusive-monitor instructions and zero LSE**, across six modules — so this is not hypothetical
+code.
+
+**The answer is a REFUTATION, and it is the useful kind.** The AEM picks a benign
+CONSTRAINED-UNPREDICTABLE choice: the exclusive simply works. So **this instrument cannot grade the
+hazard**, QEMU cannot either, and A2's atomics half stays *reasoned, not witnessed* — with silicon
+as the only remaining oracle. Recording that is the point: the deferral in ARC-4 is now a
+**measured** limit rather than an assumed one.
+
+⚠ **Read the verdict for exactly what it says.** "This model does not exhibit the hazard" is **not**
+"the hazard is benign". CONSTRAINED UNPREDICTABLE means implementations may legitimately differ, so
+a real core is still free to livelock where the AEM does not.
+
+⚠ **What makes the null trustworthy, and it took a second run to get.** The first attempt seeded
+both arms with the *same* value, so both read back the same number — which is equally what a probe
+that ran the control twice would print. The arms now carry distinct seeds, the read-backs name which
+cell was touched, a `MIS-ADDRESSED` verdict fires before `PERMITS`, and the L3 descriptor is printed
+before either arm runs. A null result has to earn the right to be reported as a null.
+
+⚠ **This probe runs at EL3; `hv-metal` runs at EL2.** The hazard is a property of the memory *type*,
+not the exception level, so it transfers — but that is an argument, not a measurement.
