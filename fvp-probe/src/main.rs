@@ -1213,6 +1213,39 @@ fn milestone_6() {
     puts(if cmdq_alive { "yes" } else { "NO (timeout)" });
     puts("\n");
 
+    // ★★ THE SANITY CONTROL, and it is the one this milestone was missing.
+    //
+    // Two runs returned INCONCLUSIVE with the answer stuck at A through every phase. "The SMMU
+    // never saw the new binding" and "this experiment cannot reach B with caches on at all" produce
+    // that transcript equally, and nothing above separates them — the same shape of gap m5's shared
+    // seed had. So: do the rebind the fully-published way (write, clean, invalidate config, flush
+    // translations) and require B. If even this answers A, the defect is in the probe and every
+    // line above is uninterpretable (design-lesson #211).
+    smmu::bind(smmu::SID_A, smmu::L1_B, smmu::VMID_B);
+    // SAFETY: the arena is mapped identity Normal-WB; this is cache maintenance.
+    unsafe {
+        mmu::clean_range(layout::SMMU_ARENA, layout::SMMU_ARENA_SIZE);
+    }
+    smmu::invalidate_ste(smmu::SID_A);
+    smmu::invalidate_all();
+    let sanity = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    puts("@@ M6 sanity  (fully published, expect B) = ");
+    puts(which(&sanity));
+    puts("  pa=");
+    puthex(sanity.pa);
+    puts(if sanity.fault { " FAULT" } else { "" });
+    puts("\n");
+
+    if which(&sanity) != "B" {
+        puts(
+            "@@ M6-VERDICT PROBE-BROKEN: even a fully published rebind — written, cleaned, config \
+             and translations invalidated — did not move the answer to B. This milestone is not \
+             measuring publication; nothing above it is a statement about the model.\n",
+        );
+        puts("@@ M6-PUBLISH-END\n");
+        return;
+    }
+
     if !cmdq_alive {
         puts(
             "@@ M6-VERDICT CMDQ-STALE: the command queue timed out, so the invalidation never \
