@@ -2185,7 +2185,20 @@ fn doc_index() -> bool {
         return false;
     }
 
-    let mut ok = true;
+    // ★ The index STATES its own size, and that number is gated rather than deleted (#276). A
+    // reader deciding whether to open `docs/` is entitled to know how big it is; the fate that
+    // makes that safe is a check, not a promise. ⚠ I wrote this count as prose FIRST — "Thirty-three
+    // design documents" — in the rung whose own lesson is that a number is gated, deleted, or
+    // rotting. Writing the lesson down is not the same as applying it.
+    let claim = format!("**{} design documents.**", universe.len());
+    let mut ok = index.contains(&claim);
+    if !ok {
+        eprintln!("doc-index: FAIL — {INDEX} does not open by stating its own size as `{claim}`;");
+        eprintln!(
+            "                  docs/ holds {} documents. Update the sentence.",
+            universe.len()
+        );
+    }
     for doc in &universe {
         match classified.iter().filter(|c| *c == doc).count() {
             1 => {}
