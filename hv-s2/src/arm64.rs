@@ -57,11 +57,15 @@ pub const TABLE_ENTRIES: usize = 512;
 /// claim about two tables in the Arm ARM, not an observation about two numbers.
 ///
 /// So the memory type is declared **once**, here, and each regime derives its own bits from it.
-/// Neither consumer contains the literal any more, so they cannot drift apart; and the values are
-/// still pinned to their golden literals by `descriptor_constants_are_pinned`, so they cannot drift
-/// *together* either. **Both halves are needed** — a shared declaration alone would let one edit
-/// change both regimes silently, which is the failure a shared declaration is usually assumed to
-/// prevent (design-lesson #243).
+/// Neither consumer *derives from* a literal any more, so they cannot drift apart — and the values
+/// are pinned to their golden literals in **two independent places** so they cannot drift *together*
+/// either: `memory_types_are_pinned_in_both_regimes` below, and a `const` assertion on
+/// `MAIR_EL2_VALUE` over in `hv-metal`'s `mmu`, deliberately far from this declaration because a pin
+/// beside what it pins is one its author edits in the same commit.
+///
+/// **Both halves are needed.** A shared declaration alone would let one edit change both regimes at
+/// once, silently and consistently — which is precisely the failure a shared declaration is usually
+/// assumed to have removed (design-lesson #243).
 ///
 /// ## Provenance
 ///

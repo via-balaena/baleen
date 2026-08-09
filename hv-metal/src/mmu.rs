@@ -239,6 +239,7 @@ const _: () = assert!(
     MAIR_EL2_VALUE == 0x00ff_4400,
     "MAIR_EL2: attr0 Device-nGnRnE (0x00), attr1 Normal-NC (0x44), attr2 Normal-WB (0xff)"
 );
+
 /// `AttrIndx[4:2]` — the whole field, so [`coverage`] can compare a descriptor's memory type for
 /// EQUALITY rather than testing bits. `desc & ATTRIDX_NORMAL_WB != 0` would be satisfied by index 2
 /// *and* by indices 3, 6 and 7, which is how an attribute check turns into no check at all.
