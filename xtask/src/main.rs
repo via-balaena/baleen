@@ -1903,7 +1903,18 @@ fn doc_paths() -> bool {
         }
     };
 
+    // ⚠ The crate READMEs are here too, and they were the first thing this check missed. They cite
+    // paths as heavily as `docs/` does — `board-probe/README.md` alone names `link.ld`,
+    // `src/main.rs` and `qemu-probe.sh` — and they are the front door for the two INSTRUMENTS,
+    // whose whole value is that a reader can find and run them. A dead pointer there costs more
+    // than one in a design doc, not less.
     let mut sources: Vec<String> = vec!["README.md".to_string()];
+    for c in &crates {
+        let readme = format!("{c}/README.md");
+        if std::path::Path::new(&readme).exists() {
+            sources.push(readme);
+        }
+    }
     match std::fs::read_dir("docs") {
         Ok(d) => sources.extend(
             d.flatten()
