@@ -27,10 +27,21 @@ here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/detect-proof-changes.sh"
 failed=0
 
-# check <case-name> <expected-run> <env assignments...>
-# Runs the script with a fresh $GITHUB_OUTPUT and asserts the `run=` it wrote.
+# check <case-name> <expected-run> <expected-reason-substring> <env assignments...>
+# Runs the script with a fresh $GITHUB_OUTPUT and asserts BOTH the `run=` it wrote and WHICH branch
+# produced it.
+#
+# ★★ **The reason is checked because the outcome alone is OVER-DETERMINED, and a kill-probe proved
+# it.** Deleting the all-zero-base fail-safe left this suite fully green: an all-zero sha also fails
+# the `git cat-file` check one line below, so the *property* ("an unresolvable base runs the
+# proofs") held via a different mechanism and the deletion was invisible. A test that cannot tell
+# which guard fired cannot notice a guard being removed — the inputs-cannot-discriminate shape this
+# project keeps finding, here in its own checker (#215: verify your verifier).
+#
+# The redundancy itself is fine — defence in depth is why it is there. What was not fine was a suite
+# that could not see it.
 check() {
-  local name="$1" expect="$2"; shift 2
+  local name="$1" expect="$2" reason="$3"; shift 3
   local out; out="$(mktemp)"
   local log; log="$(mktemp)"
   # `env -i` is deliberately NOT used: the script needs PATH and git's environment. The variables
@@ -44,13 +55,22 @@ check() {
     return
   fi
   local got; got="$(grep -o 'run=[a-z]*' "$out" | tail -1)"
-  if [ "$got" = "run=$expect" ]; then
-    echo "OK   ($name) — $got"
-  else
+  if [ "$got" != "run=$expect" ]; then
     echo "FAIL ($name) — expected run=$expect, got '${got:-<nothing written>}'"
     sed 's/^/    /' "$log"
     failed=1
+    rm -f "$out" "$log"
+    return
   fi
+  if ! grep -qF "$reason" "$log"; then
+    echo "FAIL ($name) — got $got, but not via the expected branch (wanted '$reason')."
+    echo "                The RIGHT ANSWER FROM THE WRONG GUARD is how a deleted guard hides."
+    sed 's/^/    /' "$log"
+    failed=1
+    rm -f "$out" "$log"
+    return
+  fi
+  echo "OK   ($name) — $got via '$reason'"
   rm -f "$out" "$log"
 }
 
@@ -80,18 +100,27 @@ PROOFY="$(git rev-parse HEAD)"
 echo "detect-proof-changes-test: 7 cases"
 
 # ── The five uncertainties. Each MUST run the proofs. ───────────────────────────────────────────
-check "base sha empty"        true  env EVENT=pull_request PR_BASE=""      PR_HEAD="$PROOFY"
-check "base sha all-zero"     true  env EVENT=push PUSH_BASE=0000000000000000000000000000000000000000 PUSH_HEAD="$PROOFY"
-check "base not in history"   true  env EVENT=pull_request PR_BASE=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef PR_HEAD="$PROOFY"
-check "git diff fails"        true  env EVENT=pull_request PR_BASE="$BASE" PR_HEAD="not-a-rev"
+check "base sha empty"        true  "base sha unavailable" \
+  env EVENT=pull_request PR_BASE="" PR_HEAD="$PROOFY"
+# ⚠ Reaches the SAME message as the case above — `[ -z ]` and `[ = $ZERO ]` are one `if`. What the
+# reason check buys here is that neither can silently fall through to `git cat-file`'s guard.
+check "base sha all-zero"     true  "base sha unavailable" \
+  env EVENT=push PUSH_BASE=0000000000000000000000000000000000000000 PUSH_HEAD="$PROOFY"
+check "base not in history"   true  "not in history" \
+  env EVENT=pull_request PR_BASE=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef PR_HEAD="$PROOFY"
+check "git diff fails"        true  "git diff failed" \
+  env EVENT=pull_request PR_BASE="$BASE" PR_HEAD="not-a-rev"
 # ★ ㉓'s defect: `grep` exits 2 on a malformed pattern, which the old `if`/`else` read as "no match".
-check "PROOF_PATHS malformed" true  env EVENT=pull_request PR_BASE="$BASE" PR_HEAD="$DOCS_ONLY" PROOF_PATHS='^(hv-core/'
+check "PROOF_PATHS malformed" true  "grep failed" \
+  env EVENT=pull_request PR_BASE="$BASE" PR_HEAD="$DOCS_ONLY" PROOF_PATHS='^(hv-core/'
 
 # ── The positive control: a real proof-path change must run. ────────────────────────────────────
-check "proof path changed"    true  env EVENT=pull_request PR_BASE="$DOCS_ONLY" PR_HEAD="$PROOFY"
+check "proof path changed"    true  "proof-relevant paths changed" \
+  env EVENT=pull_request PR_BASE="$DOCS_ONLY" PR_HEAD="$PROOFY"
 
 # ── ★★ THE NEGATIVE CONTROL: without this, `run=true` on line 1 passes everything above. ────────
-check "docs-only skips"       false env EVENT=pull_request PR_BASE="$BASE" PR_HEAD="$DOCS_ONLY"
+check "docs-only skips"       false "no proof-relevant paths changed" \
+  env EVENT=pull_request PR_BASE="$BASE" PR_HEAD="$DOCS_ONLY"
 
 if [ "$failed" -ne 0 ]; then
   echo "detect-proof-changes-test: FAILED"
