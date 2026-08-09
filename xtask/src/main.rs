@@ -117,6 +117,7 @@ fn main() {
         "doc-paths" => doc_paths(),
         "doc-index" => doc_index(),
         "doc-tasks" => doc_tasks(),
+        "doc-modules" => doc_modules(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -147,8 +148,12 @@ fn main() {
                 && doc_paths()
                 // ⑳-i: the docs index must still describe the whole of docs/.
                 && doc_index()
+                // ⑳-l: a README enumerating a directory must enumerate all of it, and
+                // `--help` must name every task that exists.
                 // ⑳-k: every `cargo xtask` command the docs name must exist.
                 && doc_tasks()
+                && doc_modules()
+                && help_covers_tasks()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -168,8 +173,14 @@ fn main() {
                  test   run the workspace test suite\n  \
                  check  type-check the workspace\n  \
                  doc    build docs, denying broken links\n  \
-                 ci     fmt --check, clippy -D warnings, test, doc, then doc-markers\n  \
+                 ci     THE entry point — fmt, clippy -D warnings, test, doc, the deep sweeps,\n  \
+                 \u{20}      the proof-gate test, and every doc-* gate below\n  \
                  doc-markers  assert every boot marker a doc QUOTES is still one the gates check\n  \
+                 doc-counts   assert the README's corpus counts and proof-to-code ratio match the gates\n  \
+                 doc-paths    assert every path the docs cite, and every link they carry, resolves\n  \
+                 doc-index    assert docs/README.md classifies every document in docs/\n  \
+                 doc-tasks    assert every `cargo xtask` command the docs name really exists\n  \
+                 doc-modules  assert a README enumerating a directory enumerates ALL of it\n  \
                  verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  kani-harnesses  run the Kani corpus and assert it contains exactly the expected harnesses\n  \
                  sweeps assert the deep exhaustive-sweep corpus is exactly the expected one\n  \
@@ -179,7 +190,7 @@ fn main() {
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
                  qemu-linux-smmu just the SMMU boot configuration, run alone\n  \
                  metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)\n  \
-                 fvp-lint   the same bar for fvp-probe, the other workspace-excluded crate (build only — CI cannot run the AEM)",
+                 fvp-lint   the same bar for BOTH standalone probes (build only — CI cannot run the AEM or a board)",
                 METAL_LINT_CONFIGS.len()
             );
             exit(2);
@@ -2211,6 +2222,187 @@ fn doc_tasks() -> bool {
         eprintln!("                  A dead command fails in the reader's hands while they are checking a claim.");
     }
     false
+}
+
+/// ★ ⑳-l — **a README that ENUMERATES a directory must enumerate ALL of it.**
+///
+/// ⑳-j gated that every crate *has* a README. Both crates checked here **had one, and both were
+/// substantially false**: `hv-metal`'s layout table listed **7 of 28** modules under a status
+/// heading frozen three milestones back, and `hv-fuzz`'s target table listed **4 of 7** — `p2m`,
+/// `policy` and `sched` invisible since the day they were added.
+///
+/// ★★ **Existence is not truth**, and a partial table is worse than none: it reads as complete, so
+/// a reader stops looking (#263) and nobody notices the corpus drifting. The universe is the
+/// directory, enumerated from the filesystem (#279); the table is the README.
+///
+/// ⚠ **It does NOT check whether the description beside each entry is true.** Membership is what
+/// rots mechanically when a file is added; prose needs the diff read. Same bargain `doc-index`
+/// states.
+fn doc_modules() -> bool {
+    eprintln!("$ xtask doc-modules");
+
+    // (readme, directory, what its members are called, floor)
+    const ENUMERATED: &[(&str, &str, &str, usize)] = &[
+        ("hv-metal/README.md", "hv-metal/src", "module", 25),
+        (
+            "hv-fuzz/README.md",
+            "hv-fuzz/fuzz_targets",
+            "fuzz target",
+            6,
+        ),
+    ];
+
+    let mut ok = true;
+    for (readme, dir, kind, floor) in ENUMERATED {
+        let mut universe: Vec<String> = match std::fs::read_dir(dir) {
+            Ok(d) => d
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.ends_with(".rs"))
+                .collect(),
+            Err(e) => {
+                eprintln!("doc-modules: cannot list {dir}: {e}");
+                return false;
+            }
+        };
+        universe.sort();
+
+        // ⚠⚠ THE FLOOR — #275, sixth application. A broken `read_dir` empties the universe and
+        // every table is trivially complete: "all 0 modules listed", green on nothing.
+        if universe.len() < *floor {
+            eprintln!(
+                "doc-modules: FAIL — only {} .rs files in {dir}, expected at least {floor}. The \
+                 enumeration has probably broken, which would make the check below vacuous.",
+                universe.len()
+            );
+            return false;
+        }
+
+        let Ok(text) = std::fs::read_to_string(readme) else {
+            eprintln!("doc-modules: cannot read {readme}");
+            return false;
+        };
+
+        let mut missing = 0usize;
+        for m in &universe {
+            // Cited by any path form — `src/main.rs`, `hv-metal/src/main.rs`, a link target.
+            // This checks COVERAGE, not formatting: pinning a rendering would make it a style gate
+            // that fires on every rewrite.
+            //
+            // ⚠⚠ **The leading `/` is load-bearing and a bare filename match would be WRONG.**
+            // `pl011.rs` is a substring of `vpl011.rs`, so a README that lists only the emulated
+            // one would report the real driver as covered — a false pass on the exact pair most
+            // easily confused. Matching `/pl011.rs` cannot collide with `/vpl011.rs`.
+            let cited = text.contains(&format!("/{m}"));
+            if !cited {
+                eprintln!("doc-modules: FAIL — {readme} does not list the {kind} `{m}`.");
+                missing += 1;
+                ok = false;
+            }
+        }
+        if missing == 0 {
+            eprintln!(
+                "doc-modules: OK — {readme} lists all {} {kind}s in {dir}",
+                universe.len()
+            );
+        } else {
+            eprintln!(
+                "doc-modules:      ({missing} of {} missing — a table covering part of a directory \
+                 reads as complete.)",
+                universe.len()
+            );
+        }
+    }
+    ok
+}
+
+/// ★ ⑳-l — **`cargo xtask` with no argument must name every task that exists.**
+///
+/// The usage text is a hand-maintained list of a set the compiler already knows, which is the exact
+/// shape the comment above it warns about — *"a number a human retypes is a claim that drifts"*.
+/// It had drifted: **`doc-counts`, `doc-paths` and `doc-index` all existed and none was listed**, so
+/// the tool's own front door hid three of its gates.
+///
+/// ⚠ The check is **task ⇒ listed**, not the reverse: the usage text may describe a task in more
+/// words than its name, and demanding an exact rendering would make this a formatting gate.
+fn help_covers_tasks() -> bool {
+    eprintln!("$ xtask help-covers-tasks");
+
+    let Ok(me) = std::fs::read_to_string("xtask/src/main.rs") else {
+        eprintln!("help-covers-tasks: cannot read xtask/src/main.rs");
+        return false;
+    };
+    let Some(usage) = me.find("usage: cargo xtask <task>") else {
+        eprintln!("help-covers-tasks: FAIL — the usage text is gone; this gate measures nothing.");
+        return false;
+    };
+    let Some(usage_region) = me.find("let ok = match task") else {
+        eprintln!("help-covers-tasks: FAIL — the dispatch `match` is gone; nothing to enumerate.");
+        return false;
+    };
+    let help = &me[usage..me[usage..].find(");").map_or(me.len(), |e| usage + e)];
+
+    // The dispatch arms, read from the dispatch `match` ITSELF — bounded to that region rather
+    // than scanned file-wide, so a string arm in some other `match` cannot masquerade as a task.
+    //
+    // ⚠⚠ **The first version required the arm body to contain `(`, and that silently dropped every
+    // BLOCK-BODIED arm** — `ci`, `qemu` and `qemu-linux-test`, which are `=> {`. It collected 16 of
+    // 19 and reported "all 16 tasks", so the gate ensuring the help names every task **could not
+    // see the three that matter most, `ci` among them**. An extraction that under-collects reports
+    // success over a smaller universe; that is #275's failure in its partial form, and a floor does
+    // not catch it because 16 clears any floor.
+    let region = me[usage_region..].split("_ =>").next().unwrap_or("");
+    let mut tasks: Vec<&str> = Vec::new();
+    for line in region.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else { continue };
+        if rest[end + 1..].trim_start().starts_with("=>") && !rest[..end].is_empty() {
+            tasks.push(&rest[..end]);
+        }
+    }
+    tasks.sort_unstable();
+    tasks.dedup();
+
+    // ⚠⚠ THE FLOOR — #275 again. No arms parsed => nothing to check => vacuously green.
+    const MIN_TASKS: usize = 18;
+    if tasks.len() < MIN_TASKS {
+        eprintln!(
+            "help-covers-tasks: FAIL — only {} dispatch arms parsed, expected at least {MIN_TASKS}.",
+            tasks.len()
+        );
+        return false;
+    }
+
+    // ⚠⚠ **A task is LISTED only if it BEGINS a help line.** Two weaker rules were tried and both
+    // passed a deleted entry:
+    //   * `help.contains(t)` — `doc` is a substring of `doc-markers`, `qemu` of `qemu-test`.
+    //   * `help.contains(" {t} ")` — space-bounding still passed, because `doc-markers`' own
+    //     DESCRIPTION reads "assert every boot marker **a doc QUOTES** is still one the gates
+    //     check". A short task name that is also an English word appears in prose, so no
+    //     substring rule can work; the structure has to be used instead.
+    // ★ The first of those two is the collision `doc_modules` needed a leading `/` for, written
+    // again twenty lines later in the same commit. Fixing an instance is not learning the class.
+    let listed: Vec<&str> = help.lines().map(str::trim_start).collect();
+    let mut ok = true;
+    for t in &tasks {
+        if !listed.iter().any(|l| l.starts_with(&format!("{t} "))) {
+            eprintln!(
+                "help-covers-tasks: FAIL — `cargo xtask {t}` exists but the usage text never"
+            );
+            eprintln!("                   names it. A tool whose help hides its own gates.");
+            ok = false;
+        }
+    }
+    if ok {
+        eprintln!(
+            "help-covers-tasks: OK — the usage text names all {} tasks",
+            tasks.len()
+        );
+    }
+    ok
 }
 
 /// ★ ⑳-i — **`docs/README.md` must CLASSIFY every document in `docs/`, exactly once.**
