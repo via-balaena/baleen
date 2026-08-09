@@ -1945,6 +1945,31 @@ fn doc_paths() -> bool {
         }
     }
 
+    // ⚠⚠ **THE FLOOR, and it exists because the naive version passed VACUOUSLY.** With the matcher
+    // broken — an edit to `EXTS`, a change in quoting convention — `cited` falls to 0, `dead` is
+    // empty, and this reported "0 cited repo paths … all resolve" with exit 0: a gate green on no
+    // evidence. Design-lesson #215, and the THIRD time this project has needed the same fix
+    // (`BOOT_TEST_CONFIGS` in ㉓, `EXPECTED_CASES` in its test suite, now this).
+    //
+    // ★ A FLOOR rather than an exact pin, deliberately. The citation count moves whenever anyone
+    // writes a sentence, so an exact number would fire constantly and be bumped without thought —
+    // the failure mode that makes a gate furniture. A floor fires only when the matcher has
+    // genuinely stopped working, which is the failure being guarded. Same reasoning as the
+    // proof-to-code ratio's two decimals: the granularity that catches the failure without crying
+    // wolf.
+    //
+    // ⚠ Lowering this is a claim that the docs cite substantially less code than they did, and
+    // belongs in a commit message.
+    const MIN_CITATIONS: usize = 150;
+    if cited < MIN_CITATIONS {
+        eprintln!(
+            "doc-paths: FAIL — only {cited} cited repo paths found, expected at least \
+             {MIN_CITATIONS}. The matcher has probably stopped matching (EXTS? quoting?), which \
+             would make every later check pass on nothing."
+        );
+        return false;
+    }
+
     if dead.is_empty() {
         eprintln!(
             "doc-paths: OK — {cited} cited repo paths across {} docs all resolve",
