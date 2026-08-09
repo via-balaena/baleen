@@ -1608,9 +1608,16 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
 fn metal_build_linux(boot: LinuxBoot) -> bool {
     // ⑲-1: the SMMU boot needs the `smmu` feature as well — the machine has an SMMU, so the binary
     // must be the one that programs it. Every other boot is unchanged.
+    //
+    // ⑳-f — **the two strings are consts shared with [`METAL_LINT_CONFIGS`], not literals typed
+    // here.** They used to be typed in both places, which is the drift ⑭b found the hard way: the
+    // lint list carried `real-linux` (which nothing ships) while this function built
+    // `real-linux,selftest` (which the REQUIRED job boots), so the shipped binary was linted by
+    // nothing. Sharing the declaration makes that unspellable rather than checked — the same move
+    // ⑳-e made for memory types, and the reason the linux half of ⑳-f's invariant needs no parser.
     let features = match boot {
-        LinuxBoot::Smmu => "real-linux,selftest,smmu",
-        _ => "real-linux,selftest",
+        LinuxBoot::Smmu => LINUX_SMMU_FEATURES,
+        _ => LINUX_FEATURES,
     };
     run(
         "cargo",
@@ -1631,14 +1638,15 @@ fn metal_build_linux(boot: LinuxBoot) -> bool {
     )
 }
 
-/// Lint `hv-metal` — fmt `--check` + clippy `-D warnings` on the bare-metal target, for BOTH
-/// feature configs (default and `selftest`). `hv-metal` is excluded from the workspace, so
-/// `cargo xtask ci`'s workspace-scoped fmt/clippy never touch it — yet it is the ONE crate that
-/// carries `unsafe`, so it must stay under the same `-D warnings` bar. The `metal boot (QEMU)` CI
-/// job runs this so the gate is enforced (single source of truth: CI calls this task).
-///
-/// Note: no `--all-targets` — a `#![no_std] #![no_main]` bare-metal bin has no buildable `test`
-/// target (the test harness needs `std`), so `--all-targets` would fail to compile it.
+/// The feature set every real-Linux boot builds — `qemu-linux`, and the REQUIRED
+/// `real-linux boot (QEMU)` gate. Declared once and used by **both** [`metal_build_linux`] and
+/// [`METAL_LINT_CONFIGS`], so the config that ships and the config that is linted are the same
+/// token rather than two strings that agree today (⑳-f).
+const LINUX_FEATURES: &str = "real-linux,selftest";
+/// As [`LINUX_FEATURES`], for the SMMU boot (⑲-1) — the machine has an SMMU, so the binary must be
+/// the one that programs it.
+const LINUX_SMMU_FEATURES: &str = "real-linux,selftest,smmu";
+
 /// Every `hv-metal` feature configuration `metal-lint` covers — the ONE place the set is written
 /// down, so anything that wants to state its size (the usage text) derives the number instead of
 /// repeating it.
@@ -1657,19 +1665,40 @@ fn metal_build_linux(boot: LinuxBoot) -> bool {
 /// `linux.rs`?" and fixed it, but not "does the linted set EQUAL the shipped set?".
 ///
 /// Where the shipped set is defined, so a new config has an obvious home here:
-///   default · selftest · smmu   -> `hv-metal/boot-test.sh`'s `boot_and_check` invocations
-///   real-linux,selftest         -> `metal_build_linux` below
+///   the SIX `boot_and_check` invocations in `hv-metal/boot-test.sh` — default · selftest ·
+///     dma-control (default features) · smmu · **wx-probe** · **xn-probe**
+///   [`LINUX_FEATURES`] / [`LINUX_SMMU_FEATURES`] -> `metal_build_linux` below
 /// `real-linux` alone is kept too: it is seconds, and it covers the non-selftest path.
+///
+/// ⚠ **⑳-f — THAT LIST USED TO READ "default · selftest · smmu", AND THE UNDERCOUNT WAS THE BUG.**
+/// Naming three of the six sources made the two it omitted invisible: `wx-probe` and `xn-probe`
+/// were booted by a required gate and linted by nothing. **A pointer to where the truth lives is
+/// only as good as its own completeness** — which is why the shell half is now READ rather than
+/// summarised, by [`check_lint_configs_cover_booted`]. The linux half needs no reading: it is the
+/// same two consts this list and `metal_build_linux` both use.
 const METAL_LINT_CONFIGS: &[&[&str]] = &[
     &[],
     &["--features", "selftest"],
     &["--features", "smmu"],
     &["--features", "real-linux"],
-    &["--features", "real-linux,selftest"],
+    &["--features", LINUX_FEATURES],
+    // ⑳-f — **the two configs a REQUIRED gate boots and nothing linted.** `boot-test.sh` runs six
+    // `boot_and_check` invocations; this list carried four of their feature sets. `wx-probe` and
+    // `xn-probe` are built and booted by `metal boot (QEMU)` on every PR, and their code — the W^X
+    // and execute-never witnesses, which are the whole evidence for EL2 protecting its own memory —
+    // was covered by no clippy and no rustdoc, ever.
+    //
+    // ⚠ **The list already contained the WEAKER version of this case.** `spi-route-probe` and
+    // `no-irq-confinement` are here precisely because nothing boots them (see below, citing #212).
+    // The two configs a gate *does* boot were the ones missing. **Measured at the time of the fix:
+    // both are clean** — this closes a hole rather than fixing a defect, and the only reason anyone
+    // knew they were clean was a by-hand run, which is what "ungated" means.
+    &["--features", "wx-probe"],
+    &["--features", "xn-probe"],
     // ⑲-1 — the combined configuration. It is BUILT AND BOOTED by `qemu-linux-test`'s `Smmu` boot,
     // so by this list's own stated invariant it must be linted; before this rung it was a config
     // that compiled and that no gate ever looked at, which is ⑭b's finding one rung along.
-    &["--features", "real-linux,selftest,smmu"],
+    &["--features", LINUX_SMMU_FEATURES],
     // ⑱-6 — the removed-fix probe. It is NOT booted by any gate (it is run by hand and its result is
     // tabulated in `docs/VGIC-SPI-ROUTING.md`), so this is the list's invariant read the other way:
     // a probe nothing lints is a probe that can stop compiling without anyone finding out until the
@@ -1726,17 +1755,155 @@ fn fvp_lint() -> bool {
         )
 }
 
+/// How many `boot_and_check` invocations [`BOOT_TEST`] is expected to contain.
+///
+/// ⚠⚠ **This pin exists because a parser that matches NOTHING would otherwise pass vacuously**, and
+/// that is the failure mode of every checker this project has got wrong (design-lesson #215 — ask
+/// what a checker prints when there is nothing to check). If `boot-test.sh` is restructured, the
+/// helper renamed, or the quoting convention changed, [`booted_feature_sets`] finds zero configs,
+/// every one of them is trivially "covered", and the gate reports OK on no evidence. Pinning the
+/// count makes that case RED.
+///
+/// ⚠ Raising it is normal — a new boot is a new config. **Lowering it is a claim that a boot should
+/// no longer exist**, and belongs in the commit message.
+const BOOT_TEST_CONFIGS: usize = 6;
+
+/// Every feature set [`BOOT_TEST`] actually builds and boots, parsed out of the script.
+///
+/// ## The convention this relies on, stated rather than left to be inferred
+///
+/// Each boot is one line of the form `boot_and_check "<label>" "<feature args>" \`, where the
+/// feature field is either empty or `--features <list>`. That is the shape all six invocations have
+/// and the shape [`booted_feature_sets`] reads; a boot written any other way is not found, which is
+/// what [`BOOT_TEST_CONFIGS`] is there to catch.
+///
+/// **No regex, deliberately.** Six of this project's own checkers have been broken by clever
+/// matching — a `\bldxr` that could not match `ldaxr`, a pattern that broke on Rust's `\`-newline
+/// continuation, a literal matcher blind to `{}` placeholders. Plain `split` on quotes is duller
+/// and cannot be subtly wrong.
+///
+/// Returns the feature ARGUMENT VECTORS, in [`METAL_LINT_CONFIGS`]'s own shape, so the comparison
+/// below is between two things of the same type rather than between a string and a parse of it.
+fn booted_feature_sets(script: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for line in script.lines() {
+        let Some(rest) = line.strip_prefix("boot_and_check ") else {
+            continue;
+        };
+        // `"<label>" "<features>" \` — take the SECOND quoted field.
+        let mut fields = rest.split('"').skip(1).step_by(2);
+        let (Some(_label), Some(features)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        out.push(
+            features
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>(),
+        );
+    }
+    out
+}
+
+/// ★★ ⑳-f — **THE FIFTH EVIDENCE CORPUS, PINNED: the lint-config set.**
+///
+/// ⑳/⑳-b/⑳-c/⑳-d pinned the Kani harnesses, the Verus obligations, the deep sweeps and the boot
+/// markers. [`METAL_LINT_CONFIGS`] is the fifth body of evidence and was the only one with no
+/// universe check — over `hv-metal`, the one crate carrying `unsafe`, workspace-EXCLUDED, where this
+/// task is the **sole** thing holding it to `-D warnings`.
+///
+/// ⚠ **The list stated this invariant itself, twice, and did not hold it**: *"every feature config
+/// that has code of its own is here, or that config's code is linted by nobody"*, and *"every
+/// configuration that is BUILT AND BOOTED is linted"*. It named `boot-test.sh`'s `boot_and_check`
+/// invocations as where the shipped set is defined — and then listed three of the six. `wx-probe`
+/// and `xn-probe` were booted by the REQUIRED `metal boot (QEMU)` job and linted by nothing.
+///
+/// ★ **A prose invariant is a claim nothing checks (design-lesson #230); this is the same sentence
+/// as code.** It is deliberately a SUBSET test rather than an equality: [`METAL_LINT_CONFIGS`]
+/// legitimately holds configs no gate boots (`real-linux` alone; the two removed-fix probes, kept
+/// per #212), and demanding equality would force those out — losing coverage to satisfy a checker,
+/// which is the wrong direction.
+fn check_lint_configs_cover_booted() -> bool {
+    let script = match std::fs::read_to_string(BOOT_TEST) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("metal-lint: cannot read {BOOT_TEST}: {e}");
+            return false;
+        }
+    };
+    let booted = booted_feature_sets(&script);
+    if booted.len() != BOOT_TEST_CONFIGS {
+        eprintln!(
+            "metal-lint: FAIL — {BOOT_TEST} yielded {} boot config(s), expected \
+             {BOOT_TEST_CONFIGS}. Either a boot was added/removed (update BOOT_TEST_CONFIGS) or \
+             the `boot_and_check \"<label>\" \"<features>\"` convention changed and this check is \
+             now reading nothing.",
+            booted.len()
+        );
+        return false;
+    }
+    let linted: Vec<Vec<String>> = METAL_LINT_CONFIGS
+        .iter()
+        .map(|c| c.iter().map(|s| s.to_string()).collect())
+        .collect();
+    let mut ok = true;
+    for cfg in &booted {
+        if !linted.contains(cfg) {
+            let shown = if cfg.is_empty() {
+                "(default, no features)".to_string()
+            } else {
+                cfg.join(" ")
+            };
+            eprintln!(
+                "metal-lint: FAIL — {BOOT_TEST} boots `{shown}` and METAL_LINT_CONFIGS does not \
+                 cover it. A booted configuration linted by nobody is exactly what this list's own \
+                 invariant forbids."
+            );
+            ok = false;
+        }
+    }
+    if ok {
+        eprintln!(
+            "metal-lint: OK — all {BOOT_TEST_CONFIGS} booted configs are covered by {} lint configs",
+            METAL_LINT_CONFIGS.len()
+        );
+    }
+    ok
+}
+
+/// Lint `hv-metal` — fmt `--check`, then clippy `-D warnings` and rustdoc `-D warnings` on the
+/// bare-metal target for **every config in [`METAL_LINT_CONFIGS`]**. `hv-metal` is excluded from the
+/// workspace, so `cargo xtask ci`'s workspace-scoped fmt/clippy never touch it — yet it is the ONE
+/// crate that carries `unsafe`, so it must stay under the same `-D warnings` bar. The
+/// `metal boot (QEMU)` CI job runs this, so the gate is enforced (single source of truth: CI calls
+/// this task).
+///
+/// ⚠ **⑳-f — THIS DOC WAS ATTACHED TO [`METAL_LINT_CONFIGS`], NOT TO THIS FUNCTION, AND SAID "for
+/// BOTH feature configs (default and `selftest`)".** It described the task while sitting on the
+/// list, and by then the list held eight. Two separate small failures with one cause: text that
+/// documents a *behaviour* parked on a *constant* stops being read as a claim about the behaviour,
+/// so nobody updated it as the list grew from two entries to eight. Moved to the thing it describes,
+/// and it now names the list instead of counting it (the count is derived for the usage text, and
+/// prose that restates a number is a number that drifts).
+///
+/// Note: no `--all-targets` — a `#![no_std] #![no_main]` bare-metal bin has no buildable `test`
+/// target (the test harness needs `std`), so `--all-targets` would fail to compile it.
 fn metal_lint() -> bool {
-    run(
-        "cargo",
-        &[
-            "fmt",
-            "--manifest-path",
-            "hv-metal/Cargo.toml",
-            "--",
-            "--check",
-        ],
-    ) && METAL_LINT_CONFIGS.iter().all(|cfg| metal_clippy(cfg))
+    // The universe check runs FIRST, and before any cargo invocation: it is cheap, and a lint set
+    // that does not cover what ships is a fact worth learning before spending a minute proving the
+    // subset it does cover is clean.
+    check_lint_configs_cover_booted()
+        && run(
+            "cargo",
+            &[
+                "fmt",
+                "--manifest-path",
+                "hv-metal/Cargo.toml",
+                "--",
+                "--check",
+            ],
+        )
+        && METAL_LINT_CONFIGS.iter().all(|cfg| metal_clippy(cfg))
         && METAL_LINT_CONFIGS.iter().all(|cfg| metal_doc(cfg))
 }
 
