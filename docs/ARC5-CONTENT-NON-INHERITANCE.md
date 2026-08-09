@@ -151,7 +151,7 @@ this leak sat in the ledger with every boot green. The new witness reads first. 
    moved to the free, so the bytes are gone at the tenant boundary rather than sitting in DRAM until
    the next allocate. Scrubbed-at-rest is now what is delivered.
 2. ~~**The cache-maintenance half is reasoned, not witnessed**, and cannot be witnessed under TCG
-   (§4 row 4).~~ **RESTATED 2026-08-08 — the "cannot be witnessed" half was false, and believing it
+   (§4 row 4).~~ **RESTATED 2026-08-09 — the "cannot be witnessed" half was false, and believing it
    is what let the order stay wrong.** It cannot be witnessed *under TCG*; it was witnessed on Arm's
    AEM within an hour of anyone building the instrument (`fvp-probe` m3/m4, PRs #167/#168).
    **What remains true:** the witness is the probe's and not this code's — `hv-metal` has never run
