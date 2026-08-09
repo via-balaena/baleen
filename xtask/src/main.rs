@@ -1,6 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
+// ㉔ — **every private item carries a doc, and the reason is a defect the compiler could not see.**
+//
+// Inserting an item between a doc comment and the item it documents **silently re-parents the whole
+// block**: the new item inherits the doc, and the old one is left with none. That is valid Rust,
+// clippy's defaults are silent, and `git diff` renders it as clean ADDED lines with no signal that
+// the lines *above* changed meaning — so it is invisible in the artifact you review and legal in the
+// artifact you build. It happened twice in this file within one day (⑳-f re-parented
+// `METAL_LINT_CONFIGS`'s doc onto a `&str` const; ㉓ re-parented `deep_sweeps`'s onto
+// `proof_gate_test`), the second time four hours after the lesson about it was written, by its
+// author.
+//
+// ★ **The point is not the docs, it is that the DISPLACED item is left bare** — which this lint
+// sees. MEASURED, by re-creating ㉓'s defect: clippy goes from clean to
+// `error: missing documentation for a function`, on the exact function that lost its doc.
+//
+// ⚠ **A PARTIAL guard, and worth knowing which part.** It catches "item left with no doc at all",
+// which is both real instances. It does NOT catch a doc block split in the MIDDLE (the item keeps a
+// partial doc and stays silent), nor a doc attached to the wrong item when both have one — ⑳-f's
+// other defect, where the `metal_lint` task's description sat on `METAL_LINT_CONFIGS` for several
+// arcs. Reading the diff is still the only thing that catches those.
+//
+// ⚠ It also flags a `///` that describes a GROUP while sitting on the group's first member — which
+// is the same defect one size down, and is what five of this file's thirteen findings were.
+//
+// Why here and not everywhere: `hv-hal` (0 findings) and `hv-s2` (1) get it because enabling there
+// LOCKS IN a property already held. `hv-core` has 59 and is deliberately left out — that is real
+// documentation work, not filler, but it is larger than one rung.
+#![warn(clippy::missing_docs_in_private_items)]
+
 //! Baleen's task runner. Invoke as `cargo xtask <task>` (see `.cargo/config.toml`).
 //!
 //! Deliberately tiny for M1 — it grows to cover `hv-metal` cross-builds and the
@@ -136,8 +165,12 @@ fn main() {
     }
 }
 
-/// The bare-metal target `hv-metal` builds for, and the resulting binary path.
+/// The bare-metal target `hv-metal` builds for. `softfloat` because EL2 code must not use the FP
+/// registers it is responsible for saving and restoring on a guest's behalf.
 const METAL_TARGET: &str = "aarch64-unknown-none-softfloat";
+/// Where the release build of `hv-metal` lands — the binary every boot task hands to QEMU.
+/// ⚠ Spells [`METAL_TARGET`] out rather than interpolating it: `cargo`'s output path is `cargo`'s
+/// to choose, so this is an observation about where it puts things, not a derivation from the flag.
 const METAL_BIN: &str = "hv-metal/target/aarch64-unknown-none-softfloat/release/hv-metal";
 
 // ─── M5 Arc 5e: the real-Linux capstone runner ──────────────────────────────────────────────────
@@ -151,15 +184,31 @@ const METAL_BIN: &str = "hv-metal/target/aarch64-unknown-none-softfloat/release/
 // could reach and bound this last seam at RUN time instead — `LINUX_MARKERS` asserts hv-metal's
 // banner *with its addresses in it*, and the boot only reaches userspace if the initrd address
 // agrees too. That is a real check, not a comment: see the two entries in `LINUX_MARKERS`.
-const LINUX_KERNEL_ADDR: u64 = LINUX_RAM_BASE; // Image (also guest A's DTB /memory base)
-const LINUX_DTB_ADDR: u64 = 0x4b00_0000; // DTB (hv-metal points guest x0 here)
-const LINUX_INITRD_ADDR: u64 = 0x4c00_0000; // initramfs (DTB /chosen linux,initrd-*)
+/// Where guest A's kernel `Image` is deposited — and, being the base of its window, the `/memory`
+/// base its DTB advertises.
+const LINUX_KERNEL_ADDR: u64 = LINUX_RAM_BASE;
+/// Where guest A's compiled DTB is deposited. `hv-metal` points the guest's `x0` here on `eret`.
+const LINUX_DTB_ADDR: u64 = 0x4b00_0000;
+/// Where guest A's initramfs is deposited. The DTB's `/chosen linux,initrd-{start,end}` must name
+/// this, or the kernel boots and finds no userspace — which is why the marker list asserts a
+/// userspace line rather than only a kernel one.
+const LINUX_INITRD_ADDR: u64 = 0x4c00_0000;
 
-/// The guest-RAM window and the ③-b2a split, mirroring `hv-metal/src/stage2.rs`'s `LINUX_RAM_BASE`
-/// / `LINUX_RAM_SPLIT` / `LINUX_RAM_END`. Bound at RUN time by the banner marker, which prints all
-/// three — the same seam as the load addresses above, for the same reason.
+// The guest-RAM window and the ③-b2a split, mirroring `hv-metal/src/stage2.rs`'s `LINUX_RAM_BASE`
+// / `LINUX_RAM_SPLIT` / `LINUX_RAM_END`. Bound at RUN time by the banner marker, which prints all
+// three — the same seam as the load addresses above, for the same reason.
+//
+// ⚠ ㉔ — this was ONE `///` describing THREE constants, attached to the first. That is the same
+// defect the crate-level lint exists for, one size down: a doc on `LINUX_RAM_BASE` that is really
+// about the window. The group rationale is a `//` block now, and each constant says what IT is.
+
+/// The bottom of the guest-RAM window, and guest A's base.
 const LINUX_RAM_BASE: u64 = 0x4800_0000;
+/// The boundary between guest A's half and guest B's (③-b2a). Each guest owns exactly one side; the
+/// isolation witness is that neither can reach across it.
 const LINUX_RAM_SPLIT: u64 = 0x6400_0000;
+/// The top of the guest-RAM window. **Exactly the top of a 1024 MiB `-m`** — see [`QEMU_RAM_END`]
+/// and the `const` assertion below, which is what keeps that true.
 const LINUX_RAM_END: u64 = 0x8000_0000;
 
 /// **Guest B's blobs sit exactly this far above guest A's** (③-b2b-ii-b) — a derivation, not a
@@ -173,13 +222,19 @@ const NUM_GUESTS: u64 = 2;
 
 // ─── the RAM QEMU actually creates (③-b2b-ii-b: the headroom guard) ──────────────────────────────
 
-/// Where the `virt` machine puts DRAM, and how much the `-m` flag below asks for. **These two are
-/// what QEMU really creates**, and until ③-b2b-ii-b nothing compared them against the window the
-/// emitter hands out: `LINUX_RAM_END` is *exactly* the top of a 1024 MiB `-m`, so the fit is correct
-/// and has zero headroom. Grow the window and QEMU simply never creates the memory, which presents
-/// as a guest faulting on RAM its own DTB promised it.
+// Where the `virt` machine puts DRAM, and how much the `-m` flag below asks for. **These are what
+// QEMU really creates**, and until ③-b2b-ii-b nothing compared them against the window the emitter
+// hands out: `LINUX_RAM_END` is *exactly* the top of a 1024 MiB `-m`, so the fit is correct and has
+// ZERO headroom. Grow the window and QEMU simply never creates the memory, which presents as a guest
+// faulting on RAM its own DTB promised it.
+
+/// Where the `virt` machine places DRAM. A machine fact, not a choice of ours.
 const QEMU_RAM_BASE: u64 = 0x4000_0000;
+/// What the `-m` flag asks QEMU for, in MiB. **Changing this without changing [`LINUX_RAM_END`] is
+/// what the `const` assertion below catches** — in the direction that matters, since shrinking the
+/// machine silently un-creates memory the emitter still hands out.
 const QEMU_RAM_MIB: u64 = 1024;
+/// The top of the DRAM QEMU actually creates — derived, so it cannot drift from the `-m` above.
 const QEMU_RAM_END: u64 = QEMU_RAM_BASE + QEMU_RAM_MIB * 1024 * 1024;
 
 /// The emitter's whole guest-RAM window must exist in the machine `-m` builds. True or the build
@@ -281,11 +336,19 @@ fn peer_of(slot: u64) -> GuestLoad {
 }
 
 /// Where one guest's blobs go and what RAM window its DTB advertises.
+///
+/// One value per guest, derived from the slot — so guest B's addresses are guest A's plus
+/// [`GUEST_B_OFFSET`] rather than a second set of constants to keep in step.
 struct GuestLoad {
+    /// PA the kernel `Image` is loaded at.
     kernel: u64,
+    /// PA the compiled DTB is loaded at; the guest's `x0` on entry.
     dtb: u64,
+    /// PA the initramfs is loaded at; must match the DTB's `/chosen linux,initrd-*`.
     initrd: u64,
+    /// Base of the RAM window this guest's DTB advertises as `/memory`.
     ram_base: u64,
+    /// Size of that window. `ram_base + ram_size` must stay inside [`QEMU_RAM_END`].
     ram_size: u64,
 }
 
