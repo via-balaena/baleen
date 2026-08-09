@@ -1155,7 +1155,14 @@ fn milestone_6() {
     // cacheable mapping, then do exactly what `publish()` does today: a bare `dsb sy` and no
     // maintenance. `L1_B` already maps `TEST_IPA` to `TARGET_B` from `reset_all`, so the STE is the
     // ONLY thing that changes — one mechanism, not two.
-    smmu::bind_silently(smmu::SID_A, smmu::L1_B, smmu::VMID_A);
+    //
+    // ⚠ **`VMID_B`, and this milestone got it wrong the first time in exactly the way milestone 2b
+    // documents.** Rebinding under `VMID_A` returns INCONCLUSIVE — the answer stays `A` through
+    // every phase — because `CMD_CFGI_STE` invalidates the CONFIGURATION cache while a cached
+    // `(VMID_A, IPA)` TRANSLATION shadows the new STE. 2b hit this, repaired it the same way, and
+    // wrote down why; I reproduced the defect anyway. Under `VMID_B` no cached translation applies,
+    // so the answer depends on exactly one thing: whether the SMMU re-read the STE **from memory**.
+    smmu::bind_silently(smmu::SID_A, smmu::L1_B, smmu::VMID_B);
     // SAFETY: a barrier; this is `publish()`'s exact instruction.
     unsafe {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
@@ -1183,6 +1190,18 @@ fn milestone_6() {
     smmu::invalidate_ste(smmu::SID_A);
     smmu::invalidate_all();
     let after_clean = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+
+    // ⚠ **A CPU read, so it sees the CPU's own cache** — it cannot say what the SMMU sees, and is
+    // not evidence about publication. What it DOES separate is "the STE write never happened" from
+    // "the write happened and the SMMU did not see it", which the translation alone cannot, and
+    // which is precisely the ambiguity that made this milestone's first run uninterpretable.
+    puts("@@ M6 STE.S2TTB read back by the CPU = ");
+    puthex(smmu::ste_s2ttb(smmu::SID_A));
+    puts(" (L1_A=");
+    puthex(smmu::L1_A);
+    puts(" L1_B=");
+    puthex(smmu::L1_B);
+    puts(")\n");
 
     puts("@@ M6 control (cleaned, expect A) = ");
     puts(which(&control));
