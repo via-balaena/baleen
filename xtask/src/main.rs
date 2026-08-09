@@ -103,6 +103,7 @@ fn main() {
         "fvp-lint" => fvp_lint(),
         "doc-markers" => doc_markers(),
         "doc-counts" => doc_counts(),
+        "doc-paths" => doc_paths(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -129,6 +130,8 @@ fn main() {
                 // file read) and it belongs beside `doc_markers`, which polices the same file for
                 // the same reason — prose quoting the gates must stay true to them.
                 && doc_counts()
+                // ⑳-h: every repo path the docs cite must still resolve.
+                && doc_paths()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -1859,6 +1862,101 @@ fn fvp_lint() -> bool {
                 &[("RUSTDOCFLAGS", "-D warnings")],
             )
     })
+}
+
+/// ★ ⑳-h — **every repo path the docs CITE must resolve.**
+///
+/// The prose in `docs/` and `README.md` points at the code constantly — 212 backtick-quoted paths at
+/// the time this was written — and a codebase that moves as much as this one does will eventually
+/// point at something that is not there. A dead pointer is worse than no pointer: it reads as a
+/// discharged reference, so a reader stops looking (design-lesson #263, and #259's sharper form
+/// where the reference is live but names the wrong thing).
+///
+/// ## The resolution rule, stated because it is the part that could be wrong
+///
+/// A citation passes if it resolves **either** from the repo root **or** relative to any one crate
+/// directory. The second arm is not laxity — it is how the docs actually cite `hv-metal`'s modules
+/// (`` `src/stage2.rs` `` inside a document that is entirely about `hv-metal`), and a checker that
+/// rejected those would have produced **eight false positives on its first run** and been switched
+/// off. ⚠ It was written naively first and did exactly that; the eight were real files.
+///
+/// What it therefore does NOT catch: a path that resolves under the *wrong* crate. That is a real
+/// gap, and it is the honest trade for a check that does not cry wolf — the same partial-guard
+/// bargain ㉔ made, stated rather than glossed.
+fn doc_paths() -> bool {
+    eprintln!("$ xtask doc-paths");
+
+    // Backtick-quoted tokens containing `/` and ending in an extension the repo uses. Deliberately
+    // NOT a general path matcher: prose is full of things that look like paths (`hv-core/src`,
+    // `0x40_1000_0000`), and a matcher that guessed would spend its life being tuned.
+    const EXTS: &[&str] = &[".rs", ".sh", ".toml", ".yml", ".ld", ".md", ".dts"];
+    let crates: Vec<String> = match std::fs::read_dir(".") {
+        Ok(d) => d
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.') && n != "target" && n != "docs")
+            .collect(),
+        Err(e) => {
+            eprintln!("doc-paths: cannot list the repo root: {e}");
+            return false;
+        }
+    };
+
+    let mut sources: Vec<String> = vec!["README.md".to_string()];
+    match std::fs::read_dir("docs") {
+        Ok(d) => sources.extend(
+            d.flatten()
+                .filter_map(|e| e.path().to_str().map(str::to_string))
+                .filter(|p| p.ends_with(".md")),
+        ),
+        Err(e) => {
+            eprintln!("doc-paths: cannot list docs/: {e}");
+            return false;
+        }
+    }
+
+    let mut cited = 0usize;
+    let mut dead: Vec<(String, String)> = Vec::new();
+    for src in &sources {
+        let Ok(text) = std::fs::read_to_string(src) else {
+            eprintln!("doc-paths: cannot read {src}");
+            return false;
+        };
+        for chunk in text.split('`').skip(1).step_by(2) {
+            if !chunk.contains('/') || !EXTS.iter().any(|e| chunk.ends_with(e)) {
+                continue;
+            }
+            // Reject anything with whitespace or markup: those are prose, not citations.
+            if chunk
+                .chars()
+                .any(|c| c.is_whitespace() || c == '*' || c == '(')
+            {
+                continue;
+            }
+            cited += 1;
+            let resolves = std::path::Path::new(chunk).exists()
+                || crates
+                    .iter()
+                    .any(|c| std::path::Path::new(c).join(chunk).exists());
+            if !resolves {
+                dead.push((src.clone(), chunk.to_string()));
+            }
+        }
+    }
+
+    if dead.is_empty() {
+        eprintln!(
+            "doc-paths: OK — {cited} cited repo paths across {} docs all resolve",
+            sources.len()
+        );
+        return true;
+    }
+    for (src, c) in &dead {
+        eprintln!("doc-paths: FAIL — {src} cites `{c}`, which resolves neither from the repo root");
+        eprintln!("                  nor under any crate directory. Renamed, moved, or deleted?");
+    }
+    false
 }
 
 /// Non-comment, non-blank lines under `paths` — the measure the README's proof-to-code ratio uses.
