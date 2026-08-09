@@ -203,11 +203,35 @@ fn read64(off: u64) -> u64 {
 
 /// Publish CPU writes to the tables and queues before the SMMU is told to look at them.
 ///
-/// EL2 runs MMU-off, so its stores are Device-nGnRnE — already strongly ordered and uncached — and on
+/// EL2's data accesses are Device-nGnRnE — already strongly ordered and uncached — and on
 /// QEMU this barrier is a no-op. It is issued anyway because the ordering obligation is *real* (a
 /// second agent reads this memory without going through the CPU's caches at all) and would bite on
 /// silicon the moment the EL2 MMU brings normal cacheable mappings with it. `sy` rather than `ish`:
 /// the SMMU is not in the inner-shareable domain.
+///
+/// ★★ **THAT PREDICTION IS NOW MEASURED, AND THIS FUNCTION IS NOT SUFFICIENT FOR A2 — two ways.**
+/// `fvp-probe` milestone 6 reproduced this exact sequence on Arm's AEM with the CPU side cacheable
+/// and the SMMU fetching non-cacheably (`CR1 = 0`), which is what ledger 5's **A2** creates:
+///
+/// | after | SMMU answered |
+/// |---|---|
+/// | writing the STE, then a bare `dsb sy` — *this function* | the **STALE** binding |
+/// | `DC CVAC` over the structure | the new one |
+///
+/// 1. **The barrier must become maintenance.** A `dsb` orders accesses; it does not push a dirty
+///    line to the point of coherency the SMMU fetches from.
+/// 2. ⚠ **Every SUBMITTED COMMAND must be published too, and this half is silent when it is wrong.**
+///    The doorbell (`CMDQ_PROD`) is MMIO and always visible, but the command *bytes* are DRAM. Under
+///    A2 the SMMU is told "there is a new command" and reads whatever that ring slot last held —
+///    usually a real command from an earlier round, so **`CMD_SYNC` reports success while the
+///    invalidation never happened.** Milestone 6 spent three runs inside that failure: memory held
+///    the new STE (proved by `DC IVAC` + re-read) and the SMMU kept answering the old binding,
+///    because the `CMD_CFGI_STE` telling it to look again had itself gone stale.
+///    **Order: bytes → maintenance → doorbell.**
+///
+/// ⚠ **Not yet changed here, deliberately** — EL2's mappings are still Device-nGnRnE (`MAIR_EL2`
+/// attr 0, `SCTLR_EL2.C = 0`), so today's barrier is correct and maintenance would be dead code.
+/// This is A2's specification, written down before A2 exists.
 fn publish() {
     // SAFETY: a barrier instruction; no memory operand, no privilege requirement at EL2.
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
