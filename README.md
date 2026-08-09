@@ -39,7 +39,7 @@ Most of the value here is in **not** letting these blur into one word.
 
 | tier | what it covers | how |
 | --- | --- | --- |
-| **Proven** | the model's isolation invariants; the emitter refining the authorized leaf map | **113 Kani** harnesses (∀-values at bounded size) + **117 Verus** obligations (∀-N); ∀-address refinement over `hv-s2` |
+| **Proven** | the model's isolation invariants; the emitter refining the authorized leaf map | **136 Kani** harnesses (∀-values at bounded size) + **117 Verus** obligations (∀-N); ∀-address refinement over `hv-s2` |
 | **Demonstrated** | the metal | boot witnesses: two unmodified Alpine kernels, four vCPUs, one pCPU, **zero** Stage-2 device pass-through, each guest hardware-refused from its peer's RAM |
 | **Argued** | Tier-D non-interference's instantiation to concrete Baleen | prose composition over proved generic lemmas — declared, not hidden |
 
@@ -62,15 +62,19 @@ Most of the value here is in **not** letting these blur into one word.
 ### What it is not
 
 - **Not seL4-tier.** seL4 proves full functional correctness, at a proof-to-code ratio widely
-  reported around 20:1. Here it is **0.53:1** — 6 457 non-comment lines of Kani + Verus against
-  the 12 256 of `hv-core` + `hv-s2` + `hv-vdev` + `hv-part` — property-directed verification rather than
+  reported around 20:1. Here it is **0.53:1** — 6 635 non-comment lines of Kani + Verus against
+  the 12 406 of `hv-core` + `hv-s2` + `hv-vdev` + `hv-part` — property-directed verification rather than
   functional correctness. A deliberately different bargain: a weaker guarantee, far more
   cheaply, with the remainder enforced at runtime instead. If you need seL4's guarantee, the
   gap *is* the point. (Both sides of that ratio are non-comment lines; comparing
   comments-included proof against comments-excluded code would flatter it to ~0.8:1, which is
-  the sort of thing this repo's ledger exists to catch.)
+  the sort of thing this repo's ledger exists to catch.) ⚠ **The ratio is GATED**
+  (`cargo xtask doc-counts`) to two decimal places; the two component counts beside it are not,
+  because they move on every PR while the ratio does not — it was unchanged after +178 lines of
+  proof and +150 of code. A regression that matters — proof stalling while the model grows — moves
+  the second decimal long before anyone would notice by eye.
 - **Not feature-comparable to Xen.** No toolstack, no migration, no PV drivers, one board.
-- **Not production.** EL2 runs MMU-off and single-CPU; `hv-metal` is ~11k lines that are **not**
+- **Not production.** Single-CPU, one board, QEMU-only; `hv-metal` is the bare-metal half and is **not**
   a Kani target, and every rung's docs say so where it matters.
 
 The open question this is really poking at: **how much assurance can you get for a small
@@ -79,31 +83,50 @@ is what makes that answerable instead of rhetorical.
 
 ## Workspace
 
-Sizes are non-comment lines, measured at the commit this table was last updated. The
-comment ratio is high on purpose: much of this project's argument lives in doc comments,
-and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot rot.
+The comment ratio across this workspace is high on purpose: much of the project's argument
+lives in doc comments, which is why `cargo xtask metal-lint` builds `hv-metal`'s rustdoc and
+`clippy::missing_docs_in_private_items` is enabled on `hv-hal`, `hv-s2` and `xtask` — the
+argument has to be as maintained as the code it explains.
 
-| crate       | what it is                                                                              | lines  |
-| ----------- | --------------------------------------------------------------------------------------- | ------ |
-| `hv-hal`    | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`)         | **18** |
-| `hv-core`   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, **zero external crates** (one path dep on `hv-hal`), and zero `unsafe` — measured, though not yet `#![forbid(unsafe_code)]`-enforced | 7 615 |
-| `hv-s2`     | the Stage-2 page-table **emitter**, and the ∀-address refinement theorems over it        | 3 594  |
-| `hv-vdev`   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets | 860 |
-| `hv-part`   | how the machine is **partitioned among guest slots** — windows, frame runs, domain ids — as `const fn` arithmetic proven ∀-partition rather than `const assert!`-ed at the two slots this board deploys | 187 |
-| `hv-sim`    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps | 5 653 |
-| `hv-verify` | the **Kani harnesses** (134) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) | 2 897 + 3 560 |
-| `hv-metal`  | the bare-metal AArch64/EL2 binary: boot, Stage-2, vGIC, the real-Linux path              | 10 946 |
-| `hv-fuzz`   | `cargo-fuzz` targets against the hypercall dispatcher                                    | —      |
-| `fvp-probe` | ⚠ **not part of the hypervisor** — a standalone bare-metal instrument for Arm's AEM FVP, measuring SMMU translation caching and invalidation (honest-ledger 2(d)), which QEMU structurally cannot show. Workspace-excluded and deliberately **not** CI-gated; see its README | 214 |
-| `xtask`     | build/test automation and the gate corpora (`cargo xtask <task>`)                        | 828    |
+> ⚠ **This table used to carry a `lines` column and it has been deleted, not corrected.** Every
+> entry had drifted — `hv-metal` was stated at 10 946 against a real 24 974, `fvp-probe` at 214
+> against 2 556 — so a reader got a **2×–12× wrong** impression of the project's scale from the one
+> place they would look first. Nothing could check it, and a gate on line counts would fire on every
+> PR that adds code: a gate with no signal, which trains people to bump a number to make CI green.
+> Per design-lesson #230, **a claim in prose that nothing checks is deleted rather than corrected.**
+> What the table is *for* is what each crate does; `tokei`/`wc -l` will tell you the size, freshly.
 
-`hv-metal` and `hv-fuzz` are **excluded from the workspace** — not "until their
-milestones", but permanently: `hv-metal` builds for `aarch64-unknown-none-softfloat` and
-cannot link for the host, and `hv-fuzz` needs nightly/libFuzzer at build time. Both are
-built and gated out-of-band (`cargo xtask qemu-test`, `qemu-linux-test`, and the
-`fuzz targets build` job). ⚠ The exclusion has a cost worth knowing: an excluded crate
-loses **every** `--workspace` gate, not just the one it was excluded for — `hv-metal`'s
-rustdoc was built by nothing at all until that was noticed and fixed.
+| crate       | what it is |
+| ----------- | ----------- |
+| `hv-hal`    | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`) |
+| `hv-core`   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, **zero external crates** (one path dep on `hv-hal`), and zero `unsafe` — `#![forbid(unsafe_code)]`-enforced |
+| `hv-s2`     | the Stage-2 page-table **emitter**, and the ∀-address refinement theorems over it |
+| `hv-vdev`   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets |
+| `hv-part`   | how the machine is **partitioned among guest slots** — windows, frame runs, domain ids — as `const fn` arithmetic proven ∀-partition rather than `const assert!`-ed at the two slots this board deploys |
+| `hv-sim`    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps |
+| `hv-verify` | the **Kani harnesses** (136) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) |
+| `hv-metal`  | the bare-metal AArch64/EL2 binary: boot, its own stage-1 MMU, Stage-2, vGIC, the real-Linux path |
+| `hv-fuzz`   | `cargo-fuzz` targets against the hypercall dispatcher |
+| `fvp-probe` | ⚠ **not part of the hypervisor** — a standalone bare-metal instrument for Arm's AEM FVP, measuring SMMU translation caching and invalidation (honest-ledger 2(d)), which QEMU structurally cannot show. Workspace-excluded; its **verdicts** are deliberately ungated, its **health** is (`cargo xtask fvp-lint`) |
+| `board-probe` | ⚠ **not part of the hypervisor** — measures the platform facts `hv-metal` assumes from QEMU `virt` (exception level, `SCTLR_EL2` at reset, cache line, `ICH_VTR_EL2`, granule/PA/VMID), so a future port is scoped from numbers rather than guesses. Self-tests on QEMU; see its README |
+| `xtask`     | build/test automation and the gate corpora (`cargo xtask <task>`) |
+
+**Four** crates are **excluded from the workspace** — not "until their milestones", but
+permanently. `hv-metal`, `fvp-probe` and `board-probe` build for
+`aarch64-unknown-none-softfloat` and cannot link for the host; `hv-fuzz` needs
+nightly/libFuzzer at build time. All four are built and gated out-of-band
+(`cargo xtask qemu-test`, `qemu-linux-test`, `metal-lint`, `fvp-lint`, and the
+`fuzz targets build` job).
+
+⚠ **The exclusion has a cost worth knowing: an excluded crate loses *every* `--workspace`
+gate, not just the one it was excluded for.** `hv-metal`'s rustdoc was built by nothing at
+all until that was noticed; `fvp-probe` was built by nothing at all for four milestones
+after that, which is the same finding one crate along. `board-probe` was therefore added to
+`cargo xtask fvp-lint` **in the commit that created it**.
+
+> ⚠ This paragraph said "`hv-metal` and `hv-fuzz`" while there were four. An inventory that
+> undercounts its own subject makes the ones it omits invisible — and the omitted two are
+> precisely the crates whose exclusion cost had already bitten twice.
 
 **Direction (2026-08-07).** The long-run build target is unchanged: a greenfield **"slim
 Qubes"** — GPU-accelerated near-metal disposables, an offline vault, direct device attach and
@@ -199,7 +222,7 @@ one-line regression test, not a Heisenbug.
 Beyond sampling, `hv-sim::enumerate` does **bounded model checking**: for a tiny
 configuration it breadth-first visits *every* reachable state and checks the
 integrated invariant at each — a proof, not a sample, that no reachable state can
-break it. CI runs shallow per-seam sweeps in seconds; the deep on-demand sweeps
+break it. CI runs shallow per-seam sweeps in seconds; the **23** deep exhaustive sweeps
 (`cargo test --release -- --ignored`) have exhaustively cleared **millions** of
 distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 828k states —
 including cross-domain foreign *node* shares, not just leaves; the whole integrated

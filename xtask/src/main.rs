@@ -102,6 +102,7 @@ fn main() {
         "metal-lint" => metal_lint(),
         "fvp-lint" => fvp_lint(),
         "doc-markers" => doc_markers(),
+        "doc-counts" => doc_counts(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -124,6 +125,10 @@ fn main() {
                 // ⑳-c: ~2 s (`--list` enumerates without running), so unlike the proof-corpus
                 // inventories this one is affordable on EVERY PR rather than only proof-path ones.
                 && deep_sweeps()
+                // ⑳-g: the counts the README states about the five evidence corpora. Cheap (one
+                // file read) and it belongs beside `doc_markers`, which polices the same file for
+                // the same reason — prose quoting the gates must stay true to them.
+                && doc_counts()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -1854,6 +1859,161 @@ fn fvp_lint() -> bool {
                 &[("RUSTDOCFLAGS", "-D warnings")],
             )
     })
+}
+
+/// Non-comment, non-blank lines under `paths` — the measure the README's proof-to-code ratio uses.
+///
+/// "Non-comment" means the line, trimmed, does not begin `//` (which covers `///` and `//!`).
+/// Block comments are not stripped: the crates counted here use line comments throughout, and a
+/// stripper that half-works would be worse than one whose rule is stated. ⚠ The absolute numbers are
+/// NOT gated for the reason [`doc_counts`] gives about lines of code — only the RATIO is, because
+/// that is the claim.
+fn noncomment_lines(paths: &[&str]) -> usize {
+    fn walk(dir: &std::path::Path, total: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                walk(&p, total);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    *total += t
+                        .lines()
+                        .filter(|l| {
+                            let t = l.trim();
+                            !t.is_empty() && !t.starts_with("//")
+                        })
+                        .count();
+                }
+            }
+        }
+    }
+    let mut total = 0;
+    for p in paths {
+        walk(std::path::Path::new(p), &mut total);
+    }
+    total
+}
+
+/// ★★ ⑳-g — **THE SIXTH CORPUS: the counts the README STATES about the other five.**
+///
+/// ⑳ pinned the Kani harnesses, ⑳-b the Verus obligations, ⑳-c the deep sweeps, ⑳-d the boot
+/// markers, ⑳-f the lint configs. Each is a body of evidence with something that fails when the SET
+/// changes. **This pins the numbers the front door quotes about them** — which nothing checked.
+///
+/// ⚠ **What it found on its first run, and the pattern is the point.** `README.md` stated the Kani
+/// total **twice, differently** — `**113 Kani**` in the evidence-tier table and `(134)` in the crate
+/// table — against a real **136**. In the same file Verus was stated twice and was **right both
+/// times**. ★ The difference is not care: **Verus's number had not moved and Kani's had.** With
+/// nothing checking, correctness is a function of whether the underlying number happened to stay
+/// still, which is not a property to rely on.
+///
+/// ★ This is `xtask`'s own rule about `METAL_LINT_CONFIGS.len()` applied to prose: *a number a human
+/// retypes is a claim that drifts; a number derived from the list it describes cannot.* A README
+/// cannot interpolate, so the next best thing is to make a wrong one **fail a gate**.
+///
+/// ## What it deliberately does NOT check
+///
+/// **Lines of code.** The crate table carried them and they were wrong by up to **12×**
+/// (`fvp-probe` stated at 214 against 2 556). They are **deleted, not gated** — per design-lesson
+/// #230 a claim in prose that nothing checks is removed rather than corrected, and a gate on line
+/// counts would fire on every PR that adds code: a gate with no signal, which trains people to bump
+/// a number to make CI green.
+///
+/// **Per-doc counts** like `docs/SMMU-DEVICE-PATH-COMPOSITION.md`'s "59 harnesses" are claims about a
+/// SUBSET, so they are outside this check by construction — named here because a reader grepping for
+/// `harnesses` will find them and wonder.
+///
+/// ⚠⚠ **THE BOOT MARKERS, and the reason is a bug this function had on its first run.** It summed
+/// [`MARKER_CORPUS`]'s arrays to **113** and called that "the boot-marker corpus" — but
+/// [`doc_markers`] reports **214**, because the corpus is those arrays PLUS `boot-test.sh`'s 177
+/// lines, deduplicated. Three defensible numbers (113 array entries · 177 script lines · 214 deduped
+/// distinct), and I picked one and labelled it the total. ★ **A SUBSET presented as a TOTAL, in the
+/// gate written to stop exactly that** (#155). Markers are excluded rather than checked against a
+/// number I would have to choose; [`doc_markers`] already polices the marker TEXT, which is the half
+/// that silently rots.
+fn doc_counts() -> bool {
+    eprintln!("$ xtask doc-counts");
+
+    let readme = match std::fs::read_to_string("README.md") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("doc-counts: cannot read README.md: {e}");
+            return false;
+        }
+    };
+
+    // Each entry is the phrase the README must contain — matched LITERALLY and INCLUDING the number,
+    // so a drifted count simply is not found. Same shape `doc_markers` uses for quoted boot markers.
+    let verus_total: u32 = VERUS_OBLIGATIONS.iter().map(|(_, n)| n).sum();
+    let claims: &[(String, &str)] = &[
+        (
+            format!("**{} Kani**", KANI_HARNESSES.len()),
+            "the Kani harness corpus",
+        ),
+        (
+            format!("**{verus_total} Verus**"),
+            "the Verus obligation corpus",
+        ),
+        (
+            format!("the **Kani harnesses** ({})", KANI_HARNESSES.len()),
+            "the crate table's Kani count",
+        ),
+        (
+            format!("({verus_total} obligations)"),
+            "the crate table's Verus count",
+        ),
+        (
+            format!("**{}** deep exhaustive sweeps", DEEP_SWEEPS.len()),
+            "the deep-sweep corpus",
+        ),
+    ];
+
+    // ★ THE PROOF-TO-CODE RATIO — the README's headline comparison against seL4, and the one number
+    // in this file that answers the question the whole project poses ("how much assurance for what
+    // fraction of a full-verification budget"). It is checked to TWO DECIMAL PLACES, which is the
+    // right precision for two reasons found by measuring: the components drift constantly (+178
+    // proof / +150 code since the figure was written) while the ratio did **not move at all**, so an
+    // exact-component gate would fire on every PR for no signal — and a real regression, proof
+    // stalling while code grows, moves the second decimal long before anyone would notice by eye.
+    let proof = noncomment_lines(&["hv-verify/src", "hv-verify/verus"]);
+    let code = noncomment_lines(&["hv-core/src", "hv-s2/src", "hv-vdev/src", "hv-part/src"]);
+    #[allow(clippy::cast_precision_loss)] // line counts are far below f64's exact-integer range
+    let ratio = proof as f64 / code as f64;
+    let ratio_phrase = format!("**{ratio:.2}:1**");
+    let mut ok = readme.contains(ratio_phrase.as_str());
+    if ok {
+        eprintln!("doc-counts: OK   — the proof-to-code ratio: README says `{ratio_phrase}` ({proof} proof / {code} code)");
+    } else {
+        eprintln!("doc-counts: FAIL — the proof-to-code ratio: measured {ratio:.2}:1 ({proof} non-comment");
+        eprintln!(
+            "                   lines of proof over {code} of model+emitter), but README.md does"
+        );
+        eprintln!("                   not contain `{ratio_phrase}`.");
+    }
+
+    for (phrase, what) in claims {
+        if readme.contains(phrase.as_str()) {
+            eprintln!("doc-counts: OK   — {what}: README says `{phrase}`");
+        } else {
+            eprintln!("doc-counts: FAIL — {what}: README does not contain `{phrase}`.");
+            eprintln!("                   Either the count changed and the README did not, or the");
+            eprintln!("                   wording moved. Both are the same fix: make them agree.");
+            ok = false;
+        }
+    }
+    if ok {
+        eprintln!(
+            "doc-counts: OK — {} corpus counts + the proof-to-code ratio match the gates",
+            claims.len()
+        );
+    }
+    ok
 }
 
 /// How many `boot_and_check` invocations [`BOOT_TEST`] is expected to contain.
