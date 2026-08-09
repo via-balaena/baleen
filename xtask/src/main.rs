@@ -1938,6 +1938,7 @@ fn doc_paths() -> bool {
     // `src/main.rs` and `qemu-probe.sh` — and they are the front door for the two INSTRUMENTS,
     // whose whole value is that a reader can find and run them. A dead pointer there costs more
     // than one in a design doc, not less.
+
     // ⑳-j — **every crate must have a front door.** Eight of twelve had none, and they were the
     // eight that carry the claim: a reader arriving at `hv-part` got a directory. The universe is
     // "a directory with a `Cargo.toml`", enumerated here rather than read off the workspace
