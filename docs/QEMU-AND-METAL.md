@@ -129,7 +129,7 @@ microarchitectural. It does **not** model:
 
    | behaviour | QEMU | Arm's AEM (MEASURED, `fvp-probe` m5) | consequence |
    |---|---|---|---|
-   | `LDXR`/`STXR` to **`Device-nGnRnE`** memory — CONSTRAINED UNPREDICTABLE, the documented common outcome being a perpetually-failing `STXR` (livelock) | works | **works** — succeeded on attempt 1 and incremented, with a Normal-WB control succeeding alongside and the page's descriptor printed as `AttrIndx 0` | EL2 runs `Device-nGnRnE` (`MAIR_EL2` attr 0, `SCTLR_EL2.C = 0`) and its release binary holds **244 exclusive-monitor instructions, zero LSE**, across six modules. **Neither platform can grade this.** Ledger 5's A2 closes it; until then it is *reasoned, not witnessed*, with **silicon as the only remaining oracle** |
+   | `LDXR`/`STXR` to **`Device-nGnRnE`** memory — CONSTRAINED UNPREDICTABLE, the documented common outcome being a perpetually-failing `STXR` (livelock) | works | **works** — succeeded on attempt 1 and incremented, with a Normal-WB control succeeding alongside and the page's descriptor printed as `AttrIndx 0` | EL2 runs `Device-nGnRnE` (`MAIR_EL2` attr 0, `SCTLR_EL2.C = 0`) and its release binary holds **40 exclusive-monitor instructions, zero LSE**, across six modules (identical at all nine feature configs; the 244 first published here was read off an uncontrolled `target/` artifact and reproduces nowhere). **Neither platform can grade this.** Ledger 5's A2 closes it; until then it is *reasoned, not witnessed*, with **silicon as the only remaining oracle** |
 
    ⚠ **The distinction from category 5 matters when you plan work.** A category-5 row tells you to
    go find a stricter platform — which is how ledger 2(d) and the `scrub_frame` defect were settled

@@ -162,12 +162,18 @@ gap was invisible):
    reaches `IN_GUEST_HANDLER` (Arc 4) and, pre-existing since Arc 3, the bump allocator's
    `compare_exchange`.
    ⚠ **The exposure is larger than those two sites — MEASURED 2026-08-09 on the shipped binary, not
-   read off this list.** `hv-metal`'s release build contains **244 exclusive-monitor instructions
-   and zero LSE** (`ldaxr`/`stlxr` throughout), from RMW atomics in **six** modules: `cell.rs`,
-   `heap.rs`, `linux.rs`, `pending.rs`, `guest.rs`, `role.rs`. Plain atomic loads and stores are
-   fine; it is the read-modify-writes that take the exclusive. **This entry named two sites and was
-   read for years as if that were the inventory** — declare how you enumerated, or a list is taken
-   for a census.
+   read off this list.** `hv-metal`'s release build contains **40 exclusive-monitor instructions and
+   zero LSE** (`ldaxr`/`stlxr` throughout) — **identical across all nine feature configurations**,
+   with 100 in the default debug build — from RMW atomics in **six** modules: `cell.rs`, `heap.rs`,
+   `linux.rs`, `pending.rs`, `guest.rs`, `role.rs`. Plain atomic loads and stores are fine; it is the
+   read-modify-writes that take the exclusive. **This entry named two sites and was read for years as
+   if that were the inventory** — declare how you enumerated, or a list is taken for a census.
+   ⚠ **This first shipped saying 244, and the correction is the more useful half.** That figure was
+   read off whatever binary happened to be sitting in `target/` — which `boot-test.sh` overwrites
+   across seven configurations — and then reported as *the* shipped binary. It reproduces at no
+   configuration. The count above was taken by **building each config explicitly and measuring each**,
+   which is also what shows the number does not vary. Reading a number off a build directory is
+   sampling an artifact whose provenance you did not control (design-lesson #155).
 2. **Caches are unmanaged.** Freshly-copied guest code is written (uncached) then fetched (cacheable)
    with no I-cache maintenance; the Stage-2 walker is programmed cacheable while its descriptors are
    written by uncached stores. On silicon either can read stale lines out of the UNKNOWN reset cache

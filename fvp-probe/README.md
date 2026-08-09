@@ -275,9 +275,10 @@ shipped `zero → civac` order **republished** the dead tenant's line over the z
 **The question.** `docs/ARC-4-TRAP-AND-SERVICE.md` records that EL2's data accesses are
 `Device-nGnRnE`, on which `LDXR`/`STXR` are **CONSTRAINED UNPREDICTABLE** and typically livelock.
 It deferred the fix with *"no oracle but real EL2 hardware."* Milestone 3 refuted that same sentence
-for caches, so it was worth asking here. **`hv-metal`'s release binary contains 244
-exclusive-monitor instructions and zero LSE**, across six modules — so this is not hypothetical
-code.
+for caches, so it was worth asking here. **`hv-metal`'s release binary contains 40
+exclusive-monitor instructions and zero LSE**, across six modules and identical at all nine feature
+configs — so this is not hypothetical code. (First published as 244, which was read off whatever
+`target/` held and reproduces at no config; corrected by the composite review.)
 
 **The answer is a REFUTATION, and it is the useful kind.** The AEM picks a benign
 CONSTRAINED-UNPREDICTABLE choice: the exclusive simply works. So **this instrument cannot grade the

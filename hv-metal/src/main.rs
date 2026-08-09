@@ -240,7 +240,17 @@ pub extern "C" fn rust_main() -> ! {
     //
     // ⚠ Reported, not asserted, and deliberately so. This crate cites "EL2 runs MMU-off" as a
     // premise in ~50 places, but MMU-off is not one behaviour: `M == 0` fixes DATA accesses at
-    // Device-nGnRnE, while INSTRUCTION accesses follow `SCTLR_EL2.I`. An identity mapping that
+    // Device-nGnRnE, while INSTRUCTION accesses follow `SCTLR_EL2.I`.
+    //
+    // ⚠⚠ **SINCE #156 THE PHRASE IS LITERALLY FALSE AND STILL SUBSTANTIALLY TRUE, so read it as
+    // shorthand rather than as a state claim.** EL2's MMU is ON; what A1 preserved is the
+    // ADDRESSING (identity, so `VA == PA`) and the ATTRIBUTES (`MAIR_EL2` attr 0 is Device-nGnRnE,
+    // `SCTLR_EL2.C` left 0). Of the ~50 premises, 44 are addressing claims that an identity mapping
+    // keeps true verbatim — see `mmu`'s module doc, which is where that accounting lives.
+    // **This comment is the pointer**: the sites themselves say "MMU-off" with nothing nearby to
+    // explain why that is still sound, and one of them (`docs/ARC-4`) was misread as a state claim
+    // on 2026-08-09 for exactly that reason (design-lesson #184 — a rule nobody can find from where
+    // it applies is not a rule). An identity mapping that
     // changes "nothing but permissions" therefore has to match whatever `I` actually is here — and
     // nobody had read it. Every other platform fact this project checked this week turned out to
     // differ from the assumption it carried, so this one gets measured before code depends on it.
