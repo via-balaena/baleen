@@ -71,7 +71,7 @@ pub const TABLE_ENTRIES: usize = 512;
 /// `MAIR_ELx` attribute byte: `0x00` Device-nGnRnE, high nibble outer / low nibble inner, `0b0100`
 /// Non-cacheable and `0b1111` Write-Back Read-Allocate Write-Allocate non-transient. `SH[9:8]`
 /// carries the **same encoding at the same bit positions in both regimes**, which is why
-/// [`MemoryType::shareability_bits`] is one function rather than a matched pair.
+/// [`memtype::MemoryType::shareability_bits`] is one function rather than a matched pair.
 ///
 /// ## ⛔ What deliberately does NOT use this
 ///
@@ -1810,7 +1810,11 @@ mod tests {
 
         // Stage-1: the `MAIR_ELx` attribute byte. `hv-metal`'s `mmu` builds `MAIR_EL2` from these.
         assert_eq!(NormalWbIsh.stage1_mair_byte(), 0xff, "outer+inner WB RA/WA");
-        assert_eq!(NormalNonCacheable.stage1_mair_byte(), 0x44, "outer+inner NC");
+        assert_eq!(
+            NormalNonCacheable.stage1_mair_byte(),
+            0x44,
+            "outer+inner NC"
+        );
         assert_eq!(DeviceNGnRnE.stage1_mair_byte(), 0x00, "Device-nGnRnE");
 
         // Stage-2: `MemAttr[5:2] | SH[9:8]`, a DIFFERENT encoding of the same three types — which is
@@ -1830,7 +1834,11 @@ mod tests {
         // `SH[9:8]` is one function serving both regimes, so pin it on its own too: a change that
         // moved shareability out of `NormalWbIsh` would break A2's coherency argument at EL2 while
         // leaving every Stage-2 assertion above intact.
-        assert_eq!(NormalWbIsh.shareability_bits(), 0b11 << 8, "Inner Shareable");
+        assert_eq!(
+            NormalWbIsh.shareability_bits(),
+            0b11 << 8,
+            "Inner Shareable"
+        );
         assert_eq!(NormalNonCacheable.shareability_bits(), 0);
         assert_eq!(DeviceNGnRnE.shareability_bits(), 0);
 
