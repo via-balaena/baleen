@@ -95,6 +95,11 @@ fn main() {
                 // ⑳-c: ~2 s (`--list` enumerates without running), so unlike the proof-corpus
                 // inventories this one is affordable on EVERY PR rather than only proof-path ones.
                 && deep_sweeps()
+                // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
+                // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
+                // a test that runs only when proof paths change cannot catch the defect where the
+                // decision to run wrongly says "nothing changed". Seconds; a temp repo and 7 cases.
+                && proof_gate_test()
         }
         other => {
             if !other.is_empty() {
@@ -2465,6 +2470,25 @@ const DEEP_SWEEPS: &[&str] = &[
 /// `--ignored --list` enumerates the ignored tests and exits; the sweeps themselves peak at several
 /// GB each and are `deep-verify`'s job. Both directions, for the reason `verus_counts` gives: a loop
 /// over the table alone would not notice a sweep that exists and is unnamed.
+/// ★★ ㉓ — **run the fail-safe suite for the checker that decides whether the PROOF gate runs.**
+///
+/// `.github/scripts/detect-proof-changes.sh` writes the `run=` output that gates `kani proofs (PR)`
+/// and `verus proofs (PR)` — two REQUIRED contexts standing in front of 136 harnesses and 117
+/// obligations. **A false `run=false` lets a proof-breaking PR merge green**, which is exactly what
+/// ① (#76) made those gates required to prevent.
+///
+/// ⚠ **It runs from `ci`, NOT from `proofs.yml`, and that placement is the whole point.** A test
+/// that only ran when proof paths changed could not catch the defect where the decision *"proof
+/// paths did not change"* is itself wrong — the failing case would skip its own test. Here it is
+/// inside `fmt · clippy · test`, which is required on every PR.
+///
+/// Shelling out rather than reimplementing: the script is what CI executes, so testing anything
+/// else would be testing a copy (the same reason `qemu-test` runs `boot-test.sh` rather than
+/// re-encoding the boot).
+fn proof_gate_test() -> bool {
+    run("bash", &[".github/scripts/detect-proof-changes-test.sh"])
+}
+
 fn deep_sweeps() -> bool {
     let Some((success, text)) = run_capturing(
         "cargo",
