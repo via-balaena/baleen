@@ -264,6 +264,31 @@ pub unsafe fn clean_line(va: u64) {
     }
 }
 
+/// `DC CVAC` across `[pa, pa+len)` — clean a whole structure to the point of coherency.
+///
+/// Milestone 6 needs this because the thing an SMMU reads is not one line: a stage-2 table is a
+/// page and an STE is 64 bytes. Strides by the core's reported line size for the same reason
+/// `hv-metal`'s `scrub_frame` does — a stride **larger** than the true line skips lines, and here
+/// that would leave part of a table unpublished and make a stale answer ambiguous between "the
+/// model withheld it" and "the probe only cleaned half of it".
+///
+/// # Safety
+///
+/// `[pa, pa+len)` must be mapped.
+pub unsafe fn clean_range(pa: u64, len: u64) {
+    let stride = dcache_line_bytes();
+    let mut a = pa;
+    while a < pa + len {
+        // SAFETY: caller guarantees the mapping; cache maintenance has no architectural memory
+        // effect beyond coherency.
+        unsafe { asm!("dc cvac, {a}", a = in(reg) a, options(nostack, preserves_flags)) };
+        a += stride;
+    }
+    // SAFETY: a barrier; no memory operand. `sy` rather than `ish` because the observer is the
+    // SMMU, which is not in the inner-shareable domain — the same reasoning `smmu::publish` gives.
+    unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
 /// Cache line length in bytes, from `CTR_EL0.DminLine` — reported so a reader can tell whether the
 /// model is describing a real geometry or a placeholder.
 pub fn dcache_line_bytes() -> u64 {

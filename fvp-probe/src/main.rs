@@ -943,6 +943,7 @@ extern "C" fn probe_main() -> ! {
     milestone_4();
 
     milestone_5();
+    milestone_6();
 
     puts("@@ FVPPROBE-END\n");
     semihosting_exit()
@@ -1099,6 +1100,201 @@ fn milestone_5() {
         );
     }
     puts("@@ M5-ATOMICS-END\n");
+}
+
+/// ★★★ MILESTONE 6 — **CAN THIS MODEL GRADE `smmu::publish` ONCE EL2's MAPPINGS ARE CACHEABLE?**
+///
+/// ## The claim this is pointed at
+///
+/// `hv-metal`'s `smmu::publish` issues a bare `dsb sy` and says why in its own words: the ordering
+/// obligation is real *"and would bite on silicon the moment the EL2 MMU brings normal cacheable
+/// mappings with it"* — i.e. at ledger 5's **A2**. A barrier orders accesses; it does not push a
+/// dirty line anywhere. If EL2's stores are cacheable and the SMMU fetches non-cacheably, the SMMU
+/// can read the *old* bytes.
+///
+/// **A2 is the largest unbuilt rung on the board, and nothing that currently runs can grade it** —
+/// QEMU models no cache, so a right `publish` and a wrong one produce identical green boots.
+/// Milestone 5 established that the AEM cannot grade A2's *atomics* half either. So the question
+/// this milestone settles is: **is there an instrument for A2's cache half at all, before anyone
+/// writes A2?** (design-lesson #238, and #186 — measure the baseline before designing the witness.)
+///
+/// ## Why this probe is already in A2's configuration
+///
+/// After [`mmu::enable`] the arena at [`crate::layout::SMMU_ARENA`] sits inside the Normal
+/// write-back block, so **CPU writes to the SMMU's tables and queues are cacheable** — while
+/// `smmu`'s `CR1 = 0` leaves the SMMU's own fetches non-cacheable. That pairing *is* the A2 hazard,
+/// and `smmu`'s arena comment names it exactly: *"a cacheable SMMU walk against non-cacheable CPU
+/// writes is a coherency mismatch that would show up as an inexplicably stale table"* — this
+/// milestone runs it in the other direction, which is the one `hv-metal` will actually be in.
+///
+/// ⚠ **Milestones 1–2 ran with the MMU OFF and are unaffected**; this is the first SMMU work the
+/// probe does with caches enabled. It is also why `layout.rs` had to exist first: against the old
+/// overlapping map the cache milestones had already scribbled on the stream table by this point.
+///
+/// ## The three phases, and why the outer two are not optional
+///
+/// Same shape as milestone 3, because the same ambiguity is in play — a stale answer alone cannot
+/// distinguish "the model withheld the write" from "the probe never wrote anything the SMMU could
+/// have seen".
+fn milestone_6() {
+    puts("@@ M6-PUBLISH-BEGIN\n");
+
+    // Phase 0 — a known state. `reset_all` writes through the now-CACHEABLE mapping, so it is
+    // itself subject to the hazard; the control below is what proves it took.
+    smmu::reset_all();
+    smmu::bind(smmu::SID_A, smmu::L1_A, smmu::VMID_A);
+    // SAFETY: the arena is mapped (identity, Normal-WB) and this is cache maintenance.
+    unsafe {
+        mmu::clean_range(layout::SMMU_ARENA, layout::SMMU_ARENA_SIZE);
+    }
+    smmu::invalidate_ste(smmu::SID_A);
+    smmu::invalidate_all();
+    let control = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+
+    // Phase 1 — THE QUESTION. Repoint SID_A at table set B by writing its STE through the
+    // cacheable mapping, then do exactly what `publish()` does today: a bare `dsb sy` and no
+    // maintenance. `L1_B` already maps `TEST_IPA` to `TARGET_B` from `reset_all`, so the STE is the
+    // ONLY thing that changes — one mechanism, not two.
+    //
+    // ⚠ **`VMID_B`, and this milestone got it wrong the first time in exactly the way milestone 2b
+    // documents.** Rebinding under `VMID_A` returns INCONCLUSIVE — the answer stays `A` through
+    // every phase — because `CMD_CFGI_STE` invalidates the CONFIGURATION cache while a cached
+    // `(VMID_A, IPA)` TRANSLATION shadows the new STE. 2b hit this, repaired it the same way, and
+    // wrote down why; I reproduced the defect anyway. Under `VMID_B` no cached translation applies,
+    // so the answer depends on exactly one thing: whether the SMMU re-read the STE **from memory**.
+    smmu::bind_silently(smmu::SID_A, smmu::L1_B, smmu::VMID_B);
+    // SAFETY: a barrier; this is `publish()`'s exact instruction.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+    // ⚠ **THE COMMAND QUEUE IS IN THE ARENA TOO, so it is under the same hazard** — and a stale
+    // queue entry would mean the invalidation never happened, which produces the same "answer did
+    // not move" as a stale STE. `sync()` is what separates them: it returns false on timeout, so a
+    // TRUE here says the SMMU consumed a command written cacheably and unpublished, and therefore
+    // that a stale answer is attributable to the STE rather than to a lost invalidation.
+    //
+    // `invalidate_ste` discards its own `sync()` result (`let _ = sync()`), which is why this calls
+    // `sync()` again explicitly rather than trusting it — the queue is drained either way, and this
+    // one's verdict is recorded.
+    smmu::invalidate_ste(smmu::SID_A);
+    let cmdq_alive = smmu::sync();
+    smmu::invalidate_all();
+    let after_barrier = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+
+    // Phase 2 — RELEASE. Now clean the structures and ask again. If the answer moves here and only
+    // here, the bytes were always correct and the MAINTENANCE is what published them.
+    // SAFETY: as phase 0.
+    unsafe {
+        mmu::clean_range(layout::SMMU_ARENA, layout::SMMU_ARENA_SIZE);
+    }
+    // ★ WHAT DOES **MEMORY** HOLD? `ste_s2ttb` is a CPU read and therefore reports the CPU's own
+    // cache — it cannot answer this. Dropping the line with `DC IVAC` (invalidate, no write-back)
+    // and re-reading forces the read to come from the point of coherency, which is where the SMMU
+    // fetches from.
+    //
+    // ⚠ **`IVAC` DISCARDS a dirty line, so this would destroy an unpublished write — and that is
+    // exactly why it runs HERE and not earlier.** The `clean_range` immediately above has already
+    // pushed the line out, so by this point it is clean and dropping it loses nothing. Placing the
+    // same instruction one phase earlier would have deleted the very write the milestone measures
+    // (the ordering lesson `scrub_frame` paid for in #168).
+    // SAFETY: the STE is inside the identity-mapped arena.
+    unsafe {
+        mmu::invalidate_line(smmu::ste_addr(smmu::SID_A));
+    }
+    let ste_in_memory = smmu::ste_s2ttb(smmu::SID_A);
+
+    smmu::invalidate_ste(smmu::SID_A);
+    smmu::invalidate_all();
+    let after_clean = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+
+    // ⚠ **A CPU read, so it sees the CPU's own cache** — it cannot say what the SMMU sees, and is
+    // not evidence about publication. What it DOES separate is "the STE write never happened" from
+    // "the write happened and the SMMU did not see it", which the translation alone cannot, and
+    // which is precisely the ambiguity that made this milestone's first run uninterpretable.
+    puts("@@ M6 L1_A=");
+    puthex(smmu::L1_A);
+    puts("  L1_B=");
+    puthex(smmu::L1_B);
+    puts("\n@@ M6 STE.S2TTB in MEMORY after the clean (IVAC'd, so not the CPU's cache) = ");
+    puthex(ste_in_memory);
+    puts("\n");
+
+    puts("@@ M6 control (cleaned, expect A) = ");
+    puts(which(&control));
+    puts("\n@@ M6 post-dsb  (the question)   = ");
+    puts(which(&after_barrier));
+    puts("\n@@ M6 post-clean(expect B)       = ");
+    puts(which(&after_clean));
+    puts("\n@@ M6 cmdq consumed a cacheable, unpublished command = ");
+    puts(if cmdq_alive { "yes" } else { "NO (timeout)" });
+    puts("\n");
+
+    // ★★ THE SANITY CONTROL, and it is the one this milestone was missing.
+    //
+    // Two runs returned INCONCLUSIVE with the answer stuck at A through every phase. "The SMMU
+    // never saw the new binding" and "this experiment cannot reach B with caches on at all" produce
+    // that transcript equally, and nothing above separates them — the same shape of gap m5's shared
+    // seed had. So: do the rebind the fully-published way (write, clean, invalidate config, flush
+    // translations) and require B. If even this answers A, the defect is in the probe and every
+    // line above is uninterpretable (design-lesson #211).
+    smmu::bind(smmu::SID_A, smmu::L1_B, smmu::VMID_B);
+    // SAFETY: the arena is mapped identity Normal-WB; this is cache maintenance.
+    unsafe {
+        mmu::clean_range(layout::SMMU_ARENA, layout::SMMU_ARENA_SIZE);
+    }
+    smmu::invalidate_ste(smmu::SID_A);
+    smmu::invalidate_all();
+    let sanity = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
+    puts("@@ M6 sanity  (fully published, expect B) = ");
+    puts(which(&sanity));
+    puts("  pa=");
+    puthex(sanity.pa);
+    puts(if sanity.fault { " FAULT" } else { "" });
+    puts("\n");
+
+    if which(&sanity) != "B" {
+        puts(
+            "@@ M6-VERDICT PROBE-BROKEN: even a fully published rebind — written, cleaned, config \
+             and translations invalidated — did not move the answer to B. This milestone is not \
+             measuring publication; nothing above it is a statement about the model.\n",
+        );
+        puts("@@ M6-PUBLISH-END\n");
+        return;
+    }
+
+    if !cmdq_alive {
+        puts(
+            "@@ M6-VERDICT CMDQ-STALE: the command queue timed out, so the invalidation never \
+             happened and the translation below says nothing about the STE. This IS the hazard — a \
+             cacheable CPU write the SMMU could not see — but it landed on the queue, so read it as \
+             that rather than as a statement about `publish`'s tables.\n",
+        );
+    } else if which(&control) != "A" {
+        puts(
+            "@@ M6-VERDICT CONTROL-FAILED: the SMMU did not answer target A even with the tables \
+             cleaned, so this milestone measures nothing about publication. Everything below the \
+             control line is uninterpretable.\n",
+        );
+    } else if which(&after_barrier) == "A" && which(&after_clean) == "B" {
+        puts(
+            "@@ M6-VERDICT PUBLISH-GRADEABLE: a bare DSB left the SMMU reading the STALE table and \
+             DC CVAC released it. `smmu::publish`'s barrier is NOT sufficient once EL2's mappings \
+             are cacheable — A2's SMMU half is WITNESSABLE here, and this is the instrument.\n",
+        );
+    } else if which(&after_barrier) == "B" {
+        puts(
+            "@@ M6-VERDICT BARRIER-SUFFICED: the SMMU saw the cacheable write with no maintenance. \
+             Either this model's SMMU fetches are coherent with the CPU regardless of CR1, or it \
+             caches nothing here. Then it CANNOT grade `publish` either, and A2's SMMU half joins \
+             the atomics half as silicon-only.\n",
+        );
+    } else {
+        puts(
+            "@@ M6-VERDICT INCONCLUSIVE: neither pattern. Read the three lines above; the answers \
+             say more than this verdict does.\n",
+        );
+    }
+    puts("@@ M6-PUBLISH-END\n");
 }
 
 #[panic_handler]

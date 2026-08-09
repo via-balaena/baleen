@@ -102,12 +102,22 @@ const CMD_SYNC: u64 = 0x46;
 // alignment is obvious by inspection rather than by trusting a linker script. DRAM is 4 GB from
 // 0x8000_0000, so all of this is real memory.
 //
-// ⚠ The MMU is OFF at EL3, so every access below is Device-nGnRnE: strongly ordered and
-// non-cacheable. That is why there is no cache maintenance anywhere in this file — and it is also
-// why the walk attributes are programmed NON-CACHEABLE. A cacheable SMMU walk against
-// non-cacheable CPU writes is a coherency mismatch that would show up as an inexplicably stale
-// table, which is precisely the observable this instrument exists to measure. Removing that
-// confound is worth more than the walk performance it costs.
+// The walk attributes are programmed NON-CACHEABLE. A cacheable SMMU walk against non-cacheable CPU
+// writes is a coherency mismatch that would show up as an inexplicably stale table, which is
+// precisely the observable this instrument exists to measure. Removing that confound is worth more
+// than the walk performance it costs.
+//
+// ⚠ **THIS COMMENT USED TO SAY "the MMU is OFF at EL3, so every access below is Device-nGnRnE …
+// that is why there is no cache maintenance anywhere in this file". BOTH HALVES ARE NOW FALSE**,
+// and by the same change: milestone 6 does SMMU work **after** [`crate::mmu::enable`], so its
+// accesses to this arena are **Normal write-back cacheable**, and [`submit`] now issues `DC CVAC`
+// for exactly that reason.
+//
+// ★ **Which is the whole point of milestone 6, so read the pairing rather than the halves.** The
+// walk stays non-cacheable and the CPU side became cacheable — that mismatch is not a defect here,
+// it is `hv-metal`'s ledger-5 **A2** configuration reproduced deliberately. Milestones 1–2 still run
+// MMU-off and are unaffected; what changed is that this file is no longer used in only one memory
+// regime, and a comment that names one regime for the whole file cannot stay true.
 
 const ARENA: u64 = crate::layout::SMMU_ARENA;
 const STRTAB: u64 = ARENA;
@@ -268,6 +278,16 @@ pub fn ste_s2ttb(sid: u32) -> u64 {
     mem_r64(STRTAB + u64::from(sid) * 64 + 24) & 0x000f_ffff_ffff_fff0
 }
 
+/// The address of `sid`'s STE — so a caller can aim cache maintenance at the exact line the SMMU
+/// fetches, rather than at the whole arena.
+///
+/// Exists for milestone 6: reading [`ste_s2ttb`] tells you what the **CPU** thinks the STE says,
+/// which is its own cache. Dropping that line first and re-reading is what tells you what **memory**
+/// says, and the difference between those two is the entire subject of that milestone.
+pub fn ste_addr(sid: u32) -> u64 {
+    STRTAB + u64::from(sid) * 64
+}
+
 /// Point `sid` at a stage-2 table set under `vmid`, and tell the SMMU its configuration changed.
 pub fn bind(sid: u32, s2ttb: u64, vmid: u16) {
     write_ste(sid, s2ttb, vmid);
@@ -302,6 +322,36 @@ fn submit(word0: u64, word1: u64) {
     let idx = u64::from(prod & ((1 << CMDQ_LOG2SIZE) - 1));
     mem_w64(CMDQ + idx * 16, word0);
     mem_w64(CMDQ + idx * 16 + 8, word1);
+
+    // ★★ **PUBLISH THE COMMAND BEFORE RINGING THE DOORBELL — and this is milestone 6's finding,
+    // not a detail.**
+    //
+    // The doorbell (`CMDQ_PROD`) is an MMIO register write: Device memory, always visible. The
+    // command *bytes* are DRAM, and once [`crate::mmu::enable`] has run they are written through a
+    // **cacheable** mapping while the SMMU fetches them non-cacheably (`CR1 = 0`). So without this
+    // the SMMU is told "there is a new command" and then reads whatever stale bytes that ring slot
+    // last held — with 16 slots, usually a real command from an earlier round, which is worse than
+    // garbage because it completes and `CMD_SYNC` reports success.
+    //
+    // ⚠ **This is why milestone 6 could not isolate the STE hazard at first.** The queue is how the
+    // experiment *steers* — `CMD_CFGI_STE` is what tells the SMMU to re-read a table — so the
+    // control mechanism was under the very hazard being measured. Memory held the new STE
+    // (`DC IVAC` + re-read proved it) and the SMMU still answered the old binding, because the
+    // invalidation it was supposed to act on never really arrived.
+    //
+    // ★ **The transferable part is for `hv-metal`, not this probe.** `smmu::publish()` cleans the
+    // tables it is about to point the SMMU at; under ledger 5's **A2** it must also publish **every
+    // command it submits**, and in this order — bytes, then maintenance, then doorbell. A `publish`
+    // that covers only the tables leaves the SMMU acting on stale commands.
+    //
+    // Harmless before the MMU is on: EL3 is then Device-nGnRnE, nothing is cached, and the
+    // maintenance has nothing to do.
+    // SAFETY: the command slot is inside the identity-mapped arena; cache maintenance has no
+    // architectural memory effect beyond coherency.
+    unsafe {
+        crate::mmu::clean_range(CMDQ + idx * 16, 16);
+    }
+
     // Wrap is the bit above the index, which the SMMU compares against CONS's.
     let next = (prod + 1) & ((1 << (CMDQ_LOG2SIZE + 1)) - 1);
     w32(CMDQ_PROD, next);

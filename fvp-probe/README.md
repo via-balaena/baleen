@@ -297,3 +297,48 @@ before either arm runs. A null result has to earn the right to be reported as a 
 
 ⚠ **This probe runs at EL3; `hv-metal` runs at EL2.** The hazard is a property of the memory *type*,
 not the exception level, so it transfers — but that is an argument, not a measurement.
+
+## Milestone 6 — **can this model grade `smmu::publish` under A2?** (2026-08-09)
+
+```
+@@ M6 STE.S2TTB in MEMORY after the clean (IVAC'd, so not the CPU's cache) = 0x81050000  (= L1_B)
+@@ M6 control (cleaned, expect A) = A
+@@ M6 post-dsb  (the question)   = A     ← STALE: `publish()`'s exact instruction is not enough
+@@ M6 post-clean(expect B)       = B     ← DC CVAC released it
+@@ M6 sanity  (fully published, expect B) = B  pa=0x82400000
+@@ M6-VERDICT PUBLISH-GRADEABLE
+```
+
+**Yes — and A2's SMMU half has its instrument.** After `mmu::enable()` the arena is reached through
+a **cacheable** mapping while the SMMU fetches non-cacheably (`CR1 = 0`), which is exactly what
+ledger 5's A2 creates. A bare `dsb sy` left the SMMU reading the stale binding; `DC CVAC` released
+it. That is `hv-metal`'s `smmu::publish()` shown to be insufficient under A2, **measured before A2
+was written**.
+
+### ★ The finding that cost three runs, and it is the more valuable one
+
+Runs 1–4 returned `INCONCLUSIVE` with the answer stuck at `A` even after the clean — while the STE
+read back as `L1_B`. The `DC IVAC` re-read settled it: **memory had the new binding all along.** The
+failure was not publication, it was that *the invalidation never arrived*.
+
+**The command queue is in the same cacheable arena as the tables**, so the mechanism steering the
+experiment was under the hazard being measured. The doorbell is MMIO and always visible; the command
+bytes are DRAM. The SMMU was told "there is a new command" and read whatever that ring slot last
+held — with 16 slots, a real command from an earlier round, **so `CMD_SYNC` reported success while
+nothing was invalidated.** `submit()` now cleans the slot between writing it and ringing the
+doorbell.
+
+★ **For `hv-metal` that is a second A2 requirement, and the silent one**: `publish()` must cover
+every command it submits, in the order **bytes → maintenance → doorbell** — not only the tables it
+is about to point the SMMU at.
+
+### What it does not claim
+
+* **Not that `hv-metal` is wrong today.** EL2's mappings are still `Device-nGnRnE` with
+  `SCTLR_EL2.C = 0`, so the present barrier is correct and maintenance would be dead code. This is
+  A2's specification, not a defect report against `main`.
+* **Not conformance, and not silicon.** The AEM is a model; m5 already showed it resolves some
+  CONSTRAINED-UNPREDICTABLE cases benignly. What is established is that *this* hazard is
+  **distinguishable here**, which is what A2 needs and QEMU cannot supply.
+* ⚠ **EL3, not EL2** — as milestone 5. The hazard follows the memory type, which is an argument
+  rather than a measurement.
