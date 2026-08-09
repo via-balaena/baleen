@@ -169,9 +169,12 @@ this leak sat in the ledger with every boot green. The new witness reads first. 
    but a destroyed domain's model state stays resident until reboot.
 4. ~~**`CACHE_LINE` is a conservative constant (64), not a `CTR_EL0` read.** Too-small is always safe
    (it merely repeats `dc civac` within a line); too-large would skip lines, so this must stay a
-   floor if it is ever made dynamic.~~ **DISCHARGED by PR #169** — `scrub_line_bytes()` now measures
-   `CTR_EL0.DminLine` and takes `min(64, 4 << DminLine)`, so the stride can only get *finer* than the
-   old constant and the "must stay a floor" condition this residual named is the shape of the fix.
+   floor if it is ever made dynamic.~~ **DISCHARGED by PR #169** — the stride measures
+   `CTR_EL0.DminLine` and takes `min(64, 4 << DminLine)`, so it can only get *finer* than the old
+   constant, and the "must stay a floor" condition this residual named is the shape of the fix.
+   ⚠ It was `stage2::scrub_line_bytes()` when #169 landed; **A2 moved it to
+   `hv-metal/src/cache.rs`'s `line_bytes()`**, where four maintenance loops share it instead of one —
+   naming the function here would be a pointer that has already moved once.
    Measured 64 on both platforms this project runs on (QEMU `virt` and the AEM), so it is
    behaviour-neutral where observed.
 5. **The completeness argument for the seam is an audit fact, not a machine-checked one**: "`allocate`
