@@ -497,9 +497,9 @@ pub struct Translation {
 ///
 /// ## ⚠ And the field position disagrees with my reading of the register diagram
 ///
-/// The field list reads `ADDR, bits [50:11]` / *"Result address, bits [51:12]"*, which would put
-/// PA[12] at PAR[11]. **The model's behaviour is only consistent with PA[50:12] sitting at
-/// PAR[50:12]**, with `Size` at bit 11 rather than 10 — under that reading, and only under it, the
+/// The field list reads `ADDR, bits [50:11]` / *"Result address, bits `[51:12]`"*, which would put
+/// `PA[12]` at `PAR[11]`. **The model's behaviour is only consistent with `PA[50:12]` sitting at
+/// `PAR[50:12]`**, with `Size` at bit 11 rather than 10 — under that reading, and only under it, the
 /// answer decodes to exactly the frame this code mapped, the marker bit gives exactly the block size
 /// this code programmed, and `SH` decodes to exactly the `0b11` this code put in the descriptor.
 /// Three independent agreements are not a coincidence, so the empirical layout is what is
