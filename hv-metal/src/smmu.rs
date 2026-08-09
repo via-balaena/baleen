@@ -222,11 +222,24 @@ mod doorbell {
     pub(super) struct Published(());
 
     impl Published {
-        /// Mint the proof. `pub(super)` and called from exactly one place — [`super::publish`],
-        /// which is the function that actually does the cache maintenance.
-        pub(super) const fn new() -> Self {
+        /// Mint the proof. ⚠⚠ **PRIVATE to this module, and that is the whole fence.** It was
+        /// `pub(super)` for one commit, which meant any code in `smmu.rs` could write
+        /// `ring32(v, Published::new())` and forge the evidence — a guard that the guarded code can
+        /// mint for itself is decoration. The only way to obtain a `Published` is now
+        /// [`publish`] below, which does the cache maintenance first.
+        const fn new() -> Self {
             Self(())
         }
+    }
+
+    /// **Publish `[pa, pa + len)` and return the proof a doorbell demands.**
+    ///
+    /// Lives inside this module because [`Published::new`] must stay private: the token and the
+    /// only thing that can mint it are one unit, so "I published" cannot be asserted, only done.
+    /// See [`super::publish`] for what the obligation is and how `fvp-probe` measured it.
+    pub(super) fn publish(pa: u64, len: u64) -> Published {
+        crate::cache::clean(pa, len);
+        Published::new()
     }
 
     /// An SMMU register that hands the device a DRAM **address**, or announces new **content** in
@@ -332,8 +345,7 @@ fn read64(off: u64) -> u64 {
 /// added: publishing without ringing anything is legitimate (the queues are published once at
 /// init and rung later), and a lint that fired on it would train people to ignore it.
 fn publish(pa: u64, len: u64) -> Published {
-    crate::cache::clean(pa, len);
-    Published::new()
+    doorbell::publish(pa, len)
 }
 
 /// The whole stream table, as a range for [`publish`].
