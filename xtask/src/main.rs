@@ -2255,14 +2255,19 @@ fn help_covers_tasks() -> bool {
         return false;
     }
 
-    // ⚠⚠ **Bounded by spaces, NOT `contains`** — the same collision that made `doc_modules` need a
-    // leading `/`. `doc` is a substring of `doc-markers`, `qemu` of `qemu-test`, `ci` of nothing
-    // today but of anything tomorrow: a plain `contains` would report a DELETED help entry as
-    // present because a longer sibling still spells it. ★ I fixed this in `doc_modules` and did not
-    // carry the reasoning across until the diff read — the same defect, twice, in one commit.
+    // ⚠⚠ **A task is LISTED only if it BEGINS a help line.** Two weaker rules were tried and both
+    // passed a deleted entry:
+    //   * `help.contains(t)` — `doc` is a substring of `doc-markers`, `qemu` of `qemu-test`.
+    //   * `help.contains(" {t} ")` — space-bounding still passed, because `doc-markers`' own
+    //     DESCRIPTION reads "assert every boot marker **a doc QUOTES** is still one the gates
+    //     check". A short task name that is also an English word appears in prose, so no
+    //     substring rule can work; the structure has to be used instead.
+    // ★ The first of those two is the collision `doc_modules` needed a leading `/` for, written
+    // again twenty lines later in the same commit. Fixing an instance is not learning the class.
+    let listed: Vec<&str> = help.lines().map(str::trim_start).collect();
     let mut ok = true;
     for t in &tasks {
-        if !help.contains(&format!(" {t} ")) && !help.contains(&format!(" {t}\\n")) {
+        if !listed.iter().any(|l| l.starts_with(&format!("{t} "))) {
             eprintln!(
                 "help-covers-tasks: FAIL — `cargo xtask {t}` exists but the usage text never"
             );
