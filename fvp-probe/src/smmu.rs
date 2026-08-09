@@ -109,7 +109,7 @@ const CMD_SYNC: u64 = 0x46;
 // table, which is precisely the observable this instrument exists to measure. Removing that
 // confound is worth more than the walk performance it costs.
 
-const ARENA: u64 = 0x8100_0000;
+const ARENA: u64 = crate::layout::SMMU_ARENA;
 const STRTAB: u64 = ARENA;
 const CMDQ: u64 = ARENA + 0x01_0000;
 const EVTQ: u64 = ARENA + 0x02_0000;
@@ -130,8 +130,8 @@ const EVTQ_LOG2SIZE: u32 = 4;
 pub const TEST_IPA: u64 = 0x1000_0000;
 /// The two 2 MiB frames it can be pointed at. Distinct values are the whole point: "stale" means
 /// the SMMU answered with the one that is no longer mapped.
-pub const TARGET_A: u64 = 0x8200_0000;
-pub const TARGET_B: u64 = 0x8240_0000;
+pub const TARGET_A: u64 = crate::layout::SMMU_TARGET_A;
+pub const TARGET_B: u64 = crate::layout::SMMU_TARGET_B;
 
 /// The two StreamIDs, which are the test engines' RequesterIDs. The FVP guide states the rule
 /// outright: *"The PCIe devices use a DeviceID that is the same as their RequestorID (BDF)"*, and
