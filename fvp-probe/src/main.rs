@@ -138,7 +138,10 @@ fn uart_init() {
         // Quiesce, then 8n1 with FIFOs, then enable with transmit on. In that order because
         // `LCR_H` must not be written while the UART is enabled.
         write_volatile((UART0_BASE + UART_CR) as *mut u32, 0);
-        write_volatile((UART0_BASE + UART_LCR_H) as *mut u32, (0b11 << 5) | (1 << 4));
+        write_volatile(
+            (UART0_BASE + UART_LCR_H) as *mut u32,
+            (0b11 << 5) | (1 << 4),
+        );
         write_volatile((UART0_BASE + UART_CR) as *mut u32, (1 << 8) | (1 << 0));
     }
 }
@@ -175,7 +178,11 @@ fn puthex_w(v: u64, digits: u32) {
     puts("0x");
     for shift in (0..digits).rev() {
         let nyb = ((v >> (shift * 4)) & 0xf) as u8;
-        putb(if nyb < 10 { b'0' + nyb } else { b'a' + nyb - 10 });
+        putb(if nyb < 10 {
+            b'0' + nyb
+        } else {
+            b'a' + nyb - 10
+        });
     }
 }
 
@@ -453,7 +460,10 @@ fn milestone_2a() {
 
     // Phase 1 — the positive control. MUST succeed, and MUST answer TARGET_A.
     let t = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
-    report_translation("2a.1 bound   sid=f0 ipa=0x10000000 expect PA=0x82000000", &t);
+    report_translation(
+        "2a.1 bound   sid=f0 ipa=0x10000000 expect PA=0x82000000",
+        &t,
+    );
     let (rsid, raddr) = smmu::atos_request_readback();
     puts("@@      request read back: GATOS_SID=");
     puthex_w(rsid, 16);
@@ -468,11 +478,20 @@ fn milestone_2a() {
     // block. If `+0x200000` did not fault, the walk would not be using this code's table at all and
     // every other reading would be worthless.
     let p1 = smmu::translate(smmu::SID_A, smmu::TEST_IPA + 0x1000);
-    report_translation("2a.p +0x1000    (inside the block, expect the SAME block)", &p1);
+    report_translation(
+        "2a.p +0x1000    (inside the block, expect the SAME block)",
+        &p1,
+    );
     let p2 = smmu::translate(smmu::SID_A, smmu::TEST_IPA + 0x10_0000);
-    report_translation("2a.p +0x100000  (inside the block, expect the SAME block)", &p2);
+    report_translation(
+        "2a.p +0x100000  (inside the block, expect the SAME block)",
+        &p2,
+    );
     let p3 = smmu::translate(smmu::SID_A, smmu::TEST_IPA + 0x20_0000);
-    report_translation("2a.p +0x200000  (NEXT block, unmapped, expect FAULT)    ", &p3);
+    report_translation(
+        "2a.p +0x200000  (NEXT block, unmapped, expect FAULT)    ",
+        &p3,
+    );
     let walk_ok = p1.pa == smmu::TARGET_A
         && p2.pa == smmu::TARGET_A
         && p1.size == 0x20_0000
@@ -481,7 +500,10 @@ fn milestone_2a() {
 
     // Phase 2 — the deny control, on a StreamID left at V=0.
     let d = smmu::translate(smmu::SID_B, smmu::TEST_IPA);
-    report_translation("2a.2 unbound sid=f1 ipa=0x10000000 expect FAULT           ", &d);
+    report_translation(
+        "2a.2 unbound sid=f1 ipa=0x10000000 expect FAULT           ",
+        &d,
+    );
 
     // The floor requires ALL of: the bound stream translates, to exactly the frame the table names,
     // at exactly the block size the descriptor programmed, with the block boundary in the right
@@ -570,7 +592,16 @@ fn milestone_2b() {
     report_translation("2b.3 after CFGI_STE  (expect B) ", &after);
 
     let sane = which(&base) == "A" && which(&after) == "B";
-    result("2b_ste_cache", if !sane { "INCONCLUSIVE" } else if which(&quiet) == "A" { "STALE" } else { "FRESH" });
+    result(
+        "2b_ste_cache",
+        if !sane {
+            "INCONCLUSIVE"
+        } else if which(&quiet) == "A" {
+            "STALE"
+        } else {
+            "FRESH"
+        },
+    );
 }
 
 /// **2c — is the stage-2 translation cached, and does `CMD_TLBI_*` matter?**
@@ -598,7 +629,16 @@ fn milestone_2c() {
     report_translation("2c.3 after TLBI      (expect B) ", &after);
 
     let sane = which(&base) == "A" && which(&after) == "B";
-    result("2c_tlb", if !sane { "INCONCLUSIVE" } else if which(&quiet) == "A" { "STALE" } else { "FRESH" });
+    result(
+        "2c_tlb",
+        if !sane {
+            "INCONCLUSIVE"
+        } else if which(&quiet) == "A" {
+            "STALE"
+        } else {
+            "FRESH"
+        },
+    );
 }
 
 /// **2d — are cached translations tagged with the VMID?**
@@ -734,18 +774,26 @@ fn milestone_3() {
 
     // The verdict, stated as a marker the host script can assert on.
     if after_dirty_store == SEED && after_barrier == SEED && after_clean == DIRTY {
-        puts("@@ M3-VERDICT CACHES-MODELLED: the cacheable store was WITHHELD from a \
+        puts(
+            "@@ M3-VERDICT CACHES-MODELLED: the cacheable store was WITHHELD from a \
               non-cacheable observer across a bare DSB and released only by DC CVAC. A2's \
-              re-derivation is WITNESSABLE here.\n");
+              re-derivation is WITNESSABLE here.\n",
+        );
     } else if after_dirty_store == SEED && after_barrier == DIRTY {
-        puts("@@ M3-VERDICT BARRIER-SUFFICED: a bare DSB made the store visible, so this model's \
-              write buffering is not a dirty CACHE line and DC CVAC is not what is being tested.\n");
+        puts(
+            "@@ M3-VERDICT BARRIER-SUFFICED: a bare DSB made the store visible, so this model's \
+              write buffering is not a dirty CACHE line and DC CVAC is not what is being tested.\n",
+        );
     } else if after_dirty_store == DIRTY && after_clean == DIRTY {
-        puts("@@ M3-VERDICT NO-WITHHOLDING: the cacheable store was visible immediately. This \
-              model does not exhibit the hazard, so it cannot witness A2 either.\n");
+        puts(
+            "@@ M3-VERDICT NO-WITHHOLDING: the cacheable store was visible immediately. This \
+              model does not exhibit the hazard, so it cannot witness A2 either.\n",
+        );
     } else {
-        puts("@@ M3-VERDICT INCONCLUSIVE: neither pattern. The aliases or the tables are wrong — \
-              read the three values above before believing anything about caches.\n");
+        puts(
+            "@@ M3-VERDICT INCONCLUSIVE: neither pattern. The aliases or the tables are wrong — \
+              read the three values above before believing anything about caches.\n",
+        );
     }
     puts("@@ M3-CACHE-END\n");
 }
@@ -829,26 +877,44 @@ fn milestone_4() {
     puthex(SECRET);
     puts("\n@@ M4 A zero-then-civac = ");
     puthex(a);
-    puts(if a == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)\n" });
+    puts(if a == SECRET {
+        "  <-- SECRET SURVIVED\n"
+    } else {
+        "  (erased)\n"
+    });
     puts("@@ M4 B civac-then-zero = ");
     puthex(b);
-    puts(if b == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)\n" });
+    puts(if b == SECRET {
+        "  <-- SECRET SURVIVED\n"
+    } else {
+        "  (erased)\n"
+    });
     puts("@@ M4 C zero-then-ivac  = ");
     puthex(c);
-    puts(if c == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)\n" });
+    puts(if c == SECRET {
+        "  <-- SECRET SURVIVED\n"
+    } else {
+        "  (erased)\n"
+    });
 
     puts("@@ M4 D civac-zero-civac= ");
     puthex(d);
-    puts(if d == SECRET { "  <-- SECRET SURVIVED\n" } else { "  (erased)  <-- the proposed fix\n" });
+    puts(if d == SECRET {
+        "  <-- SECRET SURVIVED\n"
+    } else {
+        "  (erased)  <-- the proposed fix\n"
+    });
 
     if a == SECRET {
         puts("@@ M4-VERDICT SHIPPED-ORDER-LEAKS: hv-metal's zero-then-CIVAC republished the dead \
               tenant's line over the zeroing. The maintenance meant to prevent a later resurrection \
               performed one.\n");
     } else {
-        puts("@@ M4-VERDICT SHIPPED-ORDER-ERASES: the shipped sequence left zero. The ordering \
+        puts(
+            "@@ M4-VERDICT SHIPPED-ORDER-ERASES: the shipped sequence left zero. The ordering \
               hypothesis is REFUTED on this model — read the three values before concluding \
-              anything about silicon.\n");
+              anything about silicon.\n",
+        );
     }
     puts("@@ M4-SCRUB-END\n");
 }

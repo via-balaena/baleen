@@ -152,6 +152,18 @@ jobs:
       - name: Lint hv-metal (fmt --check + clippy -D warnings, both feature configs)
         run: cargo xtask metal-lint
 
+      # fvp-probe is the OTHER workspace-excluded crate, and until this step nothing in CI built it
+      # at all. It rides this job because it targets the same bare-metal triple, so the toolchain and
+      # cache are already here and the cost is one build.
+      #
+      # ⚠ What this gates is the probe's HEALTH, not its results: CI cannot run Arm's AEM (an 885 MB
+      # model driven inside a Linux VM), so the milestone verdicts stay local evidence. What stops
+      # being unchecked is that the crate compiles, lints, and — the reason this could not wait —
+      # that `layout.rs`'s COMPILE-TIME region-overlap assertion is actually evaluated by something
+      # other than a developer remembering to build it.
+      - name: Lint fvp-probe (fmt --check + clippy + rustdoc + build, all -D warnings)
+        run: cargo xtask fvp-lint
+
       - name: hv-metal boots to the serial markers under QEMU
         run: cargo xtask qemu-test
 

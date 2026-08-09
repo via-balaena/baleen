@@ -233,7 +233,10 @@ pub fn build_tables(l1: u64, l2: u64, target: u64) {
 /// This is the mutation the staleness phases perform. It touches ONE descriptor, so a difference in
 /// the ATOS answer afterwards cannot be attributed to anything else having moved.
 pub fn remap(l2: u64, target: u64) {
-    mem_w64(l2 + l2_index(TEST_IPA) * 8, target | LEAF_COMMON | S2AP_RW | DESC_BLOCK);
+    mem_w64(
+        l2 + l2_index(TEST_IPA) * 8,
+        target | LEAF_COMMON | S2AP_RW | DESC_BLOCK,
+    );
 }
 
 // ─── stream table ───────────────────────────────────────────────────────────────────────────────
@@ -379,7 +382,10 @@ pub fn invalidate_ste(sid: u32) {
 
 /// Invalidate stage-2 translations for one VMID only — the VMID discriminator.
 pub fn invalidate_vmid(vmid: u16) {
-    submit(CMD_TLBI_S2_IPA | (u64::from(vmid) << 32), TEST_IPA >> 12 << 12);
+    submit(
+        CMD_TLBI_S2_IPA | (u64::from(vmid) << 32),
+        TEST_IPA >> 12 << 12,
+    );
     let _ = sync();
 }
 
@@ -424,10 +430,16 @@ pub fn bring_up() -> bool {
     w64(STRTAB_BASE, STRTAB & 0x000f_ffff_ffff_ffc0);
     w32(STRTAB_BASE_CFG, STRTAB_LOG2SIZE);
 
-    w64(CMDQ_BASE, (CMDQ & 0x000f_ffff_ffff_ffe0) | u64::from(CMDQ_LOG2SIZE));
+    w64(
+        CMDQ_BASE,
+        (CMDQ & 0x000f_ffff_ffff_ffe0) | u64::from(CMDQ_LOG2SIZE),
+    );
     w32(CMDQ_PROD, 0);
     w32(CMDQ_CONS, 0);
-    w64(EVENTQ_BASE, (EVTQ & 0x000f_ffff_ffff_ffe0) | u64::from(EVTQ_LOG2SIZE));
+    w64(
+        EVENTQ_BASE,
+        (EVTQ & 0x000f_ffff_ffff_ffe0) | u64::from(EVTQ_LOG2SIZE),
+    );
     w32(EVENTQ_PROD, 0);
     w32(EVENTQ_CONS, 0);
 
@@ -485,9 +497,9 @@ pub struct Translation {
 ///
 /// ## ⚠ And the field position disagrees with my reading of the register diagram
 ///
-/// The field list reads `ADDR, bits [50:11]` / *"Result address, bits [51:12]"*, which would put
-/// PA[12] at PAR[11]. **The model's behaviour is only consistent with PA[50:12] sitting at
-/// PAR[50:12]**, with `Size` at bit 11 rather than 10 — under that reading, and only under it, the
+/// The field list reads `ADDR, bits [50:11]` / *"Result address, bits `[51:12]`"*, which would put
+/// `PA[12]` at `PAR[11]`. **The model's behaviour is only consistent with `PA[50:12]` sitting at
+/// `PAR[50:12]`**, with `Size` at bit 11 rather than 10 — under that reading, and only under it, the
 /// answer decodes to exactly the frame this code mapped, the marker bit gives exactly the block size
 /// this code programmed, and `SH` decodes to exactly the `0b11` this code put in the descriptor.
 /// Three independent agreements are not a coincidence, so the empirical layout is what is
@@ -520,7 +532,10 @@ pub fn translate(sid: u32, ipa: u64) -> Translation {
         core::hint::spin_loop();
     }
     w64(GATOS_SID, u64::from(sid));
-    w64(GATOS_ADDR, (ipa & !0xfff) | (0b10 << 10) | (1 << 9) | (1 << 8));
+    w64(
+        GATOS_ADDR,
+        (ipa & !0xfff) | (0b10 << 10) | (1 << 9) | (1 << 8),
+    );
     w32(GATOS_CTRL, 1);
 
     for _ in 0..1_000_000 {
@@ -528,11 +543,23 @@ pub fn translate(sid: u32, ipa: u64) -> Translation {
             let par = r64(GATOS_PAR);
             let fault = par & 1 != 0;
             let (pa, size) = if fault { (0, 0) } else { decode_par(par) };
-            return Translation { par, fault, pa, size, timeout: false };
+            return Translation {
+                par,
+                fault,
+                pa,
+                size,
+                timeout: false,
+            };
         }
         core::hint::spin_loop();
     }
-    Translation { par: 0, fault: true, pa: 0, size: 0, timeout: true }
+    Translation {
+        par: 0,
+        fault: true,
+        pa: 0,
+        size: 0,
+        timeout: true,
+    }
 }
 
 /// `SMMU_GERROR` — reported after bring-up because a global error makes every later answer suspect,

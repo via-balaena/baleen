@@ -71,6 +71,7 @@ fn main() {
         // see `LINUX_SMMU_MARKERS` for why that is no longer needed.
         "qemu-linux-smmu" => qemu_linux(true, LinuxBoot::Smmu),
         "metal-lint" => metal_lint(),
+        "fvp-lint" => fvp_lint(),
         "doc-markers" => doc_markers(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
@@ -118,7 +119,8 @@ fn main() {
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
                  qemu-linux-smmu just the SMMU boot configuration, run alone\n  \
-                 metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)",
+                 metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)\n  \
+                 fvp-lint   the same bar for fvp-probe, the other workspace-excluded crate (build only — CI cannot run the AEM)",
                 METAL_LINT_CONFIGS.len()
             );
             exit(2);
@@ -1678,6 +1680,52 @@ const METAL_LINT_CONFIGS: &[&[&str]] = &[
     &["--features", "real-linux,selftest,no-irq-confinement"],
 ];
 
+/// The measurement instrument, and — like `hv-metal` — a crate **no `--workspace` gate reaches**.
+const FVP_DIR: &str = "fvp-probe";
+
+/// **Lint and build `fvp-probe`: `fmt --check` + `clippy -D warnings` + `build` + `doc -D warnings`.**
+///
+/// ## Why this exists, and it is the same hole [`metal_lint`] was dug for
+///
+/// `fvp-probe` is workspace-EXCLUDED, so until this task **nothing in CI built it at all** — zero
+/// references in `.github/workflows/`, zero in this file. Design-lesson #173's shape again:
+/// excluding a crate to escape one gate silently excuses it from all of them. `hv-metal` got
+/// [`metal_lint`] for exactly this reason; the probe simply never did, back when it was small.
+///
+/// ⚠ **What made it urgent is not the line count — it is what the crate now carries.**
+///
+/// * `layout.rs`'s `ASSERT_DISJOINT` is a **compile-time** check that two physical regions never
+///   overlap. It was written *because* three of them silently did. A `const` assertion fires only
+///   when something **compiles the crate** — so until this task it was a gate nobody ran, and the
+///   exact overlap it exists to prevent could have been reintroduced with every CI check green.
+///   That is design-lesson #199 (a gate you merely OBSERVE is not a gate) landing on the file
+///   written to prevent that class of defect.
+/// * Milestones 3–6 are the **only evidence** for what ledger 5's A2 must do — m6 is what
+///   establishes that `smmu::publish`'s barrier is insufficient once EL2's mappings are cacheable.
+///   An instrument that silently stops compiling is an argument that silently stops existing.
+///
+/// ## What this does NOT do, stated so the gate is not read for more than it is
+///
+/// **It does not run the model.** The AEM is an 885 MB download driven inside a Linux VM; CI builds
+/// the probe and checks its health, and the milestone **verdicts remain local evidence**, exactly as
+/// they were. What becomes gated is that the code compiles, lints, formats, documents — and that its
+/// compile-time assertions are actually evaluated.
+fn fvp_lint() -> bool {
+    run_in(FVP_DIR, "cargo", &["fmt", "--", "--check"])
+        && run_in(
+            FVP_DIR,
+            "cargo",
+            &["clippy", "--release", "--", "-D", "warnings"],
+        )
+        && run_in(FVP_DIR, "cargo", &["build", "--release"])
+        && run_in_env(
+            FVP_DIR,
+            "cargo",
+            &["doc", "--no-deps"],
+            &[("RUSTDOCFLAGS", "-D warnings")],
+        )
+}
+
 fn metal_lint() -> bool {
     run(
         "cargo",
@@ -2658,6 +2706,36 @@ fn verus_counts() -> bool {
 /// Run a command inheriting stdio, returning whether it succeeded.
 fn run(program: &str, args: &[&str]) -> bool {
     run_env(program, args, &[])
+}
+
+/// Like [`run`], but with the child's **working directory** set.
+///
+/// ⚠ **Needed because cargo discovers `.cargo/config.toml` from the WORKING DIRECTORY, not from
+/// `--manifest-path`.** `fvp-probe` keeps both its target *and* its linker script (`-C
+/// link-arg=-Tlink.ld`) there, so the `--manifest-path` form every other task in this file uses
+/// would silently drop the linker script and build something that is not what a developer builds.
+///
+/// Restating those flags here instead would be a second copy of the crate's own configuration —
+/// design-lesson #230 — and the copy is what goes stale. So the gate runs **the command a developer
+/// runs, in the directory they run it in**.
+fn run_in(dir: &str, program: &str, args: &[&str]) -> bool {
+    run_in_env(dir, program, args, &[])
+}
+
+/// Like [`run_in`], with extra environment variables set for the child.
+///
+/// Rustdoc's warning bar is set through `RUSTDOCFLAGS`, not through a `--` passthrough the way
+/// clippy's is — `cargo doc -- -D warnings` is rejected outright with *"unexpected argument"*. This
+/// exists so [`fvp_lint`] can hold rustdoc to the same bar [`metal_doc`] already does, by the same
+/// mechanism.
+fn run_in_env(dir: &str, program: &str, args: &[&str], env: &[(&str, &str)]) -> bool {
+    eprintln!("$ (cd {dir} && {program} {})", args.join(" "));
+    let mut cmd = Command::new(program);
+    cmd.args(args).current_dir(dir);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// Like [`run`], with extra environment variables set for the child.
