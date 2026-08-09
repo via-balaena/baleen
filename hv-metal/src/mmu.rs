@@ -34,6 +34,23 @@
 //! ★ **Inner Shareable, not merely cacheable** — see [`SH_INNER_SHAREABLE`]. And the same memory
 //! type `hv-s2` already gives a guest, so EL2 and its guests now name the same DRAM the same way.
 //!
+//! ## The axis A2 did not move: `SCTLR_EL2.I` and `.text`
+//!
+//! A2 is about the **data** cache. `SCTLR_EL2.I` stays 0 and `.text` stays Normal-Non-cacheable, and
+//! both are decisions rather than omissions:
+//!
+//! * With `I == 0` an instruction fetch is Non-cacheable **whatever the descriptor says**, so
+//!   mapping `.text` Write-Back would make the descriptor describe something the hardware does not
+//!   do — the opposite of what [`coverage`] exists to check.
+//! * Turning `I` on would buy nothing and cost an invariant. **EL2 copies no guest code** (QEMU's
+//!   `-device loader` places the blobs), so there is no instruction stream for it to keep in step
+//!   with, and `hv-metal` contains **zero `ic` instructions** — a property the whole crate leans on.
+//!   A real board needs a loader story, and that is bring-up's rung, not this one.
+//!
+//! ⚠ The one place the two axes touch is `xn_probe`, which writes instructions into a data page it
+//! expects never to be fetched; A2 gave it a `DC CVAC` so its *failure* path stays fail-loud. See
+//! that function.
+//!
 //! ## ★★ A2 is a REPAIR as well as a change, and this is the part the roadmap had backwards
 //!
 //! The board carried A2 as pure cost for months. It is also the fix for a **live** mismatch:
@@ -77,10 +94,27 @@
 //! `fvp-probe` shares no source with `hv-metal` and `hv-metal` has never run on the FVP, so the
 //! mechanism is witnessed and the call site is not — the standing of honest-ledger 2(d). Every gate
 //! in this repository was green before A2 and is green after it, and that is a statement about
-//! QEMU's cache model rather than about this rung. ⚠ **A2's ATOMICS half is a different matter and
-//! remains unwitnessable anywhere available**: m5 measured the AEM resolving `LDXR`/`STXR` on Device
-//! memory benignly, so silicon is its only oracle, and this crate's release build contains 40
-//! exclusive-monitor instructions across six modules.
+//! QEMU's cache model rather than about this rung.
+//!
+//! ## ★★★ The ATOMICS half needed no instrument at all, and that is the finding
+//!
+//! `docs/ARC-4`'s EL2-MMU gap had two consequences, and the second was **`LDXR`/`STXR` are
+//! CONSTRAINED UNPREDICTABLE, typically livelocking**. `fvp-probe` **m5** went looking for a
+//! platform that would *exhibit* it and found none — the AEM resolves the case benignly — which left
+//! "silicon is the only oracle" standing and the hazard open.
+//!
+//! **A2 closes it without an oracle, because the hazard is architectural rather than empirical.**
+//! Its own statement is *"`LDXR`/`STXR` **on Device memory**"*, and this rung is the one that stops
+//! EL2's memory being Device. The release build's **42 exclusive-monitor instructions, zero LSE**
+//! (measured; it was 40 before A2, and a 244 published earlier was read off an uncontrolled
+//! `target/` artifact) all land on statics in `.bss`/`.data` — Normal-WB Inner-Shareable, where
+//! exclusives are architecturally defined. Nothing here takes an exclusive on MMIO.
+//!
+//! ★ **And [`coverage`] is what keeps that from being an argument**: it re-reads every descriptor at
+//! all three levels on every boot, so "EL2's memory is not Device" is checked rather than asserted.
+//! ⚠ m5 is **made moot, not superseded** — its measurement stands, and the milestone is the record
+//! of asking the harder question first. The reusable shape: *a hazard stated as "X is unsafe on
+//! memory of type T" has two exits — grade X, or stop using T.*
 //!
 //! ## ⚠ The backstop A2 spent, and the residual it leaves
 //!

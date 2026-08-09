@@ -166,9 +166,11 @@ pub(crate) fn clean(pa: u64, len: u64) {
 /// ⚠⚠ **This DISCARDS a dirty line rather than writing it back, and every caller must be able to say
 /// why EL2 holds none.** That is not a technicality: `DC CIVAC` in this position would write EL2's
 /// stale copy back over the device's write, silently restoring the value the read was trying to
-/// observe. `scrub_frame` shipped that exact inversion for months (#168) and no gate could see it,
-/// because QEMU/TCG models no cache. The two call sites in this crate are the SMMU event queue and
-/// the DMA witness's sentinels, and both are memory **only a device ever stores to**.
+/// observe. That is the same inversion `scrub_frame` shipped for months — a clean-before-invalidate
+/// republishing the value the maintenance was meant to displace (#168, measured on Arm's AEM) — and
+/// no gate could see it, because QEMU/TCG models no cache. The two call sites in this crate are the
+/// SMMU event queue and the DMA witness's sentinels, and both are memory **only a device ever
+/// stores to**.
 pub(crate) fn invalidate(pa: u64, len: u64) {
     maintain(pa, len, Op::Invalidate);
 }
