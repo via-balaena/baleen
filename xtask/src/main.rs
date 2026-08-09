@@ -1638,14 +1638,15 @@ fn metal_build_linux(boot: LinuxBoot) -> bool {
     )
 }
 
-/// Lint `hv-metal` — fmt `--check` + clippy `-D warnings` on the bare-metal target, for BOTH
-/// feature configs (default and `selftest`). `hv-metal` is excluded from the workspace, so
-/// `cargo xtask ci`'s workspace-scoped fmt/clippy never touch it — yet it is the ONE crate that
-/// carries `unsafe`, so it must stay under the same `-D warnings` bar. The `metal boot (QEMU)` CI
-/// job runs this so the gate is enforced (single source of truth: CI calls this task).
-///
-/// Note: no `--all-targets` — a `#![no_std] #![no_main]` bare-metal bin has no buildable `test`
-/// target (the test harness needs `std`), so `--all-targets` would fail to compile it.
+/// The feature set every real-Linux boot builds — `qemu-linux`, and the REQUIRED
+/// `real-linux boot (QEMU)` gate. Declared once and used by **both** [`metal_build_linux`] and
+/// [`METAL_LINT_CONFIGS`], so the config that ships and the config that is linted are the same
+/// token rather than two strings that agree today (⑳-f).
+const LINUX_FEATURES: &str = "real-linux,selftest";
+/// As [`LINUX_FEATURES`], for the SMMU boot (⑲-1) — the machine has an SMMU, so the binary must be
+/// the one that programs it.
+const LINUX_SMMU_FEATURES: &str = "real-linux,selftest,smmu";
+
 /// Every `hv-metal` feature configuration `metal-lint` covers — the ONE place the set is written
 /// down, so anything that wants to state its size (the usage text) derives the number instead of
 /// repeating it.
@@ -1664,18 +1665,17 @@ fn metal_build_linux(boot: LinuxBoot) -> bool {
 /// `linux.rs`?" and fixed it, but not "does the linted set EQUAL the shipped set?".
 ///
 /// Where the shipped set is defined, so a new config has an obvious home here:
-///   default · selftest · smmu   -> `hv-metal/boot-test.sh`'s `boot_and_check` invocations
-///   real-linux,selftest         -> `metal_build_linux` below
+///   the SIX `boot_and_check` invocations in `hv-metal/boot-test.sh` — default · selftest ·
+///     dma-control (default features) · smmu · **wx-probe** · **xn-probe**
+///   [`LINUX_FEATURES`] / [`LINUX_SMMU_FEATURES`] -> `metal_build_linux` below
 /// `real-linux` alone is kept too: it is seconds, and it covers the non-selftest path.
-/// The feature set every real-Linux boot builds — `qemu-linux`, and the REQUIRED
-/// `real-linux boot (QEMU)` gate. Declared once and used by **both** [`metal_build_linux`] and
-/// [`METAL_LINT_CONFIGS`], so the config that ships and the config that is linted are the same
-/// token rather than two strings that agree today (⑳-f).
-const LINUX_FEATURES: &str = "real-linux,selftest";
-/// As [`LINUX_FEATURES`], for the SMMU boot (⑲-1) — the machine has an SMMU, so the binary must be
-/// the one that programs it.
-const LINUX_SMMU_FEATURES: &str = "real-linux,selftest,smmu";
-
+///
+/// ⚠ **⑳-f — THAT LIST USED TO READ "default · selftest · smmu", AND THE UNDERCOUNT WAS THE BUG.**
+/// Naming three of the six sources made the two it omitted invisible: `wx-probe` and `xn-probe`
+/// were booted by a required gate and linted by nothing. **A pointer to where the truth lives is
+/// only as good as its own completeness** — which is why the shell half is now READ rather than
+/// summarised, by [`check_lint_configs_cover_booted`]. The linux half needs no reading: it is the
+/// same two consts this list and `metal_build_linux` both use.
 const METAL_LINT_CONFIGS: &[&[&str]] = &[
     &[],
     &["--features", "selftest"],
@@ -1871,6 +1871,23 @@ fn check_lint_configs_cover_booted() -> bool {
     ok
 }
 
+/// Lint `hv-metal` — fmt `--check`, then clippy `-D warnings` and rustdoc `-D warnings` on the
+/// bare-metal target for **every config in [`METAL_LINT_CONFIGS`]**. `hv-metal` is excluded from the
+/// workspace, so `cargo xtask ci`'s workspace-scoped fmt/clippy never touch it — yet it is the ONE
+/// crate that carries `unsafe`, so it must stay under the same `-D warnings` bar. The
+/// `metal boot (QEMU)` CI job runs this, so the gate is enforced (single source of truth: CI calls
+/// this task).
+///
+/// ⚠ **⑳-f — THIS DOC WAS ATTACHED TO [`METAL_LINT_CONFIGS`], NOT TO THIS FUNCTION, AND SAID "for
+/// BOTH feature configs (default and `selftest`)".** It described the task while sitting on the
+/// list, and by then the list held eight. Two separate small failures with one cause: text that
+/// documents a *behaviour* parked on a *constant* stops being read as a claim about the behaviour,
+/// so nobody updated it as the list grew from two entries to eight. Moved to the thing it describes,
+/// and it now names the list instead of counting it (the count is derived for the usage text, and
+/// prose that restates a number is a number that drifts).
+///
+/// Note: no `--all-targets` — a `#![no_std] #![no_main]` bare-metal bin has no buildable `test`
+/// target (the test harness needs `std`), so `--all-targets` would fail to compile it.
 fn metal_lint() -> bool {
     // The universe check runs FIRST, and before any cargo invocation: it is cheap, and a lint set
     // that does not cover what ships is a fact worth learning before spending a minute proving the
