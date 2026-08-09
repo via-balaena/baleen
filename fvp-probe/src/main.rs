@@ -940,8 +940,116 @@ extern "C" fn probe_main() -> ! {
     milestone_3();
     milestone_4();
 
+    milestone_5();
+
     puts("@@ FVPPROBE-END\n");
     semihosting_exit()
+}
+
+/// ★★★ MILESTONE 5 — **ARE EL2's ATOMICS ARCHITECTURALLY DEFINED ON THE MEMORY TYPE IT USES?**
+///
+/// ## The claim this is pointed at
+///
+/// `docs/ARC-4-TRAP-AND-SERVICE.md` records that with EL2's data accesses `Device-nGnRnE`,
+/// `LDXR`/`STXR` are **CONSTRAINED UNPREDICTABLE** and typically livelock. It declined to fix it
+/// with: *"its core payoff has **no oracle but real EL2 hardware** — no spec, blind auditor, or
+/// QEMU run can confirm it."*
+///
+/// ⚠ **That is the same sentence milestone 3 refuted for caches**, and nobody had pointed an
+/// instrument at this one (design-lesson #238).
+///
+/// ## Why it still applies after the EL2-MMU rung
+///
+/// A1 (#156) turned EL2's MMU **on** but reproduced MMU-off attributes exactly: `hv-metal`'s
+/// `MAIR_EL2` attr 0 is `Device-nGnRnE` and `SCTLR_EL2.C` is deliberately left 0. So EL2's data
+/// memory type is unchanged, and so is this hazard. Measured on the shipped binary: **244
+/// exclusive-monitor instructions in the release build, zero LSE** — `ldaxr`/`stlxr` throughout,
+/// across `cell.rs`, `heap.rs`, `linux.rs`, `pending.rs`, `guest.rs` and `role.rs`.
+///
+/// ## The experiment
+///
+/// The same bounded `LDXR`/`STXR` increment on two memory types: `Normal` write-back (the control,
+/// which must succeed) and `Device-nGnRnE` (the question). Different physical pages, so no
+/// mismatched-attribute alias confounds the result — see [`mmu::ATOMIC_DEV_PA`].
+///
+/// ⚠ **This probe runs at EL3 and `hv-metal` runs at EL2.** The hazard is a property of the memory
+/// *type*, not the exception level, so it transfers — but that is an argument, not a measurement
+/// (design-lesson #198).
+fn milestone_5() {
+    puts("@@ M5-ATOMICS-BEGIN\n");
+
+    /// Enough retries that "the monitor never tags" is not confused with ordinary contention.
+    /// Nothing else is running on this core, so a correct implementation succeeds on attempt 1.
+    const LIMIT: u32 = 10_000;
+    const SEED: u64 = 0x4141_4141_0000_0000;
+
+    // SAFETY: the MMU is on; both cells are mapped writable and 8-byte aligned, and neither
+    // overlaps the image, its stack, or milestone 3/4's page.
+    let (wb_ok, wb_att, wb_val) = unsafe {
+        mmu::poke64(mmu::ATOMIC_WB_PA, SEED);
+        puts("@@ M5 wb-arm  : LDXR/STXR on Normal-WB (the control) ...\n");
+        let (ok, att) = mmu::bounded_exclusive_add(mmu::ATOMIC_WB_PA, LIMIT);
+        (ok, att, mmu::peek64(mmu::ATOMIC_WB_PA))
+    };
+    puts("@@ M5 wb-arm  : ok=");
+    putdec(u64::from(u8::from(wb_ok)));
+    puts(" attempts=");
+    putdec(u64::from(wb_att));
+    puts(" value=");
+    puthex(wb_val);
+    puts("\n");
+
+    // ⚠ The marker below is the discriminator for the outcomes that do not RETURN. `LDXR` to
+    // Device memory is also permitted to abort or be UNDEFINED, and this probe installs no
+    // `VBAR_EL3` — so if the transcript ends here, the model took one of those rather than
+    // livelocking, and the next step is a vector table, not a guess (design-lesson #204).
+    puts(
+        "@@ M5 dev-arm : LDXR/STXR on Device-nGnRnE — IF THE TRANSCRIPT STOPS HERE, the model \
+         aborted or went UNDEFINED rather than returning a failed STXR\n",
+    );
+    // SAFETY: as above; `DEV_ALIAS_VA` is the sole mapping of `ATOMIC_DEV_PA`.
+    let (dev_ok, dev_att, dev_val) = unsafe {
+        mmu::poke64(mmu::DEV_ALIAS_VA, SEED);
+        let (ok, att) = mmu::bounded_exclusive_add(mmu::DEV_ALIAS_VA, LIMIT);
+        (ok, att, mmu::peek64(mmu::DEV_ALIAS_VA))
+    };
+    puts("@@ M5 dev-arm : ok=");
+    putdec(u64::from(u8::from(dev_ok)));
+    puts(" attempts=");
+    putdec(u64::from(dev_att));
+    puts(" value=");
+    puthex(dev_val);
+    puts("\n");
+
+    // The verdict. The control is checked FIRST and can refuse to interpret the other arm —
+    // without it, "the Device arm failed" is indistinguishable from "the probe cannot do an
+    // exclusive at all" (design-lesson #211).
+    if !wb_ok || wb_val != SEED + 1 {
+        puts(
+            "@@ M5-VERDICT CONTROL-FAILED: the exclusive did not work on NORMAL write-back \
+             memory, so this probe measures nothing about Device memory. Read the wb-arm line \
+             above before believing anything else here.\n",
+        );
+    } else if dev_ok && dev_val == SEED + 1 {
+        puts(
+            "@@ M5-VERDICT PERMITS: the model executed LDXR/STXR on Device-nGnRnE normally and \
+             the value incremented. The AEM picks a benign CONSTRAINED-UNPREDICTABLE choice, so \
+             it CANNOT grade this hazard — neither platform can, and A2's atomics half stays \
+             reasoned-not-witnessed with silicon as the only oracle.\n",
+        );
+    } else if !dev_ok && dev_att == LIMIT {
+        puts(
+            "@@ M5-VERDICT EXHIBITS: STXR reported failure on every one of the bounded attempts \
+             against Device-nGnRnE while succeeding first-try on Normal-WB. That is the livelock \
+             the architecture warns about, reproduced — A2's atomics half is WITNESSABLE here.\n",
+        );
+    } else {
+        puts(
+            "@@ M5-VERDICT INCONCLUSIVE: neither pattern. Read the two arm lines above; the \
+             attempt counts and values say more than this verdict does.\n",
+        );
+    }
+    puts("@@ M5-ATOMICS-END\n");
 }
 
 #[panic_handler]

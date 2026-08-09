@@ -101,6 +101,24 @@ pub const TEST_PA: u64 = 0x8100_0000;
 /// 4 — an index nothing else uses, which keeps the alias the only non-identity mapping.
 pub const NC_ALIAS_VA: u64 = 0x1_0000_0000;
 
+/// Milestone 5's **control** cell — reached identity, through the same Normal write-back 1 GiB
+/// block the image runs from. An exclusive here must simply work; if it does not, nothing the
+/// Device arm reports means anything.
+pub const ATOMIC_WB_PA: u64 = 0x8200_0000;
+
+/// Milestone 5's cell **under test**, reached ONLY through [`DEV_ALIAS_VA`] as `Device-nGnRnE`.
+///
+/// ⚠ **A different PA from [`ATOMIC_WB_PA`], deliberately — this is not an alias experiment.**
+/// Milestone 3 needed one page reachable two ways because its question was about a dirty line.
+/// Milestone 5's question is what an exclusive does to a *memory type*, so mapping one page with
+/// mismatched attributes would add a second architectural hazard (a mismatched-attribute alias is
+/// itself CONSTRAINED UNPREDICTABLE) and make a failure ambiguous between the two.
+pub const ATOMIC_DEV_PA: u64 = 0x8201_0000;
+
+/// The virtual address that reaches [`ATOMIC_DEV_PA`] as **`Device-nGnRnE`** — L3 entry 1, the page
+/// after milestone 3's alias.
+pub const DEV_ALIAS_VA: u64 = NC_ALIAS_VA + 0x1000;
+
 /// Build the tables and switch translation on, with **caches enabled**.
 ///
 /// # Safety
@@ -123,6 +141,9 @@ pub unsafe fn enable() {
         (*l1).0[4] = (&raw const (*l2).0 as u64) | DESC_TABLE;
         (*l2).0[0] = (&raw const (*l3).0 as u64) | DESC_TABLE;
         (*l3).0[0] = page(TEST_PA, ATTRIDX_NORMAL_NC, XN);
+        // Milestone 5: one Device-nGnRnE page. This is the ONLY mapping of `ATOMIC_DEV_PA`, so an
+        // exclusive issued to `DEV_ALIAS_VA` is unambiguously an exclusive to Device memory.
+        (*l3).0[1] = page(ATOMIC_DEV_PA, ATTRIDX_DEVICE, XN);
 
         asm!(
             "msr mair_el3, {mair}",
@@ -267,6 +288,91 @@ pub unsafe fn clean_invalidate_line(va: u64) {
             options(nostack, preserves_flags),
         );
     }
+}
+
+/// A plain 64-bit store to any mapped VA — used to seed milestone 5's cells.
+///
+/// # Safety
+///
+/// `va` must be mapped writable and 8-byte aligned.
+pub unsafe fn poke64(va: u64, value: u64) {
+    // SAFETY: caller guarantees the mapping and alignment.
+    unsafe {
+        (va as *mut u64).write_volatile(value);
+        asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
+/// A plain 64-bit load from any mapped VA.
+///
+/// # Safety
+///
+/// `va` must be mapped readable and 8-byte aligned.
+pub unsafe fn peek64(va: u64) -> u64 {
+    // SAFETY: caller guarantees the mapping and alignment.
+    unsafe { (va as *const u64).read_volatile() }
+}
+
+/// ★★★ **A BOUNDED `LDXR`/`STXR` INCREMENT.** Returns `(succeeded, attempts_used)`.
+///
+/// ## Why this is hand-written assembly and not `AtomicU64::fetch_add`
+///
+/// **The failure this probe is looking for is an unbounded retry loop.** `LDXR`/`STXR` to
+/// `Device` memory is CONSTRAINED UNPREDICTABLE, and the outcome the Arm ARM specifically warns
+/// about is an exclusive monitor that never tags, so `STXR` reports failure *forever*. Rust's
+/// `fetch_add` compiles to exactly that loop with no exit — so calling it here would make the probe
+/// **hang instead of report**, which is design-lesson #185's shape: a witness whose predicate can
+/// never become observable.
+///
+/// So the retry count is bounded and *returned*. A model that never tags produces
+/// `(false, limit)` — a measurement — where the library form produces silence.
+///
+/// ## What the caller still cannot distinguish, and how milestone 5 handles it
+///
+/// The architecture also permits the instruction to **abort** or be **UNDEFINED**. Those do not
+/// return here at all, and `fvp-probe` installs no `VBAR_EL3`, so they would appear as a
+/// transcript that simply stops. Milestone 5 therefore prints an "about to" marker before each arm,
+/// which localises a non-return to the arm that caused it. **That is deliberately weaker than
+/// catching `ESR_EL3`**: it distinguishes *bounded-retry-exhausted* (reported) from
+/// *did-not-return* (inferred), and does not tell you which non-returning outcome occurred. A
+/// vector table is the upgrade if a run ever lands there — measure first, instrument second
+/// (design-lesson #186).
+///
+/// # Safety
+///
+/// `va` must be mapped writable and 8-byte aligned. `limit` must be non-zero.
+pub unsafe fn bounded_exclusive_add(va: u64, limit: u32) -> (bool, u32) {
+    let attempts: u32;
+    let ok: u32;
+    // SAFETY: caller guarantees the mapping and alignment. The loop is bounded by `limit`, so this
+    // returns whatever the monitor does. `clrex` on the bail path leaves no monitor set behind.
+    unsafe {
+        asm!(
+            "mov   {att:w}, wzr",
+            "2:",
+            "add   {att:w}, {att:w}, #1",
+            "ldxr  {tmp}, [{addr}]",
+            "add   {tmp}, {tmp}, #1",
+            "stxr  {res:w}, {tmp}, [{addr}]",
+            "cbz   {res:w}, 3f",
+            "cmp   {att:w}, {lim:w}",
+            "b.lo  2b",
+            "clrex",
+            "mov   {ok:w}, wzr",
+            "b     4f",
+            "3:",
+            "mov   {ok:w}, #1",
+            "4:",
+            addr = in(reg) va,
+            lim  = in(reg) limit,
+            att  = out(reg) attempts,
+            ok   = out(reg) ok,
+            tmp  = out(reg) _,
+            res  = out(reg) _,
+            options(nostack),
+        );
+    }
+    (ok != 0, attempts)
 }
 
 /// `DC IVAC` — invalidate **without** cleaning: discard the line, do not write it back.
