@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
+//! Baleen's task runner. Invoke as `cargo xtask <task>` (see `.cargo/config.toml`).
+//!
+//! Deliberately tiny for M1 — it grows to cover `hv-metal` cross-builds and the
+//! `hv-fuzz` targets as those milestones land.
+
 // ㉔ — **every private item carries a doc, and the reason is a defect the compiler could not see.**
 //
 // Inserting an item between a doc comment and the item it documents **silently re-parents the whole
@@ -29,11 +34,6 @@
 // LOCKS IN a property already held. `hv-core` has 59 and is deliberately left out — that is real
 // documentation work, not filler, but it is larger than one rung.
 #![warn(clippy::missing_docs_in_private_items)]
-
-//! Baleen's task runner. Invoke as `cargo xtask <task>` (see `.cargo/config.toml`).
-//!
-//! Deliberately tiny for M1 — it grows to cover `hv-metal` cross-builds and the
-//! `hv-fuzz` targets as those milestones land.
 
 use std::io::{BufRead, BufReader};
 use std::process::{exit, Command, Stdio};

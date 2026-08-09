@@ -16,10 +16,10 @@
 // ㉔ — **every private item carries a doc.** Inserting an item between a doc comment and the item it
 // documents silently re-parents the block, leaving the displaced item bare; that is valid Rust, and
 // `git diff` shows it as clean added lines with no sign the lines above changed meaning. It happened
-// twice in `xtask` in one day, the second time hours after the lesson was written. This crate was
-// already at ONE warning, so enabling the lint LOCKS IN a property it effectively held rather than
-// buying a new one. See `xtask/src/main.rs`'s block for the full account and the partial-guard
-// caveat.
+// twice in `xtask` in one day, the second time hours after the lesson was written. This crate had
+// exactly ONE finding (`smmu.rs`'s `STE_CONFIG_MASK`, and it was the same "doc on the wrong item"
+// shape), so enabling the lint costs one doc and locks in the rest. See `xtask/src/main.rs`'s block
+// for the full account and the partial-guard caveat.
 #![warn(clippy::missing_docs_in_private_items)]
 
 //! # `hv-s2` — Stage-2 emission, factored out of the `unsafe` metal
