@@ -47,7 +47,7 @@
 //!
 //! | site | obligation | silent? |
 //! |---|---|---|
-//! | [`smmu::publish`](crate::smmu) | `DC CVAC`, not a bare `dsb` — the SMMU fetches non-coherently (`CR1 = 0`) | no: a stale STE fails a read-back |
+//! | `smmu::publish` | `DC CVAC`, not a bare `dsb` — the SMMU fetches non-coherently (`CR1 = 0`) | no: a stale STE fails a read-back |
 //! | `smmu::submit` | ⚠ the command BYTES need publishing, not just the structure | **YES** — `CMD_SYNC` reports success either way |
 //! | `smmu::take_event` | ⚠ `DC IVAC` before reading a record the SMMU wrote | **YES** — a stale queue reads as "no event" |
 //! | `dmawitness::sentinel` | ⚠ `DC IVAC` before reading a sentinel a *device* wrote | **YES**, and it inverts an ISOLATION result — see below |

@@ -97,12 +97,20 @@ page kept a second copy from Arc 6b-pre (PR #55, the last commit to touch this f
 2026-08-09, and the second copy is what stayed wrong after the code was fixed — so what follows is
 the standing, not the argument.
 
-* **Required.** EL2's stores are non-cacheable (MMU-off, and `SCTLR_EL2.C = 0` under ledger 5's A1)
-  while the dying guest wrote through cacheable EL1 mappings, so the zeroing alone does not touch
-  the dead tenant's dirty lines.
+* **Required**, and ⚠ **the reason CHANGED under ledger 5's A2 while the requirement did not.** It
+  used to be that EL2's stores were non-cacheable (MMU-off, `SCTLR_EL2.C = 0` under A1) while the
+  dying guest wrote through cacheable EL1 mappings, so the zeroing could not touch the dead tenant's
+  dirty lines. **A2 made EL2's stores cacheable too** — the guest windows are inside `L1[1]`, which
+  A2 maps Normal-WB Inner Shareable, the same memory type `hv-s2` gives the guest. EL2 and the dying
+  tenant are now in one coherency domain, so the zeroing *does* reach the tenant's lines. The
+  maintenance is still required, for the other observer: a **bus master** reading the frame is not
+  inner-shareable, so the zeroing must be pushed to the point of coherency.
 * **Order-sensitive, and this page originally got the order wrong** — see correction 3 at the top.
-  The maintenance runs **before** the zeroing (which is what erases the tenant) and again after
-  (a no-op today, load-bearing the moment A2 makes EL2's own stores cacheable).
+  The maintenance runs **before** the zeroing (which is what erases the tenant) and again after.
+  ⚠ **The after-pass is no longer a no-op**: it was one while EL2's own stores were non-cacheable,
+  and A2 is exactly the rung that made it load-bearing — it is what pushes the *zeroing itself* out
+  to the point of coherency. The instruction sequence is unchanged; #168 wrote it in its A2 shape
+  before A2 existed.
 * **No longer "reasoned, not witnessed."** `fvp-probe` milestone 3 established that Arm's AEM does
   withhold a dirty line from a non-cacheable observer, and milestone 4 reproduced this exact
   sequence on it and measured the secret surviving the shipped order and erased by the current one.

@@ -128,7 +128,9 @@ fn maintain(pa: u64, len: u64, op: Op) {
         // each of its call sites rather than here.
         unsafe {
             match op {
-                Op::Clean => asm!("dc cvac, {a}", a = in(reg) addr, options(nostack, preserves_flags)),
+                Op::Clean => {
+                    asm!("dc cvac, {a}", a = in(reg) addr, options(nostack, preserves_flags))
+                }
                 Op::Invalidate => {
                     asm!("dc ivac, {a}", a = in(reg) addr, options(nostack, preserves_flags))
                 }
