@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright (c) 2026 Via Balaena
 
-//! # A minimal EL3 MMU, for one purpose: making a **cacheable** store possible
+//! # A minimal EL3 MMU, for two purposes: **choosing a memory type**
 //!
 //! ## Why the probe needs an MMU at all
 //!
@@ -10,24 +10,35 @@
 //! stimulus without turning translation on. That is the whole reason this file exists; it is not a
 //! port of `hv-metal`'s MMU and does not want to be.
 //!
+//! ⚠ **This header said "for ONE purpose: making a cacheable store possible" until milestone 5**,
+//! which needed the opposite — a page that is *definitely* `Device-nGnRnE` while the image around
+//! it is cacheable. Both are the same capability: with the MMU off there is no choice of memory
+//! type at all. Stated generally now, because the specific version was false within one milestone.
+//!
 //! ## What it maps, and why so little
 //!
 //! | VA | PA | attributes | why |
 //! |---|---|---|---|
 //! | `0x0000_0000`, 1 GiB block | identity | `Device-nGnRnE`, XN | the peripherals — PL011 at `0x1c09_0000`, SMMU at `0x2b40_0000` |
-//! | `0x8000_0000`, 1 GiB block | identity | **Normal WB cacheable**, RWX | the image, the stack, and [`TEST_PA`] |
-//! | [`NC_ALIAS_VA`] , one 4 KiB page | [`TEST_PA`] | **Normal Non-Cacheable**, XN | the observer |
+//! | `0x8000_0000`, 1 GiB block | identity | **Normal WB cacheable**, RWX | the image, the stack, [`TEST_PA`], and m5's control cell [`ATOMIC_WB_PA`] |
+//! | [`NC_ALIAS_VA`], one 4 KiB page | [`TEST_PA`] | **Normal Non-Cacheable**, XN | milestone 3/4's observer |
+//! | [`DEV_ALIAS_VA`], one 4 KiB page | [`ATOMIC_DEV_PA`] | **`Device-nGnRnE`**, XN | milestone 5's cell under test |
 //!
-//! ★ **The last row is the instrument.** One physical page reachable two ways — once through a
-//! write-back cacheable mapping, once through a non-cacheable one — is what lets the probe ask
-//! whether a store through the first is visible through the second *without* cache maintenance.
-//! That is precisely the hazard `hv-metal`'s `scrub_frame` guards against, and precisely the thing
-//! QEMU cannot exhibit.
+//! ★ **The last two rows are the instruments**, and they ask opposite questions.
+//! [`NC_ALIAS_VA`] gives one physical page two mappings — write-back and non-cacheable — so the
+//! probe can ask whether a store through the first is visible through the second *without* cache
+//! maintenance: the hazard `hv-metal`'s `scrub_frame` guards against, and the thing QEMU cannot
+//! exhibit. [`DEV_ALIAS_VA`] instead gives one page a *single* mapping of the memory type EL2
+//! actually runs on, so the probe can ask what an **exclusive** does there.
 //!
-//! ⚠ **Identity everywhere else, deliberately.** The alias is the ONLY non-identity mapping, so
-//! every address this probe already knew about still means what it meant with the MMU off. A
-//! general remap would make a failure ambiguous between "the model coalesces the aliases" and "the
-//! probe broke its own addressing".
+//! ⚠ **Identity apart from those two pages, deliberately.** Every address this probe already knew
+//! about still means what it meant with the MMU off. A general remap would make a failure ambiguous
+//! between "the model coalesces the aliases" and "the probe broke its own addressing".
+//!
+//! ⚠ **Only [`TEST_PA`] is aliased; [`ATOMIC_DEV_PA`] is not.** An exclusive issued to a
+//! mismatched-attribute alias is *itself* CONSTRAINED UNPREDICTABLE, so milestone 5 would have been
+//! measuring two hazards at once. Its cell has exactly one mapping and its control is a different
+//! physical page.
 //!
 //! ## Encodings
 //!
