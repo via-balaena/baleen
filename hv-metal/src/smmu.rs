@@ -201,40 +201,61 @@ fn read64(off: u64) -> u64 {
     unsafe { core::ptr::read_volatile((SMMU_BASE + off) as *const u64) }
 }
 
-/// Publish CPU writes to the tables and queues before the SMMU is told to look at them.
+/// Publish `[pa, pa + len)` — a table or a queue slot EL2 has just written — before the SMMU is told
+/// to look at it.
 ///
-/// EL2's data accesses are Device-nGnRnE — already strongly ordered and uncached — and on
-/// QEMU this barrier is a no-op. It is issued anyway because the ordering obligation is *real* (a
-/// second agent reads this memory without going through the CPU's caches at all) and would bite on
-/// silicon the moment the EL2 MMU brings normal cacheable mappings with it. `sy` rather than `ish`:
-/// the SMMU is not in the inner-shareable domain.
+/// ## ★★ This was a bare `dsb sy` until A2, and the specification for changing it was MEASURED first
 ///
-/// ★★ **THAT PREDICTION IS NOW MEASURED, AND THIS FUNCTION IS NOT SUFFICIENT FOR A2 — two ways.**
-/// `fvp-probe` milestone 6 reproduced this exact sequence on Arm's AEM with the CPU side cacheable
-/// and the SMMU fetching non-cacheably (`CR1 = 0`), which is what ledger 5's **A2** creates:
+/// Under A1, EL2's data accesses were Device-nGnRnE — already strongly ordered and uncached — so a
+/// barrier was the whole obligation and on QEMU it was a no-op. The doc here predicted the barrier
+/// "would bite on silicon the moment the EL2 MMU brings normal cacheable mappings with it".
+/// `fvp-probe` milestone 6 then reproduced this exact sequence on Arm's AEM with the CPU side
+/// cacheable and the SMMU fetching non-cacheably (`CR1 = 0`), which is what A2 creates:
 ///
 /// | after | SMMU answered |
 /// |---|---|
-/// | writing the STE, then a bare `dsb sy` — *this function* | the **STALE** binding |
+/// | writing the STE, then a bare `dsb sy` | the **STALE** binding |
 /// | `DC CVAC` over the structure | the new one |
 ///
-/// 1. **The barrier must become maintenance.** A `dsb` orders accesses; it does not push a dirty
-///    line to the point of coherency the SMMU fetches from.
-/// 2. ⚠ **Every SUBMITTED COMMAND must be published too, and this half is silent when it is wrong.**
-///    The doorbell (`CMDQ_PROD`) is MMIO and always visible, but the command *bytes* are DRAM. Under
-///    A2 the SMMU is told "there is a new command" and reads whatever that ring slot last held —
-///    usually a real command from an earlier round, so **`CMD_SYNC` reports success while the
+/// So the prediction was right and the barrier was not enough, in **two** ways — and A2 discharges
+/// both here:
+///
+/// 1. **The barrier became maintenance.** A `dsb` orders accesses; it does not push a dirty line to
+///    the point of coherency the SMMU fetches from. Hence [`crate::cache::clean`], which is
+///    `DC CVAC` over the range *followed by* `dsb sy` — the ordering obligation did not go away, it
+///    gained a prerequisite.
+/// 2. ⚠ **Every SUBMITTED COMMAND is published too, and that half is silent when it is wrong.** The
+///    doorbell (`CMDQ_PROD`) is MMIO and always visible, but the command *bytes* are DRAM. Told
+///    "there is a new command", the SMMU reads whatever that ring slot last held — with 16 slots,
+///    usually a real command from an earlier round — so **`CMD_SYNC` reports success while the
 ///    invalidation never happened.** Milestone 6 spent three runs inside that failure: memory held
 ///    the new STE (proved by `DC IVAC` + re-read) and the SMMU kept answering the old binding,
 ///    because the `CMD_CFGI_STE` telling it to look again had itself gone stale.
-///    **Order: bytes → maintenance → doorbell.**
+///    **Order: bytes → maintenance → doorbell**, which is what [`submit`] does.
 ///
-/// ⚠ **Not yet changed here, deliberately** — EL2's mappings are still Device-nGnRnE (`MAIR_EL2`
-/// attr 0, `SCTLR_EL2.C = 0`), so today's barrier is correct and maintenance would be dead code.
-/// This is A2's specification, written down before A2 exists.
-fn publish() {
-    // SAFETY: a barrier instruction; no memory operand, no privilege requirement at EL2.
-    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) }
+/// ★ **Taking a range is the change that makes this checkable.** A no-argument `publish()` was
+/// exactly right when the operation was a global barrier and exactly wrong for maintenance, which
+/// is addressed: a reviewer can now ask of each call site "is that the memory you just wrote?",
+/// which is a question the old signature could not even be asked.
+///
+/// `sy` rather than `ish` throughout: the SMMU is not in the inner-shareable domain.
+fn publish(pa: u64, len: u64) {
+    crate::cache::clean(pa, len);
+}
+
+/// The whole stream table, as a range for [`publish`].
+///
+/// ★ Callers that edit **one** STE publish the **whole** table anyway, and that is deliberate.
+/// `st::bind` and friends take the table and an index; asking each call site to re-derive the byte
+/// offset of the entry it just changed would put a second copy of the STE stride next to every one
+/// of them, and a publication that cleans the wrong 64 bytes fails exactly like no publication at
+/// all — silently, on a platform CI does not have. 16 KiB is 256 lines; the cost is not worth a
+/// derivation that can drift.
+fn strtab_range(smmu: &Smmu) -> (u64, u64) {
+    (
+        core::ptr::addr_of!(smmu.strtab.0) as u64,
+        core::mem::size_of_val(&smmu.strtab.0) as u64,
+    )
 }
 
 /// Whether an SMMUv3 appears to be present at [`SMMU_BASE`].
@@ -505,18 +526,35 @@ pub(crate) fn install_stream_table(stream_of: [u32; crate::NUM_DEVICES]) -> Stre
     let strtab_pa = core::ptr::addr_of!(smmu.strtab.0) as u64;
 
     // (2) The SMMU's own fetch attributes. `CR1 = 0` is non-cacheable, non-shareable for both tables
-    //     and queues — which is what matches an EL2 running MMU-off, where every CPU store is
-    //     Device-nGnRnE and reaches memory directly. Linux writes write-back/inner-shareable here
-    //     because *its* CPU mappings are cacheable; copying that value would be copying a premise
-    //     baleen does not have. Written explicitly rather than left at its reset value: rung 1's
-    //     entire content was a reset value that happened to be wrong.
+    //     and queues. Written explicitly rather than left at its reset value: rung 1's entire
+    //     content was a reset value that happened to be wrong.
+    //
+    // ⚠⚠ **A2 KILLED THIS VALUE'S ORIGINAL JUSTIFICATION AND KEPT THE VALUE. Read the new one.**
+    //     It used to be justified as matching "an EL2 running MMU-off, where every CPU store is
+    //     Device-nGnRnE and reaches memory directly", and noted that Linux writes
+    //     write-back/inner-shareable here "because *its* CPU mappings are cacheable; copying that
+    //     value would be copying a premise baleen does not have". **Baleen now has that premise** —
+    //     A2 made EL2's DRAM Normal-WB Inner-Shareable — and both SMMU platforms report
+    //     `IDR0.COHACC = 1` (measured: AEM `0x080fe6bf`, QEMU `0x0d44101b`), so the coherent
+    //     configuration is available and would be correct.
+    //
+    // ★ **It is deliberately NOT taken, and the reason is which arm the instrument graded.**
+    //     `fvp-probe` milestone 6 measured the **non-coherent** arm: CPU cacheable, `CR1 = 0`,
+    //     maintenance required — and found both of `publish`'s requirements there. Setting
+    //     `CR1 = WB/ISH` would discharge every one of those obligations at a stroke by making the
+    //     SMMU snoop, and would be the *ungraded* configuration on both platforms, defended by an ID
+    //     register rather than by a measurement. Explicit maintenance is correct under EITHER value
+    //     (cleaning to the point of coherency is redundant for a snooping observer, never wrong),
+    //     so this keeps the arm with evidence and pays a few hundred cache operations for it.
+    //     Flipping it is a rung with its own witness, not a one-line optimisation.
     write32(SMMU_CR1, 0);
     // Record an event for a StreamID outside the table, so the out-of-range denial is observable
     // rather than merely silent.
     write32(SMMU_CR2, CR2_RECINVSID);
 
     // (3) Publish the table, then point the SMMU at it.
-    publish();
+    let (strtab_base_va, strtab_len) = strtab_range(&smmu);
+    publish(strtab_base_va, strtab_len);
     write64(SMMU_STRTAB_BASE, st::strtab_base(strtab_pa));
     write32(SMMU_STRTAB_BASE_CFG, STRTAB_CFG);
     // Read back through the SAME masking function that produced the written value, rather than
@@ -531,7 +569,10 @@ pub(crate) fn install_stream_table(stream_of: [u32; crate::NUM_DEVICES]) -> Stre
     let eventq_pa = core::ptr::addr_of!(smmu.eventq.0) as u64;
     smmu.cmdq_prod = 0;
     smmu.eventq_cons = 0;
-    publish();
+    // Both queues, not just the command queue: the SMMU reads one and WRITES the other, and under
+    // A2 an event-queue line EL2 holds would be a line the SMMU's records have to displace.
+    publish(cmdq_pa, core::mem::size_of_val(&smmu.cmdq.0) as u64);
+    publish(eventq_pa, core::mem::size_of_val(&smmu.eventq.0) as u64);
     write64(SMMU_CMDQ_BASE, cmdq_pa | u64::from(CMDQ_LOG2SIZE));
     write32(SMMU_CMDQ_PROD, 0);
     write32(SMMU_CMDQ_CONS, 0);
@@ -598,12 +639,23 @@ fn set_cr0_bits(bits: u32) -> bool {
 }
 
 /// Push one 16-byte command and ring the doorbell.
+///
+/// ★ **The three statements below were already in the right ORDER before A2 — bytes, publish,
+/// doorbell — and that is why A2's silent half cost nothing here.** [`publish`]'s requirement 2 says
+/// a command whose bytes are not published lets `CMD_SYNC` report success over a stale ring slot;
+/// the structure that prevents it is this sequence, and it only had to be given a range to keep
+/// working once `publish` stopped being a global barrier.
 fn submit(smmu: &mut Smmu, word0: u64, word1: u64) {
     let idx = (smmu.cmdq_prod as usize) & (CMDQ_ENTRIES - 1);
     smmu.cmdq.0[idx * 2] = word0;
     smmu.cmdq.0[idx * 2 + 1] = word1;
-    // The command must be visible to the SMMU *before* `PROD` tells it to look.
-    publish();
+    // The command must be visible to the SMMU *before* `PROD` tells it to look. The range is this
+    // one slot: `CMDQ_PROD` names the slot, so publishing the slot is publishing exactly what the
+    // doorbell is about to point at.
+    publish(
+        core::ptr::addr_of!(smmu.cmdq.0[idx * 2]) as u64,
+        2 * core::mem::size_of::<u64>() as u64,
+    );
     smmu.cmdq_prod = smmu.cmdq_prod.wrapping_add(1) & queue_mask(CMDQ_LOG2SIZE);
     write32(SMMU_CMDQ_PROD, smmu.cmdq_prod);
 }
@@ -684,7 +736,8 @@ pub(crate) fn bind_stream_bypass(sid: u32) -> bool {
     if st::bind(&mut smmu.strtab.0, STRTAB_LOG2SIZE, sid, st::bypass_ste()).is_err() {
         return false;
     }
-    publish();
+    let (strtab_va, strtab_len) = strtab_range(&smmu);
+    publish(strtab_va, strtab_len);
     let synced = invalidate_ste(&mut smmu, sid);
     let permits_only_this = st::permitted_stream_count(&smmu.strtab.0, STRTAB_LOG2SIZE) == 1
         && st::verdict(&smmu.strtab.0, STRTAB_LOG2SIZE, sid).permits();
@@ -708,7 +761,8 @@ pub(crate) fn bind_stream_stage2(sid: u32, binding: &st::Stage2Binding) -> bool 
     if st::bind_stage2(&mut smmu.strtab.0, STRTAB_LOG2SIZE, sid, binding).is_err() {
         return false;
     }
-    publish();
+    let (strtab_va, strtab_len) = strtab_range(&smmu);
+    publish(strtab_va, strtab_len);
     // Both invalidations, in this order: the configuration cache (which STE this stream uses) and
     // then the stage-2 TLB (what that STE's tables translated to last time).
     let synced = invalidate_ste(&mut smmu, sid) && invalidate_s2_tlb(&mut smmu);
@@ -729,7 +783,8 @@ pub(crate) fn unbind_stream(sid: u32) -> bool {
     if st::unbind(&mut smmu.strtab.0, STRTAB_LOG2SIZE, sid).is_err() {
         return false;
     }
-    publish();
+    let (strtab_va, strtab_len) = strtab_range(&smmu);
+    publish(strtab_va, strtab_len);
     let synced = invalidate_ste(&mut smmu, sid);
     synced && st::denies_every_stream(&smmu.strtab.0, STRTAB_LOG2SIZE)
 }
@@ -822,7 +877,8 @@ pub(crate) fn rederive(hv: &hv_core::Hypervisor) -> Derived {
         } = &mut *smmu;
         strtab.0.copy_from_slice(&scratch.0);
     }
-    publish();
+    let (strtab_va, strtab_len) = strtab_range(&smmu);
+    publish(strtab_va, strtab_len);
     // The whole table was rebuilt, so the whole configuration cache is invalidated — the range form
     // of the same `CMD_CFGI_STE` rung 3 probed load-bearing — and then the stage-2 TLB, because a
     // stream whose STE now names a different domain's tables must not be answered from translations
@@ -916,6 +972,21 @@ pub(crate) fn drain_events() -> u32 {
 /// wrote) and takes only the *count* from `EVENTQ_PROD`. If [`SMMU_EVENTQ_PROD`]'s page-1 offset were
 /// wrong, the count would be wrong but the record would not — so the two pieces of evidence fail
 /// independently, which is the point of collecting both.
+///
+/// ## ⚠⚠ A2: this is the only place in the SMMU path where the data flows the OTHER way
+///
+/// Every other structure here is EL2 writing and the SMMU reading, discharged by [`publish`]. **This
+/// is the SMMU writing and EL2 reading**, and under A2 a plain load is answered from a cache the
+/// SMMU (`CR1 = 0`) never wrote to. The record would be whatever that ring slot held before — for a
+/// queue whose entries start zeroed, a **zeroed record**, which decodes to event kind 0 and would be
+/// read as "the queue produced nothing this code could decode".
+///
+/// So the record is invalidated before it is read. [`crate::cache::invalidate`] is `DC IVAC`, which
+/// **discards** rather than writes back, and that is safe here for a reason specific to this
+/// structure: **EL2 never stores into an event record.** The queue is zeroed as part of `.bss` while
+/// the MMU is off, published once in `install_stream_table`, and thereafter written only by the
+/// device. There is no EL2 dirty line to lose. A `DC CIVAC` here would be the #168 inversion —
+/// cleaning EL2's stale copy back over the SMMU's record on the way to reading it.
 pub(crate) fn take_event() -> Option<SmmuEvent> {
     let mut smmu = SMMU.borrow_mut();
     let prod = read32(SMMU_EVENTQ_PROD) & queue_mask(EVENTQ_LOG2SIZE);
@@ -923,6 +994,10 @@ pub(crate) fn take_event() -> Option<SmmuEvent> {
         return None;
     }
     let idx = (smmu.eventq_cons as usize) & (EVENTQ_ENTRIES - 1);
+    crate::cache::invalidate(
+        core::ptr::addr_of!(smmu.eventq.0[idx * 4]) as u64,
+        4 * core::mem::size_of::<u64>() as u64,
+    );
     let word0 = smmu.eventq.0[idx * 4];
     // Word 2 of a 32-byte fault record is the transaction's input address (`InputAddr`).
     let word2 = smmu.eventq.0[idx * 4 + 2];

@@ -225,7 +225,8 @@ they differ.
 ## Milestone 3 — **does this model hold a dirty cache line?** (2026-08-08)
 
 `hv-metal` runs EL2 with `SCTLR_EL2.C = 0` — all data accesses non-cacheable — as a deliberate
-backstop (rung A1). Turning caches on is rung **A2**, and it was deferred for one recorded reason:
+backstop (rung A1). Turning caches on is rung **A2** — **since built, on the strength of this
+milestone and m4/m6** — and it had been deferred for one recorded reason:
 `scrub_frame`'s confidentiality argument and `smmu::publish`'s ordering obligation must be
 *re-derived*, and the re-derivation is **unwitnessable on QEMU**, which models no cache. A wrong
 version and a right one look identical there.
@@ -282,9 +283,22 @@ configs — so this is not hypothetical code. (First published as 244, which was
 
 **The answer is a REFUTATION, and it is the useful kind.** The AEM picks a benign
 CONSTRAINED-UNPREDICTABLE choice: the exclusive simply works. So **this instrument cannot grade the
-hazard**, QEMU cannot either, and A2's atomics half stays *reasoned, not witnessed* — with silicon
-as the only remaining oracle. Recording that is the point: the deferral in ARC-4 is now a
+hazard**, and QEMU cannot either. Recording that is the point: the deferral in ARC-4 became a
 **measured** limit rather than an assumed one.
+
+> ★★ **AND THEN A2 MADE THIS MILESTONE MOOT — which is the most useful thing it did.** This probe
+> asked *"can a platform show me the livelock?"* and the answer was no on both, leaving "silicon is
+> the only remaining oracle" standing. **A2 did not find an oracle; it removed the hazard.** Its
+> statement is *`LDXR`/`STXR` **on Device memory** are UNPREDICTABLE*, and A2 maps EL2's DRAM Normal
+> Write-Back Inner Shareable, where exclusives are architecturally defined. All 42 exclusive-monitor
+> instructions in the release binary (40 before A2) land on `.bss`/`.data`.
+>
+> ⚠ **This does not retire the milestone or its caveats** — the measurement is still the measurement,
+> the m5 verdict text is unchanged, and the run is what makes "the AEM resolves this one benignly" a
+> fact rather than a guess. What it retires is the *conclusion drawn from it*. ★ The reusable shape:
+> **a hazard stated as "X is unsafe on memory of type T" has two exits — grade X, or stop using T —
+> and a milestone spent on the first can be dissolved by the second.** Nobody asked whether the
+> memory had to stay Device until A2 was scoped.
 
 ⚠ **Read the verdict for exactly what it says.** "This model does not exhibit the hazard" is **not**
 "the hazard is benign". CONSTRAINED UNPREDICTABLE means implementations may legitimately differ, so
@@ -335,9 +349,14 @@ is about to point the SMMU at.
 
 ### What it does not claim
 
-* **Not that `hv-metal` is wrong today.** EL2's mappings are still `Device-nGnRnE` with
-  `SCTLR_EL2.C = 0`, so the present barrier is correct and maintenance would be dead code. This is
-  A2's specification, not a defect report against `main`.
+* **Not that `hv-metal` was wrong when this was written.** EL2's mappings were still `Device-nGnRnE`
+  with `SCTLR_EL2.C = 0`, so the barrier of the day was correct and maintenance would have been dead
+  code. This was A2's specification, not a defect report against `main`.
+  ✅ **A2 has since landed and consumed it.** `smmu::publish` now takes a range and issues `DC CVAC`;
+  `submit` already ordered bytes → publish → doorbell, so requirement 2 needed no restructuring —
+  which is the payoff for writing the specification before the code (design-lesson #248). ⚠ **Note
+  what still does not follow**: this milestone graded the MECHANISM on a probe that shares no source
+  with `hv-metal`, and `hv-metal` has never run on the FVP. A2's call sites remain unwitnessed.
 * **Not conformance, and not silicon.** The AEM is a model; m5 already showed it resolves some
   CONSTRAINED-UNPREDICTABLE cases benignly. What is established is that *this* hazard is
   **distinguishable here**, which is what A2 needs and QEMU cannot supply.

@@ -1903,7 +1903,12 @@ const MARKER_CORPUS: &[(&str, &[&str], usize)] = &[
 /// compile-time array: `boot-test.sh` is where the `default`/`selftest`/`dma-control`/`smmu`/
 /// `wx-probe`/`xn-probe` boots name what they expect, and a marker deleted there is exactly as
 /// silent as one deleted from an array.
-const BOOT_TEST_MARKERS: usize = 176;
+/// ★ **177 since ledger 5's A2 (+1).** The `default` boot now asserts
+/// `"EL2 MMU on, data cacheable (C=1)"`, which no guest-running boot asserted before: the EL2-MMU
+/// marker existed only in the terminal `wx-probe`/`xn-probe` configurations. Raising a number here
+/// is the normal shape of adding a witness — see the block comment on [`MARKER_CORPUS`] for why
+/// LOWERING one is a different kind of claim.
+const BOOT_TEST_MARKERS: usize = 177;
 
 /// Every marker array [`MARKER_CORPUS`] must account for, found by reading this file.
 ///

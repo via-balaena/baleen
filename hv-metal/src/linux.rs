@@ -714,8 +714,15 @@ fn report_dma_inflight(uart: &mut Pl011) {
 ///
 /// Reported, not asserted against a fixed number: a core with a finer line is CORRECT here (the
 /// stride simply gets finer), so pinning 64 would fail a machine this code handles properly.
+///
+/// ⚠ **Since A2 this number governs FOUR maintenance loops, not one**, and the marker's wording
+/// still names only the frame scrub. That is deliberate rather than stale: the scrub is the loop
+/// whose stride is *isolation-relevant* (a skipped line leaves a dead tenant's data behind), and it
+/// is the loop #169 was found in. The others — the SMMU's structures, its event queue, the DMA
+/// witness's sentinels — take the same measurement from `crate::cache`, so a wrong value would be
+/// wrong in all four and this marker would show it.
 fn report_scrub_line(uart: &mut Pl011) {
-    let bytes = crate::stage2::scrub_line_bytes();
+    let bytes = crate::cache::line_bytes();
     let _ = writeln!(
         uart,
         "baleen: scrubline OK: the frame-scrub maintenance loop strides {bytes} bytes, taken as \

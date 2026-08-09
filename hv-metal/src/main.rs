@@ -50,6 +50,7 @@
 
 mod abort;
 mod blk;
+mod cache;
 mod cell;
 #[cfg(feature = "real-linux")]
 mod console;
@@ -245,15 +246,20 @@ pub extern "C" fn rust_main() -> ! {
     // nobody had read it. Every other platform fact this project checked this week turned out to
     // differ from the assumption it carried, so this one gets measured before code depends on it.
     //
-    // ⚠⚠ **SINCE #156 THE PHRASE IS LITERALLY FALSE AND STILL SUBSTANTIALLY TRUE, so read it as
-    // shorthand rather than as a state claim.** EL2's MMU is ON; what A1 preserved is the
-    // ADDRESSING (identity, so `VA == PA`) and the ATTRIBUTES (`MAIR_EL2` attr 0 is Device-nGnRnE,
-    // `SCTLR_EL2.C` left 0). Of the ~50 premises, 44 are addressing claims that an identity mapping
-    // keeps true verbatim — see `mmu`'s module doc, which is where that accounting lives.
-    // **This comment is the pointer**: the sites themselves say "MMU-off" with nothing nearby to
-    // explain why that is still sound, and one of them (`docs/ARC-4`) was misread as a state claim
-    // on 2026-08-09 for exactly that reason (design-lesson #184 — a rule nobody can find from where
-    // it applies is not a rule).
+    // ⚠⚠ **SINCE #156 THE PHRASE IS LITERALLY FALSE, AND SINCE A2 IT IS HALF-FALSE IN SUBSTANCE
+    // TOO — read it as shorthand for the ADDRESSING claim and nothing more.** EL2's MMU is ON, and
+    // A2 has made its DRAM Normal Write-Back Inner-Shareable with `SCTLR_EL2.C = 1`.
+    //   * **Addressing — still true verbatim.** The mapping is identity, so `VA == PA`, and **44 of
+    //     the ~50 premises are addressing claims**. Neither rung touched them.
+    //   * **Attributes — no longer true, deliberately.** A1 preserved them (`MAIR_EL2` attr 0 is
+    //     Device-nGnRnE, `C` left 0); **A2 is the rung that broke them**, which is the whole of what
+    //     A2 is. A premise site that says "MMU-off, so this store is uncached and strongly ordered"
+    //     is now WRONG unless it is about MMIO or `.text`.
+    // **This comment is the pointer**, and `mmu`'s module doc is where the accounting and the list of
+    // obligations A2 created live: the sites themselves say "MMU-off" with nothing nearby to explain
+    // what is still sound about that, and one of them (`docs/ARC-4`) was misread as a state claim on
+    // 2026-08-09 for exactly that reason (design-lesson #184 — a rule nobody can find from where it
+    // applies is not a rule).
     let sctlr = el2::sctlr_el2();
     let _ = writeln!(
         uart,
@@ -263,9 +269,21 @@ pub extern "C" fn rust_main() -> ! {
         u8::from(sctlr & el2::SCTLR_EL2_I != 0),
     );
 
-    // (3b) Enable EL2's own stage-1 MMU — identity-mapped, attributes reproducing what MMU-off
-    //      already gives, permissions added. Ledger item 5's first rung; see `mmu`'s module doc for
-    //      why "attributes unchanged" is the constraint that keeps ~50 existing premises true.
+    // (3b) Enable EL2's own stage-1 MMU — identity-mapped, permissions added, and (A2) its DRAM
+    //      Normal Write-Back Inner-Shareable with `SCTLR_EL2.C = 1`. Ledger item 5, both rungs; see
+    //      `mmu`'s module doc for which of the ~50 existing premises each rung keeps and which A2
+    //      deliberately broke.
+    //
+    // ⚠⚠ **THE MARKER BELOW ONCE ASSERTED MORE THAN ANYTHING CHECKED, AND A2 IS WHY THAT MATTERED.**
+    //      It used to read `EL2 MMU on — … C=0 (uncached, unchanged)`, and `boot-test.sh` matched the
+    //      prefix `"EL2 MMU on"` under a comment saying the marker meant "`SCTLR_EL2.C` is still 0
+    //      (unchanged attributes), so this is testing permissions and nothing else". Setting `C = 1`
+    //      would have left that boot test PASSING, `doc-markers` indifferent (no doc quoted the full
+    //      string) and ⑳-d indifferent (the marker COUNT is unchanged) — with the script's comment
+    //      silently false and the backstop silently gone. **Nothing anywhere would have gone red.**
+    //      So the marker now carries the state in the part the script matches (`data cacheable
+    //      (C=1)`), which is design-lesson #218/#225: attach the witness to the hazard, and never let
+    //      an assertion outrun the substring that adjudicates it.
     //
     //      The report states what was PROTECTED, not merely that something happened: a marker that
     //      says "MMU on" would be equally true of a mapping that made everything RWX.
@@ -286,14 +304,16 @@ pub extern "C" fn rust_main() -> ! {
     // printed: a collapsed region passes every per-page test vacuously, so `text_pages == 0` has to
     // be visible rather than silently fine.
     let cov = mmu::coverage();
-    if mmu::mmu_is_on(sctlr) && mmu::data_cache_still_off(sctlr) && cov.ok {
+    if mmu::mmu_is_on(sctlr) && mmu::data_cache_on(sctlr) && cov.ok {
         let _ = writeln!(
             uart,
-            "baleen: EL2 MMU on — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) data RW+XN, C=0 (uncached, unchanged); all {} mapped pages match their region ({} text, {} rodata, {} rw)",
+            "baleen: EL2 MMU on, data cacheable (C=1) — SCTLR_EL2=0x{sctlr:016x} text RO+X [0x{text_start:08x},0x{text_end:08x}) Normal-NC, data RW+XN Normal-WB Inner-Shareable; all {} mapped pages match their region ({} text, {} rodata, {} rw), {} WB blocks, {} Device GiB",
             cov.text_pages + cov.rodata_pages + cov.rw_pages,
             cov.text_pages,
             cov.rodata_pages,
-            cov.rw_pages
+            cov.rw_pages,
+            cov.wb_blocks,
+            cov.device_gib
         );
     } else {
         let _ = writeln!(

@@ -179,7 +179,36 @@ fn mmio_read32(base: u64, off: u64) -> u32 {
 }
 
 /// Read sentinel `i` back after the device has (or has not) written to it.
+///
+/// ## ★★★ A2: without the invalidation, this function inverts every isolation verdict in the module
+///
+/// The witness is `before = sentinel(i)` → let the bus master write → `after = sentinel(i)`, and a
+/// surviving [`SENTINEL_MAGIC`] means **"the SMMU aborted the DMA"**. Ledger item 5's A2 made EL2's
+/// DRAM Normal Write-Back, and a device is not in EL2's coherency domain — so the `before` read
+/// pulls the magic into a cache line, the device's write lands in memory the cache does not know
+/// about, and the `after` read is answered **from the cached magic**. Every phase would report the
+/// sentinel intact. That is not a lost measurement; it is `smmu rung1 DEFAULT-DENY OK`,
+/// `rung2 STREAM-TABLE DEFAULT-DENY OK`, `rung3 CONFINEMENT OK` and the rest **passing without the
+/// SMMU having done anything**, and the positive controls would still pass too, because a control
+/// that expects the DMA to LAND is exactly the arm the stale read breaks.
+///
+/// ⚠ **`volatile` does not help.** It constrains the compiler, not the cache: it guarantees the load
+/// is emitted, and the emitted load hits the same stale line.
+///
+/// ★ **`DC IVAC`, not `DC CIVAC`, and here the distinction is the whole result.** Clean-and-
+/// invalidate would write EL2's cached copy of the magic **back over the device's write** on its way
+/// to reading it — the sentinel would then be intact in memory as well as in cache, so the defect
+/// would survive an audit that re-read memory afterwards. Discarding is safe because **EL2 never
+/// stores to a sentinel**: `DMA_SENTINELS` is a `static mut` with a non-zero initialiser, so its
+/// magic is placed by the image loader, and the module's own doc records that sentinels are
+/// deliberately never re-seeded between phases. There is no EL2 dirty line to lose.
+///
+/// ⚠ **Latent on QEMU, like everything else A2 touched**: QEMU/TCG models no cache, so this
+/// invalidation is a no-op in CI and its absence would have been one too. The reason it is here is
+/// `fvp-probe` milestone 3, which measured Arm's AEM withholding a dirty line from a non-coherent
+/// observer.
 fn sentinel(i: usize) -> u64 {
+    crate::cache::invalidate(sentinel_pa(i), core::mem::size_of::<u64>() as u64);
     // SAFETY: `DMA_SENTINELS` is written only by the DEVICE under test (via DMA) and read here; no
     // Rust code holds a reference to it across this read, and the metal is single-threaded with the
     // secondaries parked. A volatile read is used because the value can change without any CPU store,

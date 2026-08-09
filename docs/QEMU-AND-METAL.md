@@ -109,7 +109,7 @@ microarchitectural. It does **not** model:
    | expected of hardware (asserted) | QEMU (MEASURED) | consequence |
    |---|---|---|
    | `SCTLR_EL2` has **RES1** bits a conforming implementation reads back as 1 | reads a flat **`0x0`** | a full-register write of a hand-built value would clear them and **passes here**. Setting `SCTLR_EL2.M` is a **read-modify-write** (`hv-metal/src/mmu.rs`) — which is correct practice whether or not the RES1 claim holds, so the guard does not rest on the unverified half |
-   | **instruction fetch from Device memory** is prohibited independently of `XN` | **permitted** — clear `XN` on a `Device-nGnRnE` page and the jump succeeds | the `xn-probe` witness isolates `XN` *here*; if the assertion holds, it would not on silicon, where the property is doubly held. **The witness is strongest exactly where the model is weakest** |
+   | **instruction fetch from Device memory** is prohibited independently of `XN` | **permitted** — clear `XN` on a `Device-nGnRnE` page and the jump succeeds | ✅ **MOOT SINCE A2, which is the happier ending than the one this row predicted.** It used to conclude: the `xn-probe` witness isolates `XN` *here*, but on silicon the property would be doubly held and the witness confounded — *"strongest exactly where the model is weakest"*. **A2 made EL2's data pages Normal Write-Back**, and the Device-fetch prohibition does not apply to Normal memory on any implementation, so `XN` is the only mechanism that can refuse **on both platforms**. The attribution stopped depending on QEMU's fidelity |
    | the **SMMU caches** translations and configuration, so invalidation is load-bearing | models **no SMMU caching at all** (long-established in this repo) | "the TLBI made no difference" and "there is nothing to invalidate" are **the same observation**. This is why honest-ledger 2(d) was unwitnessable here and needed Arm's AEM (`fvp-probe`), where both were then measured directly |
 
    ★ **The reusable form: when a remove-the-fix probe will not go red, ask whether the PLATFORM can
@@ -129,7 +129,7 @@ microarchitectural. It does **not** model:
 
    | behaviour | QEMU | Arm's AEM (MEASURED, `fvp-probe` m5) | consequence |
    |---|---|---|---|
-   | `LDXR`/`STXR` to **`Device-nGnRnE`** memory — CONSTRAINED UNPREDICTABLE, the documented common outcome being a perpetually-failing `STXR` (livelock) | works | **works** — succeeded on attempt 1 and incremented, with a Normal-WB control succeeding alongside and the page's descriptor printed as `AttrIndx 0` | EL2 runs `Device-nGnRnE` (`MAIR_EL2` attr 0, `SCTLR_EL2.C = 0`) and its release binary holds **40 exclusive-monitor instructions, zero LSE**, across six modules (identical at all nine feature configs; the 244 first published here was read off an uncontrolled `target/` artifact and reproduces nowhere). **Neither platform can grade this.** Ledger 5's A2 closes it; until then it is *reasoned, not witnessed*, with **silicon as the only remaining oracle** |
+   | `LDXR`/`STXR` to **`Device-nGnRnE`** memory — CONSTRAINED UNPREDICTABLE, the documented common outcome being a perpetually-failing `STXR` (livelock) | works | **works** — succeeded on attempt 1 and incremented, with a Normal-WB control succeeding alongside and the page's descriptor printed as `AttrIndx 0` | **RESOLVED, and not by a platform.** ⚠ This row used to end *"neither platform can grade this … silicon is the only remaining oracle"*, and it was right about the grading and wrong about what the row was for. Ledger 5's **A2 closed the hazard by construction**: EL2's DRAM is now Normal-WB Inner Shareable, and exclusives are UNPREDICTABLE *because the memory is Device*. The release binary's **42 exclusive-monitor instructions, zero LSE** (six modules; the 40 published before A2, and the 244 before that, which was read off an uncontrolled `target/` artifact and reproduces nowhere) all land on `.bss`/`.data`, where exclusives are architecturally defined. ★ **Kept as a category-6 row on purpose** — it is this file's clearest case that "there is nowhere further to go" is a statement about *oracles*, not about *options*: the way out was to stop needing one |
 
    ⚠ **The distinction from category 5 matters when you plan work.** A category-5 row tells you to
    go find a stricter platform — which is how ledger 2(d) and the `scrub_frame` defect were settled
@@ -147,17 +147,24 @@ that environment the timing / memory-ordering gap is **maximal, not incidental**
 functional-correctness tool, full stop, and items (1)–(4) above must be validated later on real
 ARM hardware with EL2 access.
 
-**A concrete instance of items (2) and (4), named by the M4 Arc-4 review pass — the EL2-MMU gap.**
-Through M4 the hypervisor runs with its *own* stage-1 MMU off (`SCTLR_EL2.M=0`), so on real silicon
-every EL2 data access is Device-nGnRnE. That makes the hypervisor's **atomics** (spinless
-`compare_exchange` in the allocator, the guest handler's re-entry flag) architecturally
-**UNPREDICTABLE** — `LDXR/STXR` on Device memory typically livelock — and leaves **caches unmanaged**
-(freshly-written guest code vs. the I-cache; a cacheable Stage-2 walker vs. uncached descriptor
-writes). Both are **completely invisible under TCG** and do not affect the proof; they are the
-distance between a green QEMU boot and a real-metal run. The fix is a named prerequisite arc for the
-first real-hardware run — an EL2 stage-1 Normal-cacheable identity map + `SCTLR_EL2.M/C/I` + boot
-cache-invalidation — deferred because its core payoff can only be *validated* on real EL2 silicon
-(see `docs/ARC-4-TRAP-AND-SERVICE.md`, "Real-hardware readiness"). Read a green QEMU boot as
+**A concrete instance of items (2) and (4), named by the M4 Arc-4 review pass — the EL2-MMU gap, ✅
+now BUILT (ledger 5, A1 + A2).** Through M4 the hypervisor ran with its *own* stage-1 MMU off
+(`SCTLR_EL2.M=0`), so on real silicon every EL2 data access was Device-nGnRnE. That made the
+hypervisor's **atomics** (spinless `compare_exchange` in the allocator, the guest handler's re-entry
+flag) architecturally **UNPREDICTABLE** — `LDXR/STXR` on Device memory typically livelock — and left
+**caches unmanaged** (freshly-written guest code vs. the I-cache; a cacheable Stage-2 walker vs.
+uncached descriptor writes). Both were **completely invisible under TCG** and did not affect the
+proof; they were the distance between a green QEMU boot and a real-metal run.
+
+**A1 built the identity map and `M`; A2 built the Normal-cacheable Inner-Shareable attributes and
+`C`** — closing the atomics half by construction and the cache half by explicit maintenance, plus
+repairing the walker mismatch, which was **live** rather than prospective. ⚠ **Two things the fix as
+described did NOT include, both deliberately:** `SCTLR_EL2.I` stays 0 (EL2 copies no guest code, so
+the I-cache half never applied — zero `ic` instructions in the binary), and boot cache-invalidation
+is a loader contract, recorded as A2's residual. ⚠⚠ **And the deferral's premise still stands where
+it always did:** `hv-metal` has never run on the FVP or on silicon, so what is witnessed are the
+MECHANISMS (`fvp-probe` m3/m4/m6), not these call sites — the standing of honest-ledger 2(d).
+See `docs/ARC-4-TRAP-AND-SERVICE.md`, "Real-hardware readiness". Read a green QEMU boot as
 functional evidence only, exactly as this doc says.
 
 ## The discipline — how not to be misled

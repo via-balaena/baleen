@@ -150,12 +150,38 @@ it is worth stating plainly: ~~**the hypervisor runs the entire time with its ow
 has two consequences, **both invisible under QEMU/TCG** (which ignores memory type — the reason the
 gap was invisible):
 
-> ⚠ **CORRECTED 2026-08-09 — the struck clause is false since #156, and the CONCLUSION SURVIVES IT.**
+> ⚠ **CORRECTED 2026-08-09 — the struck clause is false since #156, and the CONCLUSION SURVIVED IT.**
 > Rung A1 turned EL2's stage-1 MMU **on**. But it deliberately reproduced the MMU-off attributes:
 > `hv-metal`'s `MAIR_EL2` attr 0 is `Device-nGnRnE` and `SCTLR_EL2.C` is left 0 as a structural
-> backstop. So the *memory type* is unchanged and **both consequences below still apply verbatim** —
-> which is exactly why this section must say why it survives rather than be quietly deleted. Read
-> "the MMU is off" as "EL2's data is Device-nGnRnE", which is the property that actually matters.
+> backstop. So the *memory type* was unchanged and **both consequences below still applied
+> verbatim** — which is exactly why this section said why it survived rather than being quietly
+> deleted.
+>
+> ## ★★★ **AND RUNG A2 HAS NOW CLOSED THIS WHOLE SECTION. BOTH CONSEQUENCES. Read on.**
+>
+> A2 maps EL2's DRAM **Normal Write-Back Inner Shareable** and sets `SCTLR_EL2.C = 1`. The premise
+> this entire gap rests on — *"every EL2 data access is Device-nGnRnE"* — **is now false**, and it is
+> false in the one way that discharges both consequences at once rather than trading them:
+>
+> | consequence | status after A2 | how |
+> |---|---|---|
+> | **1. atomics UNPREDICTABLE** | ✅ **CLOSED BY CONSTRUCTION** | `LDXR`/`STXR` are CONSTRAINED UNPREDICTABLE *because the memory is Device*. Every one of the 42 exclusive-monitor instructions in the release build operates on a static in `.bss`/`.data` — now Normal-WB Inner-Shareable, where exclusives are **architecturally defined**. The hazard's precondition is gone |
+> | **2. caches unmanaged** | ✅ **CLOSED BY MAINTENANCE** | the stage-2 walker/descriptor mismatch is *repaired* (both are now WB/ISH); the SMMU, its queues and the DMA witness get explicit `DC CVAC`/`DC IVAC` via `hv-metal`'s `cache` module. The I-cache half never applied — EL2 copies no guest code, and the binary contains **zero `ic` instructions** |
+>
+> ★★ **Consequence 1's closure is the one worth pausing on, because the project spent a milestone
+> failing to grade it.** `fvp-probe` m5 asked whether Arm's AEM would *exhibit* the livelock and
+> found it would not, leaving "silicon is the only oracle" standing. **A2 does not need an oracle**:
+> the hazard was never an empirical claim, it was an architectural one — *Device memory makes
+> exclusives UNPREDICTABLE* — and you close an architectural hazard by removing its precondition, not
+> by observing it. `mmu::coverage` re-reads every descriptor at all three levels on every boot and
+> the `default` boot asserts the verdict, so "EL2's memory is not Device" is checked rather than
+> argued. **m5 is not superseded — it is made moot**, which is a better outcome than the measurement
+> it was trying to get.
+>
+> ⚠ **What A2 does NOT close, stated so this is not read as more than it is:** `hv-metal` has never
+> run on the FVP or on silicon, so A2's *call sites* are witnessed by nothing (honest-ledger 2(d));
+> and A2 introduces its own residual — it assumes EL2 is entered with no stale cache line covering
+> its image, which is a bring-up/loader contract (see `hv-metal`'s `mmu` module doc).
 
 1. **Atomics are architecturally UNPREDICTABLE.** `LDXR/STXR` (and LSE atomics) on Device memory are
    CONSTRAINED UNPREDICTABLE; the common outcome is a perpetually-failing `STXR` — a livelock. This
@@ -174,18 +200,41 @@ gap was invisible):
    configuration. The count above was taken by **building each config explicitly and measuring each**,
    which is also what shows the number does not vary. Reading a number off a build directory is
    sampling an artifact whose provenance you did not control (design-lesson #155).
+   ⚠⚠ **CLOSED BY A2 — and the count above moved to 42 in the same rung.** These 42 instructions are
+   no longer on Device memory, so they are no longer UNPREDICTABLE; see the A2 block above for why
+   that is a construction rather than a measurement. The inventory is kept because *which* modules
+   take exclusives is still the answer to "what would have livelocked", and because the two
+   corrections it records (a list read as a census, and a number read off `target/`) are the reason
+   this entry is trustworthy now.
 2. **Caches are unmanaged.** Freshly-copied guest code is written (uncached) then fetched (cacheable)
    with no I-cache maintenance; the Stage-2 walker is programmed cacheable while its descriptors are
    written by uncached stores. On silicon either can read stale lines out of the UNKNOWN reset cache
    state. (For Arc 4 *as shipped* the Device write path + the cold first-boot I-cache make it
    incidentally safe; the gap becomes load-bearing on a guest *reload* into a warm-cache window.)
+   ⚠⚠ **CLOSED BY A2, and the walker half was the sharper one.** *"The Stage-2 walker is programmed
+   cacheable while its descriptors are written by uncached stores"* was not a future risk — it was
+   **live from the day `VTCR_EL2 = 0x8002_3559` was written**, on tables in EL2's own `.bss`. A2 puts
+   EL2 in the walker's domain, which is the repair. The I-cache half never applied: EL2 copies no
+   guest code (QEMU's `-device loader` places the blobs) and the binary holds zero `ic` instructions.
+   ⚠ A2 replaces it with a **narrower** residual — a stale line from *before this boot* — recorded in
+   `hv-metal`'s `mmu` module doc as a loader contract.
 
 **Scope of this gap (important):** it is *not* introduced by Arc 4 — it spans arcs 0–4 — it does
 **not** affect QEMU (our only environment; Apple Silicon gates EL2, so we run under TCG) or the proof,
 and it is within the metal's already-declared *real-HW-deferred* scope. It is the honest distance
 between "QEMU-sound" and "runs on metal."
 
-**Why it is named-and-deferred rather than fixed now:** the single clean fix is a dedicated
+> ✅ **THE PARAGRAPH BELOW IS THE PLAN A1 AND A2 EXECUTED — kept because it predicted the shape of
+> the fix correctly and got one term of it wrong.** It named "an EL2 stage-1 Normal-cacheable
+> identity map + `SCTLR_EL2.M/C/I` + boot-time I/D-cache invalidation". A1 built the identity map and
+> `M`; A2 built the Normal-cacheable attributes and `C`. **`I` and the boot-time invalidation were
+> NOT built, and both omissions are deliberate rather than unfinished:** `I` stays 0 because EL2
+> copies no guest code, so an I-cache buys nothing and would put the "zero `ic` instructions"
+> invariant in play; and the boot-time invalidation is a *loader contract* whose correct instruction
+> differs by region, recorded as A2's residual. So read this as: the fix landed, minus one term that
+> turned out not to be wanted and one that turned out to belong to bring-up.
+
+**Why it was named-and-deferred rather than fixed then:** the single clean fix is a dedicated
 prerequisite arc for the first real-hardware run — **an EL2 stage-1 Normal-cacheable identity map +
 `SCTLR_EL2.M/C/I` + boot-time I/D-cache invalidation** (closing atomics *and* caches together). But
 its *core payoff* — "atomics stop being UNPREDICTABLE, caches become coherent *on silicon*" — has **no
@@ -206,11 +255,18 @@ is orthogonal to Arc 5's guest Stage-2 work.
 > | **caches** | ✅ **REFUTED — an oracle exists** | `fvp-probe` m3: Arm's AEM withholds a dirty line from a non-cacheable observer and releases it only on `DC CVAC`. m4 then used it to find a real defect in `scrub_frame` (PR #168) |
 > | **atomics** | ❌ **UPHELD — but now MEASURED, not assumed** | `fvp-probe` m5: the AEM executes `LDXR`/`STXR` on `Device-nGnRnE` **normally** — succeeded first attempt, value incremented, against a descriptor printed as `AttrIndx 0` with a Normal-WB control succeeding alongside. It picks a benign CONSTRAINED-UNPREDICTABLE choice, so it cannot grade this hazard either |
 >
-> **So the deferral stands for atomics, on better grounds than it was made** — "the oracle set is
-> QEMU plus silicon" is now a measurement, and the AEM has been struck off it for this hazard
+> **So the deferral stood for atomics, on better grounds than it was made** — "the oracle set is
+> QEMU plus silicon" became a measurement, and the AEM was struck off it for this hazard
 > specifically. ⚠ Read m5 for what it says: *"this model does not exhibit the hazard"* is **not**
 > *"the hazard is benign"* — CONSTRAINED UNPREDICTABLE lets implementations differ, so a real core
 > may still livelock.
+>
+> ★★ **AND THEN A2 DISSOLVED THE QUESTION.** The table above is the record of trying to *grade* a
+> hazard; A2 *removed* it, by making the memory Normal instead of Device. Both rows are still worth
+> reading, and for opposite reasons: the caches row is how the instrument that graded `scrub_frame`
+> and `publish` came to exist, and the atomics row is a milestone spent measuring something that a
+> memory-type change made irrelevant. **The lesson is the order** — the hazard's own statement said
+> "on Device memory", and nobody asked whether the memory had to stay Device.
 >
 > ★ The reusable part: **"no oracle" is a claim about instruments you have looked for, and it decays
 > the moment someone builds one.** Half of this sentence was already false when it was quoted in a

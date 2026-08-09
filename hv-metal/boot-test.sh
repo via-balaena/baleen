@@ -179,11 +179,18 @@ FORBIDDEN_MARKERS=(
 #   - "NEGATIVE-ISOLATION TEST PASSED" prints ONLY when the whole authorize/deny matrix holds — the
 #     positive controls succeeded and all four denials faulted with the right class, and the
 #     authorized frames did NOT fault. This is the diamond: deny exactly what the model forbids.
+# ★★ **"EL2 MMU on, data cacheable (C=1)" is asserted HERE, on the ordinary boot, since ledger 5's
+#    A2 — and until A2 it was asserted on NEITHER of the two boots that run a guest.** The marker
+#    existed only in the `wx-probe`/`xn-probe` configurations below, which are terminal by design and
+#    exercise no guest, so EL2's own mapping was witnessed exclusively on the two boots that do
+#    nothing else. A2 turned that mapping into load-bearing state — `SCTLR_EL2.C = 1` and Normal-WB
+#    Inner-Shareable DRAM — for every path in the crate, so every path's boot has to see it.
 boot_and_check "default" "" \
     "hv-metal alive" \
     "CurrentEL = EL2" \
     "VBAR_EL2 installed" \
     "HCR_EL2.RW=1" \
+    "EL2 MMU on, data cacheable (C=1)" \
     "generic timer live" \
     "HvCall CreditGrant(100) -> balance=100" \
     "entering EL1 guest" \
@@ -461,17 +468,27 @@ MACHINE_EXTRA=""
 #
 # The three required markers below are one claim each, and the FORBIDDEN "W^X NOT ENFORCED" (declared
 # globally above) is what makes them mean something: it is printed only if the store was PERMITTED.
-#   - "EL2 MMU on"          -> the mapping was installed and `SCTLR_EL2.C` is still 0 (unchanged
-#                              attributes), so this is testing permissions and nothing else
+#   - "EL2 MMU on, data     -> the mapping was installed AND `SCTLR_EL2.C` is 1 with every descriptor
+#      cacheable (C=1)"        at all three levels matching its region — see below, this substring is
+#                              load-bearing
 #   - "W^X probe: storing"  -> the probe actually ran; without it "no fault" would be vacuous
 #   - "EC=0x25"             -> a DATA ABORT FROM THE SAME EL, i.e. EL2 faulted on its own access —
 #                              not a guest fault, not an external abort
+#
+# ⚠⚠ **THIS MATCHER USED TO BE THE BARE PREFIX `"EL2 MMU on"`, UNDER A COMMENT CLAIMING IT MEANT
+# "`SCTLR_EL2.C` is still 0 (unchanged attributes), so this is testing permissions and nothing
+# else".** The marker line began with that prefix and continued `… C=0 (uncached, unchanged)`, so the
+# script asserted the prefix and the comment asserted the tail. When ledger 5's **A2** set `C = 1`,
+# this boot test would have stayed GREEN, `doc-markers` would not have cared (no doc quoted the full
+# string), and ⑳-d would not have cared (the marker COUNT is unchanged) — leaving a comment here
+# stating the exact opposite of the machine's state with **nothing anywhere going red**. The matcher
+# now contains the state it is about. Do not shorten it back: the prefix is not the claim.
 #
 # ★ The negative control needs no build: with the MMU off — every commit before this rung — the same
 # store succeeds silently. Removing the fix is what the entire history already did.
 boot_and_check "wx-probe" "--features wx-probe" \
     "hv-metal alive" \
-    "EL2 MMU on" \
+    "EL2 MMU on, data cacheable (C=1)" \
     "W^X probe: storing to EL2 text" \
     "EC=0x25"
 
@@ -491,7 +508,7 @@ boot_and_check "wx-probe" "--features wx-probe" \
 # actually mapped XN, so "it faulted" cannot come from having jumped somewhere else.
 boot_and_check "xn-probe" "--features xn-probe" \
     "hv-metal alive" \
-    "EL2 MMU on" \
+    "EL2 MMU on, data cacheable (C=1)" \
     "XN probe: jumping into EL2 data" \
     "EC=0x21"
 

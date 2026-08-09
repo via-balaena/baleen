@@ -291,15 +291,27 @@ draws the emulation-vs-metal line); and the timing/side-channel surface (caches,
 outside both the model and QEMU — an M7/M8-and-beyond concern that needs new design (constant-time
 discipline, SMMU config), not just testing.
 
-**Named prerequisite for the first real-hardware run — EL2 MMU bring-up.** Through M4 the hypervisor
-runs with its own stage-1 MMU off (`SCTLR_EL2.M=0`), so on real silicon its data accesses are
-Device-nGnRnE — which makes its **atomics** UNPREDICTABLE (livelock) and leaves its **caches**
-unmanaged. This is invisible under QEMU/TCG (our only environment; Apple Silicon gates EL2) and does
-not affect the proof or any QEMU-based arc, so it is *named-and-deferred*, not fixed inline: the M4
-Arc-4 review pass surfaced it and the clean fix — an EL2 stage-1 Normal-cacheable identity map +
-`SCTLR_EL2.M/C/I` + boot cache-invalidation — is a dedicated arc scheduled **before the first
-real-hardware run**, because its core payoff can only be *validated* on real EL2 silicon (no
-QEMU/spec/auditor oracle reaches it). See `docs/ARC-4-TRAP-AND-SERVICE.md`, "Real-hardware readiness".
+**✅ EL2 MMU bring-up — the named real-hardware prerequisite, now BUILT (ledger 5, rungs A1 + A2).**
+Through M4 the hypervisor ran with its own stage-1 MMU off (`SCTLR_EL2.M=0`), so on real silicon its
+data accesses were Device-nGnRnE — which made its **atomics** UNPREDICTABLE (livelock) and left its
+**caches** unmanaged. Invisible under QEMU/TCG, so it was *named-and-deferred* rather than fixed
+inline, on the grounds that its payoff could only be validated on real EL2 silicon.
+
+**A1** (#156) gave EL2 an identity mapping with `SCTLR_EL2.M`, W^X on its own image, and MMU-off
+attributes deliberately preserved. **A2** maps EL2's DRAM Normal Write-Back **Inner Shareable** and
+sets `SCTLR_EL2.C`, which closes both consequences at once: the atomics hazard is gone **by
+construction** (exclusives are UNPREDICTABLE *because the memory is Device*, and it no longer is),
+and the cache hazard is gone by explicit maintenance plus one repair — `VTCR_EL2 = 0x8002_3559` had
+the stage-2 walker fetching Write-Back Inner-Shareable from EL2's own `.bss` while EL2's stores were
+Device, a **live** mismatch A2 removes.
+
+⚠ **Two terms of the original plan were not built, both deliberately.** `SCTLR_EL2.I` stays 0 (EL2
+copies no guest code, so an I-cache buys nothing and the binary keeps zero `ic` instructions), and
+boot-time cache invalidation is a **loader contract** rather than this rung's, since the right
+instruction differs by region. ⚠ **And the deferral's own premise survives**: `hv-metal` has never
+run on the FVP or on silicon, so A2's call sites are witnessed by nothing this repository owns — the
+*mechanisms* are graded by `fvp-probe` (m3/m4, m6). See `docs/ARC-4-TRAP-AND-SERVICE.md`,
+"Real-hardware readiness", for the per-consequence accounting.
 
 ## One-line summary
 
