@@ -1835,7 +1835,11 @@ const PROBE_DIRS: &[&str] = &[FVP_DIR, BOARD_PROBE_DIR];
 fn fvp_lint() -> bool {
     PROBE_DIRS.iter().all(|dir| {
         run_in(dir, "cargo", &["fmt", "--", "--check"])
-            && run_in(dir, "cargo", &["clippy", "--release", "--", "-D", "warnings"])
+            && run_in(
+                dir,
+                "cargo",
+                &["clippy", "--release", "--", "-D", "warnings"],
+            )
             && run_in(dir, "cargo", &["build", "--release"])
             && run_in_env(
                 dir,
