@@ -1187,6 +1187,22 @@ fn milestone_6() {
     unsafe {
         mmu::clean_range(layout::SMMU_ARENA, layout::SMMU_ARENA_SIZE);
     }
+    // ★ WHAT DOES **MEMORY** HOLD? `ste_s2ttb` is a CPU read and therefore reports the CPU's own
+    // cache — it cannot answer this. Dropping the line with `DC IVAC` (invalidate, no write-back)
+    // and re-reading forces the read to come from the point of coherency, which is where the SMMU
+    // fetches from.
+    //
+    // ⚠ **`IVAC` DISCARDS a dirty line, so this would destroy an unpublished write — and that is
+    // exactly why it runs HERE and not earlier.** The `clean_range` immediately above has already
+    // pushed the line out, so by this point it is clean and dropping it loses nothing. Placing the
+    // same instruction one phase earlier would have deleted the very write the milestone measures
+    // (the ordering lesson `scrub_frame` paid for in #168).
+    // SAFETY: the STE is inside the identity-mapped arena.
+    unsafe {
+        mmu::invalidate_line(smmu::ste_addr(smmu::SID_A));
+    }
+    let ste_in_memory = smmu::ste_s2ttb(smmu::SID_A);
+
     smmu::invalidate_ste(smmu::SID_A);
     smmu::invalidate_all();
     let after_clean = smmu::translate(smmu::SID_A, smmu::TEST_IPA);
@@ -1195,13 +1211,13 @@ fn milestone_6() {
     // not evidence about publication. What it DOES separate is "the STE write never happened" from
     // "the write happened and the SMMU did not see it", which the translation alone cannot, and
     // which is precisely the ambiguity that made this milestone's first run uninterpretable.
-    puts("@@ M6 STE.S2TTB read back by the CPU = ");
-    puthex(smmu::ste_s2ttb(smmu::SID_A));
-    puts(" (L1_A=");
+    puts("@@ M6 L1_A=");
     puthex(smmu::L1_A);
-    puts(" L1_B=");
+    puts("  L1_B=");
     puthex(smmu::L1_B);
-    puts(")\n");
+    puts("\n@@ M6 STE.S2TTB in MEMORY after the clean (IVAC'd, so not the CPU's cache) = ");
+    puthex(ste_in_memory);
+    puts("\n");
 
     puts("@@ M6 control (cleaned, expect A) = ");
     puts(which(&control));

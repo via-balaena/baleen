@@ -268,6 +268,16 @@ pub fn ste_s2ttb(sid: u32) -> u64 {
     mem_r64(STRTAB + u64::from(sid) * 64 + 24) & 0x000f_ffff_ffff_fff0
 }
 
+/// The address of `sid`'s STE — so a caller can aim cache maintenance at the exact line the SMMU
+/// fetches, rather than at the whole arena.
+///
+/// Exists for milestone 6: reading [`ste_s2ttb`] tells you what the **CPU** thinks the STE says,
+/// which is its own cache. Dropping that line first and re-reading is what tells you what **memory**
+/// says, and the difference between those two is the entire subject of that milestone.
+pub fn ste_addr(sid: u32) -> u64 {
+    STRTAB + u64::from(sid) * 64
+}
+
 /// Point `sid` at a stage-2 table set under `vmid`, and tell the SMMU its configuration changed.
 pub fn bind(sid: u32, s2ttb: u64, vmid: u16) {
     write_ste(sid, s2ttb, vmid);
