@@ -42,6 +42,14 @@
 // and `asm!`, and its job is to keep that surface small and documented rather than absent.
 #![forbid(unsafe_code)]
 #![no_std]
+// ㉔ — **every private item carries a doc.** Inserting an item between a doc comment and the item it
+// documents silently re-parents the block, leaving the displaced item bare; that is valid Rust, and
+// `git diff` shows it as clean added lines with no sign the lines above changed meaning. It happened
+// twice in `xtask` in one day, the second time hours after the lesson was written. **This crate was
+// already at ZERO findings**, so enabling the lint LOCKS IN a property it already held rather than
+// buying a new one — the cheapest possible place to put a gate. See `xtask/src/main.rs`'s block for
+// the full account and the partial-guard caveat.
+#![warn(clippy::missing_docs_in_private_items)]
 
 /// Guest-physical address.
 pub type Gpa = u64;

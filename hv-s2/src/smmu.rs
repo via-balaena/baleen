@@ -90,8 +90,15 @@ pub const STE_BYTES: usize = STE_WORDS * 8;
 /// half of "allocate the stream table in `.bss`".
 const STE_V: u64 = 1 << 0;
 
-/// `STE.Config` (word 0, bits `[3:1]`).
+// `STE.Config` (word 0, bits `[3:1]`) — the shift and the mask, one `///` each.
+// ⚠ ㉔: this was a single doc on the SHIFT that described the FIELD, leaving the mask bare — the
+// same "doc on the wrong item" shape the new crate-level lint exists to catch.
+
+/// Bit position of `STE.Config`'s low bit within word 0.
 const STE_CONFIG_SHIFT: u32 = 1;
+/// Width mask for `STE.Config` **after shifting** — three bits, so `(w0 >> SHIFT) & MASK` is the
+/// field. Masking after the shift rather than before keeps the two numbers independent: a wrong
+/// shift cannot be hidden by a mask that happens to cover it.
 const STE_CONFIG_MASK: u64 = 0b111;
 
 /// `STE.Config[2]` — set on every non-aborting encoding. With it clear the SMMU aborts regardless of
