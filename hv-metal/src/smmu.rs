@@ -216,8 +216,13 @@ pub(crate) const EVT_F_PERMISSION: u8 = 0x13;
 /// call site.** Saying so is the point — ㉔ made the same distinction, and a guard that overstates
 /// itself is worse than one that does not exist, because it stops people looking.
 mod doorbell {
-    /// Proof that DRAM was published before a doorbell is rung. Minted only by
-    /// [`super::publish`]; see this module's doc for the precise (limited) claim.
+    /// Proof that DRAM was published before a doorbell is rung. **Minted only by
+    /// [`clean_and_prove`]**, immediately below, which does the cache maintenance first — see this
+    /// module's doc for the precise (limited) claim.
+    ///
+    /// ⚠ Not `super::publish`: that is the documented entry point every call site uses, and it
+    /// DELEGATES here. The distinction matters in exactly this sentence, because "where can a token
+    /// come from" is the whole guarantee — an earlier draft named `super::publish` and was wrong.
     #[derive(Clone, Copy)]
     pub(super) struct Published(());
 
@@ -226,18 +231,22 @@ mod doorbell {
         /// `pub(super)` for one commit, which meant any code in `smmu.rs` could write
         /// `ring32(v, Published::new())` and forge the evidence — a guard that the guarded code can
         /// mint for itself is decoration. The only way to obtain a `Published` is now
-        /// [`publish`] below, which does the cache maintenance first.
+        /// [`clean_and_prove`] below, which does the cache maintenance first.
         const fn new() -> Self {
             Self(())
         }
     }
 
-    /// **Publish `[pa, pa + len)` and return the proof a doorbell demands.**
+    /// **Clean `[pa, pa + len)` to the point of coherency and return the proof a doorbell demands.**
     ///
-    /// Lives inside this module because [`Published::new`] must stay private: the token and the
-    /// only thing that can mint it are one unit, so "I published" cannot be asserted, only done.
-    /// See [`super::publish`] for what the obligation is and how `fvp-probe` measured it.
-    pub(super) fn publish(pa: u64, len: u64) -> Published {
+    /// Lives inside this module because [`Published::new`] must stay private: the token and the only
+    /// thing that can mint it are one unit, so "I published" cannot be *asserted*, only *done*.
+    ///
+    /// ⚠ **Named `clean_and_prove` rather than `publish` on purpose.** It is `super::publish`'s
+    /// implementation, and two functions called `publish` in one file — one calling the other — is a
+    /// reader trap and an intra-doc-link ambiguity. `super::publish` keeps the name every call site
+    /// and every cross-reference uses; this does the work and mints the evidence.
+    pub(super) fn clean_and_prove(pa: u64, len: u64) -> Published {
         crate::cache::clean(pa, len);
         Published::new()
     }
@@ -345,7 +354,7 @@ fn read64(off: u64) -> u64 {
 /// added: publishing without ringing anything is legitimate (the queues are published once at
 /// init and rung later), and a lint that fired on it would train people to ignore it.
 fn publish(pa: u64, len: u64) -> Published {
-    doorbell::publish(pa, len)
+    doorbell::clean_and_prove(pa, len)
 }
 
 /// The whole stream table, as a range for [`publish`].
