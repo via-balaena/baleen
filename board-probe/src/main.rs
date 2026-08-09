@@ -321,17 +321,40 @@ pub extern "C" fn probe_main(x0: u64) -> ! {
     let mmfr0 = read_sysreg!("id_aa64mmfr0_el1");
     fact(u, "ID_AA64MMFR0_EL1", mmfr0);
     // PARange is bits [3:0]; the encoding is a table, not a formula.
-    let pa_bits = match mmfr0 & 0xf {
-        0 => 32,
-        1 => 36,
-        2 => 40,
-        3 => 42,
-        4 => 44,
-        5 => 48,
-        6 => 52,
-        _ => 0,
+    // ⚠ `PARange` is a TABLE, not a formula, so an encoding this probe does not know is a real
+    // possibility — Arm has extended it before (52-bit arrived as `0b0110`). Folding that into
+    // "0 bits" would report TOO SMALL, i.e. **an out-of-date probe indicting the platform**, which
+    // is #265's shape: an error read as an answer. It reports UNKNOWN instead, and says whose
+    // problem that is.
+    let pa_code = mmfr0 & 0xf;
+    let pa_bits = match pa_code {
+        0 => Some(32),
+        1 => Some(36),
+        2 => Some(40),
+        3 => Some(42),
+        4 => Some(44),
+        5 => Some(48),
+        6 => Some(52),
+        _ => None,
     };
-    capability(u, "pa_range", pa_bits, ASSUMED_PA_BITS, "bits");
+    match pa_bits {
+        Some(bits) => capability(u, "pa_range", bits, ASSUMED_PA_BITS, "bits"),
+        None => {
+            let _ = writeln!(
+                u,
+                "@@ VERDICT pa_range: UNKNOWN — PARange encoding {pa_code:#x} is not in this probe's"
+            );
+            let _ = writeln!(
+                u,
+                "@@ note: table. That indicts the PROBE, not the platform — update the table from"
+            );
+            let _ = writeln!(
+                u,
+                "@@ note: the Arm ARM's ID_AA64MMFR0_EL1.PARange encoding list."
+            );
+        }
+    }
+    let pa_bits = pa_bits.unwrap_or(0);
     if pa_bits < ASSUMED_PA_BITS && pa_bits != 0 {
         let _ = writeln!(
             u,
