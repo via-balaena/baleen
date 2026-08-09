@@ -1785,6 +1785,16 @@ const FVP_DIR: &str = "fvp-probe";
 /// the same reason as [`FVP_DIR`].
 const BOARD_PROBE_DIR: &str = "board-probe";
 
+/// Every standalone instrument crate this task keeps healthy.
+///
+/// ⚠ **`board-probe` was added here in the SAME commit that created it, and that ordering is the
+/// point.** `fvp-probe` existed for four milestones before anything built it — #176's finding was
+/// literally "the instrument A2 will rest on was built by nothing at all". Adding a second probe
+/// without adding it here would have reproduced that exactly, one crate along, which is
+/// design-lesson **#262**: extending a rule to a new case is the moment to re-derive it, because
+/// the person adding the case is the last one who will re-check the rule's base.
+const PROBE_DIRS: &[&str] = &[FVP_DIR, BOARD_PROBE_DIR];
+
 /// **Lint and build `fvp-probe`: `fmt --check` + `clippy -D warnings` + `build` + `doc -D warnings`.**
 ///
 /// ## Why this exists, and it is the same hole [`metal_lint`] was dug for
@@ -1812,18 +1822,14 @@ const BOARD_PROBE_DIR: &str = "board-probe";
 /// the probe and checks its health, and the milestone **verdicts remain local evidence**, exactly as
 /// they were. What becomes gated is that the code compiles, lints, formats, documents — and that its
 /// compile-time assertions are actually evaluated.
-/// Every standalone instrument crate this task keeps healthy.
 ///
-/// ⚠ **`board-probe` was added here in the SAME commit that created it, and that ordering is the
-/// point.** `fvp-probe` existed for four milestones before anything built it — #176's finding was
-/// literally "the instrument A2 will rest on was built by nothing at all". Adding a second probe
-/// without adding it here would have reproduced that exactly, one crate along, which is
-/// design-lesson **#262**: extending a rule to a new case is the moment to re-derive it, because
-/// the person adding the case is the last one who will re-check the rule's base.
-const PROBE_DIRS: &[&str] = &[FVP_DIR, BOARD_PROBE_DIR];
-
-/// Lint every crate in [`PROBE_DIRS`] — fmt, clippy `-D warnings`, build, and rustdoc
-/// `-D warnings`.
+/// ⚠ **⑯-hw phase 0 generalised it over [`PROBE_DIRS`]** rather than one hardcoded crate, because
+/// `board-probe` arrived and a second instrument gated by nothing would have been #176's finding
+/// again, one crate along.
+///
+/// ★ It checks the probes' **health**, never their **results**. A probe's verdicts come from
+/// hardware or a model CI does not have, so those stay LOCAL evidence — what this guarantees is that
+/// the instrument still compiles, which is the thing that rots silently between uses.
 ///
 /// ⚠ These crates are **workspace-excluded**, so `cargo xtask ci`'s workspace-scoped gates never
 /// touch them (design-lesson #173: excluding a crate to escape one gate silently excuses it from
