@@ -5,8 +5,8 @@
 //!
 //! ## Why this file exists, and it is a defect report
 //!
-//! Until milestone 6 this map did not exist. Each milestone picked its own addresses, in its own
-//! module, and **three of them overlapped**:
+//! Until this file, the probe had no address map. Each milestone picked its own addresses, in its
+//! own module, and **three of them overlapped**:
 //!
 //! | CPU-side cell | SMMU region | overlap |
 //! |---|---|---|
@@ -17,7 +17,8 @@
 //! **Nothing ever failed**, because the SMMU milestones all complete before `mmu::enable()` and
 //! nothing re-reads their structures afterwards. The collisions were invisible for exactly as long
 //! as the running order held — which is the definition of a latent defect, and the running order was
-//! about to change: milestone 6 asks the SMMU to translate *after* the cache milestones have run.
+//! about to change: the planned milestone 6 asks the SMMU to translate *after* the cache milestones
+//! have run, which is what sent anyone looking at the map at all.
 //!
 //! ⚠ **The lesson is about the SAFETY comment, not the addresses.** m5's read *"neither overlaps the
 //! image, its stack, or milestone 3/4's page"* — true as written, and it enumerated the wrong
@@ -66,18 +67,19 @@ pub const CELL_SIZE: u64 = 0x1000;
 
 /// Milestone 3/4's cell — the one reached both cacheably and non-cacheably.
 ///
-/// ⚠ **Moved out of [`SMMU_ARENA`] by milestone 6.** It used to be `0x8100_0000`, i.e. the stream
-/// table's first bytes.
+/// ⚠ **Moved out of [`SMMU_ARENA`] while scoping milestone 6.** It used to be `0x8100_0000`, i.e.
+/// the stream table's first bytes.
 pub const CACHE_CELL: u64 = 0x8110_0000;
 
 /// Milestone 5's control cell, reached identity as Normal write-back.
 ///
-/// ⚠ **Moved out of [`SMMU_TARGET_A`] by milestone 6.** It used to be `0x8200_0000`.
+/// ⚠ **Moved out of [`SMMU_TARGET_A`] while scoping milestone 6.** It used to be `0x8200_0000`.
 pub const ATOMIC_WB_CELL: u64 = 0x8111_0000;
 
 /// Milestone 5's cell under test, reached only through its `Device-nGnRnE` alias.
 ///
-/// ⚠ **Moved out of [`SMMU_TARGET_A`]'s 2 MiB block by milestone 6.** It used to be `0x8201_0000`.
+/// ⚠ **Moved out of [`SMMU_TARGET_A`]'s 2 MiB block while scoping milestone 6.** It used to be
+/// `0x8201_0000`.
 pub const ATOMIC_DEV_CELL: u64 = 0x8112_0000;
 
 /// The two physical targets an STE's stage-2 tables can point at. **2 MiB and 2 MiB-aligned**,
