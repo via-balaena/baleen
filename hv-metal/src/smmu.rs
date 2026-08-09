@@ -266,7 +266,9 @@ mod doorbell {
             Self(off)
         }
 
-        /// Ring a 32-bit doorbell. The `Published` is consumed as evidence, not used.
+        /// Ring a 32-bit doorbell. The `Published` is REQUIRED as evidence and then ignored — it is
+        /// `Copy`, so "consumed" would be the wrong word; what it costs is that you cannot call this
+        /// without having obtained one.
         pub(super) fn ring32(self, v: u32, _published: Published) {
             super::write32(self.0, v);
         }
