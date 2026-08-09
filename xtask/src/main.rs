@@ -116,6 +116,7 @@ fn main() {
         "doc-counts" => doc_counts(),
         "doc-paths" => doc_paths(),
         "doc-index" => doc_index(),
+        "doc-tasks" => doc_tasks(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -146,6 +147,8 @@ fn main() {
                 && doc_paths()
                 // ⑳-i: the docs index must still describe the whole of docs/.
                 && doc_index()
+                // ⑳-k: every `cargo xtask` command the docs name must exist.
+                && doc_tasks()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -2093,6 +2096,123 @@ fn doc_paths() -> bool {
     false
 }
 
+/// ★ ⑳-k — **every `cargo xtask <task>` the docs tell a reader to RUN must exist.**
+///
+/// `doc-paths` checks *paths*; this checks *commands*, and the distinction is the point (#278 — a
+/// checker covers the syntax it parses, not the concern its name suggests). A dead path costs a
+/// reader a lookup. **A dead command costs them a failed run and the belief that the project does
+/// not work** — and it lands at the exact moment they were trying to verify a claim, which is the
+/// worst moment this repo has.
+///
+/// ⚠ Written after the README sweep put a **block of runnable commands** at the top of the most-read
+/// file here. **Every cited task resolved on the first run** — the good case, and precisely when a
+/// guard is cheapest to install. (The count is deliberately not repeated here: the gate prints it,
+/// and a number in prose beside a number in output is the second copy #276 is about. I first wrote
+/// "thirteen", which was already wrong by two when it shipped, because my manual grep had covered
+/// fewer files than the gate does.)
+///
+/// ## The direction it checks, and the one it does not
+///
+/// **Cited ⇒ exists.** The reverse — every task documented somewhere — is deliberately NOT checked:
+/// plenty of tasks are internal plumbing (`doc-counts` is run by `ci`, not by people), and a gate
+/// demanding they all be advertised would be noise.
+///
+/// ⚠ **The task universe is every `"…" =>` arm in this file, which is a SUPERSET of `main`'s
+/// dispatch** — brace-matching the one `match` would be brittle for no gain. The consequence is
+/// stated rather than hidden: this cannot catch a fabricated task name that happens to collide with
+/// an arm in some other `match`. It catches every renamed, deleted and mistyped task, which is the
+/// population that actually rots.
+fn doc_tasks() -> bool {
+    eprintln!("$ xtask doc-tasks");
+
+    let Ok(me) = std::fs::read_to_string("xtask/src/main.rs") else {
+        eprintln!("doc-tasks: cannot read xtask/src/main.rs");
+        return false;
+    };
+    let mut arms: Vec<&str> = Vec::new();
+    for line in me.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else { continue };
+        if rest[end + 1..].trim_start().starts_with("=>") {
+            arms.push(&rest[..end]);
+        }
+    }
+
+    let mut docs: Vec<String> = vec!["README.md".to_string()];
+    for d in ["docs", "."] {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.flatten() {
+                let pth = e.path();
+                if pth.is_dir() {
+                    let r = pth.join("README.md");
+                    if r.exists() {
+                        docs.push(r.to_string_lossy().into_owned());
+                    }
+                } else if pth.extension().is_some_and(|x| x == "md") {
+                    docs.push(pth.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    let mut cited = 0usize;
+    let mut distinct: Vec<String> = Vec::new();
+    let mut dead: Vec<(String, String)> = Vec::new();
+    for d in &docs {
+        let Ok(text) = std::fs::read_to_string(d) else {
+            continue;
+        };
+        for (i, _) in text.match_indices("cargo xtask ") {
+            let rest = &text[i + "cargo xtask ".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            cited += 1;
+            if !distinct.contains(&name) {
+                distinct.push(name.clone());
+            }
+            if !arms.contains(&name.as_str()) {
+                dead.push((d.clone(), name));
+            }
+        }
+    }
+
+    // ⚠⚠ THE FLOOR — #275, and the fifth application. Break the `"cargo xtask "` scan and `cited`
+    // falls to 0 with `dead` empty: "0 cited tasks all exist", green on nothing.
+    const MIN_CITED_TASKS: usize = 25;
+    if cited < MIN_CITED_TASKS {
+        eprintln!(
+            "doc-tasks: FAIL — only {cited} `cargo xtask` citations found, expected at least \
+             {MIN_CITED_TASKS}. The scan has probably broken."
+        );
+        return false;
+    }
+
+    if dead.is_empty() {
+        eprintln!(
+            "doc-tasks: OK — {cited} `cargo xtask` citations across {} docs name {} distinct tasks, \
+             all real",
+            docs.len(),
+            distinct.len()
+        );
+        return true;
+    }
+    for (d, t) in &dead {
+        eprintln!(
+            "doc-tasks: FAIL — {d} tells a reader to run `cargo xtask {t}`, which is not a task."
+        );
+        eprintln!("                  A dead command fails in the reader's hands while they are checking a claim.");
+    }
+    false
+}
+
 /// ★ ⑳-i — **`docs/README.md` must CLASSIFY every document in `docs/`, exactly once.**
 ///
 /// The index is a **corpus claim** — "these are the documents, and this is what each is for" — and
@@ -2188,10 +2308,15 @@ fn doc_index() -> bool {
 
     // ★ The index STATES its own size, and that number is gated rather than deleted (#276). A
     // reader deciding whether to open `docs/` is entitled to know how big it is; the fate that
-    // makes that safe is a check, not a promise. ⚠ I wrote this count as prose FIRST — "Thirty-three
-    // design documents" — in the rung whose own lesson is that a number is gated, deleted, or
-    // rotting. Writing the lesson down is not the same as applying it.
-    let claim = format!("**{} design documents.**", universe.len());
+    // makes that safe is a check, not a promise. ⚠ I wrote this count as prose FIRST —
+    // "Thirty-three design documents" — in the rung whose own lesson is that a number is gated,
+    // deleted, or rotting. Writing the lesson down is not the same as applying it.
+    //
+    // ⚠ The phrase is "documents", NOT "design documents", since ⑳-k: `MILESTONES.md` is a LOG, and
+    // a count that silently reclassifies a log as a design doc is the small untruth this gate exists
+    // to prevent. (The quotation above keeps the ORIGINAL wording — it is a record of what was
+    // written, and editing a quote to match today is how a ledger stops being one.)
+    let claim = format!("**{} documents.**", universe.len());
     let mut ok = index.contains(&claim);
     if !ok {
         eprintln!("doc-index: FAIL — {INDEX} does not open by stating its own size as `{claim}`;");
