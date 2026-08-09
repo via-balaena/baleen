@@ -1806,22 +1806,108 @@ const DOC_MARKER_STEM: usize = 24;
 /// markers live in the shell script, so they are read from it.
 const BOOT_TEST: &str = "hv-metal/boot-test.sh";
 
-/// Assert that every boot marker a doc QUOTES is still a marker the gates check. See the block
-/// comment above for the rule and its limits.
+/// This file, read back at run time so [`doc_markers`] can enumerate the marker arrays that exist
+/// rather than only the ones its own table already lists. `xtask` runs from the repo root — the
+/// same assumption [`BOOT_TEST`] has always made.
+const SELF_SRC: &str = "xtask/src/main.rs";
+
+/// ★★ ⑳-d — **THE FOURTH EVIDENCE CORPUS, PINNED: the boot markers.**
+///
+/// ⚠ **The gate this closes is the one ⑳/⑳-b/⑳-c closed for the other three, left open here.**
+/// [`doc_markers`] computes the marker corpus and prints its size **as information**. Nothing
+/// asserted it. So deleting a marker from any array below left `doc-markers` printing one fewer and
+/// returning OK, and left the boot gate simply checking one fewer thing — **green, both of them**.
+/// The only accidental cover was that a marker *quoted in a doc* is caught by the drift check
+/// below, and that pins at most 46 of ~214.
+///
+/// ★ **Why this corpus deserves the same treatment as the three proof corpora, not less.**
+/// `hv-metal` is workspace-EXCLUDED and cannot be a Kani target (honest-ledger item 8). These
+/// markers are therefore not *one* source of evidence for the metal — they are the **only** one.
+///
+/// ⚠ **Pinned by COUNT, not by name, and that is deliberate.** `KANI_HARNESSES` lists names because
+/// a harness name is short and a rename should be visible. A marker is a whole sentence; listing
+/// all ~214 here would be a second copy of the corpus, which is design-lesson #230's defect — and
+/// #240's, in the very file that would then have to keep both copies in step.
+///
+/// ⚠ **Counts are PRE-dedup and PER ARRAY** — finer than one grand total on purpose, so a deletion
+/// in one array cannot be masked by an addition in another. The deduped total stays in the OK line
+/// as information, where it always was.
+///
+/// ⚠ **Raising a number here is a normal part of adding a witness; LOWERING one is a claim that a
+/// witness should no longer exist, and belongs in the commit message.**
+const MARKER_CORPUS: &[(&str, &[&str], usize)] = &[
+    ("LINUX_MARKERS", LINUX_MARKERS, 66),
+    ("LINUX_FORBIDDEN", LINUX_FORBIDDEN, 27),
+    ("LINUX_FAULT_MARKERS", LINUX_FAULT_MARKERS, 5),
+    ("LINUX_PEER_LOOP_MARKERS", LINUX_PEER_LOOP_MARKERS, 5),
+    ("LINUX_FAULT_FORBIDDEN", LINUX_FAULT_FORBIDDEN, 2),
+    // ⚠ **FOUND BY THIS GATE'S OWN UNIVERSE CHECK, on its first run (⑳-d).** These 8 are asserted
+    // by the `LinuxBoot::Smmu` boot, but the census below chained five arrays and not this one —
+    // so an SMMU marker quoted in a doc was outside the drift check, under a comment claiming the
+    // census covered everything. Latent, not live: no doc quotes one today (checked). Listing it
+    // here pins it AND puts it in the census, because both now read this one table.
+    ("LINUX_SMMU_MARKERS", LINUX_SMMU_MARKERS, 8),
+];
+
+/// The number of marker lines [`BOOT_TEST`] contributes — the synthetic path's half of the corpus.
+///
+/// Pinned separately from [`MARKER_CORPUS`] because it is derived from a FILE rather than a
+/// compile-time array: `boot-test.sh` is where the `default`/`selftest`/`dma-control`/`smmu`/
+/// `wx-probe`/`xn-probe` boots name what they expect, and a marker deleted there is exactly as
+/// silent as one deleted from an array.
+const BOOT_TEST_MARKERS: usize = 176;
+
+/// Every marker array [`MARKER_CORPUS`] must account for, found by reading this file.
+///
+/// ⚠ **Without this, the pin is one-directional.** The table above catches a marker deleted from an
+/// array it already lists; it is blind to a NEW array added and never listed, which would be
+/// ungated from birth and look exactly like a corpus that was never supposed to cover it. That is
+/// the same hole `verus_counts` closes by listing the directory rather than trusting its own table
+/// — the difference being that the universe here is a source file, not a directory.
+///
+/// ★ **It earned its cost immediately**: on its first run it found `LINUX_SMMU_MARKERS`, which the
+/// census had omitted since the SMMU boot was added (design-lesson #211 — build the control so it
+/// can falsify itself).
+///
+/// The convention this relies on, and it is the existing one: a marker array is a `const LINUX_*`
+/// of type `&[&str]`. A new corpus that follows it is caught; one that does not is not, which is
+/// why the naming is stated here rather than left to be inferred.
+fn declared_marker_arrays(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("const LINUX_") else {
+            continue;
+        };
+        let Some((name, ty)) = rest.split_once(':') else {
+            continue;
+        };
+        if ty.trim_start().starts_with("&[&str]") {
+            out.push(format!("LINUX_{name}"));
+        }
+    }
+    out
+}
+
+/// Assert that every boot marker a doc QUOTES is still a marker the gates check, and — since ⑳-d —
+/// that the corpus still holds the number of markers [`MARKER_CORPUS`] pins. See the block comment
+/// above for the drift rule and its limits.
 fn doc_markers() -> bool {
     eprintln!("$ xtask doc-markers");
 
     // The gate corpus.
-    // ALL FOUR corpora, including the fault-probe run's. A marker outside this census is outside the
-    // drift check that is this task's whole purpose: a doc could quote it, `hv-metal` could reword
-    // it, and nothing would notice. The fault corpus is small and new, which is exactly when it is
-    // cheapest to include and easiest to forget.
-    let mut gate: Vec<String> = LINUX_MARKERS
+    // EVERY marker array, including the fault-probe run's and the SMMU boot's. A marker outside
+    // this census is outside the drift check that is this task's whole purpose: a doc could quote
+    // it, `hv-metal` could reword it, and nothing would notice.
+    //
+    // ⚠ **This comment used to say "ALL FOUR corpora" while the chain below listed FIVE arrays and
+    // omitted a sixth (`LINUX_SMMU_MARKERS`).** Two different miscounts in the one place whose job
+    // is to be exhaustive — which is why the census is now derived from `MARKER_CORPUS`, and that
+    // table is checked against the arrays this file actually declares. A prose count of a corpus is
+    // design-lesson #230's defect wearing #227's clothes: it reads as an inventory.
+    let mut gate: Vec<String> = MARKER_CORPUS
         .iter()
-        .chain(LINUX_FORBIDDEN.iter())
-        .chain(LINUX_FAULT_MARKERS.iter())
-        .chain(LINUX_PEER_LOOP_MARKERS.iter())
-        .chain(LINUX_FAULT_FORBIDDEN.iter())
+        .flat_map(|(_, markers, _)| markers.iter())
         .map(|m| collapse(m))
         .collect();
     let script = match std::fs::read_to_string(BOOT_TEST) {
@@ -1831,11 +1917,63 @@ fn doc_markers() -> bool {
             return false;
         }
     };
+    let mut from_script = 0usize;
     for line in script.lines() {
         if let Some(s) = shell_string(line) {
             gate.push(collapse(&s));
+            from_script += 1;
         }
     }
+
+    // ★★ ⑳-d — THE CARDINALITY PIN. Checked BEFORE the drift check, because a corpus that has
+    // silently lost a member makes every downstream "still exact" verdict a statement about a
+    // smaller set than the one the reader thinks was checked.
+    let mut census_ok = true;
+    for (name, markers, want) in MARKER_CORPUS {
+        if markers.len() != *want {
+            eprintln!(
+                "doc-markers: FAIL — {name} holds {} marker(s), expected {want}. {}",
+                markers.len(),
+                if markers.len() < *want {
+                    "A witness was REMOVED: say why in the commit message, then lower the pin."
+                } else {
+                    "A witness was ADDED: raise the pin in `MARKER_CORPUS`."
+                }
+            );
+            census_ok = false;
+        }
+    }
+    if from_script != BOOT_TEST_MARKERS {
+        eprintln!(
+            "doc-markers: FAIL — {BOOT_TEST} contributes {from_script} marker(s), expected \
+             {BOOT_TEST_MARKERS}. Update `BOOT_TEST_MARKERS` if the change is intended."
+        );
+        census_ok = false;
+    }
+    // The other direction: a NEW marker array that nothing pins. Without this the table only guards
+    // the arrays it already knows about (design-lesson #231 — pin the cardinality in BOTH
+    // directions, or the half you skipped is the half that bites).
+    match std::fs::read_to_string(SELF_SRC) {
+        Ok(src) => {
+            for name in declared_marker_arrays(&src) {
+                if !MARKER_CORPUS.iter().any(|(n, _, _)| *n == name) {
+                    eprintln!(
+                        "doc-markers: FAIL — `{name}` is a marker array that `MARKER_CORPUS` does \
+                         not pin, so it is ungated. Add it with its count."
+                    );
+                    census_ok = false;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("doc-markers: cannot read {SELF_SRC}: {e}");
+            return false;
+        }
+    }
+    if !census_ok {
+        return false;
+    }
+
     gate.sort();
     gate.dedup();
 
