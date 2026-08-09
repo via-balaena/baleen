@@ -104,6 +104,7 @@ fn main() {
         "doc-markers" => doc_markers(),
         "doc-counts" => doc_counts(),
         "doc-paths" => doc_paths(),
+        "doc-index" => doc_index(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -132,6 +133,8 @@ fn main() {
                 && doc_counts()
                 // ⑳-h: every repo path the docs cite must still resolve.
                 && doc_paths()
+                // ⑳-i: the docs index must still describe the whole of docs/.
+                && doc_index()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -2000,6 +2003,117 @@ fn doc_paths() -> bool {
         eprintln!("                  nor under any crate directory. Renamed, moved, or deleted?");
     }
     false
+}
+
+/// ★ ⑳-i — **`docs/README.md` must CLASSIFY every document in `docs/`, exactly once.**
+///
+/// The index is a **corpus claim** — "these are the documents, and this is what each is for" — and
+/// this project has learned six times that a corpus claim maintained by memory is a corpus claim
+/// that is wrong. So it gets the same treatment as the other six: a **universe check** (#243). The
+/// universe is `std::fs::read_dir("docs")`, enumerated independently of the index; the table is the
+/// index. A document that exists and is not classified is the failure this exists to catch — a
+/// reader who opens `docs/` sees thirty-three filenames and no order, and the whole value of the
+/// index is that the set it describes is *complete*.
+///
+/// ## Why "classified", and not merely "mentioned"
+///
+/// A doc can be linked from the index's prose (the reading orders link seven of them) without ever
+/// being placed in a group. That is exactly the half-indexed state this is meant to prevent, so the
+/// check reads only **classification rows** — a table line that *begins* with the link, `| [`.
+/// Cross-references in prose and in the filename-trap table are ignored on purpose: they start with
+/// text, not a link. ⚠ That is a syntactic rule doing semantic work, and it is stated here because a
+/// later editor reformatting a table would silently change what this gate measures.
+///
+/// ⚠ **`docs/README.md` itself is excluded from the universe** — an index that must index itself is
+/// a fixed point, not a check.
+fn doc_index() -> bool {
+    eprintln!("$ xtask doc-index");
+    const INDEX: &str = "docs/README.md";
+
+    let mut universe: Vec<String> = match std::fs::read_dir("docs") {
+        Ok(d) => d
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".md") && n != "README.md")
+            .collect(),
+        Err(e) => {
+            eprintln!("doc-index: cannot list docs/: {e}");
+            return false;
+        }
+    };
+    universe.sort();
+
+    let Ok(index) = std::fs::read_to_string(INDEX) else {
+        eprintln!(
+            "doc-index: FAIL — {INDEX} is missing. It is the entry point to {} documents; a",
+            universe.len()
+        );
+        eprintln!(
+            "           `docs/` directory without one is thirty-three filenames and no order."
+        );
+        return false;
+    };
+
+    // Classification rows only: a table line whose FIRST cell is the link itself.
+    let mut classified: Vec<String> = Vec::new();
+    for line in index.lines() {
+        let t = line.trim();
+        if !t.starts_with("| [") {
+            continue;
+        }
+        let Some(open) = t.find("](") else { continue };
+        let Some(close) = t[open + 2..].find(')') else {
+            continue;
+        };
+        classified.push(t[open + 2..open + 2 + close].to_string());
+    }
+
+    // ⚠⚠ THE FLOOR — design-lesson #275, and the FOURTH application. With the row rule broken (a
+    // reformatted table, a changed link style) `classified` empties, every doc reads as missing and
+    // the failure is loud — but the SYMMETRIC break, where the universe fails to enumerate, would
+    // report "0 of 0 classified" and pass. Pin the universe, not just the table.
+    const MIN_DOCS: usize = 30;
+    if universe.len() < MIN_DOCS {
+        eprintln!(
+            "doc-index: FAIL — only {} documents found in docs/, expected at least {MIN_DOCS}. \
+             The enumeration has probably broken, which would make the comparison below vacuous.",
+            universe.len()
+        );
+        return false;
+    }
+
+    let mut ok = true;
+    for doc in &universe {
+        match classified.iter().filter(|c| *c == doc).count() {
+            1 => {}
+            0 => {
+                eprintln!("doc-index: FAIL — docs/{doc} exists but {INDEX} does not classify it.");
+                eprintln!("                  Add it to the group it belongs to (a prose mention is not enough).");
+                ok = false;
+            }
+            n => {
+                eprintln!("doc-index: FAIL — docs/{doc} is classified {n} times in {INDEX};");
+                eprintln!("                  a document belongs to exactly one group.");
+                ok = false;
+            }
+        }
+    }
+    for c in &classified {
+        if !universe.contains(c) {
+            eprintln!(
+                "doc-index: FAIL — {INDEX} classifies `{c}`, which is not a document in docs/."
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        eprintln!(
+            "doc-index: OK — all {} documents in docs/ are classified exactly once",
+            universe.len()
+        );
+    }
+    ok
 }
 
 /// Non-comment, non-blank lines under `paths` — the measure the README's proof-to-code ratio uses.
