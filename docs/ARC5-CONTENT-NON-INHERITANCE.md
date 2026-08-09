@@ -2,11 +2,18 @@
 
 **Status:** done. `hv-core` / `hv-hal` / `hv-s2` untouched.
 
-> **Two later corrections, recorded here so this page is not read as the final word.**
+> **Three later corrections, recorded here so this page is not read as the final word.**
 > 1. **Arc 6a** exposed that `scrub_frame` was **span-blind** — it always addressed the base window
 >    and zeroed 4 KiB, so this arc's claim was **false for superpages**. Fixed in PR #54; see
 >    `docs/ARC6A-SPAN-REFINEMENT.md` and the seam note below.
 > 2. **Arc 6b-pre** moved the scrub from the *allocate* to the *free*. See §2.
+> 3. ★ **2026-08-08, PR #168 — the cache-maintenance derivation this page shipped was WRONG, and in
+>    the direction that leaks.** It argued only that a dirty line could be evicted *after* the
+>    zeroing, and concluded a trailing `dc civac` was the fix. But `DC CIVAC` **cleans before it
+>    invalidates**, so the trailing pass wrote the dead tenant's still-live dirty line back *over* the
+>    zeroing: the maintenance meant to prevent a resurrection performed one. Fixed by
+>    `civac → zero → civac`. See §"Cache maintenance" below — the derivation now lives with the code,
+>    not here.
 
 `hv-core` proves a reborn slot inherits no **authority** — no grant, no port, no owned frame
 (design-lesson #15's inbound-reference sweep, live on the metal since M5 Arc 0). It says nothing
@@ -82,18 +89,28 @@ path, reached when a frame becomes **reachable** rather than **owned** — asser
 about to map was scrubbed since it was allocated, and halts otherwise. A dispatch that bypasses the
 funnel does not silently leak; it stops the machine (§4, row 3).
 
-## Cache maintenance: required, and unwitnessable here
+## Cache maintenance: required, ORDER-SENSITIVE, and witnessed on a model that caches
 
-EL2 runs MMU-off/identity, so *its* stores are non-cacheable while the dying guest wrote through
-cacheable EL1 mappings. Without maintenance a dirty line can be evicted **after** the zeroing and
-resurrect the secret in DRAM. `dc civac` over the frame kills both directions (flushes the dead
-tenant's dirty lines; invalidates stale clean ones so the next tenant's first read cannot hit
-pre-scrub data), and `dsb ish` orders it.
+**The derivation is not repeated here.** It lives on `scrub_frame` in `hv-metal/src/stage2.rs`,
+which is the only copy that a reader can check against the instruction sequence it describes. This
+page kept a second copy from Arc 6b-pre (PR #55, the last commit to touch this file) until
+2026-08-09, and the second copy is what stayed wrong after the code was fixed — so what follows is
+the standing, not the argument.
 
-**Labelled reasoned, not witnessed.** QEMU/TCG models no cache, so no boot test can distinguish this
-from a bare `write_bytes` — §4 row 4 confirms deleting it changes nothing observable. It is here
-because a scrub without it is **wrong on silicon while passing every test we own**; same standing as
-the VMID-tagging argument (#23).
+* **Required.** EL2's stores are non-cacheable (MMU-off, and `SCTLR_EL2.C = 0` under ledger 5's A1)
+  while the dying guest wrote through cacheable EL1 mappings, so the zeroing alone does not touch
+  the dead tenant's dirty lines.
+* **Order-sensitive, and this page originally got the order wrong** — see correction 3 at the top.
+  The maintenance runs **before** the zeroing (which is what erases the tenant) and again after
+  (a no-op today, load-bearing the moment A2 makes EL2's own stores cacheable).
+* **No longer "reasoned, not witnessed."** `fvp-probe` milestone 3 established that Arm's AEM does
+  withhold a dirty line from a non-cacheable observer, and milestone 4 reproduced this exact
+  sequence on it and measured the secret surviving the shipped order and erased by the current one.
+  ⚠ **The witness is the PROBE's, not this code's** — `fvp-probe` shares no source with `hv-metal`,
+  and `hv-metal` has never run on the FVP. The mechanism is witnessed; this call site is not.
+* **Still invisible to every gate this repo owns.** QEMU/TCG models no cache, so no boot test here
+  can distinguish the right order from the wrong one — §4 row 4 measured exactly that, and it is why
+  the defect survived to 2026-08-08 with every gate green throughout.
 
 ---
 
@@ -105,7 +122,7 @@ the VMID-tagging argument (#23).
 | 2a | Owner-diff sampled **at reachability time** | **LEAK REPRODUCED** — the DomId-reuse trap, exactly as §2 predicts |
 | 2b | Owner-diff sampled **after every transition** | **STILL GREEN** — works; this is what corrected the claim from "owner-diff is wrong" to "only at a costlier sampling rate" |
 | 3 | **Bypass the funnel** (`expect` dispatches directly) | **CAUGHT** — the independent Stage-2-time check halts. *(Under 6b-pre the check compares the model's allocation state against the funnel's shadow rather than a per-frame scrubbed flag; same #36 shape, same catch.)* |
-| 4 | Remove the `dc civac` cache maintenance | **STILL GREEN — does not fire.** Predicted: TCG models no cache. This row *is* the evidence for the reasoned-not-witnessed label |
+| 4 | Remove the `dc civac` cache maintenance | **STILL GREEN — does not fire.** Predicted: TCG models no cache. ⚠ **This row measures the PLATFORM, and it was over-read.** It was recorded as evidence for a "reasoned, not witnessed" label; what it actually shows is that no gate here can grade this code *at all* — which is why the order being wrong (correction 3) also went undetected. The instrument that can grade it is `fvp-probe`, not this table |
 | 5 | Remove the `scrubbed` shadow re-sync | **STILL GREEN — does not fire** |
 | 5b | Funnel bypass **and** no re-sync (the combination it should defend) | **CAUGHT anyway** — so the re-sync is not load-bearing on any path this fixture builds, either |
 | 6 | Remove the CoW overlay discard | **CAUGHT** — `THESIS TEST FAILED` (`overlay_gone=false`) |
@@ -133,13 +150,22 @@ this leak sat in the ledger with every boot green. The new witness reads first. 
 1. ~~**The scrub is eager at allocate, not at free.**~~ **DISCHARGED by Arc 6b-pre** — the scrub
    moved to the free, so the bytes are gone at the tenant boundary rather than sitting in DRAM until
    the next allocate. Scrubbed-at-rest is now what is delivered.
-2. **The cache-maintenance half is reasoned, not witnessed**, and cannot be witnessed under TCG
-   (§4 row 4). It rides on the standing crate-wide EL2-MMU real-hardware gap.
+2. ~~**The cache-maintenance half is reasoned, not witnessed**, and cannot be witnessed under TCG
+   (§4 row 4).~~ **RESTATED 2026-08-08 — the "cannot be witnessed" half was false, and believing it
+   is what let the order stay wrong.** It cannot be witnessed *under TCG*; it was witnessed on Arm's
+   AEM within an hour of anyone building the instrument (`fvp-probe` m3/m4, PRs #167/#168).
+   **What remains true:** the witness is the probe's and not this code's — `hv-metal` has never run
+   on the FVP — so the mechanism is witnessed and this call site is not. It still rides on the
+   standing crate-wide EL2-MMU real-hardware gap.
 3. **The bump heap is not scrubbed and never reclaims.** Not guest-reachable, so not a channel —
    but a destroyed domain's model state stays resident until reboot.
-4. **`CACHE_LINE` is a conservative constant (64), not a `CTR_EL0` read.** Too-small is always safe
+4. ~~**`CACHE_LINE` is a conservative constant (64), not a `CTR_EL0` read.** Too-small is always safe
    (it merely repeats `dc civac` within a line); too-large would skip lines, so this must stay a
-   floor if it is ever made dynamic.
+   floor if it is ever made dynamic.~~ **DISCHARGED by PR #169** — `scrub_line_bytes()` now measures
+   `CTR_EL0.DminLine` and takes `min(64, 4 << DminLine)`, so the stride can only get *finer* than the
+   old constant and the "must stay a floor" condition this residual named is the shape of the fix.
+   Measured 64 on both platforms this project runs on (QEMU `virt` and the AEM), so it is
+   behaviour-neutral where observed.
 5. **The completeness argument for the seam is an audit fact, not a machine-checked one**: "`allocate`
    is the sole owner-creating transition" was established by reading `hv-core/src/p2m.rs`, exactly
    the transition-list-completeness residual the Stage-2 program already carries.

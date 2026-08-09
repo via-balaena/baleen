@@ -258,8 +258,9 @@ the probe is still green. So the residual is **inherited unchanged, and the prop
 is now ruled out**: on this platform `CMD_CFGI_STE` alone is sufficient to make a rebind take (the
 previous row shows it is genuinely load-bearing), ~~which is consistent with QEMU dropping the
 stream's cached translations along with its configuration~~. The command stays because the
-architecture requires it — *reasoned, not witnessed*, the same standing as the cache maintenance in
-`scrub_frame`. Witnessing it needs a platform that caches stage-2 translations across a
+architecture requires it — the same standing as the cache maintenance in `scrub_frame`, which as of
+2026-08-08 means *mechanism witnessed on the AEM, this call site not* rather than *reasoned, not
+witnessed*. Witnessing it needs a platform that caches stage-2 translations across a
 configuration invalidation, i.e. not this one (design-lesson #72).
 
 ✅ **THAT LAST SENTENCE NAMED THE INSTRUMENT, AND IT HAS NOW BEEN BUILT** — `fvp-probe` on Arm's
