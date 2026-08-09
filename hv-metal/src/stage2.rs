@@ -77,7 +77,6 @@
 //! MMU-off/identity, so a host PA is directly addressable). Each carries its justification; the
 //! tables live behind `UnsafeCell` (never `static mut`), the same discipline as `guest.rs`/`heap.rs`.
 
-use core::arch::asm;
 use core::fmt::Write;
 
 use hv_core::hypervisor::DomId;
@@ -553,10 +552,18 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
     // tables are rewritten while executing at EL2, where the EL1&0 Stage-2 regime performs no walks
     // (no walker observes these stores mid-rebuild), so even though a *prior* phase may have Stage-2
     // enabled (this fn is called once per phase, not only before the first enable), the rewrite races
-    // no translation; and `enable_stage2`'s subsequent `dsb`+`tlbi`+`isb` fences the rewrite (and
-    // makes these Non-cacheable EL2 stores globally observable) before the next `eret`, so a
-    // switched-in domain's walker reads correct, published descriptors. That argument is `unsafe`
-    // code's, and it lives with the barriers in `enable_stage2` — see `crate::cell`'s class 2.
+    // no translation; and `enable_stage2`'s subsequent `dsb`+`tlbi`+`isb` fences the rewrite before
+    // the next `eret`, so a switched-in domain's walker reads correct, published descriptors. That
+    // argument is `unsafe` code's, and it lives with the barriers in `enable_stage2` — see
+    // `crate::cell`'s class 2.
+    //
+    // ⚠ **That sentence used to end "(and makes these Non-cacheable EL2 stores globally
+    // observable)", and A2 deleted the parenthesis rather than reworded it.** These stores are no
+    // longer Non-cacheable. For the CPU's walker that costs nothing and in fact repairs something:
+    // `VTCR_EL2 = 0x8002_3559` has always walked Write-Back Inner-Shareable, so under A1 it was the
+    // *walker* that was cacheable and EL2 that was not — a mismatched alias on these very tables.
+    // A2 puts both in the same domain, and `dsb ish` then orders EL2's stores against the walk it
+    // always should have been ordering them against.
     hv_s2::arm64::encode(
         &leaves,
         &supers,
@@ -569,6 +576,25 @@ pub fn build_stage2_from_p2m(hv: &Hypervisor, guest_dom: DomId, set: usize) -> u
             l2_sup: &mut tables.l2_sup.0,
             l2_dev: &mut tables.l2_dev.0,
         },
+    );
+
+    // ★★ **A2: publish the emitted tables to the SECOND walker, which does not snoop.**
+    //
+    // The paragraph above is about the CPU's stage-2 walker, and A2 leaves that one coherent. But
+    // since SMMU rung 3 these are not one walker's tables: `STE.S2TTB` points a **bus master's**
+    // walks at this same `Stage2Set`, and `smmu.rs` programs `SMMU_CR1 = 0` — non-cacheable,
+    // non-shareable — so the SMMU fetches descriptors from memory and sees nothing EL2 is holding
+    // dirty. Under A1 that was free: EL2's stores were Device-nGnRnE and already in memory. Under A2
+    // it is an obligation, and an unmet one would be a device translating through a **stale table**
+    // — which is the isolation-relevant direction, since the stale table is the one from before this
+    // rebuild removed a leaf.
+    //
+    // The whole set is cleaned rather than the descriptors that changed: `encode` is free to touch
+    // any of the six tables, and 24 KiB is 384 lines. A range derived from what `encode` happened to
+    // write would be a second model of `encode`'s behaviour, maintained here, wrong silently.
+    crate::cache::clean(
+        core::ptr::from_ref(&*tables) as u64,
+        core::mem::size_of::<Stage2Set>() as u64,
     );
 
     // (4) Under `selftest`, read the emitted tables BACK and assert they decode to exactly the leaf
@@ -731,45 +757,12 @@ pub fn seed_sup_frame(m: Mfn, buf: &[u8]) {
 /// 4 KiB granule). Derived, so it cannot drift from the base granule (design-lesson #14c).
 const SUPER_SIZE: u64 = hv_s2::arm64::TABLE_ENTRIES as u64 * FRAME_SIZE;
 
-/// The **ceiling** on the scrub's maintenance stride, not the stride itself.
-///
-/// The safety argument is one-directional and worth stating in the direction that bites: a stride
-/// **smaller** than the true line is always safe — it merely repeats `dc civac` within a line — while
-/// a stride **larger** than the true line **SKIPS LINES**, leaving a dead tenant's data behind. So
-/// the only dangerous case is a core whose minimum line is under 64 bytes.
-///
-/// ⚠ **This used to be the stride, justified as "64 bytes on every AArch64 core this targets".**
-/// That is an assertion about the target set, and the architecture does not require it —
-/// `CTR_EL0.DminLine` may report less. [`scrub_line_bytes`] now MEASURES it and takes the smaller of
-/// the two, so the assumption is gone rather than documented.
-const CACHE_LINE: u64 = 64;
-
-/// The stride the scrub's maintenance loop actually uses: **the smaller of [`CACHE_LINE`] and the
-/// minimum data-cache line this core reports**.
-///
-/// `CTR_EL0.DminLine` is log2 of the number of 4-byte words in the smallest data cache line, so the
-/// size is `4 << DminLine`. Taking the minimum means the stride can only ever get *finer* than the
-/// old constant — never coarser — so this cannot skip a line on any core, and does no extra work on
-/// the ones the old constant was right about.
-///
-/// **MEASURED on both platforms this project runs on: 64 bytes** — QEMU `virt` (reported by the
-/// `scrubline` marker on every boot) and Arm's AEM (`fvp-probe` milestone 3 prints the same
-/// derivation). So the change is behaviour-neutral where it has been observed, which is exactly the
-/// standing an assumption-removal should have: it buys correctness on cores nobody here has run,
-/// and costs nothing on the ones we have.
-pub(crate) fn scrub_line_bytes() -> u64 {
-    let ctr: u64;
-    // SAFETY: `CTR_EL0` is a read-only ID register, readable at EL2. No memory operand.
-    unsafe {
-        asm!("mrs {0}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
-    }
-    let dmin = 4u64 << ((ctr >> 16) & 0xf);
-    if dmin < CACHE_LINE {
-        dmin
-    } else {
-        CACHE_LINE
-    }
-}
+// ⚠ **`CACHE_LINE` and `scrub_line_bytes` used to live here and are now `crate::cache`'s**, which is
+// a move rather than a tidy-up. That measurement (a 64-byte ceiling capped by `CTR_EL0.DminLine`,
+// #169) had exactly one consumer while `scrub_frame` was the only cache maintenance in the crate.
+// A2 added three more — the SMMU's structures, its event queue, and the DMA witness's sentinels —
+// and a stride that four loops each derive is four places for #169's defect to come back. The
+// `scrubline` boot marker still reports it; it now reports it for all four.
 
 /// Zero the machine frame backing model frame `mfn`, and make the zeroing visible to a guest that
 /// will read it through *cacheable* Stage-2 mappings.
@@ -885,22 +878,16 @@ pub fn scrub_frame(mfn: Mfn) {
 /// Clean+invalidate `[pa, end)` to the point of coherency, then fence.
 ///
 /// Extracted so the before- and after-passes of [`scrub_frame`] are visibly the *same* operation —
-/// two hand-written loops would be two places for the line-stride to drift.
+/// two hand-written loops would be two places for the line-stride to drift. **A2 took that one step
+/// further**: the loop itself now lives in [`crate::cache`], which is where every consumer of the
+/// stride gets it, and this function is the name `scrub_frame` calls it by.
+///
+/// ⚠ **The barrier widened from `dsb ish` to `dsb sy` in the move, and that is a fix rather than a
+/// side effect.** Inner-shareable is the domain the CPUs and the stage-2 walker are in; a frame
+/// being handed to a new owner may also be reachable by a **bus master**, which is not. The old
+/// barrier ordered this maintenance against exactly the observers that were never the problem.
 fn scrub_maintenance(pa: u64, end: u64) {
-    let stride = scrub_line_bytes();
-    let mut addr = pa;
-    while addr < end {
-        // SAFETY: `dc civac` takes a VA in a mapped region; EL2 is identity-mapped so the PA is that
-        // VA. Cache maintenance has no architectural memory effect beyond coherency.
-        unsafe {
-            asm!("dc civac, {a}", a = in(reg) addr, options(nostack, preserves_flags));
-        }
-        addr += stride;
-    }
-    // SAFETY: a barrier; no memory operand.
-    unsafe {
-        asm!("dsb ish", options(nostack, preserves_flags));
-    }
+    crate::cache::clean_invalidate(pa, end - pa);
 }
 
 // `hv_hal::GuestMemory`, realized on ARM (M4 Arc 5) — deferred through Arc 4, landed here exactly as
