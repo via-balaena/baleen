@@ -102,15 +102,21 @@ const SMMU_GBPA: u64 = 0x0044;
 const SMMU_GERROR: u64 = 0x0060;
 const SMMU_GERRORN: u64 = 0x0064;
 /// `SMMU_STRTAB_BASE` (64-bit) — physical base of the stream table, bits `[51:6]`.
-const SMMU_STRTAB_BASE: u64 = 0x0080;
+/// ㉕ **A DOORBELL**: it hands the device an address in DRAM, so it cannot be written without a
+/// [`Published`].
+const SMMU_STRTAB_BASE: Doorbell = Doorbell::new(0x0080);
 /// `SMMU_STRTAB_BASE_CFG` — `LOG2SIZE` `[5:0]`, `SPLIT` `[10:6]`, `FMT` `[17:16]`.
 const SMMU_STRTAB_BASE_CFG: u64 = 0x0088;
-/// `SMMU_CMDQ_BASE` (64-bit) — `ADDR` `[51:5]`, `LOG2SIZE` `[4:0]`.
-const SMMU_CMDQ_BASE: u64 = 0x0090;
-const SMMU_CMDQ_PROD: u64 = 0x0098;
+/// `SMMU_CMDQ_BASE` (64-bit) — `ADDR` `[51:5]`, `LOG2SIZE` `[4:0]`. ㉕ **A DOORBELL** (address).
+const SMMU_CMDQ_BASE: Doorbell = Doorbell::new(0x0090);
+/// `SMMU_CMDQ_PROD` — the producer index. ㉕ **A DOORBELL, and the one that matters most**: it
+/// announces new *content* in the ring, and the SMMU reads whatever that slot holds. `fvp-probe`
+/// milestone 6 measured a `CMD_SYNC` reporting SUCCESS over a stale slot, so an unpublished command
+/// fails silently rather than loudly.
+const SMMU_CMDQ_PROD: Doorbell = Doorbell::new(0x0098);
 const SMMU_CMDQ_CONS: u64 = 0x009c;
-/// `SMMU_EVENTQ_BASE` (64-bit) — same layout as `CMDQ_BASE`.
-const SMMU_EVENTQ_BASE: u64 = 0x00a0;
+/// `SMMU_EVENTQ_BASE` (64-bit) — same layout as `CMDQ_BASE`. ㉕ **A DOORBELL** (address).
+const SMMU_EVENTQ_BASE: Doorbell = Doorbell::new(0x00a0);
 /// `SMMU_EVENTQ_PROD` / `_CONS` live in the SMMU's **page 1**, not page 0 — at `base + 64 KiB + 0xa8`
 /// when `IDR1.REL == 0` (the case on this machine, checked at setup rather than assumed). They are the
 /// registers Linux calls `ARM_SMMU_EVTQ_PROD`/`_CONS` at `0x100a8`/`0x100ac`.
@@ -178,6 +184,110 @@ pub(crate) const EVT_F_TRANSLATION: u8 = 0x10;
 /// permission arm: the proven emitter's read-only leaf governs the DEVICE too.
 pub(crate) const EVT_F_PERMISSION: u8 = 0x13;
 
+/// ㉕ — **the doorbell fence: a register you cannot ring without having published.**
+///
+/// ## The residual this closes
+///
+/// A2 made EL2's DRAM cacheable, so telling the SMMU to look at a structure now requires pushing
+/// that structure to the point of coherency first — the SMMU fetches non-coherently (`CR1 = 0`).
+/// Every site does; that was a **review-based guarantee**, and A2 recorded it as a residual in
+/// `mmu`'s module doc: *a future site that rings a doorbell without publishing gets no barrier and
+/// no warning.* On silicon that is a device translating through a **stale stream-table entry**, or a
+/// `CMD_SYNC` reporting success over a command the SMMU never read. Invisible on QEMU, which models
+/// no cache.
+///
+/// ## Why the REGISTER is typed and not the function
+///
+/// The obvious design — a token parameter on `write32` — does not close it: `write32` stays generic,
+/// so a **new** doorbell site simply calls it, which is the actual failure mode. Typing the register
+/// instead makes `write32(SMMU_CMDQ_PROD, …)` a **type error**, and [`Doorbell`]'s field is private
+/// to this module so `.0` cannot be unwrapped to route around it. Adding a doorbell still requires
+/// `Doorbell::new`, which is deliberate and visible; what is now unspellable is *bypassing* the
+/// obligation for a register that already is one.
+///
+/// ## ⚠ What [`Published`] proves, and what it does NOT
+///
+/// It proves **a publication happened in this scope**. It does **not** prove that publication
+/// covered the right range — a token minted by cleaning 16 bytes will happily authorise a doorbell
+/// for a 16 KiB table. That is why it is `Copy`: since it cannot check the range, insisting on
+/// one-token-per-doorbell would buy nothing and cost a redundant `DC CVAC` per register.
+///
+/// ★ **The guard targets OMISSION, which is invisible, and not WRONG RANGE, which is visible at the
+/// call site.** Saying so is the point — ㉔ made the same distinction, and a guard that overstates
+/// itself is worse than one that does not exist, because it stops people looking.
+mod doorbell {
+    /// Proof that DRAM was published before a doorbell is rung. **Minted only by
+    /// [`clean_and_prove`]**, immediately below, which does the cache maintenance first — see this
+    /// module's doc for the precise (limited) claim.
+    ///
+    /// ⚠ Not `super::publish`: that is the documented entry point every call site uses, and it
+    /// DELEGATES here. The distinction matters in exactly this sentence, because "where can a token
+    /// come from" is the whole guarantee — an earlier draft named `super::publish` and was wrong.
+    #[derive(Clone, Copy)]
+    pub(super) struct Published(());
+
+    impl Published {
+        /// Mint the proof. ⚠⚠ **PRIVATE to this module, and that is the whole fence.** It was
+        /// `pub(super)` for one commit, which meant any code in `smmu.rs` could write
+        /// `ring32(v, Published::new())` and forge the evidence — a guard that the guarded code can
+        /// mint for itself is decoration. The only way to obtain a `Published` is now
+        /// [`clean_and_prove`] below, which does the cache maintenance first.
+        const fn new() -> Self {
+            Self(())
+        }
+    }
+
+    /// **Clean `[pa, pa + len)` to the point of coherency and return the proof a doorbell demands.**
+    ///
+    /// Lives inside this module because [`Published::new`] must stay private: the token and the only
+    /// thing that can mint it are one unit, so "I published" cannot be *asserted*, only *done*.
+    ///
+    /// ⚠ **Named `clean_and_prove` rather than `publish` on purpose.** It is `super::publish`'s
+    /// implementation, and two functions called `publish` in one file — one calling the other — is a
+    /// reader trap and an intra-doc-link ambiguity. `super::publish` keeps the name every call site
+    /// and every cross-reference uses; this does the work and mints the evidence.
+    pub(super) fn clean_and_prove(pa: u64, len: u64) -> Published {
+        crate::cache::clean(pa, len);
+        Published::new()
+    }
+
+    /// An SMMU register that hands the device a DRAM **address**, or announces new **content** in
+    /// DRAM it must read. Ringing one requires a [`Published`].
+    ///
+    /// ⚠ **The field is private to THIS module on purpose.** `Doorbell(x).0` outside it would be a
+    /// hole straight back to `write32`, which is the thing being fenced off.
+    #[derive(Clone, Copy)]
+    pub(super) struct Doorbell(u64);
+
+    impl Doorbell {
+        /// Declare a register a doorbell. Deliberate and visible — the fence is against bypassing
+        /// the obligation, not against adding one.
+        pub(super) const fn new(off: u64) -> Self {
+            Self(off)
+        }
+
+        /// Ring a 32-bit doorbell. The `Published` is REQUIRED as evidence and then ignored — it is
+        /// `Copy`, so "consumed" would be the wrong word; what it costs is that you cannot call this
+        /// without having obtained one.
+        pub(super) fn ring32(self, v: u32, _published: Published) {
+            super::write32(self.0, v);
+        }
+
+        /// Ring a 64-bit doorbell — the `*_BASE` registers, which hand over an address.
+        pub(super) fn ring64(self, v: u64, _published: Published) {
+            super::write64(self.0, v);
+        }
+
+        /// Read a doorbell register back. **No token**: reading publishes nothing, and the
+        /// read-backs are how `install_stream_table` checks the address it handed over survived.
+        pub(super) fn read64(self) -> u64 {
+            super::read64(self.0)
+        }
+    }
+}
+
+use doorbell::{Doorbell, Published};
+
 fn read32(off: u64) -> u32 {
     // SAFETY: a documented SMMUv3 register offset inside the `virt` machine's 128 KiB SMMU window —
     // device memory at EL2 (MMU off). Read-only; aliases no Rust memory.
@@ -239,8 +349,14 @@ fn read64(off: u64) -> u64 {
 /// which is a question the old signature could not even be asked.
 ///
 /// `sy` rather than `ish` throughout: the SMMU is not in the inner-shareable domain.
-fn publish(pa: u64, len: u64) {
-    crate::cache::clean(pa, len);
+///
+/// ★ ㉕ — **it now RETURNS the proof that a doorbell needs.** Publishing and ringing used to be two
+/// adjacent statements a reader had to check were both present; they are now a producer and a
+/// consumer, so the second cannot be written without the first. `#[must_use]` is deliberately NOT
+/// added: publishing without ringing anything is legitimate (the queues are published once at
+/// init and rung later), and a lint that fired on it would train people to ignore it.
+fn publish(pa: u64, len: u64) -> Published {
+    doorbell::clean_and_prove(pa, len)
 }
 
 /// The whole stream table, as a range for [`publish`].
@@ -552,15 +668,21 @@ pub(crate) fn install_stream_table(stream_of: [u32; crate::NUM_DEVICES]) -> Stre
     // rather than merely silent.
     write32(SMMU_CR2, CR2_RECINVSID);
 
-    // (3) Publish the table, then point the SMMU at it.
+    // (3) Publish the table, then point the SMMU at it. ㉕ — `publish` RETURNS the proof
+    //     `ring64` demands, so "point at it" cannot be written before "publish it".
     let (strtab_base_va, strtab_len) = strtab_range(&smmu);
-    publish(strtab_base_va, strtab_len);
-    write64(SMMU_STRTAB_BASE, st::strtab_base(strtab_pa));
+    let published = publish(strtab_base_va, strtab_len);
+    SMMU_STRTAB_BASE.ring64(st::strtab_base(strtab_pa), published);
+    // ⚠ `STRTAB_BASE_CFG` is deliberately NOT a doorbell: it carries `LOG2SIZE`/`SPLIT`/`FMT`, not
+    // an address, and its other write site (`set_announced_table_size`) re-announces the table's
+    // SIZE rather than new content. The line ㉕ draws is "hands over an address, or announces new
+    // content" — drawing it anywhere looser would pair a token with a register that publishes
+    // nothing, which is how a guard starts meaning less than it says.
     write32(SMMU_STRTAB_BASE_CFG, STRTAB_CFG);
     // Read back through the SAME masking function that produced the written value, rather than
     // against a copy of the ADDR mask: a duplicated field literal that drifts would make this check
     // agree with itself and with nothing else.
-    let strtab_base_ok = st::strtab_base(read64(SMMU_STRTAB_BASE)) == st::strtab_base(strtab_pa);
+    let strtab_base_ok = st::strtab_base(SMMU_STRTAB_BASE.read64()) == st::strtab_base(strtab_pa);
     let strtab_cfg_ok = read32(SMMU_STRTAB_BASE_CFG) == STRTAB_CFG;
 
     // (4) The queues, then the enables. `CMDQ`/`EVENTQ` come up before `SMMUEN` so that the first
@@ -571,12 +693,15 @@ pub(crate) fn install_stream_table(stream_of: [u32; crate::NUM_DEVICES]) -> Stre
     smmu.eventq_cons = 0;
     // Both queues, not just the command queue: the SMMU reads one and WRITES the other, and under
     // A2 an event-queue line EL2 holds would be a line the SMMU's records have to displace.
-    publish(cmdq_pa, core::mem::size_of_val(&smmu.cmdq.0) as u64);
-    publish(eventq_pa, core::mem::size_of_val(&smmu.eventq.0) as u64);
-    write64(SMMU_CMDQ_BASE, cmdq_pa | u64::from(CMDQ_LOG2SIZE));
-    write32(SMMU_CMDQ_PROD, 0);
+    let cmdq_published = publish(cmdq_pa, core::mem::size_of_val(&smmu.cmdq.0) as u64);
+    let eventq_published = publish(eventq_pa, core::mem::size_of_val(&smmu.eventq.0) as u64);
+    SMMU_CMDQ_BASE.ring64(cmdq_pa | u64::from(CMDQ_LOG2SIZE), cmdq_published);
+    // `PROD = 0` on an empty ring is a doorbell too, and honestly so: it announces the ZEROED queue,
+    // which `cmdq_published` is the proof for. The token is `Copy` precisely so this second use of
+    // the same publication does not need a redundant `DC CVAC`.
+    SMMU_CMDQ_PROD.ring32(0, cmdq_published);
     write32(SMMU_CMDQ_CONS, 0);
-    write64(SMMU_EVENTQ_BASE, eventq_pa | u64::from(EVENTQ_LOG2SIZE));
+    SMMU_EVENTQ_BASE.ring64(eventq_pa | u64::from(EVENTQ_LOG2SIZE), eventq_published);
 
     // The event queue's producer/consumer indices live in the SMMU's **page 1**, and `IDR1.REL` is
     // what says where page 1 is. Gate the writes on it rather than merely reporting it afterwards:
@@ -652,12 +777,12 @@ fn submit(smmu: &mut Smmu, word0: u64, word1: u64) {
     // The command must be visible to the SMMU *before* `PROD` tells it to look. The range is this
     // one slot: `CMDQ_PROD` names the slot, so publishing the slot is publishing exactly what the
     // doorbell is about to point at.
-    publish(
+    let published = publish(
         core::ptr::addr_of!(smmu.cmdq.0[idx * 2]) as u64,
         2 * core::mem::size_of::<u64>() as u64,
     );
     smmu.cmdq_prod = smmu.cmdq_prod.wrapping_add(1) & queue_mask(CMDQ_LOG2SIZE);
-    write32(SMMU_CMDQ_PROD, smmu.cmdq_prod);
+    SMMU_CMDQ_PROD.ring32(smmu.cmdq_prod, published);
 }
 
 /// Issue `CMD_SYNC` and wait for `CMDQ_CONS` to reach `CMDQ_PROD`.
