@@ -26,6 +26,13 @@ set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 script="$here/detect-proof-changes.sh"
 failed=0
+ran=0
+
+# ⚠ **The summary used to end "OK — 7/7" as a LITERAL, with nothing counting the cases** — delete
+# three and it still reported 7/7 green. Same vacuous-pass shape as ⑳-f's `BOOT_TEST_CONFIGS` and
+# the same fix: pin the number, derive the comparison. A suite that cannot notice its own cases
+# going missing certifies whatever is left of it.
+EXPECTED_CASES=7
 
 # check <case-name> <expected-run> <expected-reason-substring> <env assignments...>
 # Runs the script with a fresh $GITHUB_OUTPUT and asserts BOTH the `run=` it wrote and WHICH branch
@@ -71,6 +78,7 @@ check() {
     return
   fi
   echo "OK   ($name) — $got via '$reason'"
+  ran=$((ran + 1))
   rm -f "$out" "$log"
 }
 
@@ -97,7 +105,7 @@ BASE="$(git rev-parse HEAD~2)"
 DOCS_ONLY="$(git rev-parse HEAD~1)"
 PROOFY="$(git rev-parse HEAD)"
 
-echo "detect-proof-changes-test: 7 cases"
+echo "detect-proof-changes-test: $EXPECTED_CASES cases"
 
 # ── The five uncertainties. Each MUST run the proofs. ───────────────────────────────────────────
 check "base sha empty"        true  "base sha unavailable" \
@@ -122,8 +130,13 @@ check "proof path changed"    true  "proof-relevant paths changed" \
 check "docs-only skips"       false "no proof-relevant paths changed" \
   env EVENT=pull_request PR_BASE="$BASE" PR_HEAD="$DOCS_ONLY"
 
+if [ "$ran" -ne "$EXPECTED_CASES" ]; then
+  echo "FAIL — $ran case(s) passed but $EXPECTED_CASES were expected. Either a case was"
+  echo "       added/removed (update EXPECTED_CASES) or one silently stopped running."
+  failed=1
+fi
 if [ "$failed" -ne 0 ]; then
   echo "detect-proof-changes-test: FAILED"
   exit 1
 fi
-echo "detect-proof-changes-test: OK — 7/7, fail-safes run and docs-only skips"
+echo "detect-proof-changes-test: OK — $ran/$EXPECTED_CASES, fail-safes run and docs-only skips"
