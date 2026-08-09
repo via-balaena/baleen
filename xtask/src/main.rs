@@ -1870,12 +1870,14 @@ fn fvp_lint() -> bool {
 /// **235 backtick-quoted paths across 38 documents** when this was written — and a codebase that
 /// moves as much as this one does will eventually point at something that is not there.
 ///
-/// ⚠ The crate READMEs were missing from the first version, and they are the ones that matter most:
-/// they are the front doors of the two INSTRUMENTS, whose whole value is that a reader can find and
-/// RUN them. A dead pointer where someone is trying to execute something costs more than one in a
-/// design doc. A dead pointer is worse than no pointer: it reads as a
-/// discharged reference, so a reader stops looking (design-lesson #263, and #259's sharper form
-/// where the reference is live but names the wrong thing).
+/// A dead pointer is worse than no pointer: it reads as a discharged reference, so a reader stops
+/// looking (design-lesson #263, and #259's sharper form where the reference is live but names the
+/// wrong thing).
+///
+/// ⚠ The crate READMEs were missing from the first version, and they are the ones where that costs
+/// most: they are the front doors of the two INSTRUMENTS, whose whole value is that a reader can
+/// find and RUN them. A pointer that dies where someone is trying to *execute* something costs more
+/// than one in a design doc, not less.
 ///
 /// ## The resolution rule, stated because it is the part that could be wrong
 ///
