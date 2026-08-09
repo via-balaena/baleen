@@ -43,7 +43,7 @@ default in the same machine, all under required CI gates.
   All of it is generic and ABI-agnostic — wire formats (the `shared_info` bitmaps, the
   `grant_entry` structs) stay in the M5 personality. Clean-room provenance discipline
   is live here, the first time Xen behavior informs a core design — see
-  [`CLEANROOM.md`](CLEANROOM.md).
+  [`CLEANROOM.md`](../CLEANROOM.md).
 - **Scheduling policy** *(landed)*: `hv-core::policy` — the layer that *picks*, above
   the dispatch seam (a guest never asks to be scheduled; the tick/idle path does). A
   work-conserving, weighted-proportional-fair policy that runs the least-serviced-
@@ -513,7 +513,7 @@ default in the same machine, all under required CI gates.
     `src/heap.rs`) so `hv-core`'s `alloc` links; then link `hv-core`, construct a real `Hypervisor`,
     and **dispatch a synthetic `HvCall` (`dom0 CreditGrant`) through the actual `Hypervisor::dispatch`
     path → `balance=100`**. **🔍 Architecture Audit #1 — the fence**
-    ([`docs/AUDIT-1-HAL-FENCE.md`](docs/AUDIT-1-HAL-FENCE.md)): the `hv-hal` surface is
+    ([`docs/AUDIT-1-HAL-FENCE.md`](AUDIT-1-HAL-FENCE.md)): the `hv-hal` surface is
     architecture-neutral; `TimeSource` is realized + honored on ARM; `GuestMemory`/`VcpuOps` are
     deferred to M4 with assumptions named; no soundness defect. Still **pre-guest** — a guest is M4.
 
@@ -522,7 +522,7 @@ default in the same machine, all under required CI gates.
   LAPIC) is co-equal and follows, behind the same `hv-hal` fence, per *ARM and x86 are co-equal
   targets* above. Real ARM silicon is deferred until a guest needs validating on hardware (M4+) —
   Apple Silicon gates EL2, so the Mac hosts QEMU, not a bare-metal hypervisor. **Before reading
-  anything into an emulated run, see [`docs/QEMU-AND-METAL.md`](docs/QEMU-AND-METAL.md)** — the
+  anything into an emulated run, see [`docs/QEMU-AND-METAL.md`](QEMU-AND-METAL.md)** — the
   fidelity contract for QEMU testing: what a green run does (functional refinement of the proven model
   — CPU-access isolation) and does *not* (timing, memory-ordering, DMA/SMMU, errata) tell you, and why
   on Apple Silicon Baleen-at-EL2 runs under pure-emulation TCG where that gap is maximal.
@@ -531,7 +531,7 @@ default in the same machine, all under required CI gates.
   Stage-2 tables generated from the proven `p2m`** — the fence becomes real and load-bearing, and the
   first **isolation** content reaches the metal.
   - **Arc 4 — trap-and-service. ✅ DONE**
-    ([`docs/ARC-4-TRAP-AND-SERVICE.md`](docs/ARC-4-TRAP-AND-SERVICE.md)): a trivial EL1 guest boots
+    ([`docs/ARC-4-TRAP-AND-SERVICE.md`](ARC-4-TRAP-AND-SERVICE.md)): a trivial EL1 guest boots
     behind a minimal Stage-2 (`HCR_EL2.VM=1` + one 2 MiB identity block, `src/guest.rs`), issues
     `HVC`, and traps to EL2 (vector slot 8, `EC=0x16`); a GPR save/restore frame on a dedicated
     exception stack (+ a re-entry guard) resumes it. The saved registers are decoded through
@@ -542,7 +542,7 @@ default in the same machine, all under required CI gates.
     set_entry` realized on ARM (`ELR_EL2`); `inject_interrupt`/`GuestMemory` honestly deferred.
     Three-way converged (spec-derived code + blind Arm-ARM auditor + QEMU). **No isolation content.**
   - **Arc 5 — real `p2m` → Stage-2 + the negative-isolation test. ✅ DONE**
-    ([`docs/AUDIT-2-P2M-STAGE2.md`](docs/AUDIT-2-P2M-STAGE2.md)): the guest runs behind **real AArch64
+    ([`docs/AUDIT-2-P2M-STAGE2.md`](AUDIT-2-P2M-STAGE2.md)): the guest runs behind **real AArch64
     Stage-2 tables emitted from the proven `p2m`** (`src/stage2.rs`, a leaf-reachability refinement of
     `p2m::link_edges`). The model is driven — via the actual `Hypervisor::dispatch` — into a
     two-domain config (guest `G`, peer `P` granting `G` one frame read-write), and the guest runs the
@@ -565,5 +565,5 @@ default in the same machine, all under required CI gates.
   one diamonded, audited layer at a time — never skipping ahead — with each layer marked for
   whether it *extends*, *refines*, or is orthogonal to the proof. The full phased plan,
   the two hard pillars (GPU, IOMMU/DMA), the ARM-vs-x86 platform fork, and the per-layer
-  "verified"-scope ledger are in [**`docs/ROADMAP.md`**](docs/ROADMAP.md). *(This supersedes
+  "verified"-scope ledger are in [**`docs/ROADMAP.md`**](ROADMAP.md). *(This supersedes
   the earlier "PVH Linux via a Xen personality" plan — `baleen-xenabi` is dropped.)*
