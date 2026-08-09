@@ -1898,6 +1898,45 @@ fn fvp_lint() -> bool {
 /// gate written to stop exactly that** (#155). Markers are excluded rather than checked against a
 /// number I would have to choose; [`doc_markers`] already polices the marker TEXT, which is the half
 /// that silently rots.
+/// Non-comment, non-blank lines under `paths` — the measure the README's proof-to-code ratio uses.
+///
+/// "Non-comment" means the line, trimmed, does not begin `//` (which covers `///` and `//!`).
+/// Block comments are not stripped: the crates counted here use line comments throughout, and a
+/// stripper that half-works would be worse than one whose rule is stated. ⚠ The absolute numbers are
+/// NOT gated for the reason [`doc_counts`] gives about lines of code — only the RATIO is, because
+/// that is the claim.
+fn noncomment_lines(paths: &[&str]) -> usize {
+    fn walk(dir: &std::path::Path, total: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == "target") {
+                    continue;
+                }
+                walk(&p, total);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    *total += t
+                        .lines()
+                        .filter(|l| {
+                            let t = l.trim();
+                            !t.is_empty() && !t.starts_with("//")
+                        })
+                        .count();
+                }
+            }
+        }
+    }
+    let mut total = 0;
+    for p in paths {
+        walk(std::path::Path::new(p), &mut total);
+    }
+    total
+}
+
 fn doc_counts() -> bool {
     eprintln!("$ xtask doc-counts");
 
@@ -1935,7 +1974,29 @@ fn doc_counts() -> bool {
         ),
     ];
 
-    let mut ok = true;
+    // ★ THE PROOF-TO-CODE RATIO — the README's headline comparison against seL4, and the one number
+    // in this file that answers the question the whole project poses ("how much assurance for what
+    // fraction of a full-verification budget"). It is checked to TWO DECIMAL PLACES, which is the
+    // right precision for two reasons found by measuring: the components drift constantly (+178
+    // proof / +150 code since the figure was written) while the ratio did **not move at all**, so an
+    // exact-component gate would fire on every PR for no signal — and a real regression, proof
+    // stalling while code grows, moves the second decimal long before anyone would notice by eye.
+    let proof = noncomment_lines(&["hv-verify/src", "hv-verify/verus"]);
+    let code = noncomment_lines(&["hv-core/src", "hv-s2/src", "hv-vdev/src", "hv-part/src"]);
+    #[allow(clippy::cast_precision_loss)] // line counts are far below f64's exact-integer range
+    let ratio = proof as f64 / code as f64;
+    let ratio_phrase = format!("**{ratio:.2}:1**");
+    let mut ok = readme.contains(ratio_phrase.as_str());
+    if ok {
+        eprintln!("doc-counts: OK   — the proof-to-code ratio: README says `{ratio_phrase}` ({proof} proof / {code} code)");
+    } else {
+        eprintln!("doc-counts: FAIL — the proof-to-code ratio: measured {ratio:.2}:1 ({proof} non-comment");
+        eprintln!(
+            "                   lines of proof over {code} of model+emitter), but README.md does"
+        );
+        eprintln!("                   not contain `{ratio_phrase}`.");
+    }
+
     for (phrase, what) in claims {
         if readme.contains(phrase.as_str()) {
             eprintln!("doc-counts: OK   — {what}: README says `{phrase}`");
@@ -1948,7 +2009,7 @@ fn doc_counts() -> bool {
     }
     if ok {
         eprintln!(
-            "doc-counts: OK — {} corpus counts in README.md match the gates",
+            "doc-counts: OK — {} corpus counts + the proof-to-code ratio match the gates",
             claims.len()
         );
     }

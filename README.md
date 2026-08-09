@@ -62,13 +62,17 @@ Most of the value here is in **not** letting these blur into one word.
 ### What it is not
 
 - **Not seL4-tier.** seL4 proves full functional correctness, at a proof-to-code ratio widely
-  reported around 20:1. Here it is **0.53:1** — 6 457 non-comment lines of Kani + Verus against
-  the 12 256 of `hv-core` + `hv-s2` + `hv-vdev` + `hv-part` — property-directed verification rather than
+  reported around 20:1. Here it is **0.53:1** — 6 635 non-comment lines of Kani + Verus against
+  the 12 406 of `hv-core` + `hv-s2` + `hv-vdev` + `hv-part` — property-directed verification rather than
   functional correctness. A deliberately different bargain: a weaker guarantee, far more
   cheaply, with the remainder enforced at runtime instead. If you need seL4's guarantee, the
   gap *is* the point. (Both sides of that ratio are non-comment lines; comparing
   comments-included proof against comments-excluded code would flatter it to ~0.8:1, which is
-  the sort of thing this repo's ledger exists to catch.)
+  the sort of thing this repo's ledger exists to catch.) ⚠ **The ratio is GATED**
+  (`cargo xtask doc-counts`) to two decimal places; the two component counts beside it are not,
+  because they move on every PR while the ratio does not — it was unchanged after +178 lines of
+  proof and +150 of code. A regression that matters — proof stalling while the model grows — moves
+  the second decimal long before anyone would notice by eye.
 - **Not feature-comparable to Xen.** No toolstack, no migration, no PV drivers, one board.
 - **Not production.** Single-CPU, one board, QEMU-only; `hv-metal` is the bare-metal half and is **not**
   a Kani target, and every rung's docs say so where it matters.
@@ -106,13 +110,22 @@ and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot
 | `board-probe` | ⚠ **not part of the hypervisor** — measures the platform facts `hv-metal` assumes from QEMU `virt` (exception level, `SCTLR_EL2` at reset, cache line, `ICH_VTR_EL2`, granule/PA/VMID), so a future port is scoped from numbers rather than guesses. Self-tests on QEMU; see its README |
 | `xtask`     | build/test automation and the gate corpora (`cargo xtask <task>`) |
 
-`hv-metal` and `hv-fuzz` are **excluded from the workspace** — not "until their
-milestones", but permanently: `hv-metal` builds for `aarch64-unknown-none-softfloat` and
-cannot link for the host, and `hv-fuzz` needs nightly/libFuzzer at build time. Both are
-built and gated out-of-band (`cargo xtask qemu-test`, `qemu-linux-test`, and the
-`fuzz targets build` job). ⚠ The exclusion has a cost worth knowing: an excluded crate
-loses **every** `--workspace` gate, not just the one it was excluded for — `hv-metal`'s
-rustdoc was built by nothing at all until that was noticed and fixed.
+**Four** crates are **excluded from the workspace** — not "until their milestones", but
+permanently. `hv-metal`, `fvp-probe` and `board-probe` build for
+`aarch64-unknown-none-softfloat` and cannot link for the host; `hv-fuzz` needs
+nightly/libFuzzer at build time. All four are built and gated out-of-band
+(`cargo xtask qemu-test`, `qemu-linux-test`, `metal-lint`, `fvp-lint`, and the
+`fuzz targets build` job).
+
+⚠ **The exclusion has a cost worth knowing: an excluded crate loses *every* `--workspace`
+gate, not just the one it was excluded for.** `hv-metal`'s rustdoc was built by nothing at
+all until that was noticed; `fvp-probe` was built by nothing at all for four milestones
+after that, which is the same finding one crate along. `board-probe` was therefore added to
+`cargo xtask fvp-lint` **in the commit that created it**.
+
+> ⚠ This paragraph said "`hv-metal` and `hv-fuzz`" while there were four. An inventory that
+> undercounts its own subject makes the ones it omits invisible — and the omitted two are
+> precisely the crates whose exclusion cost had already bitten twice.
 
 **Direction (2026-08-07).** The long-run build target is unchanged: a greenfield **"slim
 Qubes"** — GPU-accelerated near-metal disposables, an offline vault, direct device attach and
