@@ -215,7 +215,11 @@ fn fact(u: &mut Uart, key: &str, value: u64) {
 /// 6 measured)" tells them exactly which code has to change. Mismatch is **not failure** — it is
 /// the finding this probe exists to produce.
 fn verdict(u: &mut Uart, name: &str, measured: u64, assumed: u64, unit: &str) {
-    let tag = if measured == assumed { "MATCH " } else { "DIFFERS" };
+    let tag = if measured == assumed {
+        "MATCH "
+    } else {
+        "DIFFERS"
+    };
     let _ = writeln!(
         u,
         "@@ VERDICT {name}: {tag} — hv-metal assumes {assumed} {unit}, measured {measured}"
@@ -280,7 +284,10 @@ pub extern "C" fn probe_main(x0: u64) -> ! {
             "@@ note: check for a firmware option to enter at EL2 before concluding the board cannot."
         );
     } else {
-        let _ = writeln!(u, "@@ VERDICT el2: MATCH  — entered at EL2, as hv-metal requires");
+        let _ = writeln!(
+            u,
+            "@@ VERDICT el2: MATCH  — entered at EL2, as hv-metal requires"
+        );
     }
 
     // ── 2. Who is this? ─────────────────────────────────────────────────────────────────────────
@@ -330,7 +337,10 @@ pub extern "C" fn probe_main(x0: u64) -> ! {
             u,
             "@@ note: SMALLER than assumed — mmu.rs pins TCR_EL2.PS=0b010 (40-bit) and would be"
         );
-        let _ = writeln!(u, "@@ note: naming a physical address size this core cannot encode.");
+        let _ = writeln!(
+            u,
+            "@@ note: naming a physical address size this core cannot encode."
+        );
     }
     // `TGran4` is bits [31:28]. ⚠ It is a SUPPORT code, not a size: `0b0000` = 4 KiB supported,
     // `0b0001` = supported *including* 52-bit output addresses, `0b1111` = NOT supported. The first
@@ -354,8 +364,20 @@ pub extern "C" fn probe_main(x0: u64) -> ! {
     if el == 2 {
         let vtr = read_sysreg!("ich_vtr_el2");
         fact(u, "ICH_VTR_EL2", vtr);
-        verdict(u, "list_registers", (vtr & 0x1f) + 1, ASSUMED_LIST_REGS, "LRs");
-        verdict(u, "priority_bits", ((vtr >> 29) & 0x7) + 1, ASSUMED_PRI_BITS, "bits");
+        verdict(
+            u,
+            "list_registers",
+            (vtr & 0x1f) + 1,
+            ASSUMED_LIST_REGS,
+            "LRs",
+        );
+        verdict(
+            u,
+            "priority_bits",
+            ((vtr >> 29) & 0x7) + 1,
+            ASSUMED_PRI_BITS,
+            "bits",
+        );
     } else {
         let _ = writeln!(
             u,
@@ -388,7 +410,10 @@ pub extern "C" fn probe_main(x0: u64) -> ! {
         u,
         "@@ note: CNTFRQ_EL0 is firmware-programmed and documented as advisory; a wrong value gives"
     );
-    let _ = writeln!(u, "@@ note: a slice of the wrong duration, not a lost guarantee.");
+    let _ = writeln!(
+        u,
+        "@@ note: a slice of the wrong duration, not a lost guarantee."
+    );
 
     let _ = writeln!(u, "@@ BOARD-PROBE-END");
     loop {
