@@ -3,7 +3,7 @@
 
 # `docs/` — what is in here, and what to read first
 
-Thirty-three design documents. **They are not a manual and they are not in order**; each one was
+**33 design documents.** They are not a manual and they are not in order; each one was
 written to close a specific arc, and each records *what was established, what was refuted, and what
 was left open* at the moment it closed.
 
