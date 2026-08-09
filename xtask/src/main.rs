@@ -2069,8 +2069,8 @@ fn doc_paths() -> bool {
 /// that is wrong. So it gets the same treatment as the other six: a **universe check** (#243). The
 /// universe is `std::fs::read_dir("docs")`, enumerated independently of the index; the table is the
 /// index. A document that exists and is not classified is the failure this exists to catch — a
-/// reader who opens `docs/` sees thirty-three filenames and no order, and the whole value of the
-/// index is that the set it describes is *complete*.
+/// reader who opens `docs/` sees an alphabetical directory listing and no order, and the whole value
+/// of the index is that the set it describes is *complete*.
 ///
 /// ## Why "classified", and not merely "mentioned"
 ///
@@ -2121,7 +2121,8 @@ fn doc_index() -> bool {
             universe.len()
         );
         eprintln!(
-            "           `docs/` directory without one is thirty-three filenames and no order."
+            "           `docs/` directory without one is {} filenames and no reading order.",
+            universe.len()
         );
         return false;
     };
