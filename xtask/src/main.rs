@@ -170,7 +170,8 @@ fn main() {
                  test   run the workspace test suite\n  \
                  check  type-check the workspace\n  \
                  doc    build docs, denying broken links\n  \
-                 ci     fmt --check, clippy -D warnings, test, doc, then doc-markers\n  \
+                 ci     THE entry point — fmt, clippy -D warnings, test, doc, the deep sweeps,\n  \
+                 \u{20}      the proof-gate test, and every doc-* gate below\n  \
                  doc-markers  assert every boot marker a doc QUOTES is still one the gates check\n  \
                  doc-counts   assert the README's corpus counts and proof-to-code ratio match the gates\n  \
                  doc-paths    assert every path the docs cite, and every link they carry, resolves\n  \
