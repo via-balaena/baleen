@@ -109,7 +109,12 @@ static mut L3: Table = Table([0; ENTRIES]);
 pub const TEST_PA: u64 = 0x8100_0000;
 
 /// The virtual address that reaches [`TEST_PA`] **non-cacheably**. 4 GiB, so it lands in L1 entry
-/// 4 — an index nothing else uses, which keeps the alias the only non-identity mapping.
+/// 4 — an index nothing else uses, which keeps every non-identity mapping in one subtree.
+///
+/// ⚠ This said "the only non-identity mapping" until milestone 5 added [`DEV_ALIAS_VA`] as the next
+/// page in the same L3. The invariant that actually matters is unchanged and is the one now
+/// stated: **nothing outside L1 entry 4 is remapped**, so every address the probe knew about with
+/// the MMU off still means the same thing.
 pub const NC_ALIAS_VA: u64 = 0x1_0000_0000;
 
 /// Milestone 5's **control** cell — reached identity, through the same Normal write-back 1 GiB
