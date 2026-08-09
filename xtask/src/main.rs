@@ -1811,8 +1811,6 @@ const BOOT_TEST: &str = "hv-metal/boot-test.sh";
 /// same assumption [`BOOT_TEST`] has always made.
 const SELF_SRC: &str = "xtask/src/main.rs";
 
-/// Assert that every boot marker a doc QUOTES is still a marker the gates check. See the block
-/// comment above for the rule and its limits.
 /// ★★ ⑳-d — **THE FOURTH EVIDENCE CORPUS, PINNED: the boot markers.**
 ///
 /// ⚠ **The gate this closes is the one ⑳/⑳-b/⑳-c closed for the other three, left open here.**
@@ -1891,6 +1889,9 @@ fn declared_marker_arrays(src: &str) -> Vec<String> {
     out
 }
 
+/// Assert that every boot marker a doc QUOTES is still a marker the gates check, and — since ⑳-d —
+/// that the corpus still holds the number of markers [`MARKER_CORPUS`] pins. See the block comment
+/// above for the drift rule and its limits.
 fn doc_markers() -> bool {
     eprintln!("$ xtask doc-markers");
 
