@@ -1870,8 +1870,17 @@ fn fvp_lint() -> bool {
 /// ★ ⑳-h — **every repo path the docs CITE must resolve.**
 ///
 /// The prose in `docs/`, the root `README.md` and every crate README points at the code constantly —
-/// **235 backtick-quoted paths across 38 documents** when this was written — and a codebase that
-/// moves as much as this one does will eventually point at something that is not there.
+/// **235 backtick-quoted paths and 67 markdown links across 39 documents** when this was written —
+/// and a codebase that moves as much as this one does will eventually point at something that is not
+/// there.
+///
+/// ★★ **TWO citation styles, and they resolve by DIFFERENT rules** — see the second scan below. A
+/// backtick citation (`` `hv-metal/src/mmu.rs` ``) is written from the repo root; a markdown link
+/// (`[text](QEMU-AND-METAL.md)`) is written relative to the file it sits in. ⚠ The link half was
+/// missing at first, and ⑳-i found it the hard way: `docs/README.md` is written entirely in link
+/// style, so this gate scanned it and reported **zero** citations while a deliberately broken link
+/// in its own reading order passed. A gate for documentation that cannot see the style the newest
+/// document is written in is a gate for the past.
 ///
 /// A dead pointer is worse than no pointer: it reads as a discharged reference, so a reader stops
 /// looking (design-lesson #263, and #259's sharper form where the reference is live but names the
@@ -1937,8 +1946,11 @@ fn doc_paths() -> bool {
         }
     }
 
+    let base = std::path::Path::new(".");
     let mut cited = 0usize;
+    let mut linked = 0usize;
     let mut dead: Vec<(String, String)> = Vec::new();
+    let mut dead_links: Vec<(String, String)> = Vec::new();
     for src in &sources {
         let Ok(text) = std::fs::read_to_string(src) else {
             eprintln!("doc-paths: cannot read {src}");
@@ -1962,6 +1974,34 @@ fn doc_paths() -> bool {
                     .any(|c| std::path::Path::new(c).join(chunk).exists());
             if !resolves {
                 dead.push((src.clone(), chunk.to_string()));
+            }
+        }
+
+        // ★★ MARKDOWN LINK TARGETS — `](path)` — added because ⑳-i wrote `docs/README.md` entirely
+        // in link style and this gate saw **zero** of its links. A gate for documentation that
+        // cannot see the citation style the newest document uses is a gate for the past.
+        //
+        // ⚠ **These resolve by a DIFFERENT rule and it is not a detail**: a markdown link is
+        // relative to the FILE it appears in, not to the repo root — `QEMU-AND-METAL.md` inside
+        // `docs/` means `docs/QEMU-AND-METAL.md`, and `../README.md` means the root one. The
+        // backtick rule above (root, or under any crate) would resolve neither. Two citation
+        // styles, two resolution rules, one gate.
+        //
+        // ★ These are the links a reader CLICKS, so a dead one costs more than a dead backtick: it
+        // is the reading order's first instruction failing in the reader's hands.
+        let dir = std::path::Path::new(src).parent().unwrap_or(base);
+        for (i, _) in text.match_indices("](") {
+            let rest = &text[i + 2..];
+            let Some(end) = rest.find(')') else { continue };
+            let target = rest[..end].trim();
+            // Anchors and external links are not this gate's business; a title suffix is stripped.
+            let target = target.split(&[' ', '#'][..]).next().unwrap_or("");
+            if target.is_empty() || target.contains("://") || target.starts_with("mailto:") {
+                continue;
+            }
+            linked += 1;
+            if !dir.join(target).exists() {
+                dead_links.push((src.clone(), target.to_string()));
             }
         }
     }
@@ -1991,9 +2031,22 @@ fn doc_paths() -> bool {
         return false;
     }
 
-    if dead.is_empty() {
+    // ⚠ The links get their OWN floor. Sharing one with the backtick citations would let a total
+    // collapse of link parsing hide behind 235 healthy backticks — the subset-as-total defect ⑳-g
+    // shipped, one level up. A corpus that can fail independently needs a floor of its own.
+    const MIN_LINKS: usize = 40;
+    if linked < MIN_LINKS {
         eprintln!(
-            "doc-paths: OK — {cited} cited repo paths across {} docs all resolve",
+            "doc-paths: FAIL — only {linked} markdown link targets found, expected at least \
+             {MIN_LINKS}. The `](...)` scan has probably broken."
+        );
+        return false;
+    }
+
+    if dead.is_empty() && dead_links.is_empty() {
+        eprintln!(
+            "doc-paths: OK — {cited} backtick-cited paths + {linked} markdown links across {} docs \
+             all resolve",
             sources.len()
         );
         return true;
@@ -2001,6 +2054,10 @@ fn doc_paths() -> bool {
     for (src, c) in &dead {
         eprintln!("doc-paths: FAIL — {src} cites `{c}`, which resolves neither from the repo root");
         eprintln!("                  nor under any crate directory. Renamed, moved, or deleted?");
+    }
+    for (src, l) in &dead_links {
+        eprintln!("doc-paths: FAIL — {src} LINKS to `{l}`, which does not exist relative to that");
+        eprintln!("                  file's own directory. This is a link a reader clicks.");
     }
     false
 }
@@ -2026,6 +2083,21 @@ fn doc_paths() -> bool {
 ///
 /// ⚠ **`docs/README.md` itself is excluded from the universe** — an index that must index itself is
 /// a fixed point, not a check.
+///
+/// ## ⛔ What it does NOT catch, stated rather than glossed
+///
+/// **A document classified under the WRONG group, or described wrongly.** This checks *set
+/// membership*, which is the part that rots mechanically (a doc is added and nobody remembers the
+/// index); it cannot check *meaning*, which is the part that needs the diff read. ⚠ Do not let a
+/// green `doc-index` be read as "the index is correct" — it says the index is **complete**.
+///
+/// Six kill-probes, all failing correctly and each naming the right guard (#266): an unindexed new
+/// doc · a doc classified twice · a phantom entry · a broken universe enumeration (the floor, and
+/// the *asymmetric* direction — a broken row rule fails loudly, a broken enumeration would have
+/// passed on nothing) · a doc linked from the reading orders but never grouped, which is the
+/// half-indexed state and confirms the prose/table distinction above is real · and a **rename**,
+/// where both halves speak and the pair of messages says "moved" rather than leaving it to be
+/// inferred.
 fn doc_index() -> bool {
     eprintln!("$ xtask doc-index");
     const INDEX: &str = "docs/README.md";
