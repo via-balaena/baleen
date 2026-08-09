@@ -108,7 +108,14 @@
 //! EL2's memory being Device. The release build's **42 exclusive-monitor instructions, zero LSE**
 //! (measured; it was 40 before A2, and a 244 published earlier was read off an uncontrolled
 //! `target/` artifact) all land on statics in `.bss`/`.data` — Normal-WB Inner-Shareable, where
-//! exclusives are architecturally defined. Nothing here takes an exclusive on MMIO.
+//! exclusives are architecturally defined.
+//!
+//! ★ **"All of them" is checkable rather than asserted, and here is how:** every atomic in this
+//! crate is a Rust `static` or a field of one (`AtomicBool` in `cell`, `AtomicUsize` in `heap`,
+//! the `AtomicU8`/`U64`/`Bool` group in `guest`, and so on), and a static is in `.bss`/`.data` **by
+//! construction**. MMIO is reached only through `read_volatile`/`write_volatile` on raw addresses,
+//! never through an atomic type — there is no `Atomic*::from_ptr` anywhere in the crate. So no
+//! exclusive can land on a Device mapping without someone introducing the first one.
 //!
 //! ★ **And [`coverage`] is what keeps that from being an argument**: it re-reads every descriptor at
 //! all three levels on every boot, so "EL2's memory is not Device" is checked rather than asserted.
