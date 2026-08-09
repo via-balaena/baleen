@@ -150,6 +150,8 @@
 
 use core::arch::asm;
 
+use hv_s2::arm64::memtype::MemoryType;
+
 use crate::el2;
 
 // Symbols from `linker.ld`. Taking the boundaries from the LINK rather than restating addresses in
@@ -181,24 +183,63 @@ const ENTRIES: usize = 512;
 
 // ─── MAIR_EL2 ───────────────────────────────────────────────────────────────────────────────────
 
-/// Attribute 0 — **Device-nGnRnE**, the encoding `0x00`. What MMU-off gives every data access, and
-/// what MMIO and the two unbacked addressability windows keep.
-const ATTR_DEVICE: u64 = 0x00;
-/// Attribute 1 — **Normal, inner and outer Non-cacheable**, the encoding `0x44`. What MMU-off gives
-/// instruction fetches while `SCTLR_EL2.I == 0`, which is what it is here (measured). `.text` keeps
-/// this under A2 — see the module doc's "the axis A2 did not move".
-const ATTR_NORMAL_NC: u64 = 0x44;
-/// Attribute 2 — **Normal, inner and outer Write-Back, Read-Allocate Write-Allocate,
-/// non-transient**, the encoding `0xff`. **A2's attribute**, and it is deliberately the same memory
-/// type `hv-s2` gives a guest: `hv_s2::arm64::desc::LEAF_COMMON` is `MemAttr = 0b1111` with
-/// `SH = 0b11`, i.e. Normal-WB Inner-Shareable. EL2 and its guests now name the same DRAM the same
-/// way, which is what makes the alias between them well-defined rather than merely untested.
-const ATTR_NORMAL_WB: u64 = 0xff;
-const MAIR_EL2_VALUE: u64 = ATTR_DEVICE | (ATTR_NORMAL_NC << 8) | (ATTR_NORMAL_WB << 16);
+/// **Which memory type each `MAIR_EL2` attribute index holds — the ONE thing this module still
+/// decides about memory types, and the only thing it should.**
+///
+/// ⚠ **The encodings used to be here as literals (`0x00`, `0x44`, `0xff`) and are now
+/// [`hv_s2::arm64::memtype`]'s.** A2's safety argument is that EL2 and its guests name the same
+/// memory the same way — and until this changed, "the same" meant a `0xff` in this file and a
+/// `0b1111` in `hv-s2`, in two *different* encoding spaces, agreeing because someone had checked
+/// once and written a sentence about it. Read that module: it is where the argument lives now, and
+/// it lives in a crate the proof gate covers, which this one can never be (honest-ledger item 8).
+///
+/// ★ **The index assignment stays here, and that is the right split.** Which attribute slot a type
+/// occupies is a `MAIR_EL2` register-layout choice belonging to whoever programs `MAIR_EL2`; what a
+/// type *is* belongs to the architecture. `memtype` refuses to know about indices for the same
+/// reason this module refuses to know about `MemAttr` nibbles.
+const fn attr_type(attr_idx: u64) -> MemoryType {
+    // `match` on the index rather than `==` against the `ATTRIDX_*` constants: `PartialEq` is not
+    // callable in a `const fn`, and every use of this is in const context.
+    match attr_idx >> 2 {
+        0 => MemoryType::DeviceNGnRnE,
+        1 => MemoryType::NormalNonCacheable,
+        2 => MemoryType::NormalWbIsh,
+        // Unreachable by construction — the three `ATTRIDX_*` constants below are the only values
+        // ever passed. `panic!` rather than a default arm: a fourth index would be a new memory type
+        // nobody declared, and inventing an attribute byte for it is exactly the failure this whole
+        // module was rewritten to prevent. In a `const fn` this fails the BUILD.
+        _ => panic!("no memory type is declared for this MAIR_EL2 attribute index"),
+    }
+}
 
+/// Attribute 0 — **Device-nGnRnE**. What MMU-off gives every data access, and what MMIO and the two
+/// unbacked addressability windows keep.
 const ATTRIDX_DEVICE: u64 = 0 << 2;
+/// Attribute 1 — **Normal, inner and outer Non-cacheable**. What MMU-off gives instruction fetches
+/// while `SCTLR_EL2.I == 0`, which is what it is here (measured). `.text` keeps this under A2 — see
+/// the module doc's "the axis A2 did not move".
 const ATTRIDX_NORMAL_NC: u64 = 1 << 2;
+/// Attribute 2 — **Normal-WB Inner-Shareable, A2's attribute**, and *the same `MemoryType` variant*
+/// `hv-s2` gives a guest leaf. Not "the same as far as anyone has checked": the same value.
 const ATTRIDX_NORMAL_WB: u64 = 2 << 2;
+
+/// `MAIR_EL2` — each index's attribute byte, taken from the shared declaration rather than restated.
+const MAIR_EL2_VALUE: u64 = (attr_type(ATTRIDX_DEVICE).stage1_mair_byte() as u64)
+    | ((attr_type(ATTRIDX_NORMAL_NC).stage1_mair_byte() as u64) << 8)
+    | ((attr_type(ATTRIDX_NORMAL_WB).stage1_mair_byte() as u64) << 16);
+
+/// GOLDEN, and the half that a shared declaration does **not** give you.
+///
+/// `memtype` stops this file and `hv-s2` from drifting APART; it does nothing about one edit moving
+/// them TOGETHER, silently and consistently. So the bytes are pinned here as literals as well —
+/// independently of `hv-s2`'s own `memory_types_are_pinned_in_both_regimes`, because a pin that
+/// lives only next to the declaration is a pin the declaration's author will update in the same
+/// commit. `const`, so a mismatch fails the build rather than a test nobody ran (#243, #215).
+const _: () = assert!(
+    MAIR_EL2_VALUE == 0x00ff_4400,
+    "MAIR_EL2: attr0 Device-nGnRnE (0x00), attr1 Normal-NC (0x44), attr2 Normal-WB (0xff)"
+);
+
 /// `AttrIndx[4:2]` — the whole field, so [`coverage`] can compare a descriptor's memory type for
 /// EQUALITY rather than testing bits. `desc & ATTRIDX_NORMAL_WB != 0` would be satisfied by index 2
 /// *and* by indices 3, 6 and 7, which is how an attribute check turns into no check at all.
@@ -219,7 +260,7 @@ const AF: u64 = 1 << 10;
 /// "deliberately zero" are different things to a reader. Device memory ignores shareability, so this
 /// is what the Device mappings carry; it is **not** a claim that nothing is cacheable, which is what
 /// it used to be (see [`SH_INNER_SHAREABLE`]).
-const SH_NON_SHAREABLE: u64 = 0b00 << 8;
+const SH_NON_SHAREABLE: u64 = MemoryType::DeviceNGnRnE.shareability_bits();
 
 /// `SH[9:8] = 0b11` — **Inner Shareable**, and A2 needs it to be this rather than merely cacheable.
 ///
@@ -231,8 +272,12 @@ const SH_NON_SHAREABLE: u64 = 0b00 << 8;
 /// matching *shareability* would have left the walker and EL2 in different domains and the mismatch
 /// intact under a new description.
 ///
-/// The same argument holds for guests: `hv_s2::arm64::desc::LEAF_COMMON` carries `SH = 0b11`.
-const SH_INNER_SHAREABLE: u64 = 0b11 << 8;
+/// ★★ **Which is why shareability is part of the TYPE and not a parameter beside it.** Both of these
+/// come from [`hv_s2::arm64::memtype`], where `NormalWbIsh` carries its Inner-Shareable in its name
+/// and its encoder — so "Normal-WB but Non-shareable", the one configuration that would silently
+/// fail to close the hazard, is not a thing this module can spell. The same declaration is what
+/// `hv-s2` gives a guest leaf, so EL2 and its guests agree by derivation.
+const SH_INNER_SHAREABLE: u64 = MemoryType::NormalWbIsh.shareability_bits();
 
 /// `AP[2:1]` at bits `[7:6]` for a **single-EL** stage-1 regime (EL2 without VHE).
 ///
@@ -309,13 +354,10 @@ const fn page(pa: u64, attr_idx: u64, ap: u64, xn: u64) -> u64 {
 /// with a spelling. Making it unspellable costs one `match` and removes eight call sites at which it
 /// could have been written by hand and one of them differed.
 const fn shareability(attr_idx: u64) -> u64 {
-    if attr_idx == ATTRIDX_NORMAL_WB {
-        SH_INNER_SHAREABLE
-    } else {
-        // Device memory ignores `SH` entirely, and `.text`'s Normal-Non-cacheable has no
-        // coherency to maintain — a non-cacheable access is already visible to every observer.
-        SH_NON_SHAREABLE
-    }
+    // Via the memory type, not via a second `if` over the index: this used to branch on
+    // `attr_idx == ATTRIDX_NORMAL_WB` and hand back one of two local constants, which was a
+    // *third* place encoding "which types are shareable" after the type itself and its encoder.
+    attr_type(attr_idx).shareability_bits()
 }
 
 /// Populate the three tables. Split out so the mapping is readable on its own, and so a future

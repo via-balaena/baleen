@@ -34,8 +34,133 @@ use crate::leafmap::Perm;
 /// Entries in a 4 KiB AArch64 translation table (512 × 8-byte descriptors).
 pub const TABLE_ENTRIES: usize = 512;
 
+/// **What a region of memory IS — named once, encoded twice.**
+///
+/// ## Why this exists, and it is a defect report against the code below
+///
+/// Ledger 5's **A2** made EL2's own DRAM cacheable, and its safety argument is that **EL2 and its
+/// guests name the same memory the same way**: a physical frame the guest maps through Stage-2 and
+/// EL2 reaches directly is one address with two mappings, and that alias is well-defined only if
+/// both mappings agree on the memory type. An alias whose two sides disagree is architecturally
+/// UNPREDICTABLE, which is not a thing to leave resting on two people having typed compatible
+/// numbers.
+///
+/// ⚠ **That is exactly what it rested on.** `hv-metal`'s EL2 stage-1 mapping said Normal-WB
+/// Inner-Shareable as a `MAIR_EL2` byte (`0xff`) plus an attribute index; [`desc::LEAF_COMMON`] said
+/// it as a Stage-2 `MemAttr` nibble (`0b1111`). **Two crates, two literals, no shared derivation**,
+/// and the agreement between them was asserted in prose in a module doc — design-lesson #230's
+/// defect sitting under A2's central safety claim.
+///
+/// ★ **And they are genuinely different encoding spaces, which is the whole reason this is not
+/// pedantry.** A stage-1 MAIR byte is two 4-bit cacheability fields with their own encoding; a
+/// Stage-2 `MemAttr` is a single 4-bit field with a *different* one. "They obviously match" is a
+/// claim about two tables in the Arm ARM, not an observation about two numbers.
+///
+/// So the memory type is declared **once**, here, and each regime derives its own bits from it.
+/// Neither consumer *derives from* a literal any more, so they cannot drift apart — and the values
+/// are pinned to their golden literals in **two independent places** so they cannot drift *together*
+/// either: `memory_types_are_pinned_in_both_regimes` below, and a `const` assertion on
+/// `MAIR_EL2_VALUE` over in `hv-metal`'s `mmu`, deliberately far from this declaration because a pin
+/// beside what it pins is one its author edits in the same commit.
+///
+/// **Both halves are needed.** A shared declaration alone would let one edit change both regimes at
+/// once, silently and consistently — which is precisely the failure a shared declaration is usually
+/// assumed to have removed (design-lesson #243).
+///
+/// ## Provenance
+///
+/// **Arm Architecture Reference Manual, VMSAv8-64.** Stage-2 `MemAttr[3:0]` (descriptor bits
+/// `[5:2]`): all-zero is Device-nGnRnE; otherwise `[3:2]` is the *outer* and `[1:0]` the *inner*
+/// attribute, with `0b01` Non-cacheable, `0b10` Write-Through, `0b11` Write-Back. Stage-1
+/// `MAIR_ELx` attribute byte: `0x00` Device-nGnRnE, high nibble outer / low nibble inner, `0b0100`
+/// Non-cacheable and `0b1111` Write-Back Read-Allocate Write-Allocate non-transient. `SH[9:8]`
+/// carries the **same encoding at the same bit positions in both regimes**, which is why
+/// [`memtype::MemoryType::shareability_bits`] is one function rather than a matched pair.
+///
+/// ## ⛔ What deliberately does NOT use this
+///
+/// **`fvp-probe` keeps its own copy of these encodings, and unifying it would destroy its value.**
+/// The probe shares no source with `hv-metal` on purpose: it is the instrument that graded
+/// `scrub_frame` and `smmu::publish` on Arm's AEM, and an instrument that imports the declarations
+/// of the thing it measures is a tautology, not evidence. Its duplicate `0xff` is a *control*, not
+/// drift.
+pub mod memtype {
+    /// A memory type this hypervisor maps something with — the architectural notion, independent of
+    /// which translation regime is doing the mapping.
+    ///
+    /// Three variants because three is what the two regimes between them emit; see each variant.
+    /// Shareability is part of the type rather than a separate axis, because the only Normal
+    /// cacheable type this project maps **must** be Inner Shareable — cacheable-but-Non-shareable
+    /// would leave EL2 and the Stage-2 walker in different domains and fail to close the very
+    /// mismatch A2 exists to close. Making it a separate parameter would make that bug spellable.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum MemoryType {
+        /// **Normal, Inner+Outer Write-Back, Inner Shareable.** What guests get for their RAM
+        /// ([`super::desc::LEAF_COMMON`]) and, since A2, what EL2 gets for its own DRAM. These being
+        /// the *same variant* is the machine-checked form of A2's safety argument.
+        NormalWbIsh,
+        /// **Normal, Inner+Outer Non-cacheable.** EL2's `.text` under A2 — mapped to match
+        /// `SCTLR_EL2.I == 0`, which forces instruction fetch Non-cacheable whatever the descriptor
+        /// says, so a Write-Back descriptor there would describe something the hardware does not do.
+        /// ⚠ **The Stage-2 emitter emits this for nothing today.** Its encoding is derived and
+        /// pinned anyway, so that a future device or non-cacheable Stage-2 mapping is taken from
+        /// here rather than invented at a call site — which is how the duplicate this module removes
+        /// came to exist in the first place.
+        NormalNonCacheable,
+        /// **Device-nGnRnE** — no gathering, no reordering, no early write acknowledgement. MMIO in
+        /// both regimes, and the type EL2 gave *everything* before A2.
+        DeviceNGnRnE,
+    }
+
+    impl MemoryType {
+        /// The `MAIR_ELx` attribute **byte** for this type — the stage-1 encoding.
+        ///
+        /// Returns the byte, not a whole `MAIR` value: which attribute *index* a type occupies is a
+        /// register-layout choice belonging to whoever programs `MAIR_ELx`, not a property of the
+        /// memory. `hv-metal`'s `mmu` keeps that choice.
+        pub const fn stage1_mair_byte(self) -> u8 {
+            match self {
+                Self::NormalWbIsh => 0xff,
+                Self::NormalNonCacheable => 0x44,
+                Self::DeviceNGnRnE => 0x00,
+            }
+        }
+
+        /// The Stage-2 leaf descriptor bits for this type: `MemAttr[5:2]` **and** `SH[9:8]`.
+        ///
+        /// ⚠ **`AF` is deliberately not included.** The access flag is not a property of the memory
+        /// type — it is about whether the mapping has been touched — and folding it in here would
+        /// make it impossible to state a type without also asserting a flag. Callers add
+        /// [`super::desc::AF`].
+        pub const fn stage2_leaf_bits(self) -> u64 {
+            let mem_attr: u64 = match self {
+                Self::NormalWbIsh => 0b1111,
+                Self::NormalNonCacheable => 0b0101,
+                Self::DeviceNGnRnE => 0b0000,
+            };
+            (mem_attr << 2) | self.shareability_bits()
+        }
+
+        /// `SH[9:8]` — and **one function for both regimes**, because the field is at the same bits
+        /// with the same encoding in a stage-1 and a Stage-2 descriptor alike.
+        ///
+        /// Device memory ignores shareability and Non-cacheable memory is treated as outer-shareable
+        /// regardless, so `0b00` for those two is "deliberately zero" rather than "absent" — the
+        /// distinction `hv-metal`'s `SH_NON_SHAREABLE` was named to preserve.
+        pub const fn shareability_bits(self) -> u64 {
+            const INNER_SHAREABLE: u64 = 0b11 << 8;
+            const NON_SHAREABLE: u64 = 0b00 << 8;
+            match self {
+                Self::NormalWbIsh => INNER_SHAREABLE,
+                Self::NormalNonCacheable | Self::DeviceNGnRnE => NON_SHAREABLE,
+            }
+        }
+    }
+}
+
 /// AArch64 Stage-2 descriptor encodings (4 KiB granule).
 pub mod desc {
+    use super::memtype::MemoryType;
     /// Table descriptor low bits — an `L1`/`L2` entry pointing at the next-level table.
     pub const TABLE: u64 = 0b11;
     /// A **page** descriptor's low bits — a valid `L3` (4 KiB) leaf. (At `L3` the `0b01` block
@@ -49,10 +174,23 @@ pub mod desc {
     /// 2 MiB-block output-address mask (bits `[47:21]`).
     pub const ADDR_2M: u64 = 0x0000_ffff_ffe0_0000;
 
-    /// Leaf lower attributes shared by every mapping emitted: `MemAttr=0b1111` (Stage-2 Normal
-    /// Inner+Outer Write-Back cacheable, bits `[5:2]`), `SH=0b11` (Inner Shareable, bits `[9:8]`),
-    /// `AF=1` (bit 10 — else the first access faults).
-    pub const LEAF_COMMON: u64 = (0b1111 << 2) | (0b11 << 8) | (1 << 10);
+    /// The access flag, bit 10 — without it the first access takes an Access Flag fault, and this
+    /// regime has no handler that would set it. Named rather than inlined so the two descriptors
+    /// that need it say the same word; it is **not** part of a memory type
+    /// ([`MemoryType::stage2_leaf_bits`] deliberately omits it).
+    pub const AF: u64 = 1 << 10;
+
+    /// Leaf lower attributes shared by every Normal-memory mapping emitted: `MemAttr=0b1111`
+    /// (Stage-2 Normal Inner+Outer Write-Back cacheable, bits `[5:2]`), `SH=0b11` (Inner Shareable,
+    /// bits `[9:8]`), `AF=1`.
+    ///
+    /// ⚠ **The memory type is no longer written here.** It is [`MemoryType::NormalWbIsh`], and it is
+    /// **the same variant `hv-metal` maps EL2's own DRAM with** — which is A2's safety argument in
+    /// the only form that cannot rot: the two regimes derive from one declaration instead of
+    /// agreeing by inspection. See [`super::memtype`] for what that argument is and what it used to
+    /// rest on. The literal is still pinned by `descriptor_constants_are_pinned`, because a shared
+    /// declaration stops the two from diverging and does nothing about them moving together.
+    pub const LEAF_COMMON: u64 = MemoryType::NormalWbIsh.stage2_leaf_bits() | AF;
 
     /// `S2AP=0b11` (bits `[7:6]`) — read/write.
     pub const S2AP_RW: u64 = 0b11 << 6;
@@ -87,11 +225,17 @@ pub mod desc {
     /// `Perm::Rx` case. Read-only, so never W+X; model-driven (emitted iff the edge carries
     /// `execute`). Same bits as the guest-image block.
     pub const BLOCK_RX: u64 = BLOCK | LEAF_COMMON | S2AP_RO;
-    /// A **device** 2 MiB block (M5 Arc 6b): `MemAttr = 0b0000` (Device-nGnRnE — no gathering, no
-    /// reordering, no early write acknowledgement), read/write, **execute-never**. Note the absent
-    /// `0b1111 << 2`: that is the whole difference from a Normal-memory block, and getting it wrong
+    /// A **device** 2 MiB block (M5 Arc 6b): Device-nGnRnE (no gathering, no reordering, no early
+    /// write acknowledgement), read/write, **execute-never**. Getting the memory type wrong here
     /// turns MMIO into speculatively-accessible cacheable memory.
-    pub const BLOCK_DEVICE: u64 = BLOCK | (0b11 << 6) | (1 << 10) | XN;
+    ///
+    /// ⚠ **This used to be written as the ABSENCE of `0b1111 << 2`**, with a comment explaining that
+    /// the missing bits were the whole difference from a Normal-memory block. That is true and it is
+    /// a bad way to say it: an encoding expressed as *what is not there* cannot be read back,
+    /// compared, or got wrong loudly. It now names [`MemoryType::DeviceNGnRnE`] and contributes the
+    /// same bits — zero, but zero **said out loud**.
+    pub const BLOCK_DEVICE: u64 =
+        BLOCK | MemoryType::DeviceNGnRnE.stage2_leaf_bits() | AF | S2AP_RW | XN;
 }
 
 /// Where the tables live and what they map — the physical facts the encoder cannot know.
@@ -1656,11 +1800,87 @@ mod tests {
         )
     }
 
+    /// GOLDEN: **the memory types, in both regimes.** The other half of the pin `memtype` needs.
+    ///
+    /// ★ **A shared declaration stops the two regimes DIVERGING and does nothing about them moving
+    /// TOGETHER** — one edit to `MemoryType` would change `hv-metal`'s stage-1 mapping and this
+    /// crate's Stage-2 emission at once, silently and consistently, which is the failure mode a
+    /// shared declaration is usually assumed to have removed. These literals are what makes such an
+    /// edit loud. Every value below is from the Arm ARM, restated here as a number so that the
+    /// derivation and the number are two independent statements (design-lesson #243).
+    #[test]
+    fn memory_types_are_pinned_in_both_regimes() {
+        use memtype::MemoryType::{DeviceNGnRnE, NormalNonCacheable, NormalWbIsh};
+
+        // Stage-1: the `MAIR_ELx` attribute byte. `hv-metal`'s `mmu` builds `MAIR_EL2` from these.
+        assert_eq!(NormalWbIsh.stage1_mair_byte(), 0xff, "outer+inner WB RA/WA");
+        assert_eq!(
+            NormalNonCacheable.stage1_mair_byte(),
+            0x44,
+            "outer+inner NC"
+        );
+        assert_eq!(DeviceNGnRnE.stage1_mair_byte(), 0x00, "Device-nGnRnE");
+
+        // Stage-2: `MemAttr[5:2] | SH[9:8]`, a DIFFERENT encoding of the same three types — which is
+        // the whole reason `memtype` exists rather than a shared constant.
+        assert_eq!(
+            NormalWbIsh.stage2_leaf_bits(),
+            (0b1111 << 2) | (0b11 << 8),
+            "MemAttr=1111, SH=11"
+        );
+        assert_eq!(
+            NormalNonCacheable.stage2_leaf_bits(),
+            0b0101 << 2,
+            "MemAttr=0101 (outer NC, inner NC), SH=00"
+        );
+        assert_eq!(DeviceNGnRnE.stage2_leaf_bits(), 0, "MemAttr=0000, SH=00");
+
+        // `SH[9:8]` is one function serving both regimes, so pin it on its own too: a change that
+        // moved shareability out of `NormalWbIsh` would break A2's coherency argument at EL2 while
+        // leaving every Stage-2 assertion above intact.
+        assert_eq!(
+            NormalWbIsh.shareability_bits(),
+            0b11 << 8,
+            "Inner Shareable"
+        );
+        assert_eq!(NormalNonCacheable.shareability_bits(), 0);
+        assert_eq!(DeviceNGnRnE.shareability_bits(), 0);
+
+        // The three types must be DISTINGUISHABLE in both regimes. A type whose encoding collides
+        // with another's is a type that is lying, and the collision would be invisible at every call
+        // site — each one would simply emit "the right bits" for the wrong thing.
+        let all = [NormalWbIsh, NormalNonCacheable, DeviceNGnRnE];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(
+                    a.stage1_mair_byte(),
+                    b.stage1_mair_byte(),
+                    "{a:?} and {b:?} collide in stage 1"
+                );
+                assert_ne!(
+                    a.stage2_leaf_bits(),
+                    b.stage2_leaf_bits(),
+                    "{a:?} and {b:?} collide in stage 2"
+                );
+            }
+        }
+    }
+
     /// GOLDEN: the descriptor constants. These are the values Audit #2 converged on three ways; if
     /// a refactor changes one, isolation changes, so they are pinned literally.
     #[test]
     fn descriptor_constants_are_pinned() {
         assert_eq!(desc::LEAF_COMMON, 0x73c, "MemAttr=1111 | SH=11 | AF");
+        // ⚠ Unchanged by the `memtype` refactor, and that is the point of asserting it: the
+        // derivation moved, the bits did not. `BLOCK_DEVICE` likewise — it used to express its
+        // memory type as the ABSENCE of the Normal bits and now names `DeviceNGnRnE`, which must be
+        // the identical word.
+        assert_eq!(
+            desc::BLOCK_DEVICE & 0xfff,
+            0x4c1,
+            "Device: MemAttr=0000, S2AP=RW, AF, block"
+        );
+        assert_ne!(desc::BLOCK_DEVICE & desc::XN, 0, "device memory is XN");
         assert_eq!(desc::PAGE_RW & 0xfff, 0x7ff, "4 KiB page, RW");
         assert_eq!(desc::PAGE_RO & 0xfff, 0x77f, "4 KiB page, RO");
         assert_eq!(
