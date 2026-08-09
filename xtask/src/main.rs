@@ -3,8 +3,19 @@
 
 //! Baleen's task runner. Invoke as `cargo xtask <task>` (see `.cargo/config.toml`).
 //!
-//! Deliberately tiny for M1 — it grows to cover `hv-metal` cross-builds and the
-//! `hv-fuzz` targets as those milestones land.
+//! ★ **This crate is where every gate lives.** Each corpus the project pins — the Kani harnesses by
+//! name, the Verus obligations by count, the exhaustive sweeps, the boot markers, the README's
+//! numbers, the docs' citations and index — is a function below, and each carries a **universe
+//! check**: an enumeration of the covered set made independently of the table claiming to cover it
+//! (#243). If you want to know what Baleen actually enforces rather than what it claims, read here.
+//!
+//! `cargo xtask ci` is the real entry point and runs what CI runs. `metal-lint`, `fvp-lint`,
+//! `kani-harnesses` and `verus-counts` are separate — different toolchains, and Kani costs minutes.
+//!
+//! ⚠ Its own doc said *"deliberately tiny for M1 — it grows to cover `hv-metal` cross-builds and
+//! the `hv-fuzz` targets as those milestones land"* until 3,500 lines after those milestones landed.
+//! A file's module doc is the claim most likely to be false, because nothing reads it on the way
+//! past (#240).
 
 // ㉔ — **every private item carries a doc, and the reason is a defect the compiler could not see.**
 //
@@ -1927,12 +1938,31 @@ fn doc_paths() -> bool {
     // `src/main.rs` and `qemu-probe.sh` — and they are the front door for the two INSTRUMENTS,
     // whose whole value is that a reader can find and run them. A dead pointer there costs more
     // than one in a design doc, not less.
+    // ⑳-j — **every crate must have a front door.** Eight of twelve had none, and they were the
+    // eight that carry the claim: a reader arriving at `hv-part` got a directory. The universe is
+    // "a directory with a `Cargo.toml`", enumerated here rather than read off the workspace
+    // manifest on purpose — `hv-metal`, `hv-fuzz` and the two probes are workspace-EXCLUDED, and
+    // an excluded crate is exactly the one whose front door nobody would notice was missing.
     let mut sources: Vec<String> = vec!["README.md".to_string()];
+    let mut doorless: Vec<&str> = Vec::new();
     for c in &crates {
+        if !std::path::Path::new(c).join("Cargo.toml").exists() {
+            continue;
+        }
         let readme = format!("{c}/README.md");
         if std::path::Path::new(&readme).exists() {
             sources.push(readme);
+        } else {
+            doorless.push(c);
         }
+    }
+    if !doorless.is_empty() {
+        doorless.sort_unstable();
+        for c in &doorless {
+            eprintln!("doc-paths: FAIL — the crate `{c}` has no README.md. It is the front door;");
+            eprintln!("                  without one a reader arriving at that directory gets a file listing.");
+        }
+        return false;
     }
     match std::fs::read_dir("docs") {
         Ok(d) => sources.extend(
