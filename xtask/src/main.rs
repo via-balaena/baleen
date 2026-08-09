@@ -2105,8 +2105,11 @@ fn doc_paths() -> bool {
 /// worst moment this repo has.
 ///
 /// ⚠ Written after the README sweep put a **block of runnable commands** at the top of the most-read
-/// file here. Thirteen distinct tasks are cited across the docs; all thirteen resolved on the first
-/// run, which is the good case and precisely when a guard is cheapest to install.
+/// file here. **Every cited task resolved on the first run** — the good case, and precisely when a
+/// guard is cheapest to install. (The count is deliberately not repeated here: the gate prints it,
+/// and a number in prose beside a number in output is the second copy #276 is about. I first wrote
+/// "thirteen", which was already wrong by two when it shipped, because my manual grep had covered
+/// fewer files than the gate does.)
 ///
 /// ## The direction it checks, and the one it does not
 ///
@@ -2305,12 +2308,14 @@ fn doc_index() -> bool {
 
     // ★ The index STATES its own size, and that number is gated rather than deleted (#276). A
     // reader deciding whether to open `docs/` is entitled to know how big it is; the fate that
-    // makes that safe is a check. ⚠ The phrase is "documents", not "design documents": `MILESTONES.md`
-    // is a LOG, and a count that silently reclassifies a log as a design doc is the kind of small
-    // untruth this gate exists to prevent.
-    // makes that safe is a check, not a promise. ⚠ I wrote this count as prose FIRST — "Thirty-three
-    // documents" — in the rung whose own lesson is that a number is gated, deleted, or
-    // rotting. Writing the lesson down is not the same as applying it.
+    // makes that safe is a check, not a promise. ⚠ I wrote this count as prose FIRST —
+    // "Thirty-three design documents" — in the rung whose own lesson is that a number is gated,
+    // deleted, or rotting. Writing the lesson down is not the same as applying it.
+    //
+    // ⚠ The phrase is "documents", NOT "design documents", since ⑳-k: `MILESTONES.md` is a LOG, and
+    // a count that silently reclassifies a log as a design doc is the small untruth this gate exists
+    // to prevent. (The quotation above keeps the ORIGINAL wording — it is a record of what was
+    // written, and editing a quote to match today is how a ledger stops being one.)
     let claim = format!("**{} documents.**", universe.len());
     let mut ok = index.contains(&claim);
     if !ok {
