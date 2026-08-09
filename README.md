@@ -24,6 +24,11 @@ test on a multi-year solo project.
 > `via-balaena/baleen` repository. The internal library crates (`hv-*`) are marked
 > `publish = false` and are not intended for crates.io.
 
+> **Where to go next.** This file is long, deliberately — it carries the claims *and* the honest
+> ledger of what is not proven. If you would rather be pointed somewhere:
+> **[`docs/README.md`](docs/README.md)** is a map of every design document, with three reading
+> orders, and every crate below links to its own front door.
+
 ## What this is, honestly
 
 **A small type-1 hypervisor whose isolation core is machine-checked, and a discipline for
@@ -98,18 +103,18 @@ argument has to be as maintained as the code it explains.
 
 | crate       | what it is |
 | ----------- | ----------- |
-| `hv-hal`    | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`) |
-| `hv-core`   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, **zero external crates** (one path dep on `hv-hal`), and zero `unsafe` — `#![forbid(unsafe_code)]`-enforced |
-| `hv-s2`     | the Stage-2 page-table **emitter**, and the ∀-address refinement theorems over it |
-| `hv-vdev`   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets |
-| `hv-part`   | how the machine is **partitioned among guest slots** — windows, frame runs, domain ids — as `const fn` arithmetic proven ∀-partition rather than `const assert!`-ed at the two slots this board deploys |
-| `hv-sim`    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps |
-| `hv-verify` | the **Kani harnesses** (136) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) |
-| `hv-metal`  | the bare-metal AArch64/EL2 binary: boot, its own stage-1 MMU, Stage-2, vGIC, the real-Linux path |
-| `hv-fuzz`   | `cargo-fuzz` targets against the hypercall dispatcher |
-| `fvp-probe` | ⚠ **not part of the hypervisor** — a standalone bare-metal instrument for Arm's AEM FVP, measuring SMMU translation caching and invalidation (honest-ledger 2(d)), which QEMU structurally cannot show. Workspace-excluded; its **verdicts** are deliberately ungated, its **health** is (`cargo xtask fvp-lint`) |
-| `board-probe` | ⚠ **not part of the hypervisor** — measures the platform facts `hv-metal` assumes from QEMU `virt` (exception level, `SCTLR_EL2` at reset, cache line, `ICH_VTR_EL2`, granule/PA/VMID), so a future port is scoped from numbers rather than guesses. Self-tests on QEMU; see its README |
-| `xtask`     | build/test automation and the gate corpora (`cargo xtask <task>`) |
+| [`hv-hal`](hv-hal/README.md)    | the *southbound* fence: hardware traits (`GuestMemory`, `TimeSource`, `VcpuOps`) |
+| [`hv-core`](hv-core/README.md)   | the model: domains, grants, event channels, p2m, scheduler. `no_std`, **zero external crates** (one path dep on `hv-hal`), and zero `unsafe` — `#![forbid(unsafe_code)]`-enforced |
+| [`hv-s2`](hv-s2/README.md)     | the Stage-2 page-table **emitter**, and the ∀-address refinement theorems over it |
+| [`hv-vdev`](hv-vdev/README.md)   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets |
+| [`hv-part`](hv-part/README.md)   | how the machine is **partitioned among guest slots** — windows, frame runs, domain ids — as `const fn` arithmetic proven ∀-partition rather than `const assert!`-ed at the two slots this board deploys |
+| [`hv-sim`](hv-sim/README.md)    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps |
+| [`hv-verify`](hv-verify/README.md) | the **Kani harnesses** (136) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) |
+| [`hv-metal`](hv-metal/README.md)  | the bare-metal AArch64/EL2 binary: boot, its own stage-1 MMU, Stage-2, vGIC, the real-Linux path |
+| [`hv-fuzz`](hv-fuzz/README.md)   | `cargo-fuzz` targets against the hypercall dispatcher |
+| [`fvp-probe`](fvp-probe/README.md) | ⚠ **not part of the hypervisor** — a standalone bare-metal instrument for Arm's AEM FVP, measuring SMMU translation caching and invalidation (honest-ledger 2(d)), which QEMU structurally cannot show. Workspace-excluded; its **verdicts** are deliberately ungated, its **health** is (`cargo xtask fvp-lint`) |
+| [`board-probe`](board-probe/README.md) | ⚠ **not part of the hypervisor** — measures the platform facts `hv-metal` assumes from QEMU `virt` (exception level, `SCTLR_EL2` at reset, cache line, `ICH_VTR_EL2`, granule/PA/VMID), so a future port is scoped from numbers rather than guesses. Self-tests on QEMU; see its README |
+| [`xtask`](xtask/README.md)     | build/test automation and the gate corpora (`cargo xtask <task>`) |
 
 **Four** crates are **excluded from the workspace** — not "until their milestones", but
 permanently. `hv-metal`, `fvp-probe` and `board-probe` build for
