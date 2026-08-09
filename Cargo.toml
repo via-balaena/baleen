@@ -18,7 +18,7 @@ members = ["hv-hal", "hv-core", "hv-part", "hv-s2", "hv-sim", "hv-vdev", "hv-ver
 # `fvp-probe` joins them: it is a bare-metal AArch64 binary for Arm's AEM FVP (so it cannot link
 # for the host either), and — unlike hv-metal — it is NOT part of the product. It is a local-only
 # measurement instrument, deliberately ungated, and `fvp-probe/README.md` says so at the top.
-exclude = ["hv-fuzz", "hv-metal", "fvp-probe"]
+exclude = ["hv-fuzz", "hv-metal", "fvp-probe", "board-probe"]
 
 [workspace.package]
 version = "0.0.0"
