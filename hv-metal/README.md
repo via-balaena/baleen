@@ -22,8 +22,7 @@ default in the same machine. All of it is under required CI gates.
 carried a `## Status: M4, Arc 4` heading and described a trivial `.rodata` guest and a 2 MiB identity
 Stage-2 — frozen while the crate grew to 28 modules and real Linux. A "current status" heading is a
 claim that rots the moment it stops being tended (design-lesson #276); the arc-by-arc record lives in
-the project's **milestone log**, which is append-only and says so — see the root
-[`README.md`](../README.md).
+[`docs/MILESTONES.md`](../docs/MILESTONES.md), which is append-only and says so.
 
 ## Where it sits
 
