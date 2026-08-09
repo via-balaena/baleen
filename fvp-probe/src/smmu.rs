@@ -102,12 +102,22 @@ const CMD_SYNC: u64 = 0x46;
 // alignment is obvious by inspection rather than by trusting a linker script. DRAM is 4 GB from
 // 0x8000_0000, so all of this is real memory.
 //
-// ⚠ The MMU is OFF at EL3, so every access below is Device-nGnRnE: strongly ordered and
-// non-cacheable. That is why there is no cache maintenance anywhere in this file — and it is also
-// why the walk attributes are programmed NON-CACHEABLE. A cacheable SMMU walk against
-// non-cacheable CPU writes is a coherency mismatch that would show up as an inexplicably stale
-// table, which is precisely the observable this instrument exists to measure. Removing that
-// confound is worth more than the walk performance it costs.
+// The walk attributes are programmed NON-CACHEABLE. A cacheable SMMU walk against non-cacheable CPU
+// writes is a coherency mismatch that would show up as an inexplicably stale table, which is
+// precisely the observable this instrument exists to measure. Removing that confound is worth more
+// than the walk performance it costs.
+//
+// ⚠ **THIS COMMENT USED TO SAY "the MMU is OFF at EL3, so every access below is Device-nGnRnE …
+// that is why there is no cache maintenance anywhere in this file". BOTH HALVES ARE NOW FALSE**,
+// and by the same change: milestone 6 does SMMU work **after** [`crate::mmu::enable`], so its
+// accesses to this arena are **Normal write-back cacheable**, and [`submit`] now issues `DC CVAC`
+// for exactly that reason.
+//
+// ★ **Which is the whole point of milestone 6, so read the pairing rather than the halves.** The
+// walk stays non-cacheable and the CPU side became cacheable — that mismatch is not a defect here,
+// it is `hv-metal`'s ledger-5 **A2** configuration reproduced deliberately. Milestones 1–2 still run
+// MMU-off and are unaffected; what changed is that this file is no longer used in only one memory
+// regime, and a comment that names one regime for the whole file cannot stay true.
 
 const ARENA: u64 = crate::layout::SMMU_ARENA;
 const STRTAB: u64 = ARENA;
