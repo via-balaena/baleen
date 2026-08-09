@@ -120,6 +120,23 @@ microarchitectural. It does **not** model:
    ⚠ **None of these is a QEMU bug** — an emulator is entitled to be permissive where the
    architecture forbids. They are limits on what a green run means.
 
+6. ★ **BEHAVIOUR THE ARCHITECTURE LEAVES *CONSTRAINED UNPREDICTABLE*, WHICH BOTH OUR PLATFORMS
+   RESOLVE BENIGNLY — added 2026-08-09, and it is a third distinct category.** Items 1–4 are things
+   a model cannot *measure*; item 5 is things it *permits* that hardware forbids. These are things
+   the architecture declines to pin down at all, where an implementation may legitimately choose
+   several behaviours — so "it worked on the model" carries no information about silicon, and
+   **there is no more faithful model to escalate to.**
+
+   | behaviour | QEMU | Arm's AEM (MEASURED, `fvp-probe` m5) | consequence |
+   |---|---|---|---|
+   | `LDXR`/`STXR` to **`Device-nGnRnE`** memory — CONSTRAINED UNPREDICTABLE, the documented common outcome being a perpetually-failing `STXR` (livelock) | works | **works** — succeeded on attempt 1 and incremented, with a Normal-WB control succeeding alongside and the page's descriptor printed as `AttrIndx 0` | EL2 runs `Device-nGnRnE` (`MAIR_EL2` attr 0, `SCTLR_EL2.C = 0`) and its release binary holds **244 exclusive-monitor instructions, zero LSE**, across six modules. **Neither platform can grade this.** Ledger 5's A2 closes it; until then it is *reasoned, not witnessed*, with **silicon as the only remaining oracle** |
+
+   ⚠ **The distinction from category 5 matters when you plan work.** A category-5 row tells you to
+   go find a stricter platform — which is how ledger 2(d) and the `scrub_frame` defect were settled
+   on the AEM. A category-6 row tells you **there is nowhere further to go**: the escalation was
+   attempted and the stricter model made the same benign choice. That converts "we should probe
+   this" into "this needs a board", which is a different item on a different list.
+
 ## A note specific to Apple-Silicon / EL2-under-QEMU
 
 Baleen targets AArch64 **EL2**. If Baleen itself runs at EL2 on an Apple-Silicon host, it will
