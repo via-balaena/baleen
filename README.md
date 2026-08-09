@@ -83,9 +83,10 @@ is what makes that answerable instead of rhetorical.
 
 ## Workspace
 
-Sizes are non-comment lines, measured at the commit this table was last updated. The
-comment ratio is high on purpose: much of this project's argument lives in doc comments,
-and `cargo xtask metal-lint` now builds `hv-metal`'s rustdoc so its links cannot rot.
+The comment ratio across this workspace is high on purpose: much of the project's argument
+lives in doc comments, which is why `cargo xtask metal-lint` builds `hv-metal`'s rustdoc and
+`clippy::missing_docs_in_private_items` is enabled on `hv-hal`, `hv-s2` and `xtask` — the
+argument has to be as maintained as the code it explains.
 
 > ⚠ **This table used to carry a `lines` column and it has been deleted, not corrected.** Every
 > entry had drifted — `hv-metal` was stated at 10 946 against a real 24 974, `fvp-probe` at 214
