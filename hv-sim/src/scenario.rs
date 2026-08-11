@@ -576,6 +576,44 @@ fn run_policy_steady(
         .collect()
 }
 
+/// Worst observed **scheduling latency** in the steady, all-runnable setting: the longest
+/// run of consecutive ticks during which some vCPU held no physical CPU.
+///
+/// ★ This measures a different thing from [`run_policy_steady`], and the difference is the
+/// point. That function reports each vCPU's *total* accrued runtime, which supports an
+/// **aggregate-share** property — everyone got roughly their weighted portion over the whole
+/// window. Aggregate share says nothing about *when*: a vCPU can take its entire fair portion
+/// in two large blocks separated by an enormous gap and look perfectly fair in the totals.
+///
+/// A safety monitor cares about exactly the quantity the totals discard — **how long it can be
+/// kept off a CPU**. A monitor that is scheduled generously but rarely is not a monitor. So this
+/// returns the worst gap rather than the sum.
+#[cfg(test)]
+fn run_policy_max_wait(weights: &[policy::Weight], pcpus: usize, quantum: u64, ticks: u64) -> u64 {
+    let vcpus = weights.len();
+    let mut sys = sched::System::new(1, vcpus, pcpus);
+    let mut pol = policy::Scheduler::new(1, vcpus, quantum);
+    for (v, &w) in weights.iter().enumerate() {
+        sys.admit(0, v as u32).unwrap();
+        pol.set_weight(0, v as u32, w);
+    }
+    // Per-vCPU: consecutive ticks spent off-CPU, and the worst such run seen.
+    let mut waiting = vec![0u64; vcpus];
+    let mut worst = 0u64;
+    for t in 1..=ticks {
+        pol.advance(&mut sys, t);
+        for (v, w) in waiting.iter_mut().enumerate() {
+            if sys.is_running(0, v as u32) {
+                *w = 0;
+            } else {
+                *w += 1;
+                worst = worst.max(*w);
+            }
+        }
+    }
+    worst
+}
+
 /// A sleeper-fairness contrast: one CPU shared by two equal-weight vCPUs. `A` stays
 /// runnable the whole time; `B` sleeps through a long warm-up (so `A` piles up
 /// service) and then wakes to contend. Returns the number of contest-phase ticks each
@@ -2323,6 +2361,13 @@ mod tests {
     /// No starvation: with more runnable vCPUs than CPUs and equal weights, every vCPU
     /// still earns a fair, non-trivial slice — none is left at zero. Five equal vCPUs
     /// on two CPUs over 5000 ticks should each land near 2000.
+    ///
+    /// ⚠ **Both assertions here are about AGGREGATE SHARE, and neither bounds LATENCY.** A vCPU
+    /// that takes its entire fair portion in two large blocks separated by an enormous gap
+    /// passes both — `min > 0` because it ran, and the spread check because the totals are even.
+    /// That is fine for a throughput property and useless for a safety monitor, which cares how
+    /// long it can be kept *off* a CPU. The worst-gap property is
+    /// [`policy_bounds_scheduling_latency`]; the two are orthogonal and both are wanted.
     #[test]
     fn policy_starves_no_one() {
         let rt = run_policy_steady(&[1, 1, 1, 1, 1], 2, 2, 5000);
@@ -2334,6 +2379,63 @@ mod tests {
             max - min <= max / 5,
             "equal-weight vCPUs diverged too far: {rt:?}"
         );
+    }
+
+    /// **Bounded scheduling latency** — the property a safety monitor actually needs, and the
+    /// one [`policy_starves_no_one`] does *not* provide.
+    ///
+    /// That test bounds each vCPU's **aggregate share** over the whole window. Aggregate share
+    /// says nothing about *when*: a vCPU can take its entire fair portion in two large blocks
+    /// separated by an enormous gap and satisfy both of its assertions. A monitor scheduled
+    /// generously but rarely is not a monitor. So this bounds the **worst gap** instead.
+    ///
+    /// ## The bound, and it was MEASURED before it was asserted
+    ///
+    /// `worst_wait ≤ (W_total − wᵢ) × quantum / pcpus + 1`
+    ///
+    /// — where `W_total` is the sum of all weights and `wᵢ` the weight of the vCPU in question,
+    /// so the worst case over all vCPUs uses the *smallest* weight. The intuition: while vCPU
+    /// `i` waits, every other vCPU runs in proportion to its weight, and `+1` is the tick in
+    /// which `advance` places it back on a CPU.
+    ///
+    /// ★ **It matched the measurement exactly on all five configurations below**, which is what
+    /// makes `≤` meaningful here — a bound nothing approaches is a bound that would pass however
+    /// badly the scheduler regressed.
+    ///
+    /// ⚠ **The count-based intuition is WRONG, and that is the transferable part.** A bound of
+    /// "(vcpus − pcpus) × quantum" predicts **4** for weights `[1,2,3]`; the measured answer is
+    /// **11**. Latency depends on the *weights* of the other vCPUs, not their number — so a
+    /// monitor's latency budget is a function of what else is configured to run, and adding a
+    /// heavy neighbour lengthens the monitor's worst case without adding a vCPU.
+    #[test]
+    fn policy_bounds_scheduling_latency() {
+        for (label, weights, pcpus, quantum) in [
+            ("5 equal / 2 cpu", &[1u32, 1, 1, 1, 1][..], 2usize, 2u64),
+            ("5 equal / 1 cpu", &[1, 1, 1, 1, 1][..], 1, 2),
+            ("4 equal / 1 cpu", &[1, 1, 1, 1][..], 1, 5),
+            ("2 equal / 1 cpu", &[1, 1][..], 1, 5),
+            ("3 skewed / 1 cpu", &[1, 2, 3][..], 1, 2),
+        ] {
+            let worst = run_policy_max_wait(weights, pcpus, quantum, 5000);
+            let total: u64 = weights.iter().map(|&w| u64::from(w)).sum();
+            let lightest = u64::from(*weights.iter().min().unwrap());
+            let bound = (total - lightest) * quantum / pcpus as u64 + 1;
+
+            assert!(
+                worst <= bound,
+                "{label}: worst wait {worst} exceeds the bound {bound} \
+                 (weights={weights:?} pcpus={pcpus} quantum={quantum})"
+            );
+            // Non-vacuity: every configuration here has more vCPUs than CPUs and all of them
+            // continuously runnable, so somebody MUST wait. A zero here would mean the harness
+            // stopped measuring, not that the scheduler got perfect.
+            assert!(
+                worst > 0,
+                "{label}: measured no waiting at all, which is impossible with \
+                 {} vCPUs on {pcpus} CPU(s) — the harness has stopped measuring",
+                weights.len()
+            );
+        }
     }
 
     /// Wake-boost / sleeper fairness: a vCPU that sleeps through a long warm-up and
