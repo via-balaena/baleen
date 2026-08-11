@@ -2432,14 +2432,29 @@ mod tests {
             let lightest = u64::from(*weights.iter().min().unwrap());
             let bound = (total - lightest) * quantum / pcpus as u64 + 1;
 
+            // The safety property: the wait never exceeds the derived bound.
             assert!(
                 worst <= bound,
                 "{label}: worst wait {worst} exceeds the bound {bound} \
                  (weights={weights:?} pcpus={pcpus} quantum={quantum})"
             );
+            // ★ And the bound is EXACT, which is asserted rather than merely claimed in prose.
+            // This harness is deterministic (no RNG), so equality is stable.
+            //
+            // ⚠ A failure here in the *under* direction is NOT a regression — it means the policy
+            // now schedules better than the formula predicts, and the correct response is to
+            // RE-DERIVE the bound, never to relax this to `<=` and move on. Relaxing it would
+            // restore exactly the situation this line exists to prevent: a tightness claim in a
+            // doc comment that nothing checks, which is how the doc quietly stops being true.
+            assert_eq!(
+                worst, bound,
+                "{label}: the bound is no longer exact (weights={weights:?} pcpus={pcpus} \
+                 quantum={quantum}) — re-derive it, do not loosen this assertion"
+            );
             // Non-vacuity: every configuration here has more vCPUs than CPUs and all of them
             // continuously runnable, so somebody MUST wait. A zero here would mean the harness
-            // stopped measuring, not that the scheduler got perfect.
+            // stopped measuring, not that the scheduler got perfect. (Kept alongside the equality
+            // check because it names the *cause*, and a dead harness is the likelier failure.)
             assert!(
                 worst > 0,
                 "{label}: measured no waiting at all, which is impossible with \
