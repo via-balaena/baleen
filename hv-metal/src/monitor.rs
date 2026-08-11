@@ -105,6 +105,19 @@ const _: () = assert!(
      console address would be wrong"
 );
 
+/// ㉗ — the IPA at which the payload reads its peer's memory, and the offset of the value it checks.
+///
+/// Both derived from `crate::linux`, which owns the observation channel's placement: a second copy
+/// of "where the peer's magic lives" is a second thing to drift, and the payload — being assembly —
+/// is the one consumer the compiler cannot check against the emitter.
+const OBSERVED_HI: u64 = crate::linux::OBSERVED_IPA >> 16;
+
+const _: () = assert!(
+    OBSERVED_HI << 16 == crate::linux::OBSERVED_IPA,
+    "the observed IPA is no longer expressible as a single `movz … lsl #16`; the payload would read \
+     the wrong address"
+);
+
 /// The two halves of PSCI `SYSTEM_OFF`, for the payload's `movz`/`movk` pair.
 ///
 /// Same derivation argument as [`VPL011_HI`]: `crate::linux` owns the FID, and the payload must
@@ -159,6 +172,33 @@ __monitor_tpl_start:
     cmp     x20, #{ROUNDS}
     b.lt    10b
 
+    // ── ㉗: OBSERVE THE PEER, then prove the view is one-way FROM INSIDE ──
+    //
+    // Three steps, and the third is what a descriptor check cannot give you:
+    //   1. read the peer's `Image` magic through the read-only view — it must be there;
+    //   2. store poison to the same address — Stage-2 refuses it, EL2 records and resumes past;
+    //   3. read AGAIN and require the ORIGINAL value. Step 3 is the monitor witnessing that the
+    //      write did not land, using only its own two loads — no hypercall, no trust in EL2's
+    //      report, and no way for a refused-but-actually-applied store to pass unnoticed.
+    movz    x21, #{OBSERVED_HI}, lsl #16    // the peer's window base
+    movz    w23, #{MAGIC_LO}                // the Image magic EL2 independently verified
+    movk    w23, #{MAGIC_HI}, lsl #16
+    ldr     w22, [x21, #{MAGIC_OFF}]        // (1) observe
+    cmp     w22, w23
+    b.ne    40f
+    movz    w24, #{POISON_LO}
+    movk    w24, #{POISON_HI}, lsl #16
+    str     w24, [x21, #{MAGIC_OFF}]        // (2) MUST FAULT — resumed past by EL2
+    ldr     w25, [x21, #{MAGIC_OFF}]        // (3) unchanged?
+    cmp     w25, w23
+    b.ne    40f
+    adr     x0, 33f
+    bl      20f
+    b       41f
+40: adr     x0, 34f                         // either the view is blind or the write LANDED
+    bl      20f
+41:
+
     adr     x0, 32f
     bl      20f
     movz    x0, #{PSCI_OFF_HI}, lsl #16     // retire exactly as a Linux guest does
@@ -177,6 +217,8 @@ __monitor_tpl_start:
 30: .asciz "baleen-monitor: alive — a bare-metal EL1 partition beside an unmodified Linux guest\n"
 31: .asciz "baleen-monitor: round "
 32: .asciz "baleen-monitor: rounds complete, retiring through PSCI SYSTEM_OFF\n"
+33: .asciz "baleen-monitor: observed the policy partition (ARM\\x64 at its window base) and my store to it did NOT land\n"
+34: .asciz "baleen-monitor: OBSERVE FAIL - the peer view is blind, or my store LANDED\n"
     .balign 4
     .global __monitor_tpl_end
 __monitor_tpl_end:
@@ -185,7 +227,18 @@ __monitor_tpl_end:
     ROUNDS = const ROUNDS,
     PSCI_OFF_HI = const PSCI_OFF_HI,
     PSCI_OFF_LO = const PSCI_OFF_LO,
+    OBSERVED_HI = const OBSERVED_HI,
+    MAGIC_OFF = const crate::linux::IMAGE_MAGIC_OFF,
+    MAGIC_LO = const (crate::linux::IMAGE_MAGIC & 0xffff),
+    MAGIC_HI = const (crate::linux::IMAGE_MAGIC >> 16),
+    POISON_LO = const (OBSERVE_POISON & 0xffff),
+    POISON_HI = const (OBSERVE_POISON >> 16),
 );
+
+/// The value the payload tries to store through its read-only view. Recognisable in a memory dump
+/// and **not** a value any legitimate writer would produce, so if it ever appeared at the peer's
+/// window base the source would be unambiguous.
+const OBSERVE_POISON: u32 = 0xdead_be57;
 
 extern "C" {
     /// First byte of the monitor payload, in `hv-metal`'s own `.rodata`.
