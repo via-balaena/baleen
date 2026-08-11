@@ -74,9 +74,15 @@ observe = []
 # The DMA half of the witness is shared code across both boots; only the SMMU setup is gated.
 smmu = []
 
-# `real-linux` (M5 Arc 5e) replaces the synthetic guest phases with the real-Linux capstone: boot an
-# actual aarch64 Linux kernel as a single EL1 guest that owns the machine (device pass-through,
-# `HCR_EL2.IMO=0`). Off by default — the default build (what the CI boot-test asserts on) runs the
+# `real-linux` (M5 Arc 5e) replaces the synthetic guest phases with the real-Linux capstone: boot
+# `linux::NUM_GUESTS` (2) unmodified aarch64 Linux kernels, isolated from each other, with device
+# pass-through and `HCR_EL2.IMO=0`.
+#
+# ⚠ This said "a single EL1 guest that owns the machine" until 2026-08-11 — the pre-③-b2b state,
+# left behind by the arc that made "which guest" an index. The same stale sentence was in
+# `src/main.rs`; both understated the headline capability. Read `linux::NUM_GUESTS` for the count.
+#
+# Off by default — the default build (what the CI boot-test asserts on) runs the
 # synthetic Arc 0–5 guests unchanged. Driven by `cargo xtask qemu-linux`, which loads a kernel
 # `Image` + initramfs + DTB via QEMU `-device loader`. NO isolation content (the thesis is proven on
 # the synthetic guests); this only demonstrates the proven interface carries an unmodified kernel.
