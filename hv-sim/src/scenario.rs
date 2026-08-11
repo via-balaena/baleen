@@ -2407,6 +2407,17 @@ mod tests {
     /// **11**. Latency depends on the *weights* of the other vCPUs, not their number — so a
     /// monitor's latency budget is a function of what else is configured to run, and adding a
     /// heavy neighbour lengthens the monitor's worst case without adding a vCPU.
+    ///
+    /// ## Two kill probes, both run, both killed
+    ///
+    /// 1. **Tightness** — dropping the `+ 1` makes the first configuration fail immediately
+    ///    (`worst wait 5 exceeds the bound 4`). The inequality has no slack in it, so a
+    ///    regression cannot hide inside a generous margin.
+    /// 2. **The harness, not the code** — disabling the `worst.max(*w)` update so nothing is ever
+    ///    recorded fires the non-vacuity assertion (`the harness has stopped measuring`) rather
+    ///    than passing with a comfortable zero. This is the probe worth having: ㉓ found two of
+    ///    its four defects in the *test* rather than the code, and a latency test that silently
+    ///    measures nothing looks exactly like a scheduler with no latency.
     #[test]
     fn policy_bounds_scheduling_latency() {
         for (label, weights, pcpus, quantum) in [
