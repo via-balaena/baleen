@@ -80,9 +80,19 @@ The real question is therefore sharper, and it is the interesting one:
 > **Can a one-way, authorized observation channel be introduced such that the model
 > proves the weakening is exactly what was intended and no more?**
 
-That is a verification question of the kind this project is built for — the model already
-distinguishes an authorizing edge from its absence, so "monitor may observe policy, policy
-may not observe or affect monitor" is expressible in the vocabulary that already exists.
+That is a verification question of the kind this project is built for, and the model's
+existing vocabulary already reaches it. Both halves of "one-way, observation-only" are
+expressible today, in `hv-core/src/hypervisor.rs`:
+
+* **Direction** — `controls(&self, holder: DomId, target: DomId)` is directional by
+  signature, and `hv-metal/src/guest.rs` already tests the two orderings separately.
+* **Observation without influence** — `hv-core/src/grant.rs`'s authorization carries a
+  `writable` permission bit, so a **read-only** grant is the natural shape of "the
+  monitor may read the policy's commanded output and may not alter it".
+
+⚠ **Expressible is not proved.** What the vocabulary supports is *stating* the weakened
+property; whether the Tier-D argument survives the weakening, and what it degrades to, is
+the actual work and is not answered here.
 ⚠ It is also the point at which the isolation headline stops being *"no channel"* and
 becomes *"exactly one channel, in one direction, and here is the proof"*. **That is a
 strictly harder claim to make and a strictly more useful one.** It should not be
