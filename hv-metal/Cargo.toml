@@ -48,6 +48,20 @@ spi-route-probe = []
 # one can run per boot. Two configurations, not two phases.
 xn-probe = []
 
+# `observe` builds the **one-way observation channel** witness: a safety monitor that the
+# partition it watches cannot blind. It is a separate configuration for the same reason
+# `wx-probe` and `xn-probe` are — not because it is terminal (it is not; it returns and the boot
+# continues) but because it establishes an AUTHORIZED CHANNEL between two partitions, which is
+# precisely what the default boot's thesis enumeration asserts the *absence* of
+# (`no_channel` in `src/guest.rs`). Both claims are true; they cannot be true of the same pair in
+# the same boot, so they are two configurations rather than two phases.
+#
+# ★ The boot demonstrates the FLAW FIRST (phase A: the policy revokes its own read-only grant and
+# blinds its monitor) and only then the repair (phase B: invert ownership — the monitor owns the
+# page, so the read cannot be revoked). A probe that cannot kill proves nothing, which is the
+# lesson ㉕ paid four probes to learn. See `src/observe.rs` and `docs/CONSUMER-CORTENFORGE.md`.
+observe = []
+
 # `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rungs 1–2: `GBPA.ABORT` before any bus
 # master exists, then a stream table whose every entry denies, and the five-phase witness that the
 # device really does reach it). It is a separate binary rather

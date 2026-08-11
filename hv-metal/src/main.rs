@@ -65,6 +65,8 @@ mod heap;
 #[cfg(feature = "real-linux")]
 mod linux;
 mod mmu;
+#[cfg(feature = "observe")]
+mod observe;
 mod pcie;
 mod pending;
 mod pl011;
@@ -331,6 +333,13 @@ pub extern "C" fn rust_main() -> ! {
     // (3d) The other half of W^X. Also terminal, hence a separate configuration from `wx-probe`.
     #[cfg(feature = "xn-probe")]
     mmu::xn_probe(&mut uart);
+
+    // (3e) The one-way observation channel — a safety monitor the observed partition cannot
+    //      blind. NOT terminal, unlike (3c)/(3d): it returns and the boot continues. It is a
+    //      separate configuration because it establishes an authorized channel between two
+    //      partitions, which is exactly what the default boot's thesis asserts the ABSENCE of.
+    #[cfg(feature = "observe")]
+    observe::run(&mut uart);
 
     // (4) Realize hv_hal::TimeSource on the ARM generic timer and witness that the count is
     //     monotonic and live (advances, is not frozen at zero) — the fence honored on the metal.
