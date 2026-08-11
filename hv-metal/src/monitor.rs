@@ -130,6 +130,11 @@ const _: () = assert!(
 //   x19 — the emulated PL011's `DR`, loaded once
 //   x20 — the round counter
 //   x0/x1 — arguments and scratch for `puts`
+//   x30 — the link register, clobbered by every `bl`. Named because it is the one register the
+//         code touches without mentioning: `puts` is never called from inside `puts`, so a single
+//         level is all that is needed and no stack is used anywhere in the payload. **The payload
+//         therefore writes NO memory at all** — which is what keeps `first_word`'s readback of the
+//         deposited bytes a valid witness for the whole boot, including after the monitor has run.
 // ---------------------------------------------------------------------------------------------
 global_asm!(
     r#"
