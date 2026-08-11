@@ -1571,10 +1571,17 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
 /// `driverwitness n/a` line naming every one of them and the slot it exempted — and **that line is
 /// asserted below**, so the exemption cannot become silent.
 ///
-/// ⚠ **And the big one: THIS BOOT ESTABLISHES CO-RESIDENCY, NOT OBSERVATION.** The monitor watches
-/// nothing. `peer OK … DISJOINT` is asserted below exactly as the shipped boot asserts it, because
-/// no channel exists yet. Giving the monitor a read-only view of the policy partition is the next
-/// rung, and it is the one that must weaken that line to say anything true.
+/// ⚠⚠ **THIS PARAGRAPH SAID "THIS BOOT ESTABLISHES CO-RESIDENCY, NOT OBSERVATION" UNTIL ㉗, and it
+/// pointed at a `peer OK … DISJOINT` marker that is no longer in this array.** Kept as a correction:
+/// it was true for exactly one rung, and a marker corpus whose doc describes the previous rung's
+/// claims is how a reader concludes the gate checks something it does not.
+///
+/// **㉗ made the monitor observe**, so this corpus now pins the *replaced* disjointness sentence
+/// (the one in which the word DISJOINT does not appear) plus the channel's three voices.
+///
+/// ⚠ **What is still NOT claimed:** the monitor observes and **cannot influence** — no channel out,
+/// no actuator. And the policy partition can starve it by writing nothing, which is denial rather
+/// than deception and is not detected here.
 const LINUX_MONITOR_MARKERS: &[&str] = &[
     // ── 1. the machine is mixed, and the counts are derived ──
     "baleen: M5 Arc 5e — booting 1 REAL aarch64 Linux kernel(s) + 1 bare-metal monitor \

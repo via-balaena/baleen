@@ -72,9 +72,14 @@ observe = []
 # certify under IEC 61508 / ISO 13482, so "the monitor is small" is the whole runtime-assurance
 # argument, and until this configuration existed the two halves had only ever run separately.
 #
-# ⚠ It establishes CO-RESIDENCY and no channel: the monitor observes nothing yet, and the boot says
-# so. Giving it a read-only view of the policy partition is the next rung, and that one has to
-# weaken `linux.rs`'s disjointness claim to say anything true. See `src/monitor.rs`.
+# ★ ㉗ ADDED THE OBSERVATION CHANNEL: the monitor holds a READ-ONLY Stage-2 leaf onto one frame of the
+# policy partition, emitted by the proven emitter from an authorized grant. So this configuration's
+# `peer OK` line no longer says DISJOINT — it says "disjoint EXCEPT FOR ONE AUTHORIZED, READ-ONLY
+# FRAME", which is a different claim and not the old one with a footnote.
+#
+# ⚠ It observes and CANNOT INFLUENCE — no channel out, no actuator, no way to stop the policy doing
+# anything. And the policy can starve it by writing nothing: denial, not deception. See
+# `src/monitor.rs`.
 monitor = ["real-linux"]
 
 # `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rungs 1–2: `GBPA.ABORT` before any bus

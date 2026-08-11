@@ -55,14 +55,32 @@
 //!    looped forever would hang the gate. Retiring through the same FID means it retires through the
 //!    same code, so there is no second shutdown path that runs once and is never exercised again.
 //!
+//! 4. ★★ **㉗ — IT OBSERVES ITS PEER, AND PROVES THE VIEW IS ONE-WAY USING ONLY ITS OWN TWO LOADS.**
+//!    It reads the policy partition's `Image` magic through a read-only Stage-2 leaf, stores poison
+//!    to the same address (the hardware refuses it; EL2 records and resumes past), and **reads
+//!    again, requiring the original value**. That third step is the part no descriptor check can
+//!    give you: `crate::linux`'s walk asserts the leaf *says* `S2AP=RO`, and this asserts the write
+//!    *did not land* — a refused-but-actually-applied store passes the first and cannot pass this.
+//!    See `crate::linux`'s ㉗ block for the channel, its four kill probes, and why the monitor
+//!    cannot widen its own view.
+//!
 //! ## ⚠ What this rung does NOT claim, stated here because the name invites the overclaim
 //!
-//! **It observes nothing.** A monitor that watches no one is a partition, not a monitor, and calling
-//! it one in the transcript would be exactly the class of defect this project keeps finding. The
-//! observation channel — a read-only view of the policy partition's memory, authorized by a grant and
-//! realized by the proven emitter — is the **next** rung, and it is the one that has to weaken
-//! `crate::linux`'s disjointness claim to say something true. What is closed here is *co-residency*:
-//! a small analyzable partition and an unmodified Linux kernel, isolated, time-slicing one pCPU.
+//! ⚠⚠ **THIS SECTION SAID "It observes nothing" UNTIL ㉗, AND ㉗ IS THE RUNG THAT MADE IT FALSE.**
+//! It is kept as a correction rather than silently rewritten, because the sentence was *true and
+//! load-bearing* for one rung and is now the exact shape of stale claim this project keeps finding —
+//! in the module doc, which is the first thing a reader opens. **The monitor now observes; what it
+//! still does not do is act.**
+//!
+//! **It cannot influence.** The view is read-only in the descriptor, refused by the hardware, and
+//! checked by the payload itself — but the monitor has no channel *out*, no actuator, and no way to
+//! stop the policy partition doing anything. A monitor that detects and cannot intervene is a
+//! detector; the intervention half is not built and is not claimed anywhere in the transcript.
+//!
+//! ⚠ **And it can be starved rather than deceived.** The policy partition cannot revoke the view —
+//! that is ㉗'s point — but it can simply stop writing anything worth reading. That is **denial, not
+//! deception**, and detecting it needs a freshness field in a telemetry format this does not define
+//! (the same residual `crate::observe` records at the model level).
 //!
 //! ⚠ **The payload is not a certifiable monitor either**, and no part of the transcript should be
 //! read as saying so. It is the smallest tenant that demonstrates the configuration; what a real
@@ -143,11 +161,19 @@ const _: () = assert!(
 //   x19 — the emulated PL011's `DR`, loaded once
 //   x20 — the round counter
 //   x0/x1 — arguments and scratch for `puts`
+//   x21..x25 — ㉗'s observation scratch: the peer's window base, the expected magic, the two
+//         readbacks and the poison. Never reused by `puts`, so the sequence survives its calls.
 //   x30 — the link register, clobbered by every `bl`. Named because it is the one register the
 //         code touches without mentioning: `puts` is never called from inside `puts`, so a single
-//         level is all that is needed and no stack is used anywhere in the payload. **The payload
-//         therefore writes NO memory at all** — which is what keeps `first_word`'s readback of the
-//         deposited bytes a valid witness for the whole boot, including after the monitor has run.
+//         level is all that is needed and no stack is used anywhere in the payload.
+//
+// ⚠ **THE PAYLOAD STILL LANDS NO STORE ANYWHERE, and after ㉗ that sentence has to be read
+// carefully rather than taken as obvious.** It issues exactly one `str` — the ㉗ kill probe — and
+// that store is *refused by Stage-2*; it targets the PEER's frame, never its own. Everything else it
+// touches is a load or an MMIO write to the emulated PL011. This is load-bearing twice over:
+// `first_word`'s readback of the deposited bytes stays a valid witness for the whole boot, and
+// `crate::linux::peer_payload_at` reads the monitor's window base long after the payload has run.
+// **A future rung that gives the payload a stack or a scratch buffer breaks both, silently.**
 // ---------------------------------------------------------------------------------------------
 global_asm!(
     r#"
