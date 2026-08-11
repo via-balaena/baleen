@@ -205,16 +205,21 @@ pub(crate) fn first_word() -> u32 {
 /// **Copy the monitor payload into guest slot `slot`'s RAM window**, and report what was deposited.
 ///
 /// Called in place of the `-device loader` deposit a Linux slot gets: the monitor needs no external
-/// artifact, so its "loader" is this copy. Returns the entry address, which is the window base —
-/// the same address [`crate::linux`] would have entered a kernel at, because the arm64 boot
-/// protocol's "entry at the base of RAM" is a property of the window rather than of Linux.
+/// artifact, so its "loader" is this copy.
+///
+/// ⚠ **Returns nothing, deliberately.** An earlier draft returned "the entry address" — which is
+/// the window base — and no caller used it, because `crate::linux` already derives a slot's entry
+/// from `kernel_entry(slot)` and seeds the context with that. Handing back a second answer to
+/// "where does this payload start" would be two derivations of one fact, agreeing today and free to
+/// drift; the entry point is the window base for both payloads because the arm64 boot protocol's
+/// "entry at the base of RAM" is a property of the WINDOW, not of Linux.
 ///
 /// ⚠ **Reports the byte count rather than asserting one.** The payload's size is whatever the
 /// assembler produced; pinning it would be a number nothing measures against a second reading
 /// (design-lesson #251), and it would have to be bumped on every wording change to a string. What
 /// IS checked is that the blob is non-empty and fits, both of which are real failures — an empty
 /// template would `eret` into whatever the window last held.
-pub(crate) fn load(uart: &mut Pl011, slot: usize, window_base: u64, window_len: u64) -> u64 {
+pub(crate) fn load(uart: &mut Pl011, slot: usize, window_base: u64, window_len: u64) {
     let start = core::ptr::addr_of!(__monitor_tpl_start) as usize;
     let end = core::ptr::addr_of!(__monitor_tpl_end) as usize;
     let len = end - start;
@@ -244,6 +249,4 @@ pub(crate) fn load(uart: &mut Pl011, slot: usize, window_base: u64, window_len: 
          {ROUNDS} observe-and-yield rounds against its peer and then powers off",
         crate::linux::slot_dom(slot)
     );
-
-    window_base
 }
