@@ -3,7 +3,7 @@
 
 # `docs/` — what is in here, and what to read first
 
-**34 documents.** They are not a manual and they are not in order; each one was
+**35 documents.** They are not a manual and they are not in order; each one was
 written to close a specific arc, and each records *what was established, what was refuted, and what
 was left open* at the moment it closed.
 
@@ -139,6 +139,7 @@ first if you want the conclusion before the construction.*
 |---|---|
 | [`QEMU-AND-METAL.md`](QEMU-AND-METAL.md) | ★ **what testing against QEMU does and does not mean.** Read before trusting any "on the metal" claim |
 | [`ROADMAP.md`](ROADMAP.md) | from a proven model toward a "slim Qubes" — where this is going |
+| [`CONSUMER-CORTENFORGE.md`](CONSUMER-CORTENFORGE.md) | ⚠ **a requirements derivation, not a commitment** — what a named consumer would need, and the one place it **collides with the Tier-D precondition**. Read before reviving any rung parked "for want of a consumer" |
 | [`MILESTONES.md`](MILESTONES.md) | ⛔ **a LOG, not status** — the append-only record, 23 entries from M1's toy hypercall to two Alpine kernels on EL2. Moved out of the root README, where it was 561 of 850 lines |
 
 ---
