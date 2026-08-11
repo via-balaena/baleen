@@ -1778,7 +1778,9 @@ struct LinuxFrame {
 // PSCI function IDs (SMC Calling Convention) — the same set `guest.rs`'s Arc-5c handler services.
 const PSCI_VERSION_FID: u64 = 0x8400_0000;
 const PSCI_FEATURES_FID: u64 = 0x8400_000A;
-/// `pub(crate)` for [`crate::monitor`]: the bare-metal payload retires through the **same** FID a
+// (`crate::monitor` is spelled without an intra-doc link on purpose: the module exists only under
+// `--features monitor`, and a link would be a broken one — `-D warnings` — in every other config.)
+/// `pub(crate)` for `crate::monitor`: the bare-metal payload retires through the **same** FID a
 /// Linux guest issues, so it takes the same handler and the same retirement path rather than a
 /// second shutdown sequence that runs once and is never exercised again.
 pub(crate) const PSCI_SYSTEM_OFF_FID: u64 = 0x8400_0008;

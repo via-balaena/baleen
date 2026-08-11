@@ -196,6 +196,7 @@ fn main() {
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
                  qemu-linux-smmu just the SMMU boot configuration, run alone\n  \
+                 qemu-linux-monitor just the mixed-criticality boot (bare-metal monitor beside Linux)\n  \
                  metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)\n  \
                  fvp-lint   the same bar for BOTH standalone probes (build only — CI cannot run the AEM or a board)",
                 METAL_LINT_CONFIGS.len()
@@ -378,7 +379,7 @@ enum LinuxBoot {
 /// ⚠ **This is a SECOND declaration of a fact `hv-metal::linux::MONITOR_SLOT` owns**, and it cannot
 /// be folded into one: `hv-metal` is workspace-excluded and does not link for the host, which is the
 /// same wall the guest-RAM addresses hit (see the memory-contract note above). It is bound the same
-/// way they are — **at RUN time, by a marker**. [`MONITOR_MARKERS`] asserts hv-metal's own
+/// way they are — **at RUN time, by a marker**. [`LINUX_MONITOR_MARKERS`] asserts hv-metal's own
 /// `guestimage n/a: dom 2 …` line, so a disagreement about which slot is bare-metal fails the gate
 /// rather than producing a guest that finds no kernel where one was promised.
 const MONITOR_SLOT: u64 = 1;
@@ -1322,7 +1323,13 @@ const LINUX_MARKERS: &[&str] = &[
     // The round trip home.
     "baleen: dom 1 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
     "baleen: dom 2 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
-    "baleen: every real Linux guest has powered off — 2 unmodified kernels ran isolated on hv-metal's EL2 and shut down",
+    // ⚠ The closing line's counts are now a census over payloads rather than `NUM_GUESTS`, so this
+    // boot asserts `2 … + 0 …` — and the explicit ZERO is the useful half: the shipped transcript
+    // now states that no slot was swapped out for a bare-metal partition, which it previously could
+    // not say at all. The mixed boot asserts `1 … + 1 …` in `LINUX_MONITOR_MARKERS`.
+    "baleen: every partition has powered off — 2 unmodified kernel(s) and 0 bare-metal monitor \
+     partition(s) ran isolated on hv-metal's EL2, time-slicing one pCPU, and shut down through the \
+     same PSCI SYSTEM_OFF path",
     // ★ The pending-set rung's discriminating witness, and the ONE marker here that asserts a
     // property the shipped guest cannot demonstrate on its own. Before it, a guest that filled the
     // list-register bank reached `crate::park()` — and it could: mask interrupts, then write
@@ -1365,7 +1372,7 @@ const LINUX_MARKERS: &[&str] = &[
 /// claim; and `retire dom 1: RETIRED FOR A FAULT` is what stops a killed domain being reported as a
 /// clean shutdown — the witness-that-lies this rung had to avoid.
 ///
-/// ⚠ **`every real Linux guest has powered off` is deliberately ABSENT**, and its absence is checked
+/// ⚠ **`every partition has powered off` is deliberately ABSENT**, and its absence is checked
 /// by `LINUX_FAULT_FORBIDDEN`: a boot in which a domain was killed must not claim they all shut down.
 const LINUX_FAULT_MARKERS: &[&str] = &[
     "baleen: guest FAULT: EC=0x24 data abort outside every emulated device",
@@ -1400,7 +1407,12 @@ const LINUX_PEER_LOOP_MARKERS: &[&str] = &[
 /// exactly the conflation `Retirement` exists to prevent, and the reason `end_of_boot` gates that
 /// line on every slot being `PoweredOff`.
 const LINUX_FAULT_FORBIDDEN: &[&str] = &[
-    "baleen: every real Linux guest has powered off",
+    // ⚠⚠ **A FORBIDDEN MARKER GOES VACUOUS SILENTLY, WHICH IS WHY THIS ONE IS CALLED OUT.** The
+    // summary line was reworded (its counts became a payload census), and a stale string here would
+    // have kept passing forever — "absent" is the pass condition, and a string the boot can no
+    // longer print is absent for the wrong reason. A required marker screams when it rots; a
+    // forbidden one goes quiet. **Reword the hv-metal line and this entry in the same commit.**
+    "baleen: every partition has powered off",
     "baleen: dom 1 issued PSCI SYSTEM_OFF",
 ];
 
@@ -1468,19 +1480,54 @@ const LINUX_FAULT_FORBIDDEN: &[&str] = &[
 /// `virt`. It also means the guest half of this corpus cannot fail *independently* of the device
 /// half in that direction, which is why the probe is recorded with what it actually showed rather
 /// than with the tidier result that was expected.
-/// The mixed-criticality boot's corpus. **Written against a captured transcript, not from the
-/// source** — every string below was read off a real run before it was pinned here.
+const LINUX_SMMU_MARKERS: &[&str] = &[
+    "baleen: smmu rung1 DEFAULT-DENY",
+    "baleen: smmu rung2 THROUGH-STE",
+    "baleen: smmu rung2 STREAM-TABLE",
+    "baleen: smmu rung2 STREAMID-SPECIFIC",
+    "baleen: smmu rung2 OUT-OF-RANGE",
+    // ★★ ⑲-2 — the arc's point: a bus master confined by a REAL guest's own proven map.
+    //
+    // Rungs 1/2 above are about the SMMU itself and rung 3 (synthetic-config only) proves
+    // confinement to a domain built for the test. THIS one binds the device to `S2TTB` = the very
+    // table `VTTBR_EL2` carries for a domain running an unmodified Alpine kernel, under that
+    // domain's VMID, and shows the device reaches that guest's memory and is ABORTED on its peer's.
+    //
+    // ⚠ Two things it does NOT claim, both stated on `dmawitness::witness_real_guest`: the positive
+    // arm is a CONTROL only (real guests are identity-mapped, so it cannot separate "translated"
+    // from "passed through" — that is rung 3's, on a non-identity map); and this is CONFINEMENT,
+    // not SIMULTANEITY — nothing runs while THIS device DMAs. Ledger item 2(b) is closed by the
+    // `dmaflight OK` marker below, not by this one.
+    "baleen: smmu realguest OK",
+    // ★★ ⑲-3b — the same confinement, IN FLIGHT ACROSS GUEST EXECUTION, which closes honest-ledger
+    // item 2(b). Every DMA result before this one was taken with the machine quiesced around the
+    // device; this one is kicked 200 exits into a running pair of kernels and observed from the exit
+    // path. ⚠ It claims "in flight across guest execution", NOT wall-clock concurrency — one pCPU
+    // under TCG cannot support the stronger sentence, and `report_dma_inflight`'s docs say so.
+    //
+    // ★ The binding is DERIVED, not written: one `DeviceAssign` through the proven dispatch, then
+    // re-derived from the model by `teardown::dispatch` on every dispatch for the whole flight. A
+    // hand-poked STE measurably does NOT survive this — which is what makes it rung 4b's thesis
+    // doing work rather than a property nothing depended on.
+    "baleen: dmaflight OK",
+    // ★★ ㉑ — the SMMU's TRANSLATION is per-stream, not merely its permission. Two live requesters
+    // walking two different Stage-2 images: the same two addresses answered opposite ways by which
+    // device asked. Rung 2 phase 3 already showed permission is per-stream (a permissive entry at a
+    // neighbouring StreamID does not let the device through); this is the half that needed a second
+    // requester, and it is the half the confinement story actually rests on.
+    "baleen: twomasters OK",
+];
+
+/// The mixed-criticality boot's corpus — a bare-metal monitor partition beside a real Linux guest.
 ///
-/// ⚠ **Its own list rather than a filter over [`LINUX_MARKERS`], for the reason
-/// [`LINUX_FAULT_MARKERS`] is:** dom 2 does not run Linux in this configuration, so roughly half of
-/// that corpus is *legitimately* absent — and a filter that decided which half by matching `"dom 2"`
-/// would be a heuristic silently choosing what the gate asserts. Two lines mention both domains and
-/// have to be *replaced* rather than dropped, which a filter cannot express at all.
+/// **Written against a captured transcript, not from the source**: every string below was read off a
+/// real run before it was pinned here.
+///
 /// ## What this corpus asserts, in three groups
 ///
 /// **1 — the machine really is mixed.** The banner's derived counts, the payload deposit, and the
 /// `guestimage n/a` line together say one slot was given a kernel and the other was not. The counts
-/// are rendered from [`payload_of`], so a census that started lying would change these strings.
+/// are rendered from hv-metal's own `payload_of` census, so a census that started lying would change these strings.
 ///
 /// **2 — the monitor really RAN, as a scheduled EL1 partition.** Its console lines arrive through
 /// *its own* emulated PL011 (`[dom 2] …`, tagged by the model instance that received the byte), it
@@ -1589,44 +1636,6 @@ const LINUX_MONITOR_MARKERS: &[&str] = &[
     "baleen: every partition has powered off — 1 unmodified kernel(s) and 1 bare-metal monitor \
      partition(s) ran isolated on hv-metal's EL2, time-slicing one pCPU, and shut down through the \
      same PSCI SYSTEM_OFF path",
-];
-
-const LINUX_SMMU_MARKERS: &[&str] = &[
-    "baleen: smmu rung1 DEFAULT-DENY",
-    "baleen: smmu rung2 THROUGH-STE",
-    "baleen: smmu rung2 STREAM-TABLE",
-    "baleen: smmu rung2 STREAMID-SPECIFIC",
-    "baleen: smmu rung2 OUT-OF-RANGE",
-    // ★★ ⑲-2 — the arc's point: a bus master confined by a REAL guest's own proven map.
-    //
-    // Rungs 1/2 above are about the SMMU itself and rung 3 (synthetic-config only) proves
-    // confinement to a domain built for the test. THIS one binds the device to `S2TTB` = the very
-    // table `VTTBR_EL2` carries for a domain running an unmodified Alpine kernel, under that
-    // domain's VMID, and shows the device reaches that guest's memory and is ABORTED on its peer's.
-    //
-    // ⚠ Two things it does NOT claim, both stated on `dmawitness::witness_real_guest`: the positive
-    // arm is a CONTROL only (real guests are identity-mapped, so it cannot separate "translated"
-    // from "passed through" — that is rung 3's, on a non-identity map); and this is CONFINEMENT,
-    // not SIMULTANEITY — nothing runs while THIS device DMAs. Ledger item 2(b) is closed by the
-    // `dmaflight OK` marker below, not by this one.
-    "baleen: smmu realguest OK",
-    // ★★ ⑲-3b — the same confinement, IN FLIGHT ACROSS GUEST EXECUTION, which closes honest-ledger
-    // item 2(b). Every DMA result before this one was taken with the machine quiesced around the
-    // device; this one is kicked 200 exits into a running pair of kernels and observed from the exit
-    // path. ⚠ It claims "in flight across guest execution", NOT wall-clock concurrency — one pCPU
-    // under TCG cannot support the stronger sentence, and `report_dma_inflight`'s docs say so.
-    //
-    // ★ The binding is DERIVED, not written: one `DeviceAssign` through the proven dispatch, then
-    // re-derived from the model by `teardown::dispatch` on every dispatch for the whole flight. A
-    // hand-poked STE measurably does NOT survive this — which is what makes it rung 4b's thesis
-    // doing work rather than a property nothing depended on.
-    "baleen: dmaflight OK",
-    // ★★ ㉑ — the SMMU's TRANSLATION is per-stream, not merely its permission. Two live requesters
-    // walking two different Stage-2 images: the same two addresses answered opposite ways by which
-    // device asked. Rung 2 phase 3 already showed permission is per-stream (a permissive entry at a
-    // neighbouring StreamID does not let the device through); this is the half that needed a second
-    // requester, and it is the half the confinement story actually rests on.
-    "baleen: twomasters OK",
 ];
 
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
@@ -3204,6 +3213,12 @@ const MARKER_CORPUS: &[(&str, &[&str], usize)] = &[
     // census covered everything. Latent, not live: no doc quotes one today (checked). Listing it
     // here pins it AND puts it in the census, because both now read this one table.
     ("LINUX_SMMU_MARKERS", LINUX_SMMU_MARKERS, 8),
+    // The mixed-criticality boot's 37. ★ **This gate's universe check caught the array the DAY it
+    // was written** — the corpus was added, the boot was wired up and verified green, and
+    // `doc-markers` still failed with "`LINUX_MONITOR_MARKERS` is a marker array that
+    // `MARKER_CORPUS` does not pin, so it is ungated". That is ⑳-d's other half doing exactly what
+    // it was built for, on its author, before the PR left the branch.
+    ("LINUX_MONITOR_MARKERS", LINUX_MONITOR_MARKERS, 37),
 ];
 
 /// The number of marker lines [`BOOT_TEST`] contributes — the synthetic path's half of the corpus.

@@ -131,6 +131,7 @@ that silently covers a quarter of the crate is worse than none — the previous 
 | module | what |
 |---|---|
 | [`src/observe.rs`](src/observe.rs) | ⚠ `--features observe` — a safety monitor the watched partition **cannot blind**. Demonstrates the flaw first (consent is revocable), then the repair (invert ownership). See [`docs/CONSUMER-CORTENFORGE.md`](../docs/CONSUMER-CORTENFORGE.md) |
+| [`src/monitor.rs`](src/monitor.rs) | ⚠ `--features monitor` — the **mixed-criticality configuration**: a small bare-metal monitor partition time-slicing one pCPU beside an unmodified Linux guest. Establishes **co-residency**; it observes nothing yet |
 
 ### The real-Linux capstone
 
