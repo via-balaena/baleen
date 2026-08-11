@@ -144,10 +144,17 @@ FORBIDDEN_MARKERS=(
     # The X half. Printed only if a jump INTO EL2's data returned, i.e. the fetch was permitted.
     "XN NOT ENFORCED"
     # The one-way observation channel (`--features observe`). Printed by any phase that fails to
-    # hold OR fails to demonstrate what it exists to demonstrate — including phase A failing to
-    # blind the monitor, which is the case a required-marker list alone would NOT catch, since a
-    # phase that returns early prints nothing. Global rather than per-config for the same reason
-    # W^X's are: no configuration may ever reach it.
+    # hold or fails to demonstrate what it exists to demonstrate.
+    #
+    # ⚠ It is NOT catching a case the required-marker list misses — a phase that fails simply omits
+    # its marker, and the required list already turns that red. This comment first claimed
+    # otherwise, and the claim was about the gate's own structure, which is the worst place to be
+    # loose. What the forbidden marker actually buys is (a) a DIAGNOSTIC: the FAIL line carries the
+    # individual booleans, so a red run says which half broke instead of only that something did,
+    # and (b) a guard against a FUTURE phase that prints a partial success alongside a failure —
+    # the shape a required-only list genuinely cannot see.
+    #
+    # Global rather than per-config for the same reason W^X's are: no configuration may ever reach it.
     "baleen: observe FAIL"
 )
 
