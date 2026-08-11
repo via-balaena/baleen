@@ -33,6 +33,17 @@
 //! behind its own proven-emitted Stage-2 image. "Owns the machine" is the one phrase of the original
 //! framing that has to go: a guest owns its RAM and nothing else, and now not even a CPU to itself.
 //!
+//! ⚠ **AND THAT COUNT IS NOW PER-CONFIGURATION, so do not read "two kernels" as a property of this
+//! file.** Under `--features monitor` one slot carries a small bare-metal partition
+//! (`Payload::Monitor`, from `crate::monitor`) instead of a kernel — the mixed-criticality role
+//! `docs/CONSUMER-CORTENFORGE.md` derives. Neither name is an intra-doc link because both exist
+//! only under that feature, where a link would break every other config's rustdoc.
+//! **Read [`payload_of`] for what a slot carries and
+//! [`runs_linux`] before asserting anything about a kernel.** The paragraph above is left as it
+//! stands because it is true of the shipped `real-linux` boot; this pointer is here because the
+//! ⑱-4b correction it records was itself missed in three other files for want of exactly such a
+//! pointer, which is the lesson #195 paid for.
+//!
 //! ## The model — the guest owns its RAM, and NOTHING else
 //!
 //! hv-metal maps the guest's RAM window through Stage-2 and **no device MMIO whatsoever**:
@@ -303,6 +314,186 @@ pub(crate) const NUM_GUESTS: usize = 2;
 /// The guest slot that boots first, and the one that does not run until ③-b2b-ii-c.
 const SLOT_A: usize = 0;
 const SLOT_B: usize = 1;
+
+/// **What a guest slot actually carries.**
+///
+/// Until the `monitor` configuration every slot ran an unmodified Linux kernel, so "which guest" was
+/// the only per-slot axis and "is it Linux" was not a question anything could ask. It is now, and
+/// this is the one place that answers it.
+///
+/// ★ **A value rather than a `#[cfg]` at each use site, and that is the rung's main structural
+/// decision.** Roughly a dozen per-guest reports assert Linux-workload facts — a userspace marker in
+/// the transmit stream, a kernel's bus scan, a device tree's reservations. Under a `#[cfg]` per site
+/// each of those is an independent chance to forget one, and a forgotten one does not fail: it
+/// **asserts a Linux fact about a partition that never ran Linux**, and the zero it reads is
+/// correct. That is design-lesson #127's shape exactly, and [`witnesses_assertable`] exists because
+/// the fault probe already found three reports doing it.
+///
+/// ⚠ **A skipped assertion must SAY it was skipped.** A report that quietly drops a slot presents a
+/// subset as a total — the defect ⑳-f was built to catch, written into the guard against it. Every
+/// site that consults this prints which slots it covered and why.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Payload {
+    /// An unmodified aarch64 Linux kernel, loaded by QEMU `-device loader`.
+    Linux,
+    /// [`crate::monitor`]'s bare-metal payload, copied out of hv-metal's own `.rodata`.
+    #[cfg(feature = "monitor")]
+    Monitor,
+}
+
+/// The slot carrying the bare-metal monitor in the `monitor` configuration.
+///
+/// **Not slot A**, and the constraint is structural rather than a preference: slot A is the one
+/// entered by `run`'s `eret`, with `ELR_EL2`/`SPSR_EL2` written directly, while every other slot is
+/// entered by a context restore from [`crate::vcpu::VcpuCtx::seed_boot`]. Putting the monitor on a
+/// restored slot is what makes it a *payload swap* instead of a second entry sequence.
+#[cfg(feature = "monitor")]
+pub(crate) const MONITOR_SLOT: usize = SLOT_B;
+
+#[cfg(feature = "monitor")]
+const _: () = assert!(
+    MONITOR_SLOT != SLOT_A,
+    "the monitor must sit on a context-restored slot; slot A is entered by run()'s own eret"
+);
+
+/// What guest `slot` carries. Total over the slots this build deploys.
+pub(crate) const fn payload_of(slot: usize) -> Payload {
+    #[cfg(feature = "monitor")]
+    if slot == MONITOR_SLOT {
+        return Payload::Monitor;
+    }
+    let _ = slot;
+    Payload::Linux
+}
+
+/// Whether `slot` runs a real kernel — the guard every Linux-workload witness consults.
+pub(crate) const fn runs_linux(slot: usize) -> bool {
+    matches!(payload_of(slot), Payload::Linux)
+}
+
+/// **Whether `slot`'s Linux-DRIVER witnesses apply — and if they do not, SAY SO on the wire.**
+///
+/// A whole family of per-guest witnesses assert that a kernel's driver traffic went through EL2's
+/// emulation: forwarded timer ticks, GIC register traps, mediated SGIs, routed SPIs, affinity
+/// collisions. Every one of them reads **zero** for a partition that has no drivers, and zero is the
+/// *correct* reading — the same shape [`witnesses_assertable`] exists for, arriving through a
+/// different door. (Measured: the first boot of the `monitor` configuration produced six such
+/// FAILs, all of them true statements about a machine that was working.)
+///
+/// ⚠⚠ **The exemption is PRINTED, and that is the whole design of this function.** A guard that
+/// merely `continue`d would leave the transcript looking exactly like a boot where those witnesses
+/// had been asserted and passed — a subset presented as a total, which is the defect ⑳-f was built
+/// to catch. So the skip is a line on the wire naming the slot, the mechanisms, and the reason.
+///
+/// ★ **The Linux partition's witnesses are NOT weakened by this.** Each of these reports loops over
+/// slots and asserts per-slot; exempting a slot with no drivers removes nothing from the slot that
+/// has them, which is why this is a per-slot question and not a per-boot one.
+fn linux_driver_witnesses_apply(slot: usize, uart: &mut Pl011) -> bool {
+    if runs_linux(slot) {
+        return true;
+    }
+    let _ = writeln!(
+        uart,
+        "baleen: driverwitness n/a: dom {} carries the bare-metal monitor payload — it runs no \
+         kernel and drives no GIC, timer, SGI or SPI, so the vtimer / vgic / vsgi / vspi / \
+         irqconfine / perguest witnesses have nothing to observe for this slot and are NOT asserted \
+         for it. They ARE asserted, unchanged, for every slot that runs Linux",
+        slot_dom(slot)
+    );
+    false
+}
+
+/// What `slot` carries, and — for a Linux slot — the reason its landing pad stayed untouched.
+///
+/// The two halves of the pad claim are genuinely different evidence: a kernel honoured a `no-map`
+/// reservation it read out of its own device tree (asserted independently by the `OF: reserved mem:
+/// … nomap …` markers), while the bare-metal payload has no device tree and simply never addresses
+/// the range. Collapsing both into "its device tree reserves no-map" is what made that line false
+/// for a slot with no device tree.
+fn payload_kind(slot: usize) -> &'static str {
+    if runs_linux(slot) {
+        "unmodified Linux, no-map reserved in its own device tree"
+    } else {
+        "bare-metal monitor, which has no device tree and never addresses the range"
+    }
+}
+
+/// What `slot` carries, for a transcript line. Short enough to sit inside a sentence.
+fn payload_name(slot: usize) -> &'static str {
+    if runs_linux(slot) {
+        "kernel 'ARM\\x64'"
+    } else {
+        "bare-metal payload"
+    }
+}
+
+/// **Whether guest `slot`'s RAM window still holds the payload EL2 deposited in it**, and the word
+/// that was actually read there.
+///
+/// The signature differs per payload — an `Image` carries its magic at [`IMAGE_MAGIC_OFF`], the
+/// bare-metal payload is raw instructions from its first byte — so this reads the right place and
+/// compares against the right thing. Returned as a pair so a failing caller can print what it saw
+/// rather than only that it disagreed (design-lesson #71: a check whose diagnostic cannot
+/// discriminate is half a check).
+fn peer_payload_at(slot: usize) -> (bool, u32) {
+    if runs_linux(slot) {
+        let magic = peek::u32_at(guest_ram_base(slot) + IMAGE_MAGIC_OFF);
+        return (magic == IMAGE_MAGIC, magic);
+    }
+    #[cfg(feature = "monitor")]
+    {
+        let word = peek::u32_at(guest_ram_base(slot));
+        (word == crate::monitor::first_word(), word)
+    }
+    // Unreachable without the feature — `runs_linux` is total and returns `true` for every slot when
+    // no payload swap is compiled in — but written as a value rather than an `unreachable!()`: this
+    // runs inside a fault handler, where a panic would replace a real diagnostic with a worse one.
+    #[cfg(not(feature = "monitor"))]
+    (false, 0)
+}
+
+/// How many slots run an unmodified kernel, and how many carry a bare-metal payload.
+///
+/// Derived from [`payload_of`] rather than written down, so the boot banner and the per-payload
+/// reports cannot claim a division of the machine that the seeding does not perform.
+const fn count_payload(want_linux: bool) -> usize {
+    let mut n = 0;
+    let mut slot = 0;
+    while slot < NUM_GUESTS {
+        if runs_linux(slot) == want_linux {
+            n += 1;
+        }
+        slot += 1;
+    }
+    n
+}
+
+/// Slots running an unmodified Linux kernel.
+const NUM_LINUX: usize = count_payload(true);
+/// Slots carrying a bare-metal payload.
+const NUM_MONITOR: usize = count_payload(false);
+
+const _: () = assert!(
+    NUM_LINUX + NUM_MONITOR == NUM_GUESTS,
+    "the payload census does not cover every slot"
+);
+
+/// **At least one slot still runs Linux.** The configuration is *mixed* criticality: a monitor with
+/// no partition to sit beside would make every peer-relative witness in this file vacuous.
+const _: () = {
+    let mut any = false;
+    let mut slot = 0;
+    while slot < NUM_GUESTS {
+        if runs_linux(slot) {
+            any = true;
+        }
+        slot += 1;
+    }
+    assert!(
+        any,
+        "no slot runs Linux — the mixed-criticality claim needs a real kernel to be mixed WITH"
+    );
+};
 
 /// A guest slot's model [`DomId`]. Dom 0 is the control domain, so guest slot `i` is dom `i + 1`.
 ///
@@ -762,16 +953,24 @@ fn report_dma_pad(uart: &mut Pl011) {
     if ok {
         let _ = writeln!(
             uart,
-            "baleen: dmapad OK: every guest booted an unmodified Linux to userspace and powered \
-             off without writing one byte of the {} KiB its device tree reserves no-map at the top \
-             of its own window (dom {} pad {:#x}, dom {} pad {:#x}, both still holding the \
-             {DMA_PAD_SENTINEL:#x} EL2 left there before the first eret) — a DMA landing here \
-             disturbs nothing a kernel can observe",
+            // ⚠ **"every guest booted an unmodified Linux to userspace" was FALSE the moment a slot
+            // stopped running Linux**, and nothing caught it: this is not a forbidden marker, so the
+            // `monitor` boot printed the sentence and passed. Found by reading the transcript, which
+            // is where this class keeps being found. The claim is now the one the check actually
+            // makes — nobody wrote the pad — and the reason each guest did not is stated per
+            // payload, because for a kernel it is a device-tree reservation being honoured and for
+            // the monitor there is no device tree at all.
+            "baleen: dmapad OK: every partition powered off without writing one byte of the {} KiB \
+             at the top of its own window (dom {} — {} — pad {:#x}; dom {} — {} — pad {:#x}; both \
+             still holding the {DMA_PAD_SENTINEL:#x} EL2 left there before the first eret) — a DMA \
+             landing here disturbs nothing a guest can observe",
             DMA_PAD_SIZE / 1024,
             slot_dom(SLOT_A),
+            payload_kind(SLOT_A),
             dma_pad_ipa(SLOT_A),
-            slot_dom(1),
-            dma_pad_ipa(1),
+            slot_dom(SLOT_B),
+            payload_kind(SLOT_B),
+            dma_pad_ipa(SLOT_B),
         );
     }
 }
@@ -1590,7 +1789,12 @@ struct LinuxFrame {
 // PSCI function IDs (SMC Calling Convention) — the same set `guest.rs`'s Arc-5c handler services.
 const PSCI_VERSION_FID: u64 = 0x8400_0000;
 const PSCI_FEATURES_FID: u64 = 0x8400_000A;
-const PSCI_SYSTEM_OFF_FID: u64 = 0x8400_0008;
+// (`crate::monitor` is spelled without an intra-doc link on purpose: the module exists only under
+// `--features monitor`, and a link would be a broken one — `-D warnings` — in every other config.)
+/// `pub(crate)` for `crate::monitor`: the bare-metal payload retires through the **same** FID a
+/// Linux guest issues, so it takes the same handler and the same retirement path rather than a
+/// second shutdown sequence that runs once and is never exercised again.
+pub(crate) const PSCI_SYSTEM_OFF_FID: u64 = 0x8400_0008;
 const PSCI_VERSION_1_1: u64 = 0x0001_0001;
 const PSCI_NOT_SUPPORTED: u64 = (-1i64) as u64;
 /// PSCI `CPU_ON`, SMC64. ⑱-4b-ii is the rung that answers it with anything but `NOT_SUPPORTED`.
@@ -3302,20 +3506,35 @@ fn handle_peer_fault(
         let in_peer = stage2::walk_stage2(peer_l1, ipa);
         let in_mine = stage2::walk_stage2(mine_l1, ipa);
         let identity = in_peer.map(|r| r.pa == ipa).unwrap_or(false);
-        let magic = peek::u32_at(guest_ram_base(owner) + IMAGE_MAGIC_OFF);
+        // ★ **"The peer's own payload is sitting there" — asked of whichever payload the peer has.**
+        //
+        // This third conjunct is what makes the refusal mean something: an address that is merely
+        // unmapped for the toucher and empty for its owner would fault for a boring reason. It used
+        // to read the `ARM\x64` header, which asked "is a LINUX KERNEL there" — a question with a
+        // right answer only while every slot ran Linux. Under the `monitor` configuration the peer's
+        // window holds a bare-metal payload, and the check FAILED on a machine that was working
+        // exactly as designed (measured, on the first boot of that configuration).
+        //
+        // ⚠ **The general question was always the one worth asking**, and the kernel magic was a
+        // narrow instance of it that happened to be total. What is checked now is that the owner's
+        // window holds *what EL2 deposited in it*, which is the same claim for a kernel and strictly
+        // better evidence for the monitor: the monitor's word is read back out of the template
+        // rather than compared against a constant.
+        let (payload_present, observed) = peer_payload_at(owner);
 
-        if in_mine.is_none() && identity && magic == IMAGE_MAGIC {
+        if in_mine.is_none() && identity && payload_present {
             let _ = writeln!(
                 uart,
                 "baleen: peerfault OK: dom {} touched dom {}'s memory at IPA 0x{ipa:08x} and the \
                  HARDWARE refused it — that address is unmapped in dom {}'s image, resolves to \
-                 itself in dom {}'s live emitted image, and dom {}'s loaded kernel ('ARM\\x64') is \
+                 itself in dom {}'s live emitted image, and dom {}'s own loaded payload ({}) is \
                  sitting there right now; dom {} took the abort and kept running",
                 slot_dom(faulting),
                 slot_dom(owner),
                 slot_dom(faulting),
                 slot_dom(owner),
                 slot_dom(owner),
+                payload_name(owner),
                 slot_dom(faulting)
             );
         } else {
@@ -3323,12 +3542,13 @@ fn handle_peer_fault(
                 uart,
                 "baleen: peerfault FAIL: dom {} faulted at IPA 0x{ipa:08x}, but the refusal proves \
                  nothing — mapped in its own image: {}; resolves to itself in dom {}'s: {}; dom \
-                 {}'s kernel magic there: 0x{magic:08x}",
+                 {}'s {} signature there: 0x{observed:08x}",
                 slot_dom(faulting),
                 in_mine.is_some(),
                 slot_dom(owner),
                 identity,
-                slot_dom(owner)
+                slot_dom(owner),
+                payload_name(owner)
             );
             crate::park();
         }
@@ -3579,8 +3799,9 @@ fn end_of_boot(uart: &mut Pl011) -> ! {
     if (0..NUM_GUESTS).all(|s| retirement_of(s) == Retirement::PoweredOff) {
         let _ = writeln!(
             uart,
-            "baleen: every real Linux guest has powered off — {NUM_GUESTS} unmodified \
-             kernels ran isolated on hv-metal's EL2 and shut down (M5 Arc 5e)"
+            "baleen: every partition has powered off — {NUM_LINUX} unmodified kernel(s) and \
+             {NUM_MONITOR} bare-metal monitor partition(s) ran isolated on hv-metal's EL2, \
+             time-slicing one pCPU, and shut down through the same PSCI SYSTEM_OFF path (M5 Arc 5e)"
         );
     }
     semihosting_exit(); // clean QEMU exit (falls through to a fault→park if -semihosting off)
@@ -3977,11 +4198,18 @@ extern "C" fn handle_linux_sync(frame: *mut LinuxFrame) {
                 // without a terminating newline in front of this `HVC`. Flush before reporting, or
                 // the witness swallows the last thing it said.
                 CONSOLE.borrow_mut().flush(cur, &mut uart);
+                // The FID is shared, so the sentence must name what actually retired. Saying "a real
+                // Linux kernel" over a bare-metal partition would be a false claim in the transcript
+                // the gate reads, made by the one code path both payloads deliberately share.
                 let _ = writeln!(
                     uart,
-                    "baleen: dom {} issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut \
-                     down on hv-metal's EL2",
-                    slot_dom(cur)
+                    "baleen: dom {} issued PSCI SYSTEM_OFF — {} on hv-metal's EL2",
+                    slot_dom(cur),
+                    if runs_linux(cur) {
+                        "a real Linux kernel booted and shut down"
+                    } else {
+                        "the bare-metal monitor partition ran and shut down"
+                    }
                 );
                 // ③-b2b-ii-c2: one guest powering off is no longer the end of the machine. Retire
                 // it in the MODEL and hand the physical CPU to whoever is still Runnable; only when
@@ -4836,6 +5064,34 @@ fn report_vpl011(uart: &mut Pl011) {
         }
         let dom = slot_dom(slot);
         let (ok, traps, dr_writes) = VPL011.borrow_mut()[slot].witness();
+        // ★ A bare-metal slot gets its OWN assertion rather than a skip, and the distinction is the
+        // point. `witness()`'s needle is a **Linux userspace** marker, so it can never fire for a
+        // payload that has no userspace — asserting it here would fail a slot that is working, and
+        // skipping the slot would drop the strongest piece of co-residency evidence this boot
+        // produces. What is checkable for the monitor is the same mechanism minus the needle: the
+        // emulator was entered and relayed the payload's bytes. That is ingress through a SECOND,
+        // non-Linux tenant's device model, which nothing before this configuration could witness.
+        if !runs_linux(slot) {
+            if traps > 0 && dr_writes > 0 {
+                let _ = writeln!(
+                    uart,
+                    "baleen: vpl011 OK: dom {dom}'s console is EMULATED — the bare-metal monitor's \
+                     own bytes reached dom {dom}'s emulated PL011 DR in EL2 ({traps} register \
+                     traps, {dr_writes} bytes relayed). The 'BALEEN-STEP0-OK' needle is NOT checked \
+                     here and could not be: it is a Linux userspace marker and this partition has \
+                     no userspace"
+                );
+            } else {
+                let _ = writeln!(
+                    uart,
+                    "baleen: vpl011 FAIL: dom {dom}'s bare-metal payload transmitted nothing \
+                     through its emulator ({traps} register traps, {dr_writes} bytes) — either it \
+                     never ran or its console window is not being trapped"
+                );
+                crate::park();
+            }
+            continue;
+        }
         if ok {
             let _ = writeln!(
                 uart,
@@ -4876,6 +5132,12 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
         // A retired domain's witnesses are not assertable — see `witnesses_assertable`.
         if !witnesses_assertable(slot) {
+            continue;
+        }
+        // Five of this file's driver witnesses live in this one loop, so the payload exemption is
+        // asked once here rather than five times below — five conditionals would be five chances to
+        // word one differently or forget it entirely.
+        if !linux_driver_witnesses_apply(slot, uart) {
             continue;
         }
         let dom = slot_dom(slot);
@@ -5101,6 +5363,21 @@ mod peek {
 /// spare, and which nothing would have noticed it outgrowing.
 fn report_loaded_images(uart: &mut Pl011) {
     for slot in 0..NUM_GUESTS {
+        // A monitor slot has no externally loaded blobs at all — `crate::monitor::load` copies its
+        // payload out of hv-metal's own `.rodata` and reports what it deposited. Checking for an
+        // `Image` header here would fail on a window that is correct, so the slot is skipped BY NAME
+        // rather than silently: a loop that quietly covers fewer slots than it iterates is the
+        // subset-as-total defect, and this report is exactly where it would be invisible.
+        if !runs_linux(slot) {
+            let _ = writeln!(
+                uart,
+                "baleen: guestimage n/a: dom {} carries no loaded image — its payload is copied \
+                 from EL2's .rodata, so there is no Image, DTB or initramfs to read back here \
+                 (see the `monitor` line for what WAS deposited)",
+                slot_dom(slot)
+            );
+            continue;
+        }
         let (dom, kernel, dtb, initrd) = (
             slot_dom(slot),
             kernel_entry(slot),
@@ -6106,6 +6383,23 @@ fn report_per_guest_state(uart: &mut Pl011) {
             );
             continue;
         }
+        // The same reasoning one axis over, and the same requirement to say so out loud: five of
+        // these eleven counters tally KERNEL DRIVER traffic (GIC traps, INTID enables, forwarded
+        // ticks, SGIs, refused peer accesses), which a partition with no drivers correctly leaves at
+        // zero. ★ Its counters are still PRINTED below, and that is deliberate — the ones it does
+        // exercise (its own PL011 traps, console bytes and lines, dispatches, handovers) are
+        // non-zero beside dom 1's, which is exactly the not-shared evidence this report exists for.
+        // What is dropped is the parking, not the evidence.
+        if !runs_linux(slot) {
+            let _ = writeln!(
+                uart,
+                "baleen: perguest: dom {} carries the bare-metal monitor payload — its counters are \
+                 PRINTED below but not asserted, because five of the eleven tally kernel driver \
+                 traffic a partition with no drivers correctly never generates",
+                slot_dom(slot)
+            );
+            continue;
+        }
         for (name, value) in PER_GUEST_COUNTERS.iter().zip(sample(slot)) {
             if value == 0 && dead.is_none() {
                 dead = Some((slot_dom(slot), *name));
@@ -6117,11 +6411,21 @@ fn report_per_guest_state(uart: &mut Pl011) {
         None => {
             let _ = writeln!(
                 uart,
+                // ⚠ The count is [`NUM_LINUX`], not `NUM_GUESTS`: a slot whose counters were exempted
+                // above must not be claimed as one they were asserted for. With no payload swap
+                // compiled in the two are equal and this line is byte-identical to what it always
+                // was — which is why the shipped corpus's marker is unchanged.
                 "baleen: perguest OK: the guests' device models, vCPU contexts and witnesses are \
                  INDEXED, not shared — all {} of them are non-zero for EVERY one of the \
-                 {NUM_GUESTS} guests, which no arrangement of shared state produces (a shared \
-                 model carries both guests' work in one tally and leaves the other at zero)",
-                PER_GUEST_COUNTERS.len()
+                 {NUM_LINUX} guests, which no arrangement of shared state produces (a shared \
+                 model carries both guests' work in one tally and leaves the other at zero){}",
+                PER_GUEST_COUNTERS.len(),
+                if NUM_MONITOR == 0 {
+                    ""
+                } else {
+                    ". The bare-metal slot's own tallies are printed below and are non-zero where \
+                     it has a mechanism to exercise, which is the same not-shared evidence"
+                }
             );
             for slot in 0..NUM_GUESTS {
                 let c = sample(slot);
@@ -6225,12 +6529,30 @@ extern "C" {
 /// GIC/timer, point `ELR_EL2` at the loaded kernel `Image`, install the Linux vectors, and `eret`
 /// into a real Linux kernel with `x0` = the DTB. Never returns (transfers to EL1).
 pub(crate) fn run(uart: &mut Pl011) -> ! {
+    // ⚠ **Counted, never written down.** This line used to say `{NUM_GUESTS} REAL … kernels`, which
+    // was one hardcoded relationship — "every slot runs Linux" — asserted in the first sentence of
+    // the transcript. The `monitor` configuration makes it false, and a number that only a human
+    // re-reads is a number that rots (design-lesson #276). Both counts are now derived from
+    // [`payload_of`], so the banner cannot disagree with what the boot actually seeds.
     let _ = writeln!(
         uart,
-        "baleen: M5 Arc 5e — booting {NUM_GUESTS} REAL aarch64 Linux kernels as EL1 guests \
-         time-slicing ONE pCPU (dom {GUEST_A} owns 0x{GUEST_RAM_BASE:08x}..0x{split:08x}, dom \
-         {GUEST_B} owns 0x{split:08x}..0x{GUEST_RAM_END:08x})",
+        "baleen: M5 Arc 5e — booting {NUM_LINUX} REAL aarch64 Linux kernel(s) + {NUM_MONITOR} \
+         bare-metal monitor partition(s) as EL1 guests time-slicing ONE pCPU (dom {GUEST_A} owns \
+         0x{GUEST_RAM_BASE:08x}..0x{split:08x}, dom {GUEST_B} owns \
+         0x{split:08x}..0x{GUEST_RAM_END:08x})",
         split = stage2::LINUX_RAM_SPLIT
+    );
+
+    // The monitor's payload has no external loader, so EL2 deposits it here — BEFORE
+    // `report_loaded_images`, which is the readback of what every slot now holds. Doing the copy
+    // first is what lets that report speak about all `NUM_GUESTS` slots in one pass instead of
+    // being silent about one of them.
+    #[cfg(feature = "monitor")]
+    crate::monitor::load(
+        uart,
+        MONITOR_SLOT,
+        guest_ram_base(MONITOR_SLOT),
+        PARTITION.window_len,
     );
 
     // ③-b2b-ii-b — BEFORE anything else, read what the loader actually deposited. Every guest's
@@ -6468,20 +6790,27 @@ pub(crate) fn run(uart: &mut Pl011) -> ! {
             VCPU_SEEDED
                 .at(slot, VcpuIdx::boot())
                 .store(1, Ordering::Relaxed);
+            // ★ The payload swap in one value. A bare-metal tenant is entered at the same window
+            // base under the same `SPSR`/`SCTLR_EL1` — it is an EL1 guest booting on a machine with
+            // the MMU off, which is what the arm64 boot protocol describes and is not a Linux fact.
+            // What differs is `x0`: a kernel takes a DTB pointer there, and the monitor takes
+            // nothing, so it is handed a zero rather than a pointer to a device tree describing a
+            // machine it will never parse.
+            let x0 = if runs_linux(slot) { dtb_addr(slot) } else { 0 };
             ctx.at_mut(slot, VcpuIdx::boot()).seed_boot(
                 kernel_entry(slot),
-                dtb_addr(slot),
+                x0,
                 SPSR_EL2_LINUX,
                 sctlr_at_boot,
             );
             let _ = writeln!(
                 uart,
-                "baleen: dom {} seeded for its first switch-in — entry 0x{:08x}, x0 = DTB \
-                 0x{:08x}, SPSR 0x{SPSR_EL2_LINUX:x}, SCTLR_EL1 0x{sctlr_at_boot:x} (MMU off, as \
+                "baleen: dom {} seeded for its first switch-in — entry 0x{:08x}, x0 = {} \
+                 0x{x0:08x}, SPSR 0x{SPSR_EL2_LINUX:x}, SCTLR_EL1 0x{sctlr_at_boot:x} (MMU off, as \
                  the arm64 boot protocol requires); it is entered by a context restore, not an eret",
                 slot_dom(slot),
                 kernel_entry(slot),
-                dtb_addr(slot)
+                if runs_linux(slot) { "DTB" } else { "(none)" },
             );
         }
     }

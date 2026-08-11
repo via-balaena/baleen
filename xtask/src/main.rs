@@ -82,7 +82,9 @@ fn main() {
         "qemu-test" => run("bash", &["hv-metal/boot-test.sh"]),
         // Metal (M5 Arc 5e): boot REAL aarch64 Linux under hv-metal — `linux::NUM_GUESTS` (2)
         // unmodified kernels, isolated from each other, not one. ⚠ This said "a single EL1 guest"
-        // until 2026-08-11; see the sweep note in `hv-metal/src/main.rs`.
+        // until 2026-08-11; see the sweep note in `hv-metal/src/main.rs`. ★ And the count is
+        // per-CONFIGURATION: `LinuxBoot::Monitor` gives one slot a bare-metal monitor partition
+        // instead of a kernel, so it loads blobs for fewer slots than the machine has.
         // Needs a kernel `Image` + initramfs in `$BALEEN_LINUX_DIR`, which `hv-metal/linux/
         // fetch-guest-image.sh` builds from checksum-pinned Alpine downloads.
         //   `qemu-linux`      the interactive demo (stdio inherited; you watch a kernel boot).
@@ -106,8 +108,13 @@ fn main() {
             let faulted = qemu_linux(true, LinuxBoot::UnmappedFault);
             let looped = qemu_linux(true, LinuxBoot::PeerLoop);
             let smmu = qemu_linux(true, LinuxBoot::Smmu);
-            shipped && faulted && looped && smmu
+            let monitor = qemu_linux(true, LinuxBoot::Monitor);
+            shipped && faulted && looped && smmu && monitor
         }
+        // The mixed-criticality boot alone, for working on the monitor without paying the other
+        // four. Same reasoning as `qemu-linux-smmu`: a named task, not a local-only escape hatch —
+        // it is the fifth configuration of the REQUIRED `qemu-linux-test` above.
+        "qemu-linux-monitor" => qemu_linux(true, LinuxBoot::Monitor),
         // ⑲-1b — the same boot `qemu-linux-test` now runs as its fourth configuration, kept as a
         // named task for running it alone during SMMU work. It is NOT a local-only escape hatch:
         // see `LINUX_SMMU_MARKERS` for why that is no longer needed.
@@ -191,6 +198,7 @@ fn main() {
                  qemu-linux      boot a REAL Linux kernel under hv-metal (interactive demo)\n  \
                  qemu-linux-test the same boot, headless, asserting its markers (a CI check)\n  \
                  qemu-linux-smmu just the SMMU boot configuration, run alone\n  \
+                 qemu-linux-monitor just the mixed-criticality boot (bare-metal monitor beside Linux)\n  \
                  metal-lint fmt --check + clippy + rustdoc, all -D warnings, for hv-metal ({} feature configs)\n  \
                  fvp-lint   the same bar for BOTH standalone probes (build only — CI cannot run the AEM or a board)",
                 METAL_LINT_CONFIGS.len()
@@ -358,6 +366,30 @@ enum LinuxBoot {
     /// It asserts BOTH corpora — the full shipped real-Linux marker set *and* the SMMU's rung-1/2
     /// markers — so neither half can rot behind the other.
     Smmu,
+    /// ★ **The MIXED-CRITICALITY configuration:** slot [`MONITOR_SLOT`] carries `hv-metal`'s
+    /// bare-metal monitor payload instead of a second Linux kernel, so an unmodified kernel and a
+    /// small analyzable partition time-slice one pCPU.
+    ///
+    /// The machine is the shipped one; what changes is that this boot loads blobs for **fewer slots
+    /// than the machine has**, because the monitor's payload is copied out of hv-metal's own
+    /// `.rodata` and needs no external artifact, device tree or initramfs.
+    Monitor,
+}
+
+/// The guest slot carrying the bare-metal monitor under [`LinuxBoot::Monitor`].
+///
+/// ⚠ **This is a SECOND declaration of a fact `hv-metal::linux::MONITOR_SLOT` owns**, and it cannot
+/// be folded into one: `hv-metal` is workspace-excluded and does not link for the host, which is the
+/// same wall the guest-RAM addresses hit (see the memory-contract note above). It is bound the same
+/// way they are — **at RUN time, by a marker**. [`LINUX_MONITOR_MARKERS`] asserts hv-metal's own
+/// `guestimage n/a: dom 2 …` line, so a disagreement about which slot is bare-metal fails the gate
+/// rather than producing a guest that finds no kernel where one was promised.
+const MONITOR_SLOT: u64 = 1;
+
+/// Whether guest `slot` carries a Linux payload in this configuration — the loader's half of the
+/// question [`MONITOR_SLOT`] describes. Total over the boots this file can launch.
+fn slot_runs_linux(boot: LinuxBoot, slot: u64) -> bool {
+    !(boot == LinuxBoot::Monitor && slot == MONITOR_SLOT)
 }
 
 /// How many extra peer-probe nodes the [`LinuxBoot::PeerLoop`] device tree carries.
@@ -448,10 +480,18 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
     // they cannot drift. Running A through it too means the needle checks below guard A's DTB as
     // well, on every single boot.
     let initrd_size = std::fs::metadata(&initrd).map(|m| m.len()).unwrap_or(0);
-    let mut dtbs = Vec::new();
+    //
+    // ⚠ **The monitor configuration renders a DTB for FEWER slots than it has**, so the slot each
+    // path belongs to is carried explicitly rather than taken from the vector's index. Index
+    // alignment would still be correct today — the monitor sits on the LAST slot — and would break
+    // silently the moment it did not, which is the kind of coincidence this file has been burned by.
+    let mut dtbs: Vec<(u64, PathBuf)> = Vec::new();
     for slot in 0..NUM_GUESTS {
+        if !slot_runs_linux(boot, slot) {
+            continue;
+        }
         match render_guest_dtb(task, &dir, slot, initrd_size, boot) {
-            Some(path) => dtbs.push(path),
+            Some(path) => dtbs.push((slot, path)),
             None => return false,
         }
     }
@@ -531,8 +571,8 @@ fn qemu_linux(check: bool, boot: LinuxBoot) -> bool {
     // `const assert!` on `LINUX_RAM_END`), which is precisely the condition under which nobody
     // notices the check is missing.
     let mut blobs: Vec<(String, &std::path::Path, u64)> = Vec::new();
-    for (slot, dtb) in dtbs.iter().enumerate() {
-        let at = guest_load_addrs(slot as u64);
+    for (slot, dtb) in &dtbs {
+        let at = guest_load_addrs(*slot);
         blobs.push((
             format!("dom {} Image", slot + 1),
             image.as_path(),
@@ -742,6 +782,10 @@ fn render_guest_dtb(
         // ⑲-1: byte-identical device trees to the shipped boot — the guests must not be able to
         // tell they are on a machine with an SMMU, which is the point.
         LinuxBoot::Smmu => "",
+        // Byte-identical for the same reason, one axis over: the Linux partition must not be able to
+        // tell that its PEER is a bare-metal monitor rather than a second kernel. Its device tree
+        // describes its own window and its own devices, neither of which the payload swap touches.
+        LinuxBoot::Monitor => "",
     };
     let dts_out = dir.join(format!("guest-dom{dom}{suffix}.dts"));
     let dtb_out = dir.join(format!("guest-dom{dom}{suffix}.dtb"));
@@ -849,8 +893,15 @@ const LINUX_MARKERS: &[&str] = &[
     // can bind the two — ⑭ folded the contract into one declaration everywhere it *could* reach, and
     // this marker is what binds the remaining cross-crate seam. Change `LINUX_KERNEL_ADDR` or
     // `LINUX_DTB_ADDR` without changing hv-metal and this goes red here rather than hanging a guest.
-    "baleen: M5 Arc 5e — booting 2 REAL aarch64 Linux kernels as EL1 guests time-slicing ONE pCPU \
-     (dom 1 owns 0x48000000..0x64000000, dom 2 owns 0x64000000..0x80000000)",
+    //
+    // ⚠ **The COUNTS in this line moved from prose to a derivation, and this marker is what pins
+    // them.** hv-metal used to print `{NUM_GUESTS} REAL … kernels`, which silently assumed every
+    // slot runs Linux; the `monitor` configuration makes that false, so the banner now counts
+    // payloads. Asserting the rendered result here is what keeps the derivation honest — a census
+    // that started miscounting would change this string rather than merely printing a wrong number.
+    "baleen: M5 Arc 5e — booting 2 REAL aarch64 Linux kernel(s) + 0 bare-metal monitor \
+     partition(s) as EL1 guests time-slicing ONE pCPU (dom 1 owns 0x48000000..0x64000000, dom 2 \
+     owns 0x64000000..0x80000000)",
     // ③-b2a: 224 leaves each, not 448 — the window is split. BOTH domains are asserted, so a
     // build that quietly stopped emitting the peer would redden here and not only at `peer OK`.
     "baleen: linux model built for dom 1 — 224 super-span leaves (448 MiB at 0x48000000) across 28 L2-pinned tables, into stage-2 set 0",
@@ -1274,7 +1325,13 @@ const LINUX_MARKERS: &[&str] = &[
     // The round trip home.
     "baleen: dom 1 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
     "baleen: dom 2 issued PSCI SYSTEM_OFF — a real Linux kernel booted and shut down on hv-metal's EL2",
-    "baleen: every real Linux guest has powered off — 2 unmodified kernels ran isolated on hv-metal's EL2 and shut down",
+    // ⚠ The closing line's counts are now a census over payloads rather than `NUM_GUESTS`, so this
+    // boot asserts `2 … + 0 …` — and the explicit ZERO is the useful half: the shipped transcript
+    // now states that no slot was swapped out for a bare-metal partition, which it previously could
+    // not say at all. The mixed boot asserts `1 … + 1 …` in `LINUX_MONITOR_MARKERS`.
+    "baleen: every partition has powered off — 2 unmodified kernel(s) and 0 bare-metal monitor \
+     partition(s) ran isolated on hv-metal's EL2, time-slicing one pCPU, and shut down through the \
+     same PSCI SYSTEM_OFF path",
     // ★ The pending-set rung's discriminating witness, and the ONE marker here that asserts a
     // property the shipped guest cannot demonstrate on its own. Before it, a guest that filled the
     // list-register bank reached `crate::park()` — and it could: mask interrupts, then write
@@ -1295,9 +1352,15 @@ const LINUX_MARKERS: &[&str] = &[
     // off. On its own this is only consistent with the reservation being honoured — the half that
     // says Linux SAW the range is the pair of `OF: reserved mem: …nomap…` markers ABOVE, one per
     // guest. Matched up to the addresses, which are the part that varies.
-    "baleen: dmapad OK: every guest booted an unmodified Linux to userspace and powered off \
-     without writing one byte of the 2048 KiB its device tree reserves no-map at the top of its \
-     own window",
+    //
+    // ⚠ **This sentence used to say "every guest booted an unmodified Linux to userspace", and it
+    // became FALSE the day a slot stopped running one** — the mixed-criticality boot printed it and
+    // passed, because `dmapad OK` is a required marker here and not a forbidden one, so nothing
+    // compares it against the machine. Found by reading a transcript. The claim now matches what the
+    // check performs (nobody wrote the pad); the per-payload REASON is printed after this prefix,
+    // which is why the pin stops here.
+    "baleen: dmapad OK: every partition powered off without writing one byte of the 2048 KiB at \
+     the top of its own window",
 ];
 
 /// What the **fault-probe** boot must show, and it is the whole rung in five lines.
@@ -1311,7 +1374,7 @@ const LINUX_MARKERS: &[&str] = &[
 /// claim; and `retire dom 1: RETIRED FOR A FAULT` is what stops a killed domain being reported as a
 /// clean shutdown — the witness-that-lies this rung had to avoid.
 ///
-/// ⚠ **`every real Linux guest has powered off` is deliberately ABSENT**, and its absence is checked
+/// ⚠ **`every partition has powered off` is deliberately ABSENT**, and its absence is checked
 /// by `LINUX_FAULT_FORBIDDEN`: a boot in which a domain was killed must not claim they all shut down.
 const LINUX_FAULT_MARKERS: &[&str] = &[
     "baleen: guest FAULT: EC=0x24 data abort outside every emulated device",
@@ -1346,7 +1409,12 @@ const LINUX_PEER_LOOP_MARKERS: &[&str] = &[
 /// exactly the conflation `Retirement` exists to prevent, and the reason `end_of_boot` gates that
 /// line on every slot being `PoweredOff`.
 const LINUX_FAULT_FORBIDDEN: &[&str] = &[
-    "baleen: every real Linux guest has powered off",
+    // ⚠⚠ **A FORBIDDEN MARKER GOES VACUOUS SILENTLY, WHICH IS WHY THIS ONE IS CALLED OUT.** The
+    // summary line was reworded (its counts became a payload census), and a stale string here would
+    // have kept passing forever — "absent" is the pass condition, and a string the boot can no
+    // longer print is absent for the wrong reason. A required marker screams when it rots; a
+    // forbidden one goes quiet. **Reword the hv-metal line and this entry in the same commit.**
+    "baleen: every partition has powered off",
     "baleen: dom 1 issued PSCI SYSTEM_OFF",
 ];
 
@@ -1450,6 +1518,126 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
     // neighbouring StreamID does not let the device through); this is the half that needed a second
     // requester, and it is the half the confinement story actually rests on.
     "baleen: twomasters OK",
+];
+
+/// The mixed-criticality boot's corpus — a bare-metal monitor partition beside a real Linux guest.
+///
+/// **Written against a captured transcript, not from the source**: every string below was read off a
+/// real run before it was pinned here.
+///
+/// ## What this corpus asserts, in three groups
+///
+/// **1 — the machine really is mixed.** The banner's derived counts, the payload deposit, and the
+/// `guestimage n/a` line together say one slot was given a kernel and the other was not. The counts
+/// are rendered from hv-metal's own `payload_of` census, so a census that started lying would change these strings.
+///
+/// **2 — the monitor really RAN, as a scheduled EL1 partition.** Its console lines arrive through
+/// *its own* emulated PL011 (`[dom 2] …`, tagged by the model instance that received the byte), it
+/// was entered by a context restore rather than an `eret`, and it retired through the shared PSCI
+/// path. ★ **The load-bearing one is the WFI count**: `4 WFIs trapped, 4 of them yielded the pCPU to
+/// a peer` is EL2's own tally of the payload's four observe-and-yield rounds, so it is a number
+/// produced by the scheduler about a loop written in the guest — the two halves cannot agree by
+/// accident, and one line of output could not produce it.
+///
+/// **3 — the Linux partition was NOT degraded by sitting beside it.** Dom 1's full driver-witness
+/// set is asserted unchanged: emulated console to userspace, forwarded ticks, emulated GIC, mediated
+/// SGIs, routed SPIs, and the peer-fault refusal. That is what makes this a mixed-criticality claim
+/// rather than a boot with one guest missing.
+///
+/// ⚠ **Its own list rather than a filter over [`LINUX_MARKERS`], for the reason
+/// [`LINUX_FAULT_MARKERS`] is:** dom 2 does not run Linux here, so a large part of that corpus is
+/// *legitimately* absent — and a filter deciding which part by matching `"dom 2"` would be a
+/// heuristic silently choosing what the gate asserts. Two of its lines name both domains and have to
+/// be **replaced** rather than dropped, which a filter cannot express at all.
+///
+/// ⚠ **What is NOT asserted here, stated so the corpus is not read as more than it is:** dom 2's
+/// vtimer / vgic / vsgi / vspi / irqconfine / perguest witnesses. A partition with no drivers
+/// generates no driver traffic, so those read zero *correctly*. hv-metal prints one
+/// `driverwitness n/a` line naming every one of them and the slot it exempted — and **that line is
+/// asserted below**, so the exemption cannot become silent.
+///
+/// ⚠ **And the big one: THIS BOOT ESTABLISHES CO-RESIDENCY, NOT OBSERVATION.** The monitor watches
+/// nothing. `peer OK … DISJOINT` is asserted below exactly as the shipped boot asserts it, because
+/// no channel exists yet. Giving the monitor a read-only view of the policy partition is the next
+/// rung, and it is the one that must weaken that line to say anything true.
+const LINUX_MONITOR_MARKERS: &[&str] = &[
+    // ── 1. the machine is mixed, and the counts are derived ──
+    "baleen: M5 Arc 5e — booting 1 REAL aarch64 Linux kernel(s) + 1 bare-metal monitor \
+     partition(s) as EL1 guests time-slicing ONE pCPU (dom 1 owns 0x48000000..0x64000000, dom 2 \
+     owns 0x64000000..0x80000000)",
+    // The payload deposit. The byte count is NOT pinned — it is whatever the assembler produced, and
+    // pinning it would redden on every wording change to a string inside the blob.
+    "baleen: monitor OK: dom 2 carries the bare-metal monitor payload —",
+    "from EL2's own .rodata, no external image and no device tree; it runs 4 observe-and-yield \
+     rounds against its peer and then powers off",
+    "baleen: guestimage OK: dom 1 — Image 'ARM\\x64' 34 MiB, relocatable, at 0x48000000; DTB \
+     0xd00dfeed at 0x4b000000; gzip initramfs at 0x4c000000",
+    "baleen: guestimage n/a: dom 2 carries no loaded image",
+    // Both images are still built and still disjoint — the payload swap changes what a window HOLDS,
+    // never who may reach it.
+    "baleen: linux model built for dom 1 — 224 super-span leaves (448 MiB at 0x48000000) across 28 L2-pinned tables, into stage-2 set 0",
+    "baleen: linux model built for dom 2 — 224 super-span leaves (448 MiB at 0x64000000) across 28 L2-pinned tables, into stage-2 set 1",
+    "baleen: peer OK: two domains, two Stage-2 images, DISJOINT over the guest-RAM window",
+    // ── 2. the monitor ran as a scheduled EL1 partition ──
+    //
+    // Seeded with no DTB pointer, and entered by a context restore — the two facts that make this a
+    // payload swap on the existing entry path rather than a second entry sequence.
+    "baleen: dom 2 seeded for its first switch-in — entry 0x64000000, x0 = (none) 0x00000000",
+    "it is entered by a context restore, not an eret",
+    // Its own words, through its OWN emulated PL011 — the `[dom N]` tag is derived from which model
+    // instance received the byte, so these lines cannot be produced by any other slot's device.
+    "[dom 2] baleen-monitor: alive — a bare-metal EL1 partition beside an unmodified Linux guest",
+    // Every round, individually. `ROUNDS` is 4; asserting each one (rather than only the last) is
+    // what makes this a claim about being scheduled REPEATEDLY.
+    "[dom 2] baleen-monitor: round 1",
+    "[dom 2] baleen-monitor: round 2",
+    "[dom 2] baleen-monitor: round 3",
+    "[dom 2] baleen-monitor: round 4",
+    "[dom 2] baleen-monitor: rounds complete, retiring through PSCI SYSTEM_OFF",
+    // ★★ EL2's own count of those rounds. The payload yields with `WFI`; the hypervisor tallies the
+    // traps and the handovers. Four rounds written in the guest, four yields counted in EL2.
+    "baleen: wfi: dom 2 — 4 WFIs trapped, 4 of them yielded the pCPU to a peer",
+    "baleen: idle: dom 2 vcpu 0 — blocked 4 time(s), woken 4",
+    // The emulated console, entered by a second NON-LINUX tenant, with the needle exemption stated in
+    // the same sentence so it cannot be read as a checked claim.
+    "baleen: vpl011 OK: dom 2's console is EMULATED — the bare-metal monitor's own bytes reached \
+     dom 2's emulated PL011 DR in EL2",
+    "The 'BALEEN-STEP0-OK' needle is NOT checked here and could not be: it is a Linux userspace \
+     marker and this partition has no userspace",
+    // Retirement through the SAME PSCI path a kernel takes, named for what actually retired.
+    "baleen: dom 2 issued PSCI SYSTEM_OFF — the bare-metal monitor partition ran and shut down on \
+     hv-metal's EL2",
+    "baleen: retire dom 2: powered off cleanly",
+    // The exemption itself is a REQUIRED marker: a skipped witness that stopped announcing itself
+    // would leave this transcript looking like one where those witnesses had passed.
+    "baleen: driverwitness n/a: dom 2 carries the bare-metal monitor payload",
+    "the vtimer / vgic / vsgi / vspi / irqconfine / perguest witnesses have nothing to observe for \
+     this slot and are NOT asserted for it",
+    "baleen: perguest: dom 2 carries the bare-metal monitor payload — its counters are PRINTED \
+     below but not asserted",
+    // ── 3. the Linux partition is undegraded beside it ──
+    "Linux version 6.18.",
+    "Run /init as init process",
+    "[dom 1] ########## BALEEN-STEP0-OK ##########",
+    "baleen: vpl011 OK: dom 1's console is EMULATED — its own userspace's 'BALEEN-STEP0-OK' was \
+     written to dom 1's emulated PL011 DR register in EL2",
+    "baleen: vtimer OK: dom 1's scheduler tick is FORWARDED —",
+    "baleen: vgic OK: dom 1's interrupt controller is EMULATED —",
+    "of dom 1's SGIs MEDIATED at EL2 —",
+    "baleen: vspi OK: dom 1 re-aimed INTID 33 away from its boot vCPU and EL2 HONOURED it",
+    "baleen: vcpu OK: dom 1 was dispatched onto the pCPU",
+    // ★ The isolation refusal, with its third conjunct now payload-general: dom 1 is refused dom 2's
+    // memory, and what is sitting at that address is dom 2's OWN deposited payload — which is what
+    // stops the fault being a boring one about empty space.
+    "baleen: peerfault OK: dom 1 touched dom 2's memory at IPA 0x64000fe0 and the HARDWARE refused \
+     it",
+    "dom 2's own loaded payload (bare-metal payload) is sitting there right now; dom 1 took the \
+     abort and kept running",
+    // Both partitions retire, and the closing line counts them by payload rather than calling them
+    // all kernels.
+    "baleen: every partition has powered off — 1 unmodified kernel(s) and 1 bare-metal monitor \
+     partition(s) ran isolated on hv-metal's EL2, time-slicing one pCPU, and shut down through the \
+     same PSCI SYSTEM_OFF path",
 ];
 
 /// Strings that must NEVER appear — the twin of `boot-test.sh`'s `FORBIDDEN_MARKERS`.
@@ -1662,6 +1850,7 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
             .chain(LINUX_SMMU_MARKERS.iter())
             .copied()
             .collect(),
+        LinuxBoot::Monitor => LINUX_MONITOR_MARKERS.to_vec(),
     };
     for m in &markers {
         if serial.contains(m) {
@@ -1674,7 +1863,7 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
     // `LINUX_FAULT_FORBIDDEN` applies to BOTH retiring boots: in each of them a domain was KILLED,
     // so neither may claim every guest powered off, and dom 1 may not claim it shut down.
     let forbidden = LINUX_FORBIDDEN.iter().chain(match boot {
-        LinuxBoot::Shipped | LinuxBoot::Smmu => [].iter(),
+        LinuxBoot::Shipped | LinuxBoot::Smmu | LinuxBoot::Monitor => [].iter(),
         LinuxBoot::UnmappedFault | LinuxBoot::PeerLoop => LINUX_FAULT_FORBIDDEN.iter(),
     });
     for m in forbidden {
@@ -1723,6 +1912,7 @@ fn metal_build_linux(boot: LinuxBoot) -> bool {
     // ⑳-e made for memory types, and the reason the linux half of ⑳-f's invariant needs no parser.
     let features = match boot {
         LinuxBoot::Smmu => LINUX_SMMU_FEATURES,
+        LinuxBoot::Monitor => LINUX_MONITOR_FEATURES,
         _ => LINUX_FEATURES,
     };
     run(
@@ -1752,6 +1942,9 @@ const LINUX_FEATURES: &str = "real-linux,selftest";
 /// As [`LINUX_FEATURES`], for the SMMU boot (⑲-1) — the machine has an SMMU, so the binary must be
 /// the one that programs it.
 const LINUX_SMMU_FEATURES: &str = "real-linux,selftest,smmu";
+/// As [`LINUX_FEATURES`], for the mixed-criticality boot — slot [`MONITOR_SLOT`] carries the
+/// bare-metal monitor payload instead of a second kernel.
+const LINUX_MONITOR_FEATURES: &str = "real-linux,selftest,monitor";
 
 /// Every `hv-metal` feature configuration `metal-lint` covers — the ONE place the set is written
 /// down, so anything that wants to state its size (the usage text) derives the number instead of
@@ -1809,6 +2002,10 @@ const METAL_LINT_CONFIGS: &[&[&str]] = &[
     // so by this list's own stated invariant it must be linted; before this rung it was a config
     // that compiled and that no gate ever looked at, which is ⑭b's finding one rung along.
     &["--features", LINUX_SMMU_FEATURES],
+    // The mixed-criticality configuration. BUILT AND BOOTED by `qemu-linux-test`'s `Monitor` boot,
+    // so it belongs here from the day it lands — the invariant above, applied on arrival rather
+    // than discovered missing later, which is exactly what ⑳-f cost.
+    &["--features", LINUX_MONITOR_FEATURES],
     // ⑱-6 — the removed-fix probe. It is NOT booted by any gate (it is run by hand and its result is
     // tabulated in `docs/VGIC-SPI-ROUTING.md`), so this is the list's invariant read the other way:
     // a probe nothing lints is a probe that can stop compiling without anyone finding out until the
@@ -3018,6 +3215,12 @@ const MARKER_CORPUS: &[(&str, &[&str], usize)] = &[
     // census covered everything. Latent, not live: no doc quotes one today (checked). Listing it
     // here pins it AND puts it in the census, because both now read this one table.
     ("LINUX_SMMU_MARKERS", LINUX_SMMU_MARKERS, 8),
+    // The mixed-criticality boot's 37. ★ **This gate's universe check caught the array the DAY it
+    // was written** — the corpus was added, the boot was wired up and verified green, and
+    // `doc-markers` still failed with "`LINUX_MONITOR_MARKERS` is a marker array that
+    // `MARKER_CORPUS` does not pin, so it is ungated". That is ⑳-d's other half doing exactly what
+    // it was built for, on its author, before the PR left the branch.
+    ("LINUX_MONITOR_MARKERS", LINUX_MONITOR_MARKERS, 37),
 ];
 
 /// The number of marker lines [`BOOT_TEST`] contributes — the synthetic path's half of the corpus.
