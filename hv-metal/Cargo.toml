@@ -62,6 +62,21 @@ xn-probe = []
 # lesson ㉕ paid four probes to learn. See `src/observe.rs` and `docs/CONSUMER-CORTENFORGE.md`.
 observe = []
 
+# `monitor` builds the **mixed-criticality configuration**: guest slot B carries a small bare-metal
+# monitor payload instead of a second Linux kernel, so an unmodified kernel and a tiny analyzable
+# partition time-slice one pCPU, isolated. It IMPLIES `real-linux` — the monitor is a tenant of that
+# capstone's machine (its window, its emitted Stage-2, its emulated console), not a boot of its own.
+#
+# ★ This is the last requirement in `docs/CONSUMER-CORTENFORGE.md`'s table that was gated on nothing
+# — every other open row needs a physical board. A monitor running full Linux has a TCB nobody can
+# certify under IEC 61508 / ISO 13482, so "the monitor is small" is the whole runtime-assurance
+# argument, and until this configuration existed the two halves had only ever run separately.
+#
+# ⚠ It establishes CO-RESIDENCY and no channel: the monitor observes nothing yet, and the boot says
+# so. Giving it a read-only view of the policy partition is the next rung, and that one has to
+# weaken `linux.rs`'s disjointness claim to say anything true. See `src/monitor.rs`.
+monitor = ["real-linux"]
+
 # `smmu` builds the SMMU **default-deny** boot (the SMMU arc, rungs 1–2: `GBPA.ABORT` before any bus
 # master exists, then a stream table whose every entry denies, and the five-phase witness that the
 # device really does reach it). It is a separate binary rather

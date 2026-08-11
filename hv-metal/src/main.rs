@@ -65,6 +65,8 @@ mod heap;
 #[cfg(feature = "real-linux")]
 mod linux;
 mod mmu;
+#[cfg(feature = "monitor")]
+mod monitor;
 #[cfg(feature = "observe")]
 mod observe;
 mod pcie;
