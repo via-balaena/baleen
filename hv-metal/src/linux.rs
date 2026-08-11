@@ -368,6 +368,25 @@ const _: () = assert!(
 // ("a frame a domain neither owns nor holds a grant for is not in the table at all"). So the
 // monitor's descriptor is emitted BY THE PROVEN EMITTER from an authorized edge; nothing here writes
 // a descriptor, and nothing here is a special case in the emitter.
+//
+// ## ★★ THE KILL PROBES — all four run, all four killed (2026-08-11)
+//
+// A channel witness that cannot fail is decorative, which is the lesson ㉕ paid four probes to
+// learn. Each of these was applied to a working tree, booted, and reverted.
+//
+// | # | probe | result |
+// |---|---|---|
+// | 1 | ask for a **writable** link while holding only the read-only grant | `Unauthorized` — the model refuses; **the monitor cannot widen its own view** |
+// | 2 | delete the grant entirely, keep the link | `Unauthorized` — the leaf exists *because* of the grant, not because it was written |
+// | 3 | read-write grant + writable link, **descriptor check left asserting** | `observe FAIL … got Reach { perm: Rw, xn: false }` — **voice 1** catches it |
+// | 4 | the same, with the descriptor check **relaxed** so the payload runs | the payload's own readback prints `OBSERVE FAIL … my store LANDED` — **voice 3** catches it |
+//
+// ★ Probe 4 is the one that matters, because it is the only one that tests the witness the monitor
+// makes **for itself**: same three instructions, on a leaf that really is writable, opposite verdict.
+// ⚠ And note how 3 and 4 compose: with a writable leaf there is no fault, so `observe OK` (voice 2)
+// is correctly **absent** while voice 3 FAILs. The two disagree in the same direction, which is what
+// independent witnesses are supposed to do — had voice 2 still fired, it would have been reporting a
+// refusal that never happened.
 
 /// The model frame the monitor observes: **guest A's first**, whose window base is where its kernel
 /// `Image` was loaded.

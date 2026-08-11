@@ -1408,6 +1408,16 @@ const LINUX_PEER_LOOP_MARKERS: &[&str] = &[
 /// printed it would be reporting a clean two-kernel shutdown for a boot where a kernel was retired —
 /// exactly the conflation `Retirement` exists to prevent, and the reason `end_of_boot` gates that
 /// line on every slot being `PoweredOff`.
+const LINUX_FAULT_FORBIDDEN: &[&str] = &[
+    // ⚠⚠ **A FORBIDDEN MARKER GOES VACUOUS SILENTLY, WHICH IS WHY THIS ONE IS CALLED OUT.** The
+    // summary line was reworded (its counts became a payload census), and a stale string here would
+    // have kept passing forever — "absent" is the pass condition, and a string the boot can no
+    // longer print is absent for the wrong reason. A required marker screams when it rots; a
+    // forbidden one goes quiet. **Reword the hv-metal line and this entry in the same commit.**
+    "baleen: every partition has powered off",
+    "baleen: dom 1 issued PSCI SYSTEM_OFF",
+];
+
 /// Strings the **mixed-criticality** boot must NOT show, on top of [`LINUX_FORBIDDEN`].
 ///
 /// ⚠⚠ **Its own list rather than an addition to [`LINUX_FORBIDDEN`], and that is lesson #285 applied
@@ -1422,16 +1432,6 @@ const LINUX_PEER_LOOP_MARKERS: &[&str] = &[
 /// one that matters most — the monitor taking a **READ** fault inside its own observation window,
 /// which is the blinded-monitor condition #193 spent a whole rung making impossible.
 const LINUX_MONITOR_FORBIDDEN: &[&str] = &["baleen: observe FAIL"];
-
-const LINUX_FAULT_FORBIDDEN: &[&str] = &[
-    // ⚠⚠ **A FORBIDDEN MARKER GOES VACUOUS SILENTLY, WHICH IS WHY THIS ONE IS CALLED OUT.** The
-    // summary line was reworded (its counts became a payload census), and a stale string here would
-    // have kept passing forever — "absent" is the pass condition, and a string the boot can no
-    // longer print is absent for the wrong reason. A required marker screams when it rots; a
-    // forbidden one goes quiet. **Reword the hv-metal line and this entry in the same commit.**
-    "baleen: every partition has powered off",
-    "baleen: dom 1 issued PSCI SYSTEM_OFF",
-];
 
 /// ★ **⑲-1's corpus: the shipped real-Linux boot PLUS the SMMU's own markers, in ONE boot.**
 ///
