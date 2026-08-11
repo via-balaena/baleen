@@ -11,8 +11,14 @@
 >
 > **What this document is not.** A commitment, a schedule, or a scope. Nothing here is
 > queued. It is the input a rung gets scoped *from*, and its most useful output is the
-> two places where the consumer's requirements **collide with a property this project
-> has already proved** — because those are design questions, not backlog items.
+> place where the consumer's requirements **collide with a property this project has
+> already proved** — because that is a design question, not a backlog item.
+>
+> ⚠ This sentence first read *"the **two** places"*, and there is **one**. The other ⚠
+> rows below are gaps — unanalyzed, or never attempted — which is a different and much
+> cheaper thing than a collision with a theorem. Corrected rather than quietly reworded,
+> because a count asserted in a header is exactly the kind this project keeps writing
+> wrong (#276, #281–#284).
 
 ## The consumer
 
@@ -90,13 +96,14 @@ expressible today, in `hv-core/src/hypervisor.rs`:
   `writable` permission bit, so a **read-only** grant is the natural shape of "the
   monitor may read the policy's commanded output and may not alter it".
 
+⚠ Introducing that channel is the point at which the isolation headline stops being
+*"no channel"* and becomes *"exactly one channel, in one direction, and here is the
+proof"*. **That is a strictly harder claim to make and a strictly more useful one.** It
+should not be attempted as a side effect of some other rung.
+
 ⚠ **Expressible is not proved.** What the vocabulary supports is *stating* the weakened
 property; whether the Tier-D argument survives the weakening, and what it degrades to, is
 the actual work and is not answered here.
-⚠ It is also the point at which the isolation headline stops being *"no channel"* and
-becomes *"exactly one channel, in one direction, and here is the proof"*. **That is a
-strictly harder claim to make and a strictly more useful one.** It should not be
-attempted as a side effect of some other rung.
 
 ## The requirement table
 
