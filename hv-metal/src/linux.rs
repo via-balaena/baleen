@@ -1552,7 +1552,21 @@ fn report_disjointness(vttbr: &[u64; NUM_GUESTS], uart: &mut Pl011) {
     #[cfg(not(feature = "monitor"))]
     let b_expected = per;
 
-    if a_own == per && b_own == b_expected && a_peer == 0 && b_peer == 0 {
+    // ⚠⚠ **㉗'s two counters are ASSERTED, not merely printed, and that is not a formality.** The
+    // success line says "gave up 1 … reaches EXACTLY 1", and both numbers come from branches
+    // reached only if their frame index falls where this code thinks it does. Without this check an
+    // `OBSERVED_FRAME` outside the walked range — or a `VACATED_OFFSET` that stopped matching —
+    // would leave the counter at **0**, and the boot would cheerfully print *"reaches EXACTLY 0 of
+    // dom 1's"* under a green `peer OK`. That is #275's shape ("found nothing" and "nothing is
+    // wrong" are the same output), inside the rung whose entire subject is one frame.
+    //
+    // ★ Kill-probed (probe 5): disabling the observed-frame branch reddens the boot.
+    #[cfg(feature = "monitor")]
+    let channel_ok = observed == 1 && vacated == 1;
+    #[cfg(not(feature = "monitor"))]
+    let channel_ok = true;
+
+    if a_own == per && b_own == b_expected && a_peer == 0 && b_peer == 0 && channel_ok {
         #[cfg(not(feature = "monitor"))]
         let _ = writeln!(
             uart,
@@ -1584,8 +1598,21 @@ fn report_disjointness(vttbr: &[u64; NUM_GUESTS], uart: &mut Pl011) {
     } else {
         let _ = writeln!(
             uart,
-            "baleen: peer FAIL: the two images are NOT disjoint — dom {GUEST_A} own={a_own} \
-             peer={a_peer}, dom {GUEST_B} own={b_own} peer={b_peer} (expected own={per}, peer=0)"
+            "baleen: peer FAIL: the two images are not as this configuration expects — dom \
+             {GUEST_A} own={a_own} peer={a_peer}, dom {GUEST_B} own={b_own} peer={b_peer} \
+             (expected dom {GUEST_A} own={per}, dom {GUEST_B} own={b_expected}, peer=0)"
+        );
+        // ㉗ — a SECOND line rather than an interpolated clause, because `no_std` has no cheap way
+        // to build one conditionally. ★ It earns its keep: probe 5 showed the line above reporting
+        // `peer=1`, which reads as an ISOLATION failure and sends a reader to debug the emitter,
+        // while the real cause was `observed=0` — the channel's frame never walked. A shared
+        // diagnostic for two unrelated failure modes misdirects on at least one of them.
+        #[cfg(feature = "monitor")]
+        let _ = writeln!(
+            uart,
+            "baleen: peer FAIL: the observation channel counted observed={observed} \
+             vacated={vacated} (expected 1 and 1) — a zero here means the frame the channel is \
+             built on was never walked, not that the images disagree"
         );
         crate::park();
     }
