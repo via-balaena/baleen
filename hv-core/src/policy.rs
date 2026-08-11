@@ -15,7 +15,23 @@
 //! **What it is vs. what the mechanism is.** The mechanism has a *safety invariant*
 //! (one vCPU per pCPU, checked every transition). A policy has no safety invariant of
 //! its own — a bad policy is unfair, not unsafe. What it has instead are *properties*
-//! worth proving, and this one is built to hold three:
+//! worth proving, and this one is built to hold **four**:
+//!
+//! ⚠ This line said **three** while four were listed below — sleeper-fairness was added without
+//! the count moving. Nothing gates a count inside a module doc, which is exactly why a number in
+//! prose is a liability (design-lesson #276). Corrected, not quietly reworded.
+//!
+//! ⚠⚠ **"Worth proving" is the operative phrase: NONE OF THE FOUR IS PROVEN.** This module sits
+//! in `hv-core` — the crate whose isolation core is machine-checked — and a reader is entitled to
+//! assume its contents carry that tier. They do not. **No Kani harness and no Verus obligation
+//! touches `policy::`, and no deep sweep names it.** The evidence for every property below is
+//! `hv-sim`'s seeded simulation, which is the project's *weakest* tier.
+//!
+//! That is defensible and deliberate — a policy has no safety invariant, so a bad one is unfair
+//! rather than unsafe, and the mechanism beneath it *is* proven and cannot be corrupted by a
+//! wrong choice here. **But it must not be silent**, because anything that comes to depend on a
+//! latency property (a safety monitor, say) would be depending on a simulation result while
+//! believing it depended on a proof.
 //!
 //! * **Work-conserving** — it never leaves a physical CPU idle while a vCPU is
 //!   runnable. After [`Scheduler::advance`] settles, no idle-CPU/waiting-vCPU pair
@@ -23,9 +39,19 @@
 //! * **Weighted-proportional-fair** — each vCPU carries a [`Weight`]; over time the
 //!   CPU splits between continuously-runnable vCPUs in proportion to their weights,
 //!   because the policy always runs the one with the least *service per weight*.
-//! * **Starvation-free** — a [`Scheduler::quantum`] time-slice forces a running vCPU to
-//!   yield to a more-deserving waiter, so nobody waits behind a CPU-bound peer
-//!   forever.
+//! * **Starvation-free, with a MEASURED BOUND rather than "eventually"** — a
+//!   [`Scheduler::quantum`] time-slice forces a running vCPU to yield to a more-deserving
+//!   waiter. The worst observed wait for a continuously-runnable vCPU `i` is
+//!   `(W_total − wᵢ) × quantum / pcpus + 1`, matched exactly across five configurations by
+//!   `hv-sim`'s `policy_bounds_scheduling_latency`.
+//!   ⚠ **Note what that bound is a function of: the WEIGHTS of the other vCPUs, not their
+//!   number.** The count-based intuition `(vcpus − pcpus) × quantum` predicts 4 for weights
+//!   `[1,2,3]` where the real answer is 11 — so adding a *heavy* neighbour lengthens a vCPU's
+//!   worst case without adding a vCPU. Anything with a latency requirement (a safety monitor,
+//!   say) has to budget against the configured weights.
+//!   ⚠ **Aggregate fairness does not imply this**, and the two are checked separately:
+//!   `policy_starves_no_one` bounds each vCPU's *share*, which a vCPU can satisfy while taking
+//!   its whole portion in two blocks around one enormous gap.
 //! * **Sleeper-fair** — [wake-boost](Scheduler::set_wake_boost) places a vCPU that
 //!   re-enters the runnable pool (from `Blocked`, or freshly `admit`ted) at the pool's
 //!   *floor*, not below it. Without this, a vCPU that slept — and so accrued no
