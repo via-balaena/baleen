@@ -3029,7 +3029,7 @@ const MARKER_CORPUS: &[(&str, &[&str], usize)] = &[
 /// marker existed only in the terminal `wx-probe`/`xn-probe` configurations. Raising a number here
 /// is the normal shape of adding a witness — see the block comment on [`MARKER_CORPUS`] for why
 /// LOWERING one is a different kind of claim.
-const BOOT_TEST_MARKERS: usize = 177;
+const BOOT_TEST_MARKERS: usize = 182;
 
 /// Every marker array [`MARKER_CORPUS`] must account for, found by reading this file.
 ///
