@@ -48,11 +48,13 @@
 //! `a_handle_names_only_the_callers_own_maptrack`: *"cross-domain handle confusion is
 //! unrepresentable, which is stronger than catching it"*).
 //!
-//! Phase B's runtime check — the policy naming `gref` 0 and reaching its own empty slot — is
-//! therefore a *demonstration* of a property the API surface already guarantees, not the
-//! guarantee itself. ⚠ Stated that way round deliberately: a test that passes because the slot
-//! happens to be empty would be a weaker thing than what is actually true here, and conflating
-//! them is how a rung becomes decorative.
+//! Phase B's runtime check — the policy naming [`GREF_B`] and reaching its own slot, which was
+//! never populated — is therefore a *demonstration* of a property the API surface already
+//! guarantees, not the guarantee itself. ⚠ Stated that way round deliberately: a test that
+//! passes because a slot happens to be empty is a weaker thing than what is actually true here,
+//! and conflating them is how a rung becomes decorative. See [`GREF_B`] for why the two phases
+//! must not share a slot — the first draft of this module had them sharing one, and phase B was
+//! quietly passing on phase A's side effect.
 //!
 //! ⚠ **The trade, taken deliberately: the policy can now CORRUPT the shared page.** Accepted —
 //! the contents are the untrusted partition's own claims about itself and were never
@@ -89,9 +91,23 @@ const F_POLICY_OWNED: Frame = 1;
 /// The frame the *monitor* owns in phase B (the inverted, unrevocable direction).
 const F_MONITOR_OWNED: Frame = 2;
 
-/// The grant slot each phase uses. Deliberately the **same number in both phases and in both
-/// domains' tables** — that is the point of phase B's namespace witness.
-const GREF: GrantRef = 0;
+/// Phase A's grant slot, in the **policy's** table.
+const GREF_A: GrantRef = 0;
+
+/// Phase B's grant slot. ⚠ **Deliberately a DIFFERENT number from [`GREF_A`], and the reason is
+/// the whole soundness of phase B's check.**
+///
+/// The two phases must not share a slot. Phase A ends the policy's grant at [`GREF_A`], so after
+/// it runs the policy's slot 0 is `Free` — and a phase-B check that the policy "cannot end
+/// `GREF_A`" would then be passing on **phase A's leftover side effect**, not on the namespace
+/// property it claims. Worse, it would inverting-ly *depend on the flaw*: if phase A ever stopped
+/// being able to revoke, slot 0 would still be occupied and phase B would fail for a reason
+/// unrelated to what it tests.
+///
+/// Using an untouched slot makes "the policy's own table holds nothing here" true **by
+/// construction**, and keeps the two phases independent. The monitor grants at *its own*
+/// `GREF_B`; that the two domains name the same number is exactly the point.
+const GREF_B: GrantRef = 1;
 
 /// Dispatch one call and return the model's verdict, without halting. Phases here *expect*
 /// refusals, so unlike `guest::expect` a failure is data rather than a bug.
@@ -135,7 +151,7 @@ fn phase_a_consent_is_revocable(hv: &mut Hypervisor, uart: &mut Pl011) -> bool {
         hv,
         POLICY_DOM,
         HvCall::GrantAccess {
-            gref: GREF,
+            gref: GREF_A,
             grantee: MONITOR_DOM,
             frame: F_POLICY_OWNED,
             readonly: true,
@@ -151,13 +167,13 @@ fn phase_a_consent_is_revocable(hv: &mut Hypervisor, uart: &mut Pl011) -> bool {
         MONITOR_DOM,
         HvCall::GrantCopy {
             grantor: POLICY_DOM,
-            gref: GREF,
+            gref: GREF_A,
             write: false,
         },
     );
 
     // ⚠ THE DEFECT: nothing holds the grant open, so the observed party revokes it.
-    let revoked = call(hv, POLICY_DOM, HvCall::GrantEndAccess { gref: GREF });
+    let revoked = call(hv, POLICY_DOM, HvCall::GrantEndAccess { gref: GREF_A });
 
     // The monitor is now blind.
     let observed_after = call(
@@ -165,7 +181,7 @@ fn phase_a_consent_is_revocable(hv: &mut Hypervisor, uart: &mut Pl011) -> bool {
         MONITOR_DOM,
         HvCall::GrantCopy {
             grantor: POLICY_DOM,
-            gref: GREF,
+            gref: GREF_A,
             write: false,
         },
     );
@@ -209,7 +225,7 @@ fn phase_b_ownership_is_not_revocable(hv: &mut Hypervisor, uart: &mut Pl011) -> 
         hv,
         MONITOR_DOM,
         HvCall::GrantAccess {
-            gref: GREF,
+            gref: GREF_B,
             grantee: POLICY_DOM,
             frame: F_MONITOR_OWNED,
             readonly: false,
@@ -225,21 +241,23 @@ fn phase_b_ownership_is_not_revocable(hv: &mut Hypervisor, uart: &mut Pl011) -> 
             POLICY_DOM,
             HvCall::GrantMap {
                 grantor: MONITOR_DOM,
-                gref: GREF,
+                gref: GREF_B,
                 writable: true,
             },
         ),
         Ok(HvOutcome::Handle(_))
     );
 
-    // ★ THE WITNESS, and it is a NAMESPACE fact rather than a permission check: the policy
-    //   names `GREF` and reaches its OWN grant table, where it holds nothing. There is no call
-    //   by which it can name the monitor's grant at all.
-    let policy_cannot_reach = !call(hv, POLICY_DOM, HvCall::GrantEndAccess { gref: GREF });
+    // ★ THE WITNESS, and it is a NAMESPACE fact rather than a permission check: the policy names
+    //   `GREF_B` and reaches its OWN grant table, whose slot `GREF_B` was never populated by
+    //   anything (see the const's doc — sharing a slot with phase A made this pass on phase A's
+    //   side effect instead). There is no call by which it can name the MONITOR's slot at all:
+    //   `HvCall::GrantEndAccess { gref }` carries no grantor field.
+    let policy_cannot_reach = !call(hv, POLICY_DOM, HvCall::GrantEndAccess { gref: GREF_B });
 
     // ★ AND the monitor cannot yank it mid-flight either: `InUse` refuses an end while the
     //   mapping is live. The channel is stable in BOTH directions once established.
-    let stable_while_mapped = !call(hv, MONITOR_DOM, HvCall::GrantEndAccess { gref: GREF });
+    let stable_while_mapped = !call(hv, MONITOR_DOM, HvCall::GrantEndAccess { gref: GREF_B });
 
     let held = mapped && policy_cannot_reach && stable_while_mapped;
     if held {
