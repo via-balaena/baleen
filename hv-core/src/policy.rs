@@ -21,6 +21,18 @@
 //! the count moving. Nothing gates a count inside a module doc, which is exactly why a number in
 //! prose is a liability (design-lesson #276). Corrected, not quietly reworded.
 //!
+//! ⚠⚠ **"Worth proving" is the operative phrase: NONE OF THE FOUR IS PROVEN.** This module sits
+//! in `hv-core` — the crate whose isolation core is machine-checked — and a reader is entitled to
+//! assume its contents carry that tier. They do not. **No Kani harness and no Verus obligation
+//! touches `policy::`, and no deep sweep names it.** The evidence for every property below is
+//! `hv-sim`'s seeded simulation, which is the project's *weakest* tier.
+//!
+//! That is defensible and deliberate — a policy has no safety invariant, so a bad one is unfair
+//! rather than unsafe, and the mechanism beneath it *is* proven and cannot be corrupted by a
+//! wrong choice here. **But it must not be silent**, because anything that comes to depend on a
+//! latency property (a safety monitor, say) would be depending on a simulation result while
+//! believing it depended on a proof.
+//!
 //! * **Work-conserving** — it never leaves a physical CPU idle while a vCPU is
 //!   runnable. After [`Scheduler::advance`] settles, no idle-CPU/waiting-vCPU pair
 //!   remains.
