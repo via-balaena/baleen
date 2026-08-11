@@ -40,6 +40,13 @@ interface deliver it — exactly how KVM and Xen do it. `hv-metal/src/gic.rs` ho
 
 ## 5e — the real Linux capstone (DONE)
 
+> ⚠ **Read this before the paragraph below: it is SUPERSEDED as a description of today, and kept as
+> a record of this arc's close.** "A single EL1 guest that owns the machine" was true when Arc 5e
+> landed and became false at **③-b2b-ii**; what boots now is **two** unmodified kernels, four vCPUs
+> on one pCPU, neither owning the machine. It is **not** edited to match today — an arc doc records
+> what was established when it closed, and rewriting that is how a ledger stops being one. For the
+> current shape read [`hv-metal/src/linux.rs`](../hv-metal/src/linux.rs)'s module doc.
+
 The capstone is landed (`hv-metal/src/linux.rs`, feature `real-linux`; run via `cargo xtask qemu-linux`).
 A **real Alpine Linux 6.18 aarch64 kernel** boots end-to-end as a single EL1 guest that owns the machine,
 reaches userspace (runs `/init`), and powers off via PSCI `SYSTEM_OFF` — serviced by hv-metal's HVC

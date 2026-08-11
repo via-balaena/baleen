@@ -150,12 +150,30 @@ answer was read.
 | Stage-2 isolation, machine-checked | ✅ proven | [`AUDIT-2-P2M-STAGE2.md`](AUDIT-2-P2M-STAGE2.md), [`STAGE2-REFINEMENT-FORALL-N.md`](STAGE2-REFINEMENT-FORALL-N.md) |
 | DMA confinement for assigned devices | ✅ | [`SMMU-DEVICE-PATH-COMPOSITION.md`](SMMU-DEVICE-PATH-COMPOSITION.md), `hv-metal/src/smmu.rs` |
 | Hypervisor self-protection (W^X, own MMU) | ✅ | `hv-metal/src/mmu.rs`, `hv-metal/src/cache.rs` |
-| **Authorized monitor → policy observation** | ⚠ **collides with the thesis** — see above | `hv-metal/src/guest.rs` |
-| **Bounded scheduling latency for the monitor** | ⚠ unanalyzed | `hv-core/src/sched.rs`, driven from `hv-metal/src/role.rs` |
+| **Authorized monitor → policy observation** | ✅ **built (#193)** — and the naive direction is revocable, so ownership is inverted | `hv-metal/src/observe.rs` |
+| **Bounded scheduling latency for the monitor** | ✅ **bounded (#194)**, ⚠ at the *simulation* tier only | `hv-sim`'s `policy_bounds_scheduling_latency` |
 | **Actuator / sensor I/O reaching a guest** | ⚠ groundwork only; no real device is driven | `hv-metal/src/smmu.rs` |
-| **A non-Linux (small) monitor partition** | ⚠ unknown — never attempted | — |
+| A non-Linux (small) monitor partition, **alone** | ✅ done on every default boot | `hv-metal/src/guest.rs`'s `load_guest` |
+| **A non-Linux monitor partition running *beside* a Linux one** | ⚠ **never attempted — the two paths are mutually exclusive** | `hv-metal/src/main.rs` |
 | Real silicon | ⛔ never run outside QEMU | [`QEMU-AND-METAL.md`](QEMU-AND-METAL.md) |
 | SMP | ⛔ **not wanted** — see below | — |
+
+⚠⚠ **FOUR of these rows were wrong within a day of being written, and the pattern is worth more
+than the corrections.** Two went stale because the work got *done* (#193, #194) — the ordinary,
+healthy kind. The other two were **wrong on arrival**:
+
+* *"A non-Linux monitor partition — unknown, never attempted"* was **false when written**.
+  `hv-metal/src/guest.rs`'s `load_guest` copies an in-image template into guest RAM, and the
+  synthetic Arc 0–5 guests *are* bare-metal EL1 payloads. It runs on **every default boot**. The row
+  was written from an assumption about what a "guest" meant here, not from the loader.
+* The real gap was one question further in, and only appeared once the first answer was checked:
+  the synthetic and `real-linux` paths are **mutually exclusive** (`main.rs`: *"the synthetic phases
+  are replaced by the real-Linux capstone"*), so a small bare-metal monitor has never run **beside**
+  a Linux partition — which is the configuration the whole mixed-criticality role needs.
+
+★ **A requirements table is exactly as good as the reading behind each row**, and a row asserting
+that something was never attempted is the cheapest of all to get wrong: nothing contradicts it,
+because absence leaves no artifact to trip over.
 
 ⚠ **The `no_std` question was checked and came back the other way.** A bare-metal
 partition running CortenForge code directly is not available: its layer-0 crates declare

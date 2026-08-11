@@ -448,9 +448,22 @@ pub extern "C" fn rust_main() -> ! {
     //     never returns.
     //
     //     Under `--features real-linux` (M5 Arc 5e), the synthetic phases are replaced by the
-    //     real-Linux capstone: `linux::run` boots an actual aarch64 Linux kernel as a single EL1
-    //     guest that owns the machine (device pass-through, `IMO=0`). Feature-gated, so the default
-    //     build — the one the CI boot-test asserts on — is unchanged.
+    //     real-Linux capstone: `linux::run` boots **`linux::NUM_GUESTS` (2) unmodified aarch64
+    //     Linux kernels**, isolated from each other, with device pass-through and `IMO=0`.
+    //     Feature-gated, so the default build — the one the CI boot-test asserts on — is unchanged.
+    //
+    //     ⚠⚠ THE SWEEP NOTE, and the finding is bigger than this comment. This said "a single EL1
+    //     guest that owns the machine" until 2026-08-11 — but `linux.rs` had ALREADY CORRECTED that
+    //     exact sentence in ⑱-4b, recording that it "HAD BEEN FALSE SINCE ③-b2b-ii". The correction
+    //     was thorough and well written. **Nobody swept for the other copies, and THREE survived it**
+    //     — here, `Cargo.toml`'s `real-linux` feature doc, and `xtask`'s `qemu-linux` comment — all
+    //     understating the project's HEADLINE capability (two isolated kernels, not one) in the
+    //     files a reader opens first.
+    //
+    //     ★ A correction that is not swept is worse than none, because the fixed copy makes the
+    //     claim LOOK handled: anyone grepping finds `linux.rs`'s careful note and stops. When you
+    //     correct a sentence, grep for it — the duplicates are the whole risk (#230, one level up).
+    //     Read `linux::NUM_GUESTS`, never prose, for the count.
     #[cfg(feature = "real-linux")]
     linux::run(&mut uart);
     #[cfg(not(feature = "real-linux"))]
