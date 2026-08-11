@@ -36,9 +36,14 @@
 //! ## The repair — invert ownership
 //!
 //! **Phase B**: the *monitor* owns the telemetry frame and offers the *policy* writable
-//! access. The policy maps it and writes; the monitor reads its own memory with **no
-//! hypercall at all**. The monitor's read capability is then unrevocable, because access to
-//! one's own page is not something another domain can withdraw.
+//! access. In the deployed shape the policy then writes telemetry there and the monitor reads
+//! its own memory with **no hypercall at all** — which is what makes the read capability
+//! unrevocable, since access to one's own page is not something another domain can withdraw.
+//!
+//! ⚠ **What this module exercises is the CAPABILITY, not the data movement**: it drives the
+//! grant and the map through the proven model and checks who can withdraw what. No bytes are
+//! written and none are read (see *Scope*, below). Said here rather than only at the bottom
+//! because this paragraph is the one a reader takes the design from.
 //!
 //! ★★ **The witness is in the TYPE, and that is the strongest thing here.**
 //! `HvCall::GrantEndAccess { gref: GrantRef }` **has no grantor field**. A domain can only ever
