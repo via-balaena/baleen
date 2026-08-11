@@ -33,6 +33,17 @@
 //! behind its own proven-emitted Stage-2 image. "Owns the machine" is the one phrase of the original
 //! framing that has to go: a guest owns its RAM and nothing else, and now not even a CPU to itself.
 //!
+//! ⚠ **AND THAT COUNT IS NOW PER-CONFIGURATION, so do not read "two kernels" as a property of this
+//! file.** Under `--features monitor` one slot carries a small bare-metal partition
+//! (`Payload::Monitor`, from `crate::monitor`) instead of a kernel — the mixed-criticality role
+//! `docs/CONSUMER-CORTENFORGE.md` derives. Neither name is an intra-doc link because both exist
+//! only under that feature, where a link would break every other config's rustdoc.
+//! **Read [`payload_of`] for what a slot carries and
+//! [`runs_linux`] before asserting anything about a kernel.** The paragraph above is left as it
+//! stands because it is true of the shipped `real-linux` boot; this pointer is here because the
+//! ⑱-4b correction it records was itself missed in three other files for want of exactly such a
+//! pointer, which is the lesson #195 paid for.
+//!
 //! ## The model — the guest owns its RAM, and NOTHING else
 //!
 //! hv-metal maps the guest's RAM window through Stage-2 and **no device MMIO whatsoever**:

@@ -82,7 +82,9 @@ fn main() {
         "qemu-test" => run("bash", &["hv-metal/boot-test.sh"]),
         // Metal (M5 Arc 5e): boot REAL aarch64 Linux under hv-metal — `linux::NUM_GUESTS` (2)
         // unmodified kernels, isolated from each other, not one. ⚠ This said "a single EL1 guest"
-        // until 2026-08-11; see the sweep note in `hv-metal/src/main.rs`.
+        // until 2026-08-11; see the sweep note in `hv-metal/src/main.rs`. ★ And the count is
+        // per-CONFIGURATION: `LinuxBoot::Monitor` gives one slot a bare-metal monitor partition
+        // instead of a kernel, so it loads blobs for fewer slots than the machine has.
         // Needs a kernel `Image` + initramfs in `$BALEEN_LINUX_DIR`, which `hv-metal/linux/
         // fetch-guest-image.sh` builds from checksum-pinned Alpine downloads.
         //   `qemu-linux`      the interactive demo (stdio inherited; you watch a kernel boot).

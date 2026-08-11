@@ -454,6 +454,14 @@ pub extern "C" fn rust_main() -> ! {
     //     Linux kernels**, isolated from each other, with device pass-through and `IMO=0`.
     //     Feature-gated, so the default build — the one the CI boot-test asserts on — is unchanged.
     //
+    //     ★ AND `--features monitor` (which implies `real-linux`) SWAPS ONE OF THOSE SLOTS for a
+    //     small bare-metal MONITOR partition — the mixed-criticality role of
+    //     `docs/CONSUMER-CORTENFORGE.md`, and the configuration in which an unmodified kernel and a
+    //     tiny analyzable partition time-slice one pCPU. So "N unmodified kernels" is a property of
+    //     a CONFIGURATION, not of `linux::run`: read `linux::payload_of` for what a slot carries.
+    //     This pointer sits here, one line below the claim it qualifies, precisely because the
+    //     sweep note below is about the last claim in this comment that went stale unpointed-at.
+    //
     //     ⚠⚠ THE SWEEP NOTE, and the finding is bigger than this comment. This said "a single EL1
     //     guest that owns the machine" until 2026-08-11 — but `linux.rs` had ALREADY CORRECTED that
     //     exact sentence in ⑱-4b, recording that it "HAD BEEN FALSE SINCE ③-b2b-ii". The correction
