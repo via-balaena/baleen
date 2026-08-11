@@ -356,6 +356,95 @@ const _: () = assert!(
     "the monitor must sit on a context-restored slot; slot A is entered by run()'s own eret"
 );
 
+// ─── ㉗: the one-way observation channel ─────────────────────────────────────────────────────────
+//
+// ⚠⚠ **THIS IS THE ONE PLACE THE TWO PARTITIONS ARE NOT DISJOINT, AND IT IS DELIBERATE.** ㉖
+// established co-residency with `no channel`; ㉗ gives the monitor a READ-ONLY view of one frame of
+// the policy partition's RAM, because a monitor that observes nothing is not a monitor.
+//
+// ★ **The authorization is the model's, not this file's.** `hv_core`'s `p2m_link` refuses a foreign
+// child unless `grant.authorizes(owner, caller, child, writable)` — "any grant for a read-only one"
+// — and `hv-verify`'s `an_unauthorized_frame_is_never_mapped` is stated over exactly that relation
+// ("a frame a domain neither owns nor holds a grant for is not in the table at all"). So the
+// monitor's descriptor is emitted BY THE PROVEN EMITTER from an authorized edge; nothing here writes
+// a descriptor, and nothing here is a special case in the emitter.
+//
+// ## ★★ THE KILL PROBES — all four run, all four killed (2026-08-11)
+//
+// A channel witness that cannot fail is decorative, which is the lesson ㉕ paid four probes to
+// learn. Each of these was applied to a working tree, booted, and reverted.
+//
+// | # | probe | result |
+// |---|---|---|
+// | 1 | ask for a **writable** link while holding only the read-only grant | `Unauthorized` — the model refuses; **the monitor cannot widen its own view** |
+// | 2 | delete the grant entirely, keep the link | `Unauthorized` — the leaf exists *because* of the grant, not because it was written |
+// | 3 | read-write grant + writable link, **descriptor check left asserting** | `observe FAIL … got Reach { perm: Rw, xn: false }` — **voice 1** catches it |
+// | 4 | the same, with the descriptor check **relaxed** so the payload runs | the payload's own readback prints `OBSERVE FAIL … my store LANDED` — **voice 3** catches it |
+//
+// ★ Probe 4 is the one that matters, because it is the only one that tests the witness the monitor
+// makes **for itself**: same three instructions, on a leaf that really is writable, opposite verdict.
+// ⚠ And note how 3 and 4 compose: with a writable leaf there is no fault, so `observe OK` (voice 2)
+// is correctly **absent** while voice 3 FAILs. The two disagree in the same direction, which is what
+// independent witnesses are supposed to do — had voice 2 still fired, it would have been reporting a
+// refusal that never happened.
+
+/// The model frame the monitor observes: **guest A's first**, whose window base is where its kernel
+/// `Image` was loaded.
+///
+/// ★ Chosen so the observation has a **checkable** value rather than merely a readable one: this
+/// frame carries `IMAGE_MAGIC` at [`IMAGE_MAGIC_OFF`], which [`report_loaded_images`] independently
+/// verifies from EL2 before any guest runs. The monitor comparing against it is therefore a claim
+/// two separate readers agree on, not "the load returned something".
+#[cfg(feature = "monitor")]
+const OBSERVED_FRAME: Mfn = first_frame(SLOT_A);
+
+/// The IPA the monitor reaches [`OBSERVED_FRAME`] at.
+///
+/// ⚠⚠ **NOT A CHOICE — it is the address its OWNER sees it at, and that is what forces this rung to
+/// weaken [`report_disjointness`].** `hv_s2::leaf_map_from_edges` indexes its output by the CHILD
+/// FRAME, and the emitter maps `IPA(m) -> PA(m)`; so a granted frame necessarily appears in the
+/// grantee's image at the grantor's address, inside the grantor's half of the RAM window. Mapping it
+/// anywhere else would mean changing the refinement relation itself, which is Architecture Audit
+/// #2's subject and is proven in `hv-verify`. **There is no version of this rung in which the two
+/// images stay disjoint over the guest-RAM window.**
+#[cfg(feature = "monitor")]
+pub(crate) const OBSERVED_IPA: u64 = guest_ram_base(SLOT_A);
+
+/// The offset, within the monitor's own window, of the frame it **gives up** to make room.
+///
+/// ⚠ **There is no free table slot.** `LINUX_TABLES_PER_GUEST` (28) × `TABLE_SLOTS` (8) = **224** =
+/// `LINUX_SUP_FRAMES_PER_GUEST` exactly, so every slot a guest has is already populated by one of
+/// its own frames. Rather than grow the partition — which would move `NUM_LINUX_TABLES`,
+/// `NUM_FRAMES` and `PARTITION`'s shape, all checked against `hv-part` predicates proven
+/// ∀-partition — **the monitor trades one of its own frames for the view**. Its payload is a few
+/// hundred bytes in a 448 MiB window, so the 2 MiB hole costs it nothing real, and the trade is
+/// visible in the counts rather than hidden.
+///
+/// ⚠ **The byte count is deliberately NOT written here.** It said "284-byte payload" and was wrong
+/// within this very rung — ㉗'s additions took it to 532 — which is #276 in its purest form, in a
+/// comment by the author who had just finished documenting #276. `monitor::load` prints the real
+/// size, measured, on every boot; that is the only place it belongs.
+///
+/// ⚠⚠ **NOT the last frame, and this is load-bearing:** `DMA_PAD_SIZE` is exactly one super frame at
+/// the TOP of each window, so the pad **is** offset `LINUX_SUP_FRAMES_PER_GUEST - 1` — and
+/// [`seed_dma_pads`], [`report_dma_pad`] and ⑲-3b's in-flight witness all read it. Vacating that one
+/// would break three consumers in a way the boot would not explain. This is the second-to-last,
+/// which nothing else names.
+#[cfg(feature = "monitor")]
+const VACATED_OFFSET: u64 = stage2::LINUX_SUP_FRAMES_PER_GUEST - 2;
+
+#[cfg(feature = "monitor")]
+const _: () = assert!(
+    VACATED_OFFSET * stage2::SUP_FRAME_BYTES
+        != stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES - DMA_PAD_SIZE,
+    "the monitor would give up the frame its DMA landing pad lives in; seed_dma_pads, \
+     report_dma_pad and the in-flight witness all read that frame"
+);
+
+/// The grant slot, in **guest A's** table, that carries the monitor's view.
+#[cfg(feature = "monitor")]
+const OBSERVE_GREF: hv_core::grant::GrantRef = 0;
+
 /// What guest `slot` carries. Total over the slots this build deploys.
 pub(crate) const fn payload_of(slot: usize) -> Payload {
     #[cfg(feature = "monitor")]
@@ -1086,6 +1175,39 @@ fn build_model_and_stage2(
         "create the linux domain",
     );
 
+    // ㉗ — **the grant, and its position here is a CORRECTION the machine made.**
+    //
+    // The scope for this rung put it between the two guests' builds, reasoning that `GrantAccess`
+    // names a frame the grantor must already own. That is true and it is not sufficient: the call
+    // also requires the **GRANTEE** to be alive, and the monitor's domain does not exist until the
+    // `DomainCreate` immediately above. The first boot said `NotAlive` and named the caller, which
+    // read like a grantor problem and was a grantee one.
+    //
+    // ★ So the only correct home is *inside the grantee's build, after it exists and before it links
+    // anything* — which is also where it reads best, one statement above the link it authorizes.
+    //
+    // ⚠ **Issued AS GUEST A (`go` takes the caller), which is the integrator authorizing the read
+    // rather than a cheat.** Every model call here is already dispatched on a guest's behalf, and an
+    // unmodified Linux kernel issues no baleen hypercalls at all — a deployment's static
+    // configuration is the only place this authorization could come from. ★ That is the right shape
+    // for mixed criticality: **the untrusted partition never had a say in whether it is watched.**
+    #[cfg(feature = "monitor")]
+    if !runs_linux(set) {
+        go(
+            GUEST_A,
+            HvCall::GrantAccess {
+                gref: OBSERVE_GREF,
+                grantee: guest,
+                frame: OBSERVED_FRAME,
+                // ★ The narrowness is load-bearing: `p2m_link` accepts a foreign child only with a
+                // grant of matching permission, so a read-only grant leaves a WRITABLE leaf
+                // unauthorized. The monitor cannot widen its own view by asking for more.
+                readonly: true,
+            },
+            "grant the monitor a read-only view of the policy partition",
+        );
+    }
+
     // One super-span leaf per 2 MiB of THIS guest's half of the window, spread across
     // `LINUX_TABLES_PER_GUEST` `L2`-pinned tables because `hv_core::TABLE_SLOTS` is 8 (see
     // `crate::NUM_FRAMES`). Each table is allocated and pinned before its leaves are linked.
@@ -1114,6 +1236,32 @@ fn build_model_and_stage2(
             let offset = t * hv_core::p2m::TABLE_SLOTS as u64 + slot as u64;
             if offset >= stage2::LINUX_SUP_FRAMES_PER_GUEST {
                 break;
+            }
+            // ㉗ — **the one slot that does not hold one of this guest's own frames.** The monitor
+            // trades its frame at `VACATED_OFFSET` for a read-only leaf onto the policy partition's.
+            // Written here, inside the ordinary link loop, rather than as a patch afterwards: the
+            // slot must be *taken* by the foreign edge, and a second pass that overwrote a populated
+            // slot would be a different (and much less obvious) operation than never filling it.
+            #[cfg(feature = "monitor")]
+            if !runs_linux(set) && offset == VACATED_OFFSET {
+                go(
+                    guest,
+                    HvCall::P2mLink {
+                        parent: table,
+                        slot,
+                        child: OBSERVED_FRAME,
+                        // ★ The whole rung is this `false`. `p2m_link` accepts a foreign child only
+                        // with a matching grant, and the emitter turns a non-writable leaf into
+                        // `S2AP=RO` — so "observe without influence" is the model's own vocabulary,
+                        // not a new concept.
+                        writable: false,
+                        leaf: true,
+                        // Not executable: the monitor reads its peer's memory, it never runs it.
+                        execute: false,
+                    },
+                    "link the monitor's read-only view of its peer",
+                );
+                continue;
             }
             let m = first_frame + offset as Mfn;
             go(
@@ -1145,9 +1293,76 @@ fn build_model_and_stage2(
         stage2::LINUX_SUP_FRAMES_PER_GUEST * stage2::SUP_FRAME_BYTES / (1024 * 1024),
         stage2::LINUX_TABLES_PER_GUEST
     );
+    // ㉗ — said AFTER the loop, not inside it: `go` holds `uart` for the whole link pass. One
+    // summary line beats a message buried among 224 links anyway.
+    #[cfg(feature = "monitor")]
+    if !runs_linux(set) {
+        let _ = writeln!(
+            uart,
+            "baleen: observe: dom {guest} spent its own frame at window offset {VACATED_OFFSET} \
+             (2 MiB its payload does not need) on a READ-ONLY leaf onto dom {}'s frame \
+             {OBSERVED_FRAME} — so it links {} of its own instead of {}. The leaf is emitted by the \
+             PROVEN emitter from an authorized grant; nothing here writes a descriptor",
+            slot_dom(SLOT_A),
+            stage2::LINUX_SUP_FRAMES_PER_GUEST - 1,
+            stage2::LINUX_SUP_FRAMES_PER_GUEST
+        );
+    }
 
     stage2::build_stage2_from_p2m(hv, guest, set)
 }
+
+/// ㉗ — **the monitor faulted on its own observation window**, which is either the kill-probe
+/// working or the rung broken, and the two are distinguished by one bit.
+///
+/// **A WRITE (`wnr`) is the expected outcome and the point of the probe:** the view is `S2AP=RO`, so
+/// the hardware refuses the store, EL2 records it, and the guest is resumed past the instruction.
+/// `report_disjointness` asserts the descriptor says read-only; this asserts the *hardware acts on
+/// it*, which is a different claim and the one a safety argument actually needs — a permission bit
+/// nothing ever tested is a permission bit that could have been decoded wrong.
+///
+/// **A READ here is a FAILURE and halts.** The whole rung is that the monitor can read this frame
+/// without a hypercall; a read that faults means the leaf is missing, and a monitor that cannot see
+/// is the exact condition #193 spent a rung making impossible.
+#[cfg(feature = "monitor")]
+fn handle_observation_fault(
+    faulting: usize,
+    ipa: u64,
+    write: bool,
+    _frame: &mut LinuxFrame,
+    uart: &mut Pl011,
+) {
+    if !write {
+        let _ = writeln!(
+            uart,
+            "baleen: observe FAIL: dom {} took a READ fault at IPA 0x{ipa:08x} inside its own \
+             observation window — the read-only leaf is missing, so the monitor is blind; halting",
+            slot_dom(faulting)
+        );
+        crate::park();
+    }
+    let n = OBSERVE_WRITES_REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 {
+        let _ = writeln!(
+            uart,
+            "baleen: observe OK: dom {} stored through its read-only view at IPA 0x{ipa:08x} and \
+             the HARDWARE refused it — a Stage-2 permission fault, taken at EL2, resumed past. The \
+             channel is one-way in the only sense that matters: not because the monitor is trusted \
+             not to write, but because the write does not land",
+            slot_dom(faulting)
+        );
+    }
+    // Resumed, exactly as the peer-fault negative test is: the probe is part of the payload's normal
+    // execution, not a fatal event.
+    crate::guest::advance_elr_past_fault();
+}
+
+/// How many stores the monitor made through its read-only view that the hardware refused.
+///
+/// A plain atomic, not a [`crate::cell::BootCell`]: written from an EL2 exception handler, which is
+/// `crate::cell`'s class-3 hazard and has no borrow to overlap.
+#[cfg(feature = "monitor")]
+static OBSERVE_WRITES_REFUSED: AtomicU64 = AtomicU64::new(0);
 
 /// **③-b2a's proven half: walk BOTH emitted images and assert each reaches exactly its own frames
 /// and nothing of the peer's**, over every frame of the guest-RAM window, plus three probes that
@@ -1196,12 +1411,82 @@ fn report_disjointness(vttbr: &[u64; NUM_GUESTS], uart: &mut Pl011) {
 
     let per = stage2::LINUX_SUP_FRAMES_PER_GUEST;
     let (mut a_own, mut b_own, mut a_peer, mut b_peer) = (0u64, 0u64, 0u64, 0u64);
+    // ㉗ — the two deliberate exceptions, both counted so the report states them as facts rather
+    // than tolerating them as silence. `observed` is the authorized read-only view; `vacated` is the
+    // monitor's own frame that it gave up to make room for it.
+    #[cfg(feature = "monitor")]
+    let (mut observed, mut vacated) = (0u64, 0u64);
 
     for m in 0..stage2::NUM_SUP_FRAMES {
         let ipa = stage2::LINUX_RAM_BASE + m * stage2::SUP_FRAME_BYTES;
         let mine_is_a = m < per;
         let ra = stage2::walk_stage2(l1_a, ipa);
         let rb = stage2::walk_stage2(l1_b, ipa);
+
+        // ㉗ — **the authorized view, checked before the disjointness arms and asserted HARDER than
+        // they are.** This frame is guest A's, and it IS reachable from the monitor's image: that is
+        // the rung. What must hold is that the reach is exactly the one that was authorized —
+        // identity-mapped (the emitter maps `IPA(m) -> PA(m)`, and a view landing anywhere else
+        // would be a translation defect wearing the rung's clothes) and **READ-ONLY**.
+        //
+        // ★ `perm` is read here for the first time in this walk. Until ㉗ the report checked only
+        // *reachability* — which is exactly why the rung is a strengthening and not merely a
+        // weakening: the one frame that is now shared is the one frame whose PERMISSION is asserted.
+        #[cfg(feature = "monitor")]
+        if m == u64::from(OBSERVED_FRAME) {
+            match rb {
+                Some(reach) if reach.pa == ipa && !reach.writable() && reach.xn => observed += 1,
+                other => {
+                    let _ = writeln!(
+                        uart,
+                        "baleen: observe FAIL: dom {}'s view of dom {}'s frame {m} (IPA \
+                         0x{ipa:08x}) is not the authorized one — expected an identity-mapped, \
+                         read-only, execute-never leaf, got {other:?}",
+                        slot_dom(MONITOR_SLOT),
+                        slot_dom(SLOT_A)
+                    );
+                    crate::park();
+                }
+            }
+            // Guest A's own reach at this frame is still asserted by the loop below; only the
+            // monitor's arm is answered here.
+            match ra {
+                Some(reach) if reach.pa == ipa => a_own += 1,
+                _ => {
+                    let _ = writeln!(
+                        uart,
+                        "baleen: peer FAIL: frame {m} (IPA 0x{ipa:08x}) did not resolve to its own \
+                         identity mapping in its owner's image"
+                    );
+                    crate::park();
+                }
+            }
+            continue;
+        }
+
+        // ㉗ — the frame the monitor GAVE UP. Unmapped in both images, and that is correct rather
+        // than a hole to tolerate: nobody allocated it, so no domain owns it and the emitter has
+        // nothing to map. Counted and named, because an unmapped frame inside a guest's own window
+        // would otherwise hit the `_ =>` arm below and PARK the boot on a hole it was told to make.
+        #[cfg(feature = "monitor")]
+        if m == u64::from(first_frame(MONITOR_SLOT)) + VACATED_OFFSET {
+            if rb.is_none() && ra.is_none() {
+                vacated += 1;
+                continue;
+            }
+            let _ = writeln!(
+                uart,
+                "baleen: observe FAIL: the frame dom {} gave up (frame {m}, IPA 0x{ipa:08x}) is \
+                 still mapped somewhere — dom {} {:?}, dom {} {:?}; the slot was supposed to be \
+                 spent on the peer view",
+                slot_dom(MONITOR_SLOT),
+                slot_dom(SLOT_A),
+                ra,
+                slot_dom(MONITOR_SLOT),
+                rb
+            );
+            crate::park();
+        }
 
         // The identity property the arm64 boot protocol needs, checked from the DESCRIPTORS: an
         // owned frame must resolve to its own IPA, not merely to something.
@@ -1261,7 +1546,28 @@ fn report_disjointness(vttbr: &[u64; NUM_GUESTS], uart: &mut Pl011) {
         }
     }
 
-    if a_own == per && b_own == per && a_peer == 0 && b_peer == 0 {
+    // ㉗ — the monitor owns one fewer frame than its peer, having spent the slot on the view.
+    #[cfg(feature = "monitor")]
+    let b_expected = per - 1;
+    #[cfg(not(feature = "monitor"))]
+    let b_expected = per;
+
+    // ⚠⚠ **㉗'s two counters are ASSERTED, not merely printed, and that is not a formality.** The
+    // success line says "gave up 1 … reaches EXACTLY 1", and both numbers come from branches
+    // reached only if their frame index falls where this code thinks it does. Without this check an
+    // `OBSERVED_FRAME` outside the walked range — or a `VACATED_OFFSET` that stopped matching —
+    // would leave the counter at **0**, and the boot would cheerfully print *"reaches EXACTLY 0 of
+    // dom 1's"* under a green `peer OK`. That is #275's shape ("found nothing" and "nothing is
+    // wrong" are the same output), inside the rung whose entire subject is one frame.
+    //
+    // ★ Kill-probed (probe 5): disabling the observed-frame branch reddens the boot.
+    #[cfg(feature = "monitor")]
+    let channel_ok = observed == 1 && vacated == 1;
+    #[cfg(not(feature = "monitor"))]
+    let channel_ok = true;
+
+    if a_own == per && b_own == b_expected && a_peer == 0 && b_peer == 0 && channel_ok {
+        #[cfg(not(feature = "monitor"))]
         let _ = writeln!(
             uart,
             "baleen: peer OK: two domains, two Stage-2 images, DISJOINT over the guest-RAM window \
@@ -1271,11 +1577,42 @@ fn report_disjointness(vttbr: &[u64; NUM_GUESTS], uart: &mut Pl011) {
              emitted descriptors)",
             stage2::NUM_SUP_FRAMES
         );
+        // ⚠⚠ **A DIFFERENT SENTENCE, NOT A QUALIFIED ONE.** The shipped boot's claim is "DISJOINT",
+        // full stop, and ㉗'s is not that claim with an asterisk — it is a narrower claim about a
+        // machine with an authorized channel in it. Printing the old sentence plus a footnote is how
+        // a reader ends up quoting the strong half of a weakened guarantee, so this configuration
+        // says its own thing and the word DISJOINT does not appear in it.
+        #[cfg(feature = "monitor")]
+        let _ = writeln!(
+            uart,
+            "baleen: peer OK: two domains, two Stage-2 images, disjoint over the guest-RAM window \
+             EXCEPT FOR ONE AUTHORIZED, READ-ONLY FRAME — dom {GUEST_A} reaches its {a_own} frames \
+             and 0 of dom {GUEST_B}'s (the policy partition is unaware it is watched, and cannot \
+             reach the monitor at all); dom {GUEST_B} reaches its own {b_own}, gave up {vacated} to \
+             make room, and reaches EXACTLY {observed} of dom {GUEST_A}'s — identity-mapped, S2AP=RO \
+             and execute-never, asserted from the descriptor. Neither maps hv-metal's memory or any \
+             window outside guest RAM ({} frames + 3 out-of-window probes, walked from the emitted \
+             descriptors)",
+            stage2::NUM_SUP_FRAMES
+        );
     } else {
         let _ = writeln!(
             uart,
-            "baleen: peer FAIL: the two images are NOT disjoint — dom {GUEST_A} own={a_own} \
-             peer={a_peer}, dom {GUEST_B} own={b_own} peer={b_peer} (expected own={per}, peer=0)"
+            "baleen: peer FAIL: the two images are not as this configuration expects — dom \
+             {GUEST_A} own={a_own} peer={a_peer}, dom {GUEST_B} own={b_own} peer={b_peer} \
+             (expected dom {GUEST_A} own={per}, dom {GUEST_B} own={b_expected}, peer=0)"
+        );
+        // ㉗ — a SECOND line rather than an interpolated clause, because `no_std` has no cheap way
+        // to build one conditionally. ★ It earns its keep: probe 5 showed the line above reporting
+        // `peer=1`, which reads as an ISOLATION failure and sends a reader to debug the emitter,
+        // while the real cause was `observed=0` — the channel's frame never walked. A shared
+        // diagnostic for two unrelated failure modes misdirects on at least one of them.
+        #[cfg(feature = "monitor")]
+        let _ = writeln!(
+            uart,
+            "baleen: peer FAIL: the observation channel counted observed={observed} \
+             vacated={vacated} (expected 1 and 1) — a zero here means the frame the channel is \
+             built on was never walked, not that the images disagree"
         );
         crate::park();
     }
@@ -4479,6 +4816,17 @@ fn handle_linux_data_abort(frame: &mut LinuxFrame, esr: u64, elr: u64, far: u64,
     // retiring hands the pCPU on and that is a `(guest, vCPU)` decision.
     let running = current_vcpu();
     let faulting = running.guest();
+    // ㉗ — **the write kill-probe, recognised BEFORE the peer-fault path.** The monitor's view is
+    // read-only, so a store through it is a Stage-2 PERMISSION fault at an IPA the monitor really
+    // does map — which `handle_peer_fault` would report as "the refusal proves nothing" and park on,
+    // because its whole argument is built on the address being unmapped for the toucher. Both are
+    // "a guest touched its peer's memory and the hardware refused", and they are entirely different
+    // claims; this is the one place they have to be told apart.
+    #[cfg(feature = "monitor")]
+    if !runs_linux(faulting) && ipa & !(stage2::SUP_FRAME_BYTES - 1) == OBSERVED_IPA {
+        handle_observation_fault(faulting, ipa, a.wnr, frame, uart);
+        return;
+    }
     if let Some(owner) = guest_owning(ipa) {
         if owner != faulting {
             handle_peer_fault(faulting, owner, ipa, frame, uart);
@@ -5297,9 +5645,9 @@ fn report_interrupt_mediation(uart: &mut Pl011) {
 /// at +24, and the `ARM\x64` magic at +56.
 const IMAGE_SIZE_OFF: u64 = 16;
 const IMAGE_FLAGS_OFF: u64 = 24;
-const IMAGE_MAGIC_OFF: u64 = 56;
+pub(crate) const IMAGE_MAGIC_OFF: u64 = 56;
 /// `"ARM\x64"` as the little-endian `u32` the header stores.
-const IMAGE_MAGIC: u32 = 0x644d_5241;
+pub(crate) const IMAGE_MAGIC: u32 = 0x644d_5241;
 /// `flags` bit 3: **1 = the 2 MiB-aligned base may be ANYWHERE in physical memory.**
 ///
 /// **This is the single fact the whole arc rests on.** The second kernel needs no second build only

@@ -55,14 +55,32 @@
 //!    looped forever would hang the gate. Retiring through the same FID means it retires through the
 //!    same code, so there is no second shutdown path that runs once and is never exercised again.
 //!
+//! 4. ★★ **㉗ — IT OBSERVES ITS PEER, AND PROVES THE VIEW IS ONE-WAY USING ONLY ITS OWN TWO LOADS.**
+//!    It reads the policy partition's `Image` magic through a read-only Stage-2 leaf, stores poison
+//!    to the same address (the hardware refuses it; EL2 records and resumes past), and **reads
+//!    again, requiring the original value**. That third step is the part no descriptor check can
+//!    give you: `crate::linux`'s walk asserts the leaf *says* `S2AP=RO`, and this asserts the write
+//!    *did not land* — a refused-but-actually-applied store passes the first and cannot pass this.
+//!    See `crate::linux`'s ㉗ block for the channel, its four kill probes, and why the monitor
+//!    cannot widen its own view.
+//!
 //! ## ⚠ What this rung does NOT claim, stated here because the name invites the overclaim
 //!
-//! **It observes nothing.** A monitor that watches no one is a partition, not a monitor, and calling
-//! it one in the transcript would be exactly the class of defect this project keeps finding. The
-//! observation channel — a read-only view of the policy partition's memory, authorized by a grant and
-//! realized by the proven emitter — is the **next** rung, and it is the one that has to weaken
-//! `crate::linux`'s disjointness claim to say something true. What is closed here is *co-residency*:
-//! a small analyzable partition and an unmodified Linux kernel, isolated, time-slicing one pCPU.
+//! ⚠⚠ **THIS SECTION SAID "It observes nothing" UNTIL ㉗, AND ㉗ IS THE RUNG THAT MADE IT FALSE.**
+//! It is kept as a correction rather than silently rewritten, because the sentence was *true and
+//! load-bearing* for one rung and is now the exact shape of stale claim this project keeps finding —
+//! in the module doc, which is the first thing a reader opens. **The monitor now observes; what it
+//! still does not do is act.**
+//!
+//! **It cannot influence.** The view is read-only in the descriptor, refused by the hardware, and
+//! checked by the payload itself — but the monitor has no channel *out*, no actuator, and no way to
+//! stop the policy partition doing anything. A monitor that detects and cannot intervene is a
+//! detector; the intervention half is not built and is not claimed anywhere in the transcript.
+//!
+//! ⚠ **And it can be starved rather than deceived.** The policy partition cannot revoke the view —
+//! that is ㉗'s point — but it can simply stop writing anything worth reading. That is **denial, not
+//! deception**, and detecting it needs a freshness field in a telemetry format this does not define
+//! (the same residual `crate::observe` records at the model level).
 //!
 //! ⚠ **The payload is not a certifiable monitor either**, and no part of the transcript should be
 //! read as saying so. It is the smallest tenant that demonstrates the configuration; what a real
@@ -105,6 +123,19 @@ const _: () = assert!(
      console address would be wrong"
 );
 
+/// ㉗ — the IPA at which the payload reads its peer's memory, and the offset of the value it checks.
+///
+/// Both derived from `crate::linux`, which owns the observation channel's placement: a second copy
+/// of "where the peer's magic lives" is a second thing to drift, and the payload — being assembly —
+/// is the one consumer the compiler cannot check against the emitter.
+const OBSERVED_HI: u64 = crate::linux::OBSERVED_IPA >> 16;
+
+const _: () = assert!(
+    OBSERVED_HI << 16 == crate::linux::OBSERVED_IPA,
+    "the observed IPA is no longer expressible as a single `movz … lsl #16`; the payload would read \
+     the wrong address"
+);
+
 /// The two halves of PSCI `SYSTEM_OFF`, for the payload's `movz`/`movk` pair.
 ///
 /// Same derivation argument as [`VPL011_HI`]: `crate::linux` owns the FID, and the payload must
@@ -130,11 +161,19 @@ const _: () = assert!(
 //   x19 — the emulated PL011's `DR`, loaded once
 //   x20 — the round counter
 //   x0/x1 — arguments and scratch for `puts`
+//   x21..x25 — ㉗'s observation scratch: the peer's window base, the expected magic, the two
+//         readbacks and the poison. Never reused by `puts`, so the sequence survives its calls.
 //   x30 — the link register, clobbered by every `bl`. Named because it is the one register the
 //         code touches without mentioning: `puts` is never called from inside `puts`, so a single
-//         level is all that is needed and no stack is used anywhere in the payload. **The payload
-//         therefore writes NO memory at all** — which is what keeps `first_word`'s readback of the
-//         deposited bytes a valid witness for the whole boot, including after the monitor has run.
+//         level is all that is needed and no stack is used anywhere in the payload.
+//
+// ⚠ **THE PAYLOAD STILL LANDS NO STORE ANYWHERE, and after ㉗ that sentence has to be read
+// carefully rather than taken as obvious.** It issues exactly one `str` — the ㉗ kill probe — and
+// that store is *refused by Stage-2*; it targets the PEER's frame, never its own. Everything else it
+// touches is a load or an MMIO write to the emulated PL011. This is load-bearing twice over:
+// `first_word`'s readback of the deposited bytes stays a valid witness for the whole boot, and
+// `crate::linux::peer_payload_at` reads the monitor's window base long after the payload has run.
+// **A future rung that gives the payload a stack or a scratch buffer breaks both, silently.**
 // ---------------------------------------------------------------------------------------------
 global_asm!(
     r#"
@@ -159,6 +198,33 @@ __monitor_tpl_start:
     cmp     x20, #{ROUNDS}
     b.lt    10b
 
+    // ── ㉗: OBSERVE THE PEER, then prove the view is one-way FROM INSIDE ──
+    //
+    // Three steps, and the third is what a descriptor check cannot give you:
+    //   1. read the peer's `Image` magic through the read-only view — it must be there;
+    //   2. store poison to the same address — Stage-2 refuses it, EL2 records and resumes past;
+    //   3. read AGAIN and require the ORIGINAL value. Step 3 is the monitor witnessing that the
+    //      write did not land, using only its own two loads — no hypercall, no trust in EL2's
+    //      report, and no way for a refused-but-actually-applied store to pass unnoticed.
+    movz    x21, #{OBSERVED_HI}, lsl #16    // the peer's window base
+    movz    w23, #{MAGIC_LO}                // the Image magic EL2 independently verified
+    movk    w23, #{MAGIC_HI}, lsl #16
+    ldr     w22, [x21, #{MAGIC_OFF}]        // (1) observe
+    cmp     w22, w23
+    b.ne    40f
+    movz    w24, #{POISON_LO}
+    movk    w24, #{POISON_HI}, lsl #16
+    str     w24, [x21, #{MAGIC_OFF}]        // (2) MUST FAULT — resumed past by EL2
+    ldr     w25, [x21, #{MAGIC_OFF}]        // (3) unchanged?
+    cmp     w25, w23
+    b.ne    40f
+    adr     x0, 33f
+    bl      20f
+    b       41f
+40: adr     x0, 34f                         // either the view is blind or the write LANDED
+    bl      20f
+41:
+
     adr     x0, 32f
     bl      20f
     movz    x0, #{PSCI_OFF_HI}, lsl #16     // retire exactly as a Linux guest does
@@ -177,6 +243,8 @@ __monitor_tpl_start:
 30: .asciz "baleen-monitor: alive — a bare-metal EL1 partition beside an unmodified Linux guest\n"
 31: .asciz "baleen-monitor: round "
 32: .asciz "baleen-monitor: rounds complete, retiring through PSCI SYSTEM_OFF\n"
+33: .asciz "baleen-monitor: observed the policy partition (ARM\\x64 at its window base) and my store to it did NOT land\n"
+34: .asciz "baleen-monitor: OBSERVE FAIL - the peer view is blind, or my store LANDED\n"
     .balign 4
     .global __monitor_tpl_end
 __monitor_tpl_end:
@@ -185,7 +253,18 @@ __monitor_tpl_end:
     ROUNDS = const ROUNDS,
     PSCI_OFF_HI = const PSCI_OFF_HI,
     PSCI_OFF_LO = const PSCI_OFF_LO,
+    OBSERVED_HI = const OBSERVED_HI,
+    MAGIC_OFF = const crate::linux::IMAGE_MAGIC_OFF,
+    MAGIC_LO = const (crate::linux::IMAGE_MAGIC & 0xffff),
+    MAGIC_HI = const (crate::linux::IMAGE_MAGIC >> 16),
+    POISON_LO = const (OBSERVE_POISON & 0xffff),
+    POISON_HI = const (OBSERVE_POISON >> 16),
 );
+
+/// The value the payload tries to store through its read-only view. Recognisable in a memory dump
+/// and **not** a value any legitimate writer would produce, so if it ever appeared at the peer's
+/// window base the source would be unambiguous.
+const OBSERVE_POISON: u32 = 0xdead_be57;
 
 extern "C" {
     /// First byte of the monitor payload, in `hv-metal`'s own `.rodata`.

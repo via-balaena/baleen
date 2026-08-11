@@ -1418,6 +1418,21 @@ const LINUX_FAULT_FORBIDDEN: &[&str] = &[
     "baleen: dom 1 issued PSCI SYSTEM_OFF",
 ];
 
+/// Strings the **mixed-criticality** boot must NOT show, on top of [`LINUX_FORBIDDEN`].
+///
+/// ⚠⚠ **Its own list rather than an addition to [`LINUX_FORBIDDEN`], and that is lesson #285 applied
+/// rather than merely written down.** `baleen: observe FAIL` can only be printed by the `monitor`
+/// configuration — hv-metal's observation code does not exist in the other four builds. Putting it
+/// in the shared list would buy **one real check and four vacuous ones**, and a forbidden marker
+/// that the machine cannot print passes for the wrong reason. Scoped here, every run of it is a
+/// check that could actually fail.
+///
+/// `observe FAIL` covers all four failure paths at once: the grant refused, the view not
+/// identity-mapped / not read-only / not execute-never, the vacated frame still mapped, and — the
+/// one that matters most — the monitor taking a **READ** fault inside its own observation window,
+/// which is the blinded-monitor condition #193 spent a whole rung making impossible.
+const LINUX_MONITOR_FORBIDDEN: &[&str] = &["baleen: observe FAIL"];
+
 /// ★ **⑲-1's corpus: the shipped real-Linux boot PLUS the SMMU's own markers, in ONE boot.**
 ///
 /// ## Why this list is a concatenation and not a new set
@@ -1556,10 +1571,17 @@ const LINUX_SMMU_MARKERS: &[&str] = &[
 /// `driverwitness n/a` line naming every one of them and the slot it exempted — and **that line is
 /// asserted below**, so the exemption cannot become silent.
 ///
-/// ⚠ **And the big one: THIS BOOT ESTABLISHES CO-RESIDENCY, NOT OBSERVATION.** The monitor watches
-/// nothing. `peer OK … DISJOINT` is asserted below exactly as the shipped boot asserts it, because
-/// no channel exists yet. Giving the monitor a read-only view of the policy partition is the next
-/// rung, and it is the one that must weaken that line to say anything true.
+/// ⚠⚠ **THIS PARAGRAPH SAID "THIS BOOT ESTABLISHES CO-RESIDENCY, NOT OBSERVATION" UNTIL ㉗, and it
+/// pointed at a `peer OK … DISJOINT` marker that is no longer in this array.** Kept as a correction:
+/// it was true for exactly one rung, and a marker corpus whose doc describes the previous rung's
+/// claims is how a reader concludes the gate checks something it does not.
+///
+/// **㉗ made the monitor observe**, so this corpus now pins the *replaced* disjointness sentence
+/// (the one in which the word DISJOINT does not appear) plus the channel's three voices.
+///
+/// ⚠ **What is still NOT claimed:** the monitor observes and **cannot influence** — no channel out,
+/// no actuator. And the policy partition can starve it by writing nothing, which is denial rather
+/// than deception and is not detected here.
 const LINUX_MONITOR_MARKERS: &[&str] = &[
     // ── 1. the machine is mixed, and the counts are derived ──
     "baleen: M5 Arc 5e — booting 1 REAL aarch64 Linux kernel(s) + 1 bare-metal monitor \
@@ -1577,7 +1599,43 @@ const LINUX_MONITOR_MARKERS: &[&str] = &[
     // never who may reach it.
     "baleen: linux model built for dom 1 — 224 super-span leaves (448 MiB at 0x48000000) across 28 L2-pinned tables, into stage-2 set 0",
     "baleen: linux model built for dom 2 — 224 super-span leaves (448 MiB at 0x64000000) across 28 L2-pinned tables, into stage-2 set 1",
-    "baleen: peer OK: two domains, two Stage-2 images, DISJOINT over the guest-RAM window",
+    //
+    // ⚠⚠ **㉗ REPLACED THIS LINE RATHER THAN QUALIFYING IT, and the marker follows.** ㉖ asserted the
+    // shipped boot's `DISJOINT` here, because the monitor observed nothing. ㉗ gives it a read-only
+    // view of one frame, so that sentence is no longer true of this configuration — and a footnote
+    // on the strong wording is how a reader ends up quoting the strong half of a weakened guarantee.
+    // hv-metal prints a different sentence for this boot, in which the word DISJOINT does not
+    // appear, and this corpus pins that one.
+    "baleen: peer OK: two domains, two Stage-2 images, disjoint over the guest-RAM window EXCEPT \
+     FOR ONE AUTHORIZED, READ-ONLY FRAME",
+    // ── 1b. ㉗ — the observation channel, in three independent voices ──
+    //
+    // The trade that made room for it. Counts derived from `LINUX_SUP_FRAMES_PER_GUEST`, so a
+    // partition change would move them together rather than leaving this line stale.
+    "baleen: observe: dom 2 spent its own frame at window offset 222",
+    "on a READ-ONLY leaf onto dom 1's frame 0 — so it links 223 of its own instead of 224",
+    "The leaf is emitted by the PROVEN emitter from an authorized grant; nothing here writes a \
+     descriptor",
+    // ★ VOICE 1 — the DESCRIPTOR, walked from the emitted tables. Note what is asserted: not merely
+    // that the monitor reaches one peer frame, but that the reach is identity-mapped, `S2AP=RO` and
+    // execute-never. Until ㉗ this walk read only *reachability* and never `perm` — so the one frame
+    // that is now shared is the one frame whose PERMISSION the boot checks.
+    "dom 1 reaches its 224 frames and 0 of dom 2's (the policy partition is unaware it is watched, \
+     and cannot reach the monitor at all)",
+    "dom 2 reaches its own 223, gave up 1 to make room, and reaches EXACTLY 1 of dom 1's — \
+     identity-mapped, S2AP=RO and execute-never, asserted from the descriptor",
+    // ★★ VOICE 2 — the HARDWARE. A descriptor that says read-only and a CPU that enforces it are
+    // different claims, and a permission bit nothing ever tested is one that could have been decoded
+    // wrong. The monitor stores through its view; the store takes a Stage-2 permission fault.
+    "baleen: observe OK: dom 2 stored through its read-only view at IPA 0x48000038 and the HARDWARE \
+     refused it",
+    "not because the monitor is trusted not to write, but because the write does not land",
+    // ★★★ VOICE 3 — the MONITOR ITSELF, using nothing but its own two loads. It reads the magic,
+    // stores poison, reads again, and requires the original value. This is the only one of the three
+    // that needs no hypercall and takes nothing on trust from EL2's own report — a refused-but-
+    // actually-applied store could pass voices 1 and 2 and cannot pass this one.
+    "[dom 2] baleen-monitor: observed the policy partition (ARM\\x64 at its window base) and my \
+     store to it did NOT land",
     // ── 2. the monitor ran as a scheduled EL1 partition ──
     //
     // Seeded with no DTB pointer, and entered by a context restore — the two facts that make this a
@@ -1863,8 +1921,9 @@ fn boot_and_check_linux(argv: &[&str], boot: LinuxBoot) -> bool {
     // `LINUX_FAULT_FORBIDDEN` applies to BOTH retiring boots: in each of them a domain was KILLED,
     // so neither may claim every guest powered off, and dom 1 may not claim it shut down.
     let forbidden = LINUX_FORBIDDEN.iter().chain(match boot {
-        LinuxBoot::Shipped | LinuxBoot::Smmu | LinuxBoot::Monitor => [].iter(),
+        LinuxBoot::Shipped | LinuxBoot::Smmu => [].iter(),
         LinuxBoot::UnmappedFault | LinuxBoot::PeerLoop => LINUX_FAULT_FORBIDDEN.iter(),
+        LinuxBoot::Monitor => LINUX_MONITOR_FORBIDDEN.iter(),
     });
     for m in forbidden {
         if serial.contains(m) {
@@ -3220,7 +3279,11 @@ const MARKER_CORPUS: &[(&str, &[&str], usize)] = &[
     // `doc-markers` still failed with "`LINUX_MONITOR_MARKERS` is a marker array that
     // `MARKER_CORPUS` does not pin, so it is ungated". That is ⑳-d's other half doing exactly what
     // it was built for, on its author, before the PR left the branch.
-    ("LINUX_MONITOR_MARKERS", LINUX_MONITOR_MARKERS, 37),
+    ("LINUX_MONITOR_MARKERS", LINUX_MONITOR_MARKERS, 45),
+    // ㉗'s forbidden list. Registered here on arrival — ㉖ learned that the hard way when this
+    // gate's universe check caught `LINUX_MONITOR_MARKERS` ungated *after* the boot was already
+    // green, and a forbidden array is exactly as silent when nothing pins it.
+    ("LINUX_MONITOR_FORBIDDEN", LINUX_MONITOR_FORBIDDEN, 1),
 ];
 
 /// The number of marker lines [`BOOT_TEST`] contributes — the synthetic path's half of the corpus.
