@@ -120,7 +120,13 @@ fn create_partitions(hv: &mut Hypervisor) -> bool {
 /// and the policy can end it. Returns `true` when the blinding was *successfully
 /// demonstrated*, which is the outcome this phase wants.
 fn phase_a_consent_is_revocable(hv: &mut Hypervisor, uart: &mut Pl011) -> bool {
-    if !call(hv, POLICY_DOM, HvCall::P2mAllocate { mfn: F_POLICY_OWNED }) {
+    if !call(
+        hv,
+        POLICY_DOM,
+        HvCall::P2mAllocate {
+            mfn: F_POLICY_OWNED,
+        },
+    ) {
         let _ = writeln!(uart, "baleen: observe FAIL — phase A could not allocate");
         return false;
     }
