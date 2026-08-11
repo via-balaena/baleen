@@ -93,17 +93,49 @@ expressible today, in `hv-core/src/hypervisor.rs`:
 * **Direction** — `controls(&self, holder: DomId, target: DomId)` is directional by
   signature, and `hv-metal/src/guest.rs` already tests the two orderings separately.
 * **Observation without influence** — `hv-core/src/grant.rs`'s authorization carries a
-  `writable` permission bit, so a **read-only** grant is the natural shape of "the
-  monitor may read the policy's commanded output and may not alter it".
+  `writable` permission bit, so permission is expressible per-direction.
+
+⚠⚠ **This bullet first concluded that "a **read-only** grant is the natural shape of *the monitor
+may read the policy's output and may not alter it*". That is the WRONG DIRECTION, and two facts in
+the code say so** — recorded here because the appealing answer was the wrong one:
+
+1. **A grant is not one-way.** `obs(a)` carries *"grant table rows **and their live-map counts**"*
+   (`hv-sim/src/noninterference.rs`), and the consent channel authorizes the grantee to move
+   them. So **the act of observing is visible to the observed** — a reverse channel, and one that
+   lets a learned policy detect that it is being monitored, which is the precise failure runtime
+   assurance exists to prevent.
+2. **Consent is the wrong model for an adversarial tenant.** If the policy owns the frame it must
+   *offer* the grant, and `end_access` refuses with `InUse` **only while a mapping is held** — a
+   copy holds none. **The untrusted policy could revoke at will and blind its own monitor.**
+
+**The repair is to invert ownership: the monitor owns the telemetry page**, offers the policy
+writable access, and reads its own memory with no hypercall. The read then cannot be revoked,
+because access to one's own page is not revocable. The trade — the policy can *corrupt* that page —
+is accepted deliberately: the contents are the untrusted partition's own claims and were never
+trustworthy, while a **blinded** monitor is a safety failure. *Trust the channel's existence, never
+its contents.*
 
 ⚠ Introducing that channel is the point at which the isolation headline stops being
 *"no channel"* and becomes *"exactly one channel, in one direction, and here is the
 proof"*. **That is a strictly harder claim to make and a strictly more useful one.** It
 should not be attempted as a side effect of some other rung.
 
-⚠ **Expressible is not proved.** What the vocabulary supports is *stating* the weakened
-property; whether the Tier-D argument survives the weakening, and what it degrades to, is
-the actual work and is not answered here.
+⚠⚠ **CORRECTION (2026-08-10, same day, forced by reading §2.1–2.3 of
+[`TIER-D-NONINTERFERENCE.md`](TIER-D-NONINTERFERENCE.md)). This paragraph first read: *"whether the
+Tier-D argument survives the weakening, and what it degrades to, is the actual work."* **That
+overstated it, and the overstatement is worth keeping visible because it was a claim about a
+theorem made without re-reading the theorem.**
+
+**Tier-D is not weakened at all.** Local respect is a **conditional** —
+`¬(b ⇝ a) ⟹ obs(a)(dispatch(s,(b,α))) = obs(a)(s)` — and `⇝` **already includes consent (grant)**
+as one of its five authorized channels, whose safety content is the grant seam's own invariants.
+Introducing an authorized grant does not damage the theorem; it moves the pair out of the
+antecedent-false branch and into a branch the theorem already covers.
+
+**What changes is the deployment's claim, not the model's theorem.** The metal's `no_channel`
+assertion stops holding for that pair, so the sentence this project can say about it changes from
+*"no channel"* to *"exactly one channel, in one direction, and here is what governs it"*. That is
+the honest description of the cost, and it is a smaller cost than the original wording implied.
 
 ## The requirement table
 
