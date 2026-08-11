@@ -143,6 +143,19 @@ FORBIDDEN_MARKERS=(
     "W^X NOT ENFORCED"
     # The X half. Printed only if a jump INTO EL2's data returned, i.e. the fetch was permitted.
     "XN NOT ENFORCED"
+    # The one-way observation channel (`--features observe`). Printed by any phase that fails to
+    # hold or fails to demonstrate what it exists to demonstrate.
+    #
+    # ⚠ It is NOT catching a case the required-marker list misses — a phase that fails simply omits
+    # its marker, and the required list already turns that red. This comment first claimed
+    # otherwise, and the claim was about the gate's own structure, which is the worst place to be
+    # loose. What the forbidden marker actually buys is (a) a DIAGNOSTIC: the FAIL line carries the
+    # individual booleans, so a red run says which half broke instead of only that something did,
+    # and (b) a guard against a FUTURE phase that prints a partial success alongside a failure —
+    # the shape a required-only list genuinely cannot see.
+    #
+    # Global rather than per-config for the same reason W^X's are: no configuration may ever reach it.
+    "baleen: observe FAIL"
 )
 
 # Default path: the whole Arc-3 sequence must complete. Each marker guards a distinct mechanism, so
@@ -511,5 +524,26 @@ boot_and_check "xn-probe" "--features xn-probe" \
     "EL2 MMU on, data cacheable (C=1)" \
     "XN probe: jumping into EL2 data" \
     "EC=0x21"
+
+# The ONE-WAY OBSERVATION CHANNEL (the CortenForge consumer's mixed-criticality role — see
+# `docs/CONSUMER-CORTENFORGE.md`). A separate configuration because it ESTABLISHES an authorized
+# channel between two partitions, which is exactly what the default boot's thesis enumeration
+# asserts the absence of; both claims are true, neither is true of the same pair in one boot.
+#
+# ★ Phase A is asserted FIRST and it is the KILL PROBE: the naive design (the policy owns its
+# telemetry frame and offers a read-only grant) lets the OBSERVED party revoke and blind its own
+# safety monitor, because `end_access` refuses only while a mapping is held and a `GrantCopy`
+# holds none. A rung whose probe cannot kill proves nothing (㉕, design-lesson #271), so the
+# blinding is a REQUIRED marker: if phase A ever stops demonstrating the flaw, this boot goes red
+# and the repair in phase B has lost its reason to exist.
+#
+# Phase B is the repair — invert ownership so the monitor owns the page and its read cannot be
+# revoked. `baleen: observe FAIL` is a GLOBAL forbidden marker, so a phase that silently fails to
+# hold cannot pass by omission.
+boot_and_check "observe" "--features observe" \
+    "hv-metal alive" \
+    "baleen: observe A: the policy revoked its own grant and BLINDED the monitor" \
+    "baleen: observe B: the policy cannot reach the monitor's grant" \
+    "baleen: observe: one-way channel established"
 
 echo "boot-test: OK — all checks passed"

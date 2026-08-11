@@ -1799,6 +1799,10 @@ const METAL_LINT_CONFIGS: &[&[&str]] = &[
     // knew they were clean was a by-hand run, which is what "ungated" means.
     &["--features", "wx-probe"],
     &["--features", "xn-probe"],
+    // The one-way observation channel. Booted by `boot-test.sh`'s seventh `boot_and_check`, so by
+    // this list's own stated invariant — anything a gate boots must be linted — it belongs here
+    // from the day it lands rather than being found missing later, which is what ⑳-f cost.
+    &["--features", "observe"],
     // ⑲-1 — the combined configuration. It is BUILT AND BOOTED by `qemu-linux-test`'s `Smmu` boot,
     // so by this list's own stated invariant it must be linted; before this rung it was a config
     // that compiled and that no gate ever looked at, which is ⑭b's finding one rung along.
@@ -2716,7 +2720,7 @@ fn doc_counts() -> bool {
 ///
 /// ⚠ Raising it is normal — a new boot is a new config. **Lowering it is a claim that a boot should
 /// no longer exist**, and belongs in the commit message.
-const BOOT_TEST_CONFIGS: usize = 6;
+const BOOT_TEST_CONFIGS: usize = 7;
 
 /// Every feature set [`BOOT_TEST`] actually builds and boots, parsed out of the script.
 ///
@@ -3025,7 +3029,7 @@ const MARKER_CORPUS: &[(&str, &[&str], usize)] = &[
 /// marker existed only in the terminal `wx-probe`/`xn-probe` configurations. Raising a number here
 /// is the normal shape of adding a witness — see the block comment on [`MARKER_CORPUS`] for why
 /// LOWERING one is a different kind of claim.
-const BOOT_TEST_MARKERS: usize = 177;
+const BOOT_TEST_MARKERS: usize = 182;
 
 /// Every marker array [`MARKER_CORPUS`] must account for, found by reading this file.
 ///

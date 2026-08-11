@@ -126,6 +126,12 @@ that silently covers a quarter of the crate is worse than none — the previous 
 | [`src/pcie.rs`](src/pcie.rs) | the minimum config-space access a DMA witness needs |
 | [`src/dmawitness.rs`](src/dmawitness.rs) | a **real bus master**, whether the SMMU stops it, and where it lands |
 
+### The consumer's channel
+
+| module | what |
+|---|---|
+| [`src/observe.rs`](src/observe.rs) | ⚠ `--features observe` — a safety monitor the watched partition **cannot blind**. Demonstrates the flaw first (consent is revocable), then the repair (invert ownership). See [`docs/CONSUMER-CORTENFORGE.md`](../docs/CONSUMER-CORTENFORGE.md) |
+
 ### The real-Linux capstone
 
 | module | what |
