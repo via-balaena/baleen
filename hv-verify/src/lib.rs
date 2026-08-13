@@ -5391,8 +5391,9 @@ mod policy_work_conservation {
             if kani::any() {
                 sys.admit(0, v).unwrap();
             }
-            // Masks are taken modulo the machine's pCPU count by `set_affinity` itself, so values
-            // at or above `1 << PCPUS` add solver state without adding a distinct configuration.
+            // `set_affinity` ANDs what it is given with the machine's full mask, so any value at
+            // or above `1 << PCPUS` lands on a configuration already covered below it — solver
+            // state with no new behaviour behind it.
             // The all-zero mask is deliberately NOT excluded: it is representable in production,
             // and the oracle formulation handles it correctly for free.
             let affinity: u64 = kani::any();
