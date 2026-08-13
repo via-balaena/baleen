@@ -3,8 +3,9 @@
 
 # Three green test tiers, one false property
 
-*A case study: what a Kani harness found in a scheduler that a seeded simulation, a fuzz target, and
-an exhaustive enumerator all reported clean.*
+*A scheduler property that a seeded simulation, a fuzz target and an exhaustive enumerator all
+reported clean — and that was false the whole time. How it hid, what actually found it, and what the
+proof added afterwards.*
 
 ---
 
@@ -124,7 +125,33 @@ The union looked like coverage. The intersection was empty exactly where the def
 
 ## 4. The harness
 
-The harness was written first and landed **failing on purpose**, against the unfixed policy:
+### What actually found it, stated plainly
+
+**Not the harness.** The order was: read the code while scoping an item in the honest ledger; notice
+that `next` chooses a CPU without consulting affinity while `run` refuses on it; write an ordinary
+`cargo test` that pins one vCPU away from the lowest idle CPU; watch it stall. **A plain unit test
+reproduced this before any harness existed**, and a unit test could have caught it years earlier —
+had anyone thought to set an affinity mask.
+
+So the discovery was **conceptual**: asking *which axes do the generators actually move?* rather than
+running a better tool. That is the transferable part, and pretending otherwise would sell a tool
+where the lesson is a habit.
+
+**What the proof added is precise and worth separating from discovery:**
+
+| the unit test says | the harness says |
+|---|---|
+| here is *one* input where the policy stalls | there is *no* input where it stalls — over every admission pattern and every affinity mask, at this shape |
+| on the code as I ran it | on the shipped code, symbolically executed |
+| until someone deletes the test | in CI, where the fix cannot silently regress |
+
+That is a real contribution and a different one. The rest of this section is about how the property
+had to be *stated* to make it true — which is where the harness earned its keep.
+
+### Written before the fix, and failing on purpose
+
+The harness landed red against the unfixed policy, deliberately, so that the fix had something to
+turn green:
 
 ```
 ** 1 of 1721 failed (8 unreachable)
