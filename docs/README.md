@@ -13,8 +13,9 @@ title: Documentation index
 
 # `docs/` — what is in here, and what to read first
 
-**36 documents.** (Plus this index and the [site landing page](index.html) — the only two files
-`doc-index` treats as indexes rather than classified documents.)
+**36 documents.** (Plus this index, which `doc-index` exempts from classification because it is
+the thing doing the classifying, and the [site landing page](index.html), which the gate never
+sees at all — it collects `.md` only.)
 They are not a manual and they are not in order; each one was
 written to close a specific arc, and each records *what was established, what was refuted, and what
 was left open* at the moment it closed.
