@@ -1,0 +1,44 @@
+{
+  "_generated_by": "cargo xtask site-data — do not hand-edit",
+  "fence": [
+    { "crate": "hv-core", "lines": 7689, "fenced": true },
+    { "crate": "hv-s2", "lines": 3682, "fenced": true },
+    { "crate": "hv-vdev", "lines": 939, "fenced": true },
+    { "crate": "hv-part", "lines": 169, "fenced": true },
+    { "crate": "hv-hal", "lines": 20, "fenced": true },
+    { "crate": "hv-metal", "lines": 12964, "fenced": false }
+  ],
+  "kani_by_module": [
+    { "module": "device_models", "harnesses": 35 },
+    { "module": "partition", "harnesses": 15 },
+    { "module": "smmu_stream_table", "harnesses": 10 },
+    { "module": "vgic_cpu_interface", "harnesses": 10 },
+    { "module": "smmu_stream_binding", "harnesses": 8 },
+    { "module": "stage2_encoding", "harnesses": 8 },
+    { "module": "stage2_refinement", "harnesses": 8 },
+    { "module": "gic_declared_residues", "harnesses": 7 },
+    { "module": "device_assignment", "harnesses": 6 },
+    { "module": "device_path_composition", "harnesses": 6 },
+    { "module": "smmu_stream_derivation", "harnesses": 6 },
+    { "module": "stage2_device_region", "harnesses": 4 },
+    { "module": "grant_refcount", "harnesses": 3 },
+    { "module": "p2m_write_xor_execute", "harnesses": 3 },
+    { "module": "pending_set_algebra", "harnesses": 3 },
+    { "module": "foreign_link_state_machine", "harnesses": 2 },
+    { "module": "grant_state_machine", "harnesses": 1 },
+    { "module": "policy_work_conservation", "harnesses": 1 },
+    { "module": "vgic_active_lr", "harnesses": 1 }
+  ],
+  "matrix": [
+    { "subsystem": "sched (mechanism)", "enumerator": "full", "kani": "gap", "kani_n": 0, "verus": "full", "verus_n": 3, "fuzz": "full", "boot": "full" },
+    { "subsystem": "policy (scheduling)", "enumerator": "out", "kani": "part", "kani_n": 1, "verus": "gap", "verus_n": 0, "fuzz": "full", "boot": "out" },
+    { "subsystem": "evtchn", "enumerator": "full", "kani": "gap", "kani_n": 0, "verus": "full", "verus_n": 9, "fuzz": "full", "boot": "full" },
+    { "subsystem": "grant tables", "enumerator": "full", "kani": "full", "kani_n": 4, "verus": "full", "verus_n": 15, "fuzz": "full", "boot": "full" },
+    { "subsystem": "p2m / page types", "enumerator": "full", "kani": "full", "kani_n": 5, "verus": "full", "verus_n": 38, "fuzz": "full", "boot": "full" },
+    { "subsystem": "device assignment", "enumerator": "full", "kani": "full", "kani_n": 36, "verus": "full", "verus_n": 6, "fuzz": "gap", "boot": "full" },
+    { "subsystem": "Stage-2 emitter", "enumerator": "full", "kani": "full", "kani_n": 20, "verus": "full", "verus_n": 8, "fuzz": "full", "boot": "full" },
+    { "subsystem": "vGIC / PL011 models", "enumerator": "out", "kani": "full", "kani_n": 56, "verus": "gap", "verus_n": 0, "fuzz": "gap", "boot": "full" },
+    { "subsystem": "partitioning", "enumerator": "out", "kani": "full", "kani_n": 15, "verus": "gap", "verus_n": 0, "fuzz": "gap", "boot": "full" },
+    { "subsystem": "hv-metal", "enumerator": "out", "kani": "out", "kani_n": 0, "verus": "out", "verus_n": 0, "fuzz": "out", "boot": "full" }
+  ]
+}
