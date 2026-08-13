@@ -1,3 +1,13 @@
+---
+# ⚠ This front matter exists ONLY so GitHub Pages renders this file as HTML.
+# GitHub's `jekyll-optional-front-matter` plugin, which turns the other markdown in this
+# directory into pages, deliberately SKIPS files named README — so without this block the
+# site served this index as raw markdown while every neighbouring page rendered, and the
+# landing page's "full documentation index" link dumped source at a first-time reader.
+# Both GitHub's markdown viewer and Jekyll strip this block, so it is invisible in the repo.
+title: Documentation index
+---
+
 <!-- SPDX-License-Identifier: Apache-2.0 OR MIT -->
 <!-- Copyright (c) 2026 Via Balaena -->
 
