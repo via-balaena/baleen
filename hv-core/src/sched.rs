@@ -430,7 +430,9 @@ impl System {
     /// ⚠ **It answers the affinity question and nothing else.** `true` says only that the mask
     /// admits this pCPU — not that the vCPU is `Runnable`, and not that the pCPU is free. It is a
     /// *necessary* condition for [`Self::run`] to succeed, never a sufficient one. An out-of-range
-    /// `dom`/`vcpu` is `false`, the same refusal `run` gives it.
+    /// `dom`/`vcpu` is `false` — note `run` rejects those ids earlier and with a *different* error
+    /// (`BadDom`/`BadVcpu`, not `NotAffine`), so this is a safe answer here rather than the same
+    /// answer.
     pub fn affinity_permits(&self, dom: DomId, vcpu: Vcpu, pcpu: Pcpu) -> bool {
         self.vcpu(dom, vcpu)
             .is_ok_and(|v| mask_permits(v.affinity, pcpu))

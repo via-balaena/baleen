@@ -306,11 +306,27 @@ impl Scheduler {
             match self.next(sys, now) {
                 Decision::Run { dom, vcpu, pcpu } => {
                     // Enacted through the public mechanism; it re-checks exclusivity.
+                    //
+                    // ⚠⚠ **This `break` was load-bearing before ㉘ and is defensive after it.**
+                    // `next` used to recommend off-affinity dispatches, so `run` really did
+                    // refuse — and taking that refusal as `break` abandoned the whole fixpoint,
+                    // leaving CPUs idle with placeable vCPUs waiting. Now every refusal reason is
+                    // excluded before we get here: `next` returns `Run` only for a `Runnable`
+                    // vCPU (not `WrongState`), on an in-range pCPU (not `BadPcpu`) that is
+                    // unoccupied (not `PcpuBusy`) and in its mask (not `NotAffine`).
+                    //
+                    // ⚠ **Unreachable by construction, NOT by proof.** The work-conservation
+                    // harness would fail if this fired at its shape, which is evidence rather
+                    // than a theorem; nothing yet asserts the stronger "`next` never proposes a
+                    // decision the mechanism refuses" directly. Keep the `break`: if a future
+                    // rule reintroduces a refusal, stopping is safer than looping on it.
                     if sys.run(dom, vcpu, pcpu, now).is_err() {
                         break;
                     }
                 }
                 Decision::Preempt { dom, vcpu, .. } => {
+                    // Likewise: `next` names a vCPU it just observed `Running`, so `preempt`
+                    // cannot refuse it.
                     if sys.preempt(dom, vcpu, now).is_err() {
                         break;
                     }
