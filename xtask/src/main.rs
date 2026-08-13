@@ -3125,11 +3125,18 @@ fn doc_index() -> bool {
     eprintln!("$ xtask doc-index");
     const INDEX: &str = "docs/README.md";
 
+    // ⚠ The two files that are INDEXES rather than classified documents. `README.md` is this
+    // gate's own subject; `index.md` is the GitHub Pages landing page, which serves the same role
+    // for an outside reader. Excluding a file from a completeness gate is how holes are made, so
+    // the set is named and stated rather than being a `!=` buried in a filter: **anything added
+    // here stops being checked, and that has to be a decision somebody made on purpose.**
+    const INDEX_FILES: &[&str] = &["README.md", "index.md"];
+
     let mut universe: Vec<String> = match std::fs::read_dir("docs") {
         Ok(d) => d
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".md") && n != "README.md")
+            .filter(|n| n.ends_with(".md") && !INDEX_FILES.contains(&n.as_str()))
             .collect(),
         Err(e) => {
             eprintln!("doc-index: cannot list docs/: {e}");

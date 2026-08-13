@@ -3,7 +3,9 @@
 
 # `docs/` — what is in here, and what to read first
 
-**35 documents.** They are not a manual and they are not in order; each one was
+**36 documents.** (Plus this index and the [site landing page](index.md) — the only two files
+`doc-index` treats as indexes rather than classified documents.)
+They are not a manual and they are not in order; each one was
 written to close a specific arc, and each records *what was established, what was refuted, and what
 was left open* at the moment it closed.
 
@@ -26,6 +28,10 @@ cargo xtask qemu-test   # the hypervisor boots on the metal, under QEMU
 Then read the root [`README.md`](../README.md)'s *"What this is, honestly"* section, which states the
 limits before the claims, and [`QEMU-AND-METAL.md`](QEMU-AND-METAL.md) — **what testing against QEMU
 does and does not mean**. Read that one before believing any sentence containing the word "metal".
+
+**"Show me the verification catching something."** — [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md): a real defect, why three
+green test tiers missed it, and what the harness did differently. **Start here if you have an hour
+and no context.**
 
 **"How does the proof work?"** — [`TIER-B-CUTOFF.md`](TIER-B-CUTOFF.md) →
 [`TIER-C-SPIKE.md`](TIER-C-SPIKE.md) → [`TIER-D-NONINTERFERENCE.md`](TIER-D-NONINTERFERENCE.md), in
@@ -61,6 +67,16 @@ The files are **not being renamed**: 235 cited paths across the docs and READMEs
 rename trades a stated trap for a silent one.
 
 ---
+
+## Case studies — what the verification actually caught
+
+*Written for a reader who does not know this project and has an hour. Each one is a single defect,
+end to end: what was claimed, what was false, why the existing tests missed it, and what the proof
+did that they could not.*
+
+| document | what it establishes |
+|---|---|
+| [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md) | a scheduler property that a seeded simulation, a fuzz target **and** an exhaustive enumerator all reported green while it was false — one pinned vCPU stopped the machine permanently, with every safety invariant holding. The Kani harness that caught it uses the **mechanism as its own oracle**, which is the transferable technique; the lesson is *count the axes your generators move, not the tiers that assert* |
 
 ## The deductive program — the model, proven
 

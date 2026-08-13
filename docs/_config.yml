@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+# Copyright (c) 2026 Via Balaena
+#
+# GitHub Pages serves this directory directly — no build step, no CI job, no generated
+# artifacts checked in. Every page on the site is a markdown file that is ALSO the
+# repository's own working documentation, which is deliberate: a site built from a separate
+# copy of the argument is a second derivation, and this project has been bitten by those.
+#
+# ⚠ The landing page carries NO corpus counts. `cargo xtask doc-counts` gates the numbers in
+# the root README against the gates that produce them; nothing gates a website. So the site
+# states the argument and links into the repository for every figure. Do not add a count here.
+
+title: Baleen
+description: >-
+  A static-partitioning separation kernel for AArch64/EL2, built so that its claims
+  can be checked rather than believed.
+theme: jekyll-theme-minimal
+show_downloads: false
