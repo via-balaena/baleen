@@ -5326,3 +5326,90 @@ mod partition {
         window_top_fits_at(4)
     }
 }
+
+/// **Work conservation for the scheduling policy (㉘) — the first Kani harness over
+/// `hv_core::policy` or `hv_core::sched`.**
+///
+/// [`policy`] states four properties it is "built to hold", and until ㉘ **none of them was
+/// machine-checked**: no harness here named `policy::`, no Verus obligation covered it, and no
+/// exhaustive sweep reached it. Its evidence was `hv-sim`'s seeded simulation plus a `hv-fuzz`
+/// target — and *both* explore the same four-op alphabet (admit / block / wake / offline), so
+/// **both are blind to the same axis: neither ever varies affinity.** The enumerator does sweep
+/// affinity (`0..(1 << pcpus)`), but over the *mechanism's* hypercalls, never through the policy.
+/// Three tiers asserted work conservation, three passed, and the union only *looked* like coverage.
+///
+/// ## The property, stated so that it is the real one
+///
+/// Work conservation is "no physical CPU idles while a vCPU could use it". The tempting phrasing —
+/// *no idle pCPU coexists with a `Runnable` vCPU* — is **false as an invariant of any scheduler**,
+/// because a vCPU whose hard-affinity mask excludes every idle pCPU is `Runnable` and legitimately
+/// unplaceable; `set_affinity(_, _, 0)` is accepted, so even a permanently unplaceable vCPU is
+/// representable. That is exactly the phrasing `hv-sim` and `hv-fuzz` assert, and it survives there
+/// only because neither ever sets an affinity mask.
+///
+/// ★ So this harness does not re-derive the placement rule at all. It asks the **mechanism**:
+/// after [`Scheduler::advance`] has driven the system to its fixpoint, *no dispatch may still be
+/// legal* — for every `(dom, vcpu, pcpu)`, [`System::run`] must refuse. That formulation is
+/// faithful by construction (design-lesson #14c: one derivation, no drift — the oracle is the
+/// production transition, not a copy of its guards), and it is **automatically the correct
+/// statement**: an unplaceable vCPU can never make `run` succeed, so the affinity qualification
+/// falls out rather than being bolted on. `run` validates before mutating — a refusal is a true
+/// no-op — so using it as a probe cannot perturb the state it is probing.
+///
+/// ## What is symbolic, and what is not
+///
+/// Symbolic: which vCPUs are admitted, and **every vCPU's affinity mask** — the axis the existing
+/// tiers never move. Concrete: the shape (1 domain × 2 vCPUs × 2 pCPUs), the quantum, and `now = 0`.
+/// ⚠ **The concrete half is a declared bound, not an oversight.** At `now = 0` with nothing yet run,
+/// every vCPU's accrued service is `0`, which keeps `share`'s `u128` cross-multiplication trivial
+/// for the solver; widening `now`/quantum/runtime is a cost question to be *measured*, not assumed
+/// affordable (honest-ledger item 11 — this suite's two heaviest harnesses already sit at ~6.1 and
+/// ~4.5 GiB). The defect this harness exists to catch is fully exposed at this shape.
+///
+/// [`policy`]: hv_core::policy
+/// [`Scheduler::advance`]: hv_core::policy::Scheduler::advance
+/// [`System::run`]: hv_core::sched::System::run
+#[cfg(kani)]
+mod policy_work_conservation {
+    use hv_core::policy::Scheduler;
+    use hv_core::sched::System;
+
+    const DOMS: usize = 1;
+    const VCPUS: usize = 2;
+    const PCPUS: usize = 2;
+    const QUANTUM: u64 = 10;
+
+    /// Drive the real policy to its fixpoint over a symbolic admission pattern and symbolic
+    /// per-vCPU affinity, then assert the mechanism refuses every remaining dispatch.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn advance_leaves_no_legal_dispatch_unmade() {
+        let mut sys = System::new(DOMS, VCPUS, PCPUS);
+        let mut pol = Scheduler::new(DOMS, VCPUS, QUANTUM);
+
+        for v in 0..VCPUS as u32 {
+            if kani::any() {
+                sys.admit(0, v).unwrap();
+            }
+            // Masks are taken modulo the machine's pCPU count by `set_affinity` itself, so values
+            // at or above `1 << PCPUS` add solver state without adding a distinct configuration.
+            // The all-zero mask is deliberately NOT excluded: it is representable in production,
+            // and the oracle formulation handles it correctly for free.
+            let affinity: u64 = kani::any();
+            kani::assume(affinity < (1 << PCPUS));
+            sys.set_affinity(0, v, affinity).unwrap();
+        }
+
+        pol.advance(&mut sys, 0);
+
+        for v in 0..VCPUS as u32 {
+            for p in 0..PCPUS as u32 {
+                assert!(
+                    sys.run(0, v, p, 0).is_err(),
+                    "work conservation: the policy reached its fixpoint while a legal dispatch \
+                     remained — the mechanism still accepts this vCPU onto this idle pCPU"
+                );
+            }
+        }
+    }
+}

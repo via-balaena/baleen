@@ -3848,6 +3848,7 @@ const KANI_HARNESSES: &[&str] = &[
     "pending_set_algebra::a_bit_round_trips_and_is_exactly_one_bit",
     "pending_set_algebra::lowest_set_is_the_minimum_member_and_none_only_when_empty",
     "pending_set_algebra::the_word_index_of_any_nameable_intid_is_in_range",
+    "policy_work_conservation::advance_leaves_no_legal_dispatch_unmade",
     "smmu_stream_binding::a_binding_that_cannot_be_named_exactly_is_refused_and_writes_nothing",
     "smmu_stream_binding::a_bound_stream_names_exactly_the_domain_it_was_given",
     "smmu_stream_binding::binding_a_stream_to_a_domain_leaves_every_other_denied",
