@@ -128,6 +128,7 @@ fn main() {
         "doc-tasks" => doc_tasks(),
         "doc-modules" => doc_modules(),
         "seam-census" => seam_census(),
+        "site-data" => site_data(true),
         "hvcall-census" => hvcall_census(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
@@ -175,6 +176,8 @@ fn main() {
                 // merely audited — but a different question, so a different task rather than a
                 // second obligation hidden under the first one's name.
                 && hvcall_census()
+                // ㉛: the published assurance map must still match the gates that produce its figures.
+                && site_data(false)
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -204,6 +207,7 @@ fn main() {
                  doc-modules  assert a README enumerating a directory enumerates ALL of it\n  \
                  seam-census  assert every hv-core transition is hypercall-reachable, or DECLARED above the seam\n  \
                  hvcall-census  assert the fuzz target that drives HvCall constructs EVERY variant\n  \
+                 site-data    regenerate the published assurance map's data from the gates\n  \
                  verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  kani-harnesses  run the Kani corpus and assert it contains exactly the expected harnesses\n  \
                  sweeps assert the deep exhaustive-sweep corpus is exactly the expected one\n  \
@@ -3126,11 +3130,11 @@ fn doc_index() -> bool {
     const INDEX: &str = "docs/README.md";
 
     // ⚠ The two files that are INDEXES rather than classified documents. `README.md` is this
-    // gate's own subject; `index.md` is the GitHub Pages landing page, which serves the same role
-    // for an outside reader. Excluding a file from a completeness gate is how holes are made, so
+    // gate's own subject; (The Pages landing page is `index.html`, which this
+    // glob never sees — it only collects `.md`.) Excluding a file from a completeness gate is how holes are made, so
     // the set is named and stated rather than being a `!=` buried in a filter: **anything added
     // here stops being checked, and that has to be a decision somebody made on purpose.**
-    const INDEX_FILES: &[&str] = &["README.md", "index.md"];
+    const INDEX_FILES: &[&str] = &["README.md"];
 
     let mut universe: Vec<String> = match std::fs::read_dir("docs") {
         Ok(d) => d
@@ -4586,4 +4590,374 @@ fn run_env(program: &str, args: &[&str], env: &[(&str, &str)]) -> bool {
         cmd.env(key, value);
     }
     cmd.status().map(|s| s.success()).unwrap_or(false)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// ㉛ — THE ASSURANCE MAP'S DATA, DERIVED RATHER THAN TYPED
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// One subsystem's row in the published evidence matrix.
+///
+/// ⚠⚠ **The MAPPING is declared; every CELL is derived.** Which Kani modules and Verus files
+/// belong to a subsystem is a judgement nothing can compute — but *whether those artifacts exist*
+/// is mechanical, and this gate checks it. So a renamed harness module or a deleted Verus file
+/// turns the published matrix red instead of quietly leaving a subsystem looking covered.
+///
+/// ★ That split is the whole design. A hand-maintained matrix rots (design-lesson #276); a fully
+/// derived one cannot express "these harnesses are *about* grants". Declaring only the mapping
+/// keeps the judgement where a human can see it and the facts where the compiler can.
+struct Subsystem {
+    /// The subsystem's name as the published matrix shows it.
+    name: &'static str,
+    /// `KANI_HARNESSES` module prefixes covering this subsystem.
+    kani: &'static [&'static str],
+    /// `VERUS_OBLIGATIONS` file stems covering it.
+    verus: &'static [&'static str],
+    /// A `hv-fuzz/fuzz_targets/<name>.rs` that drives it, if any.
+    fuzz: Option<&'static str>,
+    /// Reachable from an `HvCall`, hence swept exhaustively by `hv-sim::enumerate`.
+    /// ⚠ For `policy` this is FALSE and that is not an oversight — see `seam-census`.
+    enumerated: bool,
+    /// Exercised by a real boot, asserted by markers in `MARKER_CORPUS`.
+    booted: bool,
+    /// Methods that **structurally cannot** reach this subsystem, named so the published matrix
+    /// can tell them apart from methods that simply have not been applied.
+    ///
+    /// ⚠⚠ **This distinction is the difference between an honest matrix and an alarming one.** A
+    /// *gap* says "this method reaches here and has not been used" — closeable, and worth someone's
+    /// afternoon. *Out of reach* says "no amount of work applies this method here without changing
+    /// the architecture": `hv-metal` is outside the workspace so no prover links it; `policy` sits
+    /// above the dispatch seam so no `HvCall` enumeration touches it; `hv-part` is `const fn`
+    /// arithmetic with no state machine to enumerate. Painting those four `hv-metal` cells red
+    /// would report an architecture as a backlog.
+    out: &'static [&'static str],
+}
+
+/// The rows of the published evidence matrix, in the order the site renders them.
+const SUBSYSTEMS: &[Subsystem] = &[
+    Subsystem {
+        name: "sched (mechanism)",
+        kani: &[],
+        verus: &["unwinding_control"],
+        fuzz: Some("sched"),
+        enumerated: true,
+        booted: true,
+        out: &[],
+    },
+    Subsystem {
+        name: "policy (scheduling)",
+        kani: &["policy_work_conservation"],
+        verus: &[],
+        fuzz: Some("policy"),
+        enumerated: false,
+        booted: false,
+        out: &["enumerator", "boot"],
+    },
+    Subsystem {
+        name: "evtchn",
+        kani: &[],
+        verus: &["unwinding_signal", "unwinding_destroy"],
+        fuzz: Some("evtchn"),
+        enumerated: true,
+        booted: true,
+        out: &[],
+    },
+    Subsystem {
+        name: "grant tables",
+        kani: &["grant_refcount", "grant_state_machine"],
+        verus: &["refcount_mismatch", "read_closure", "frame_lemma"],
+        fuzz: Some("grant"),
+        enumerated: true,
+        booted: true,
+        out: &[],
+    },
+    Subsystem {
+        name: "p2m / page types",
+        kani: &["p2m_write_xor_execute", "foreign_link_state_machine"],
+        verus: &["mislevelled_link_preservation", "foreign_link_preservation"],
+        fuzz: Some("p2m"),
+        enumerated: true,
+        booted: true,
+        out: &[],
+    },
+    Subsystem {
+        name: "device assignment",
+        kani: &[
+            "device_assignment",
+            "smmu_stream_binding",
+            "smmu_stream_derivation",
+            "smmu_stream_table",
+            "device_path_composition",
+        ],
+        verus: &["device_assignment_preservation"],
+        fuzz: None,
+        enumerated: true,
+        booted: true,
+        out: &[],
+    },
+    Subsystem {
+        name: "Stage-2 emitter",
+        kani: &[
+            "stage2_encoding",
+            "stage2_refinement",
+            "stage2_device_region",
+        ],
+        verus: &["stage2_leaf_authorized"],
+        fuzz: Some("hypervisor"),
+        enumerated: true,
+        booted: true,
+        out: &[],
+    },
+    Subsystem {
+        name: "vGIC / PL011 models",
+        kani: &[
+            "device_models",
+            "vgic_cpu_interface",
+            "vgic_active_lr",
+            "pending_set_algebra",
+            "gic_declared_residues",
+        ],
+        verus: &[],
+        fuzz: None,
+        enumerated: false,
+        booted: true,
+        out: &["enumerator"],
+    },
+    Subsystem {
+        name: "partitioning",
+        kani: &["partition"],
+        verus: &[],
+        fuzz: None,
+        enumerated: false,
+        booted: true,
+        out: &["enumerator"],
+    },
+    Subsystem {
+        name: "hv-metal",
+        kani: &[],
+        verus: &[],
+        fuzz: None,
+        enumerated: false,
+        booted: true,
+        out: &["enumerator", "kani", "verus", "fuzz"],
+    },
+];
+
+/// Crates whose code SHIPS, and which side of the proof fence each sits on. Tooling
+/// (`hv-sim`, `hv-verify`, `xtask`, the probes) is excluded deliberately: counting it would
+/// flatter the ratio, since none of it runs on the machine being protected.
+const SHIPPED: &[(&str, bool)] = &[
+    ("hv-core", true),
+    ("hv-s2", true),
+    ("hv-vdev", true),
+    ("hv-part", true),
+    ("hv-hal", true),
+    ("hv-metal", false),
+];
+
+/// Non-blank, non-comment lines under `<crate>/src`.
+fn crate_lines(krate: &str) -> usize {
+    fn walk(dir: &std::path::Path, n: &mut usize) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, n);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                if let Ok(t) = std::fs::read_to_string(&p) {
+                    *n += t
+                        .lines()
+                        .filter(|l| {
+                            let t = l.trim();
+                            !t.is_empty() && !t.starts_with("//")
+                        })
+                        .count();
+                }
+            }
+        }
+    }
+    let mut n = 0;
+    walk(std::path::Path::new(&format!("{krate}/src")), &mut n);
+    n
+}
+
+/// **Emit the published assurance map's data from the gates that own it (㉛).**
+///
+/// The site renders numbers; this produces them. `write == false` is the CI mode: recompute and
+/// compare against what is committed, failing if they differ — the same bargain `doc-counts`
+/// makes for the README, and for the same reason. **A published figure nothing regenerates is a
+/// figure that is already drifting.**
+fn site_data(write: bool) -> bool {
+    eprintln!("$ xtask site-data{}", if write { "" } else { " (check)" });
+    const OUT: &str = "docs/assurance-data.json";
+
+    let mut ok = true;
+
+    // (1) The declared mapping must name artifacts that EXIST. This is what keeps the matrix
+    //     honest across renames: a subsystem cannot keep claiming coverage that moved away.
+    for s in SUBSYSTEMS {
+        for m in s.kani {
+            if !KANI_HARNESSES
+                .iter()
+                .any(|h| h.starts_with(&format!("{m}::")))
+            {
+                eprintln!(
+                    "site-data: FAIL — subsystem `{}` claims Kani module `{m}`, which no harness \
+                     in KANI_HARNESSES belongs to. Renamed or deleted; fix the mapping.",
+                    s.name
+                );
+                ok = false;
+            }
+        }
+        for v in s.verus {
+            if !VERUS_OBLIGATIONS.iter().any(|(n, _)| n == v) {
+                eprintln!(
+                    "site-data: FAIL — subsystem `{}` claims Verus file `{v}`, which is not in \
+                     VERUS_OBLIGATIONS.",
+                    s.name
+                );
+                ok = false;
+            }
+        }
+        if let Some(f) = s.fuzz {
+            if !std::path::Path::new(&format!("hv-fuzz/fuzz_targets/{f}.rs")).exists() {
+                eprintln!(
+                    "site-data: FAIL — subsystem `{}` claims fuzz target `{f}`, which does not \
+                     exist.",
+                    s.name
+                );
+                ok = false;
+            }
+        }
+    }
+    if !ok {
+        return false;
+    }
+
+    // (2) Derive.
+    let mut j = String::from("{\n");
+    j.push_str("  \"_generated_by\": \"cargo xtask site-data — do not hand-edit\",\n");
+
+    j.push_str("  \"fence\": [\n");
+    let rows: Vec<String> = SHIPPED
+        .iter()
+        .map(|(k, inside)| {
+            format!(
+                "    {{ \"crate\": \"{k}\", \"lines\": {}, \"fenced\": {inside} }}",
+                crate_lines(k)
+            )
+        })
+        .collect();
+    j.push_str(&rows.join(",\n"));
+    j.push_str("\n  ],\n");
+
+    let mut by_mod: Vec<(String, usize)> = Vec::new();
+    for h in KANI_HARNESSES {
+        let m = h.split("::").next().unwrap_or(h).to_string();
+        match by_mod.iter_mut().find(|(n, _)| *n == m) {
+            Some((_, c)) => *c += 1,
+            None => by_mod.push((m, 1)),
+        }
+    }
+    by_mod.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    j.push_str("  \"kani_by_module\": [\n");
+    let rows: Vec<String> = by_mod
+        .iter()
+        .map(|(m, c)| format!("    {{ \"module\": \"{m}\", \"harnesses\": {c} }}"))
+        .collect();
+    j.push_str(&rows.join(",\n"));
+    j.push_str("\n  ],\n");
+
+    j.push_str("  \"matrix\": [\n");
+    let rows: Vec<String> = SUBSYSTEMS
+        .iter()
+        .map(|s| {
+            let kani_n: usize = s
+                .kani
+                .iter()
+                .map(|m| {
+                    KANI_HARNESSES
+                        .iter()
+                        .filter(|h| h.starts_with(&format!("{m}::")))
+                        .count()
+                })
+                .sum();
+            let verus_n: usize = s
+                .verus
+                .iter()
+                .map(|v| {
+                    VERUS_OBLIGATIONS
+                        .iter()
+                        .find(|(n, _)| n == v)
+                        .map_or(0usize, |(_, c)| *c as usize)
+                })
+                .sum();
+            // "partial" is reserved for a subsystem whose only proof is explicitly bounded —
+            // today that is `policy`, whose single harness is stated at one shape.
+            let kani_state = match kani_n {
+                0 => "gap",
+                _ if s.name.starts_with("policy") => "part",
+                _ => "full",
+            };
+            // A method named in `out` reports `out` whatever the evidence count says — the
+            // architecture decides reachability, not the tally.
+            let st = |method: &str, covered: bool, bounded: bool| -> &'static str {
+                if s.out.contains(&method) {
+                    "out"
+                } else if !covered {
+                    "gap"
+                } else if bounded {
+                    "part"
+                } else {
+                    "full"
+                }
+            };
+            format!(
+                "    {{ \"subsystem\": \"{}\", \"enumerator\": \"{}\", \"kani\": \"{}\", \
+                 \"kani_n\": {kani_n}, \"verus\": \"{}\", \"verus_n\": {verus_n}, \
+                 \"fuzz\": \"{}\", \"boot\": \"{}\" }}",
+                s.name,
+                st("enumerator", s.enumerated, false),
+                st("kani", kani_n > 0, kani_state == "part"),
+                st("verus", verus_n > 0, false),
+                st("fuzz", s.fuzz.is_some(), false),
+                st("boot", s.booted, false),
+            )
+        })
+        .collect();
+    j.push_str(&rows.join(",\n"));
+    j.push_str("\n  ]\n}\n");
+
+    // (3) Write, or compare.
+    let current = std::fs::read_to_string(OUT).unwrap_or_default();
+    if write {
+        if current != j {
+            if let Err(e) = std::fs::write(OUT, &j) {
+                eprintln!("site-data: FAIL — cannot write {OUT}: {e}");
+                return false;
+            }
+            eprintln!("site-data: OK — regenerated {OUT}");
+        } else {
+            eprintln!("site-data: OK — {OUT} already current");
+        }
+        true
+    } else if current != j {
+        eprintln!(
+            "site-data: FAIL — {OUT} is stale. The published assurance map would show figures \
+             that no longer match the gates.\n\
+             \x20                Run `cargo xtask site-data` and commit the result."
+        );
+        false
+    } else {
+        eprintln!(
+            "site-data: OK — {OUT} matches the gates ({} shipped crates, {} Kani modules, {} \
+             subsystems)",
+            SHIPPED.len(),
+            by_mod.len(),
+            SUBSYSTEMS.len()
+        );
+        true
+    }
 }

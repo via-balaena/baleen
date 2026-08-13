@@ -3,7 +3,7 @@
 
 # `docs/` — what is in here, and what to read first
 
-**36 documents.** (Plus this index and the [site landing page](index.md) — the only two files
+**36 documents.** (Plus this index and the [site landing page](index.html) — the only two files
 `doc-index` treats as indexes rather than classified documents.)
 They are not a manual and they are not in order; each one was
 written to close a specific arc, and each records *what was established, what was refuted, and what
