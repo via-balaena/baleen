@@ -58,6 +58,9 @@ default in the same machine, all under required CI gates.
   `advance_leaves_no_legal_dispatch_unmade`, at a bounded shape); the other three remain
   property-tested (`hv-sim`) and fuzzed (`hv-fuzz`), and two of them — a *limit* and a claim about
   *unbounded runs* — are not bounded-depth properties, so no larger Kani harness reaches them.
+  ★ The technique is nonetheless **scoped rather than unknown**: Verus has a TLA embedding
+  (`anvil-verifier/verus-tla`) and Anvil used it to verify liveness of Kubernetes controllers,
+  on the same Verus this repository already gates with.
   ⚠ **"A bad policy is unfair, not unsafe" used to stand here unqualified, and ㉘ is the reason it
   no longer does.** The work-conservation property was false: a vCPU pinned away from the lowest
   idle CPU made the policy recommend a dispatch the mechanism refuses, which `advance` took as its
