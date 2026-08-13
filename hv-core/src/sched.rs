@@ -241,7 +241,9 @@ impl System {
         // Affinity: the vCPU may be dispatched only onto a pCPU in its hard-affinity mask.
         // Checked before occupancy, so an off-affinity dispatch is refused for the same
         // reason regardless of whether the pCPU happens to be free — and it is a no-op.
-        if !mask_permits(v.affinity, pcpu) {
+        // Routed through the public predicate so the policy layer above cannot be testing a
+        // *different* rule from the one enforced here (design-lesson #14c).
+        if !self.affinity_permits(dom, vcpu, pcpu) {
             return Err(SchedError::NotAffine);
         }
         if self.pcpus[pcpu as usize].is_some() {
@@ -416,6 +418,24 @@ impl System {
     /// include it. Always the all-pCPUs default while the vCPU is `Offline`.
     pub fn affinity_of(&self, dom: DomId, vcpu: Vcpu) -> Option<u64> {
         self.vcpu(dom, vcpu).ok().map(|v| v.affinity)
+    }
+
+    /// Whether this vCPU's hard affinity permits `pcpu` — the **single derivation** of the rule
+    /// [`Self::run`] enforces, which routes through this method rather than re-testing the mask
+    /// itself. It is exposed because a policy layer sitting above the mechanism must be able to
+    /// avoid *recommending* a dispatch the mechanism would refuse; without it, that layer has to
+    /// re-implement the bit test, and two copies of a rule are a rule that can drift
+    /// (design-lesson #14c).
+    ///
+    /// ⚠ **It answers the affinity question and nothing else.** `true` says only that the mask
+    /// admits this pCPU — not that the vCPU is `Runnable`, and not that the pCPU is free. It is a
+    /// *necessary* condition for [`Self::run`] to succeed, never a sufficient one. An out-of-range
+    /// `dom`/`vcpu` is `false` — note `run` rejects those ids earlier and with a *different* error
+    /// (`BadDom`/`BadVcpu`, not `NotAffine`), so this is a safe answer here rather than the same
+    /// answer.
+    pub fn affinity_permits(&self, dom: DomId, vcpu: Vcpu, pcpu: Pcpu) -> bool {
+        self.vcpu(dom, vcpu)
+            .is_ok_and(|v| mask_permits(v.affinity, pcpu))
     }
 
     /// The all-pCPUs affinity mask for this system — the default every vCPU boots and

@@ -14,28 +14,56 @@
 //!
 //! **What it is vs. what the mechanism is.** The mechanism has a *safety invariant*
 //! (one vCPU per pCPU, checked every transition). A policy has no safety invariant of
-//! its own — a bad policy is unfair, not unsafe. What it has instead are *properties*
-//! worth proving, and this one is built to hold **four**:
+//! its own; what it has instead are *properties* worth proving, and this one is built to hold
+//! **four**. ⚠ **This used to gloss that as "a bad policy is unfair, not unsafe", and ㉘ deleted
+//! the gloss rather than softening it** — see the paragraph below, where a wrong choice here
+//! stopped the machine outright while every invariant held. The mechanism still cannot be
+//! *corrupted* from up here; that is a narrower guarantee than the phrase implied.
 //!
 //! ⚠ This line said **three** while four were listed below — sleeper-fairness was added without
 //! the count moving. Nothing gates a count inside a module doc, which is exactly why a number in
 //! prose is a liability (design-lesson #276). Corrected, not quietly reworded.
 //!
-//! ⚠⚠ **"Worth proving" is the operative phrase: NONE OF THE FOUR IS PROVEN.** This module sits
-//! in `hv-core` — the crate whose isolation core is machine-checked — and a reader is entitled to
-//! assume its contents carry that tier. They do not. **No Kani harness and no Verus obligation
-//! touches `policy::`, and no deep sweep names it.** The evidence for every property below is
-//! `hv-sim`'s seeded simulation, which is the project's *weakest* tier.
+//! ⚠⚠ **"Worth proving" is the operative phrase: ONE of the four is proven, and three are not.**
+//! This module sits in `hv-core` — the crate whose isolation core is machine-checked — and a
+//! reader is entitled to assume its contents carry that tier. **Mostly they still do not.**
 //!
-//! That is defensible and deliberate — a policy has no safety invariant, so a bad one is unfair
-//! rather than unsafe, and the mechanism beneath it *is* proven and cannot be corrupted by a
-//! wrong choice here. **But it must not be silent**, because anything that comes to depend on a
-//! latency property (a safety monitor, say) would be depending on a simulation result while
-//! believing it depended on a proof.
+//! * **Work conservation is machine-checked since ㉘**, by
+//!   `hv-verify`'s `policy_work_conservation::advance_leaves_no_legal_dispatch_unmade` — the first
+//!   Kani harness over this module or [`crate::sched`]. It drives the real [`Scheduler::advance`]
+//!   over a symbolic admission pattern and symbolic per-vCPU affinity, then requires that the
+//!   mechanism refuse every remaining dispatch. ⚠ **At a bounded shape** (1 domain × 2 vCPUs ×
+//!   2 pCPUs, concrete quantum, `now = 0`) — ∀-values on the axes that are symbolic, not ∀-size.
+//! * **The other three are still `hv-sim` seeded simulation**, the project's weakest tier, and
+//!   **two of them cannot be Kani's** at any shape: proportional fairness is a statement about a
+//!   *limit*, and the starvation bound is a statement about *unbounded runs*. Neither is a
+//!   bounded-depth property, so closing them means a different technique, not a bigger harness.
 //!
-//! * **Work-conserving** — it never leaves a physical CPU idle while a vCPU is
-//!   runnable. After [`Scheduler::advance`] settles, no idle-CPU/waiting-vCPU pair
-//!   remains.
+//! ★★ **And the warning this paragraph used to carry was not hypothetical — it had already come
+//! true when it was written.** It said a policy has no safety invariant, so a bad one is "unfair
+//! rather than unsafe", and that the proven mechanism beneath cannot be corrupted by a wrong
+//! choice here. Both clauses are true and both were beside the point: ㉘ found that the
+//! work-conservation property **was simply false**, and its failure mode was neither unfairness
+//! nor corruption but a **total, permanent scheduling stall** — every CPU idle, every vCPU
+//! runnable, zero transitions, forever (see [`Scheduler::next`]). The mechanism's invariants held
+//! perfectly throughout. **"It cannot break the proven layer beneath" is not the same as "it
+//! works", and a module doc that reaches for the first when a reader wants the second is telling
+//! them something true and useless.**
+//!
+//! ⚠ **The residual that matters most is still open.** Anything depending on the *latency* bound —
+//! a safety monitor, say — is depending on a simulation result while a reader of this crate would
+//! assume a proof. That is exactly what ㉘ did **not** close.
+//!
+//! * **Work-conserving** — it never leaves a physical CPU idle while a vCPU **that may use that
+//!   CPU** is runnable. After [`Scheduler::advance`] settles, no idle-CPU/waiting-vCPU pair
+//!   remains *where the waiter's hard affinity admits that CPU*.
+//!   ⚠⚠ **The qualification is load-bearing and its absence was a real defect, not pedantry.**
+//!   A vCPU whose mask excludes every free CPU is `Runnable` and legitimately unplaceable —
+//!   `set_affinity(_, _, 0)` is accepted — so the unqualified sentence is unsatisfiable rather
+//!   than merely strict. It stood here for four arcs, and read as true the whole time, because
+//!   **no tier that checked it ever set an affinity mask**: `hv-sim`'s `run_policy` churn and the
+//!   `hv-fuzz` `policy` target drew from the same four-op alphabet, so every mask stayed full in
+//!   every run of both. ★ Two tiers sharing one blind axis are one tier with two names.
 //! * **Weighted-proportional-fair** — each vCPU carries a [`Weight`]; over time the
 //!   CPU splits between continuously-runnable vCPUs in proportion to their weights,
 //!   because the policy always runs the one with the least *service per weight*.
@@ -100,11 +128,12 @@ pub const MIN_WEIGHT: Weight = 1;
 pub enum Decision {
     /// Dispatch this runnable vCPU onto this idle physical CPU.
     Run { dom: DomId, vcpu: Vcpu, pcpu: Pcpu },
-    /// Preempt this running vCPU (its quantum has expired and a more-deserving vCPU
-    /// is waiting), freeing its physical CPU for the next [`Decision::Run`].
+    /// Preempt this running vCPU (its quantum has expired and a more-deserving vCPU **affine to
+    /// this physical CPU** is waiting), freeing its physical CPU for the next [`Decision::Run`].
     Preempt { dom: DomId, vcpu: Vcpu, pcpu: Pcpu },
-    /// Nothing to do: either no vCPU is runnable, or every runnable vCPU that could
-    /// run is already running and no preemption is warranted.
+    /// Nothing to do: no vCPU is runnable, or every runnable vCPU that could legally take a free
+    /// CPU is already running, or the only waiters are barred by affinity from every free CPU —
+    /// and no preemption is warranted.
     Idle,
 }
 
@@ -206,36 +235,42 @@ impl Scheduler {
     /// so the decision logic can be unit-tested with no mutation in the loop.
     ///
     /// The rule, in order:
-    /// 1. If a physical CPU is idle and any vCPU is runnable, [`Decision::Run`] the
-    ///    least-serviced-per-weight runnable vCPU on the lowest-numbered idle CPU
-    ///    (work conservation).
-    /// 2. Otherwise, if the best waiting vCPU is strictly more deserving than some
-    ///    running vCPU whose quantum has expired, [`Decision::Preempt`] the least
-    ///    deserving such runner (the following `next` will then run the waiter).
+    /// 1. If any runnable vCPU can legally take an idle physical CPU, [`Decision::Run`] the
+    ///    least-serviced-per-weight such vCPU on the lowest-numbered idle CPU **its affinity
+    ///    admits** (work conservation).
+    /// 2. Otherwise, if some running vCPU's quantum has expired and a strictly-more-deserving
+    ///    waiter is affine to *that* CPU, [`Decision::Preempt`] the least deserving such runner
+    ///    (the following `next` will then run the waiter).
     /// 3. Otherwise [`Decision::Idle`].
+    ///
+    /// ⚠⚠ **Both rules are affinity-aware, and neither was before ㉘.** The earlier form chose
+    /// the globally most-deserving runnable vCPU and *then* looked for an idle CPU, consulting no
+    /// mask — so it would recommend a dispatch [`sched::System::run`] refuses with `NotAffine`,
+    /// whereupon [`Self::advance`] took the `Err` as its `break` and **abandoned the whole
+    /// fixpoint**. One vCPU pinned away from the lowest idle CPU therefore stopped the machine:
+    /// measured at 0 transitions over 200 ticks on a 2-vCPU/2-pCPU system, permanently, starving
+    /// the *other* vCPU too — which was legally placeable the entire time. It was permanent
+    /// because the unplaceable vCPU is the most deserving precisely *because* it never runs, so
+    /// the choice repeated forever.
+    ///
+    /// ★ **Choosing the most-deserving *placeable* vCPU is what makes it right, not merely
+    /// choosing an affine CPU for the most-deserving one.** If the best candidate has no affine
+    /// idle CPU while a worse one does, work conservation obliges us to run the worse one.
+    /// Likewise rule 2 pairs a waiter with a runner it could actually replace: freeing a CPU no
+    /// waiter may use is a context switch that buys nothing and leaves the same CPU idle.
+    ///
+    /// **With every mask full both rules reduce exactly to the old behaviour** — which is why
+    /// every existing test, the seeded simulation and the fuzz target all continued to pass, and
+    /// why none of them ever saw the defect.
     pub fn next(&self, sys: &sched::System, now: Ticks) -> Decision {
-        let best_runnable = self.best_runnable(sys, now);
-
-        // Rule 1 — fill an idle CPU with the most-deserving runnable vCPU.
-        if let Some((dom, vcpu)) = best_runnable {
-            if let Some(pcpu) = self.first_idle_pcpu(sys) {
-                return Decision::Run { dom, vcpu, pcpu };
-            }
+        // Rule 1 — fill an idle CPU with the most-deserving vCPU that can legally use one.
+        if let Some((dom, vcpu, pcpu)) = self.best_placement(sys, now) {
+            return Decision::Run { dom, vcpu, pcpu };
         }
 
-        // Rule 2 — all CPUs busy: preempt for a strictly-more-deserving waiter.
-        if let Some((wdom, wvcpu)) = best_runnable {
-            if let Some((rdom, rvcpu, rpcpu)) = self.worst_expired_runner(sys, now) {
-                let waiter = self.share(sys, wdom, wvcpu, now);
-                let runner = self.share(sys, rdom, rvcpu, now);
-                if more_deserving(waiter, runner) {
-                    return Decision::Preempt {
-                        dom: rdom,
-                        vcpu: rvcpu,
-                        pcpu: rpcpu,
-                    };
-                }
-            }
+        // Rule 2 — no legal placement left: preempt for a strictly-more-deserving affine waiter.
+        if let Some((dom, vcpu, pcpu)) = self.best_preemption(sys, now) {
+            return Decision::Preempt { dom, vcpu, pcpu };
         }
 
         Decision::Idle
@@ -271,11 +306,27 @@ impl Scheduler {
             match self.next(sys, now) {
                 Decision::Run { dom, vcpu, pcpu } => {
                     // Enacted through the public mechanism; it re-checks exclusivity.
+                    //
+                    // ⚠⚠ **This `break` was load-bearing before ㉘ and is defensive after it.**
+                    // `next` used to recommend off-affinity dispatches, so `run` really did
+                    // refuse — and taking that refusal as `break` abandoned the whole fixpoint,
+                    // leaving CPUs idle with placeable vCPUs waiting. Now every refusal reason is
+                    // excluded before we get here: `next` returns `Run` only for a `Runnable`
+                    // vCPU (not `WrongState`), on an in-range pCPU (not `BadPcpu`) that is
+                    // unoccupied (not `PcpuBusy`) and in its mask (not `NotAffine`).
+                    //
+                    // ⚠ **Unreachable by construction, NOT by proof.** The work-conservation
+                    // harness would fail if this fired at its shape, which is evidence rather
+                    // than a theorem; nothing yet asserts the stronger "`next` never proposes a
+                    // decision the mechanism refuses" directly. Keep the `break`: if a future
+                    // rule reintroduces a refusal, stopping is safer than looping on it.
                     if sys.run(dom, vcpu, pcpu, now).is_err() {
                         break;
                     }
                 }
                 Decision::Preempt { dom, vcpu, .. } => {
+                    // Likewise: `next` names a vCPU it just observed `Running`, so `preempt`
+                    // cannot refuse it.
                     if sys.preempt(dom, vcpu, now).is_err() {
                         break;
                     }
@@ -289,29 +340,46 @@ impl Scheduler {
 
     // ─── internals ────────────────────────────────────────────────────────────
 
-    /// The most-deserving runnable (waiting) vCPU: least service-per-weight, ties
-    /// broken by lowest `(dom, vcpu)` for determinism. `None` if none is runnable.
-    fn best_runnable(&self, sys: &sched::System, now: Ticks) -> Option<(DomId, Vcpu)> {
-        let mut best: Option<((DomId, Vcpu), Share)> = None;
+    /// The most-deserving runnable vCPU that can be placed *right now*, paired with the pCPU it
+    /// would take: least service-per-weight among those with an affine idle CPU, ties broken by
+    /// lowest `(dom, vcpu)` for determinism. `None` when no runnable vCPU has one — every CPU
+    /// busy, or every free CPU outside every waiter's mask.
+    ///
+    /// ⚠ **The placeability test is part of the *selection*, not a filter applied afterwards.**
+    /// Ranking first and checking affinity second is the defect ㉘ closed: it lets an unplaceable
+    /// front-runner mask a placeable candidate behind it, and since that front-runner accrues no
+    /// service while it waits, it stays the front-runner forever.
+    fn best_placement(&self, sys: &sched::System, now: Ticks) -> Option<(DomId, Vcpu, Pcpu)> {
+        let mut best: Option<((DomId, Vcpu, Pcpu), Share)> = None;
         for dom in 0..sys.domain_count() as DomId {
             for vcpu in 0..sys.vcpu_count(dom) as Vcpu {
                 if sys.state_of(dom, vcpu) != Some(RunState::Runnable) {
                     continue;
                 }
+                let pcpu = match self.first_idle_pcpu_for(sys, dom, vcpu) {
+                    Some(p) => p,
+                    None => continue,
+                };
                 let share = self.share(sys, dom, vcpu, now);
                 // Strictly-more-deserving keeps the earliest index on a tie.
                 if best.map(|(_, b)| more_deserving(share, b)).unwrap_or(true) {
-                    best = Some(((dom, vcpu), share));
+                    best = Some(((dom, vcpu, pcpu), share));
                 }
             }
         }
         best.map(|(id, _)| id)
     }
 
-    /// Among running vCPUs whose quantum has expired, the *least* deserving (greatest
-    /// service-per-weight) — the best candidate to evict. Ties broken by lowest
-    /// `(dom, vcpu)`. `None` if no running vCPU is past its quantum.
-    fn worst_expired_runner(&self, sys: &sched::System, now: Ticks) -> Option<(DomId, Vcpu, Pcpu)> {
+    /// Among running vCPUs whose quantum has expired **and whose CPU some strictly-more-deserving
+    /// waiter is affine to**, the *least* deserving (greatest service-per-weight) — the best
+    /// candidate to evict. Ties broken by lowest `(dom, vcpu)`. `None` if no such runner exists.
+    ///
+    /// ⚠ The affinity condition is what keeps a preemption *useful*. Evicting a runner from a CPU
+    /// no waiter may occupy frees it for nobody: the following `next` cannot place the waiter
+    /// there, so the eviction costs a context switch and leaves the CPU idle — and it breaks the
+    /// bound [`Self::advance`] relies on, which assumes the CPU a preemption frees is one the
+    /// waiter that motivated it can take.
+    fn best_preemption(&self, sys: &sched::System, now: Ticks) -> Option<(DomId, Vcpu, Pcpu)> {
         let mut worst: Option<((DomId, Vcpu, Pcpu), Share)> = None;
         for dom in 0..sys.domain_count() as DomId {
             for vcpu in 0..sys.vcpu_count(dom) as Vcpu {
@@ -324,6 +392,9 @@ impl Scheduler {
                     continue; // still within its time-slice
                 }
                 let share = self.share(sys, dom, vcpu, now);
+                if !self.some_affine_waiter_beats(sys, pcpu, share, now) {
+                    continue; // freeing this CPU would help nobody
+                }
                 // Replace when the tracked worst is strictly more deserving than this
                 // one (i.e. this one is less deserving); strictness keeps the earliest
                 // index on a tie.
@@ -333,6 +404,31 @@ impl Scheduler {
             }
         }
         worst.map(|(id, _)| id)
+    }
+
+    /// Whether some `Runnable` vCPU affine to `pcpu` is strictly more deserving than `runner` —
+    /// i.e. whether evicting the vCPU currently on `pcpu` would actually hand it to a better
+    /// claimant.
+    fn some_affine_waiter_beats(
+        &self,
+        sys: &sched::System,
+        pcpu: Pcpu,
+        runner: Share,
+        now: Ticks,
+    ) -> bool {
+        for dom in 0..sys.domain_count() as DomId {
+            for vcpu in 0..sys.vcpu_count(dom) as Vcpu {
+                if sys.state_of(dom, vcpu) != Some(RunState::Runnable)
+                    || !sys.affinity_permits(dom, vcpu, pcpu)
+                {
+                    continue;
+                }
+                if more_deserving(self.share(sys, dom, vcpu, now), runner) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// A vCPU's proportional-share position as the rational `service / weight`, kept
@@ -396,8 +492,14 @@ impl Scheduler {
         }
     }
 
-    fn first_idle_pcpu(&self, sys: &sched::System) -> Option<Pcpu> {
-        (0..sys.pcpu_count() as Pcpu).find(|&p| sys.occupant(p).is_none())
+    /// The lowest-numbered idle pCPU this vCPU's affinity admits, if any. `None` means the vCPU
+    /// cannot be dispatched at this instant — either every CPU is occupied, or none of the free
+    /// ones is in its mask. The affinity question is put to [`sched::System::affinity_permits`],
+    /// the same predicate [`sched::System::run`] enforces, so the policy cannot be testing a
+    /// different rule from the one that will judge its recommendation.
+    fn first_idle_pcpu_for(&self, sys: &sched::System, dom: DomId, vcpu: Vcpu) -> Option<Pcpu> {
+        (0..sys.pcpu_count() as Pcpu)
+            .find(|&p| sys.occupant(p).is_none() && sys.affinity_permits(dom, vcpu, p))
     }
 
     fn offset_of(&self, dom: DomId, vcpu: Vcpu) -> u128 {
@@ -625,6 +727,92 @@ mod tests {
             sys.occupant(0),
             Some((0, 1)),
             "an unboosted newcomer preempts and seizes the CPU"
+        );
+    }
+
+    /// ㉘ — the regression. A vCPU pinned away from the lowest idle CPU used to make the policy
+    /// recommend a dispatch the mechanism refuses (`NotAffine`), which `advance` took as its
+    /// `break`, abandoning the fixpoint before placing *anybody*. Both CPUs then sat idle with
+    /// both vCPUs `Runnable`, forever: measured at 0 transitions over 200 ticks, because the
+    /// unplaceable vCPU stays the most deserving precisely by never running.
+    ///
+    /// ★ Note what this asserts about the *innocent* vCPU. (0,1) is affine to everything and was
+    /// legally placeable the whole time; the bug starved it as collateral. A fix that placed only
+    /// the pinned vCPU would satisfy a weaker test and still leave a CPU idle here.
+    #[test]
+    fn a_pinned_vcpu_does_not_stall_the_whole_scheduling_pass() {
+        let mut sys = sched::System::new(1, 2, 2);
+        let mut pol = Scheduler::new(1, 2, 10);
+        sys.admit(0, 0).unwrap();
+        sys.admit(0, 1).unwrap();
+        // (0,0) may run only on pCPU 1; (0,0) is also the tie-break winner, so the old code
+        // picked it first, aimed it at pCPU 0, and gave up when the mechanism said no.
+        sys.set_affinity(0, 0, 0b10).unwrap();
+
+        pol.advance(&mut sys, 0);
+
+        assert_eq!(
+            sys.occupant(1),
+            Some((0, 0)),
+            "the pinned vCPU takes its own CPU"
+        );
+        assert_eq!(
+            sys.occupant(0),
+            Some((0, 1)),
+            "and the unpinned one is not starved with it"
+        );
+        assert_eq!(sys.busy_pcpus(), 2);
+    }
+
+    /// A vCPU whose mask admits no CPU at all is `Runnable` and legitimately unplaceable — so
+    /// work conservation must be read as "no idle CPU that some waiter *may use*", and the policy
+    /// must still place everyone else rather than stalling on it.
+    #[test]
+    fn an_unplaceable_vcpu_does_not_block_the_others() {
+        let mut sys = sched::System::new(1, 2, 1);
+        let mut pol = Scheduler::new(1, 2, 10);
+        sys.admit(0, 0).unwrap();
+        sys.admit(0, 1).unwrap();
+        sys.set_affinity(0, 0, 0).unwrap(); // admits nothing
+
+        pol.advance(&mut sys, 0);
+
+        assert_eq!(sys.occupant(0), Some((0, 1)));
+        assert_eq!(sys.state_of(0, 0), Some(RunState::Runnable));
+    }
+
+    /// Rule 2's half: a runner past its quantum is evicted only for a waiter that could actually
+    /// take *its* CPU. Every pCPU is occupied here, so rule 1 cannot fire and the preemption path
+    /// is genuinely the one under test.
+    ///
+    /// ★ The victim the old rule would pick is deliberately the *wrong* one. `A` on pCPU 0 is the
+    /// least deserving runner (service 20 at weight 1) and so the globally best eviction
+    /// candidate; `B` on pCPU 1 is far more deserving (service 20 at weight 100). The waiter `W`
+    /// is more deserving than both — but it is pinned to pCPU 1. Choosing `A` would free a CPU
+    /// `W` may not use, leaving it idle and `W` still waiting.
+    #[test]
+    fn a_runner_is_evicted_only_from_a_cpu_the_waiter_can_take() {
+        let mut sys = sched::System::new(1, 3, 2);
+        let mut pol = Scheduler::new(1, 3, 10);
+        pol.set_weight(0, 1, 100); // B is heavily weighted, so its share stays tiny
+
+        sys.admit(0, 0).unwrap();
+        sys.run(0, 0, 0, 0).unwrap(); // A on pCPU 0
+        sys.admit(0, 1).unwrap();
+        sys.run(0, 1, 1, 0).unwrap(); // B on pCPU 1
+        sys.admit(0, 2).unwrap(); // W waits, service 0
+        sys.set_affinity(0, 2, 0b10).unwrap(); // ...and only pCPU 1 will have it
+
+        // At t=20 both runners are past the quantum of 10, and both CPUs are busy.
+        assert_eq!(
+            pol.next(&sys, 20),
+            Decision::Preempt {
+                dom: 0,
+                vcpu: 1,
+                pcpu: 1
+            },
+            "the evicted runner must be the one on the CPU the waiter is affine to, \
+             not the globally least-deserving one"
         );
     }
 

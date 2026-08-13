@@ -44,7 +44,7 @@ Most of the value here is in **not** letting these blur into one word.
 
 | tier | what it covers | how |
 | --- | --- | --- |
-| **Proven** | the model's isolation invariants; the emitter refining the authorized leaf map | **136 Kani** harnesses (∀-values at bounded size) + **117 Verus** obligations (∀-N); ∀-address refinement over `hv-s2` |
+| **Proven** | the model's isolation invariants; the emitter refining the authorized leaf map | **137 Kani** harnesses (∀-values at bounded size) + **117 Verus** obligations (∀-N); ∀-address refinement over `hv-s2` |
 | **Demonstrated** | the metal | boot witnesses: two unmodified Alpine kernels, four vCPUs, one pCPU, **zero** Stage-2 device pass-through, each guest hardware-refused from its peer's RAM |
 | **Argued** | Tier-D non-interference's instantiation to concrete Baleen | prose composition over proved generic lemmas — declared, not hidden |
 
@@ -109,7 +109,7 @@ argument has to be as maintained as the code it explains.
 | [`hv-vdev`](hv-vdev/README.md)   | guest-facing **device models** under the proof fence — GICv3, PL011, SGI decode, pending sets |
 | [`hv-part`](hv-part/README.md)   | how the machine is **partitioned among guest slots** — windows, frame runs, domain ids — as `const fn` arithmetic proven ∀-partition rather than `const assert!`-ed at the two slots this board deploys |
 | [`hv-sim`](hv-sim/README.md)    | host harness — fake memory, hand-cranked clock, seeded deterministic simulation + ∀-size sweeps |
-| [`hv-verify`](hv-verify/README.md) | the **Kani harnesses** (136) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) |
+| [`hv-verify`](hv-verify/README.md) | the **Kani harnesses** (137) and, under `verus/`, the ∀-N **Verus** proofs (117 obligations) |
 | [`hv-metal`](hv-metal/README.md)  | the bare-metal AArch64/EL2 binary: boot, its own stage-1 MMU, Stage-2, vGIC, the real-Linux path |
 | [`hv-fuzz`](hv-fuzz/README.md)   | `cargo-fuzz` targets against the hypercall dispatcher |
 | [`fvp-probe`](fvp-probe/README.md) | ⚠ **not part of the hypervisor** — a standalone bare-metal instrument for Arm's AEM FVP, measuring SMMU translation caching and invalidation (honest-ledger 2(d)), which QEMU structurally cannot show. Workspace-excluded; its **verdicts** are deliberately ungated, its **health** is (`cargo xtask fvp-lint`) |
