@@ -729,7 +729,7 @@ pub enum DeriveError {
 ///
 /// Split out of [`intended_binding`] so the *relation lookup* is one derivation shared by the
 /// specification seam, the composition theorem's statement and any future consumer — rather than a
-/// search each of them writes for itself (design-lesson #14c).
+/// search each of them writes for itself: one derivation, no drift (design-lesson #14c).
 ///
 /// At most one device can match once [`derive_stream_table`] has accepted the map (it refuses a
 /// non-injective one), so the first match is the only match.

@@ -151,7 +151,7 @@ answer was read.
 | DMA confinement for assigned devices | ✅ | [`SMMU-DEVICE-PATH-COMPOSITION.md`](SMMU-DEVICE-PATH-COMPOSITION.md), `hv-metal/src/smmu.rs` |
 | Hypervisor self-protection (W^X, own MMU) | ✅ | `hv-metal/src/mmu.rs`, `hv-metal/src/cache.rs` |
 | **Authorized monitor → policy observation** | ✅ **built (#193)** — and the naive direction is revocable, so ownership is inverted | `hv-metal/src/observe.rs` |
-| **Bounded scheduling latency for the monitor** | ✅ **bounded (#194)**, ⚠ at the *simulation* tier only | `hv-sim`'s `policy_bounds_scheduling_latency` |
+| **Bounded scheduling latency for the monitor** | ✅ **bounded** — first stated in #194, but that formula was **false at `quantum = 1`**; the bound in force is the *derived*, scale-invariant one from #208. ⚠ Still at the *simulation* tier only, and **budget against the weights you configure, not the vCPU count** | `hv-sim`'s `policy_bounds_scheduling_latency` |
 | **Actuator / sensor I/O reaching a guest** | ⚠ groundwork only; no real device is driven | `hv-metal/src/smmu.rs` |
 | A non-Linux (small) monitor partition, **alone** | ✅ done on every default boot | `hv-metal/src/guest.rs`'s `load_guest` |
 | **A non-Linux monitor partition running *beside* a Linux one** | ⚠ **never attempted — the two paths are mutually exclusive** | `hv-metal/src/main.rs` |
@@ -161,6 +161,13 @@ answer was read.
 ⚠⚠ **FOUR of these rows were wrong within a day of being written, and the pattern is worth more
 than the corrections.** Two went stale because the work got *done* (#193, #194) — the ordinary,
 healthy kind. The other two were **wrong on arrival**:
+
+⚠ **And the `#194` row went stale a SECOND time, in a third way worth naming separately:** the work
+stayed done, but the *claim it recorded* was later found false (`quantum = 1`) and replaced by a
+derived bound. A row can rot because the work advanced past it **or** because the work was wrong;
+this table had been watching only for the first. ★ **A citation is a claim with a date on it** —
+when the cited PR is superseded, every row pointing at it is stale even though nothing about the row
+changed.
 
 * *"A non-Linux monitor partition — unknown, never attempted"* was **false when written**.
   `hv-metal/src/guest.rs`'s `load_guest` copies an in-image template into guest RAM, and the

@@ -102,7 +102,7 @@
 //! refusal. Both discharge [`free_preserves`]'s premise identically, which is why every lemma
 //! below stands verbatim — the file constrains *the state at each step*, not the reason it holds.
 //!
-//! ## Fidelity (a mirror, managed — the #21b discipline)
+//! ## Fidelity (a mirror, managed)
 //!
 //! [`current_type`], [`is_alloc`] and [`entry_child_ref`] transcribe `p2m::System::current_type` /
 //! `is_allocated` / the free `entry_child_ref`; [`edge_ok`]/[`inv`] transcribe `first_violation`'s

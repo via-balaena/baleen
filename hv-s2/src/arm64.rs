@@ -431,8 +431,9 @@ pub fn encode(
             // leaf into the one W+X descriptor (`BLOCK_RW_X`), for a real kernel's writable+
             // executable RAM. Read-only (`Ro`, XN) and read-execute (`Rx`, model-driven not-XN)
             // leaves ignore the exemption — they follow the model's execute bit either way.
-            // Same #14c emit-seam routing as the base leaves, but the super window carries the
-            // declared W^X exemption, so the attributes read `layout.sup_wx_exempt`.
+            // Same emit-seam routing as the base leaves — one derivation, no drift
+            // (design-lesson #14c) — but the super window carries the declared W^X
+            // exemption, so the attributes read `layout.sup_wx_exempt`.
             let attrs = block_leaf_attrs(*perm, layout.sup_wx_exempt);
             // Indexed by the block's own L2 slot, derived from its IPA — NOT by `m` directly, so the
             // window's base offset cannot silently shift the mapping.
@@ -565,7 +566,7 @@ pub fn page_leaf_attrs(perm: Perm) -> u64 {
 /// permission `perm` under the declared W^X exemption `wx_exempt`. The exemption turns ONLY a
 /// writable leaf into the one W+X descriptor (`BLOCK_RW_X`); read-only and read-execute leaves
 /// follow the model regardless. The emit-side counterpart of [`page_leaf_attrs`] for the super
-/// window — same #14c rationale.
+/// window, and for the same reason: one derivation, no drift (design-lesson #14c).
 pub fn block_leaf_attrs(perm: Perm, wx_exempt: bool) -> u64 {
     match (perm, wx_exempt) {
         (Perm::Rw, false) => desc::BLOCK_RW,

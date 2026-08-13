@@ -242,7 +242,8 @@ impl System {
         // Checked before occupancy, so an off-affinity dispatch is refused for the same
         // reason regardless of whether the pCPU happens to be free — and it is a no-op.
         // Routed through the public predicate so the policy layer above cannot be testing a
-        // *different* rule from the one enforced here (design-lesson #14c).
+        // *different* rule from the one enforced here — one derivation, no drift
+        // (design-lesson #14c).
         if !self.affinity_permits(dom, vcpu, pcpu) {
             return Err(SchedError::NotAffine);
         }
@@ -424,8 +425,8 @@ impl System {
     /// [`Self::run`] enforces, which routes through this method rather than re-testing the mask
     /// itself. It is exposed because a policy layer sitting above the mechanism must be able to
     /// avoid *recommending* a dispatch the mechanism would refuse; without it, that layer has to
-    /// re-implement the bit test, and two copies of a rule are a rule that can drift
-    /// (design-lesson #14c).
+    /// re-implement the bit test, and two copies of a rule are a rule that can drift: one
+    /// derivation, no drift (design-lesson #14c).
     ///
     /// ⚠ **It answers the affinity question and nothing else.** `true` says only that the mask
     /// admits this pCPU — not that the vCPU is `Runnable`, and not that the pCPU is free. It is a

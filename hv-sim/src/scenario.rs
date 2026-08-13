@@ -2429,28 +2429,29 @@ mod tests {
     /// separated by an enormous gap and satisfy both of its assertions. A monitor scheduled
     /// generously but rarely is not a monitor. So this bounds the **worst gap** instead.
     ///
-    /// ## The bound, and it was MEASURED before it was asserted
+    /// ## The bound, and it is DERIVED rather than fitted
     ///
-    /// `worst_wait ≤ (W_total − wᵢ) × quantum / pcpus + 1`
+    /// `worst_wait ≤ ⌈ Σⱼ≠ᵢ max(quantum, ⌊wⱼ·quantum / w_min⌋ + 1) / pcpus ⌉`
     ///
-    /// — where `W_total` is the sum of all weights and `wᵢ` the weight of the vCPU in question,
-    /// so the worst case over all vCPUs uses the *smallest* weight. The intuition: while vCPU
-    /// `i` waits, every other vCPU runs in proportion to its weight, and `+1` is the tick in
-    /// which `advance` places it back on a CPU.
+    /// — a sum over the *other* vCPUs of what one turn costs each of them, divided across the
+    /// servers. Every factor traces to `policy.rs` rather than to these measurements; the three
+    /// derivation steps are spelled out inline in the body below and in `policy`'s module doc.
     ///
-    /// ★ **It matched the measurement exactly on all five configurations below**, which is what
-    /// makes `≤` meaningful here — a bound nothing approaches is a bound that would pass however
-    /// badly the scheduler regressed.
+    /// ★★ **It is SCALE-INVARIANT, and that is why it replaced the previous one.** The policy
+    /// ranks by `service / weight`, so scaling every weight by a constant cannot change a
+    /// decision — `wⱼ·quantum / w_min` is invariant under that. Measurement agrees exactly:
+    /// `[2,2]` and `[1,1]` produce identical waits.
     ///
-    /// ⚠⚠ **AND THE FIVE ARE THE WHOLE DOMAIN: `quantum` takes only the values 2 and 5 across
-    /// them, and the formula is FALSE at `quantum == 1`.** On one pCPU with equal weights,
+    /// ⚠⚠ **THE PREVIOUS FORMULA WAS `(W_total − wᵢ) × quantum / pcpus + 1`, IT WAS FALSE AT
+    /// `quantum == 1`, AND IT STOOD HERE FOR FOUR ARCS.** On one pCPU with equal weights,
     /// `[1,1,1]` measures a worst wait of **4** against a predicted 3, and `[1,1,1,1]` measures
-    /// **6** against 4. A vCPU placed at tick `t` has `elapsed == 0` and is not preemptible until
-    /// `t + 1`, so a turn occupies more ticks than `quantum`. ⛔ **Do not add `quantum = 1` here
-    /// expecting it to pass, and do not "fix" it by loosening the assertion** — the correct
-    /// general formula has not been derived, and `quantum + 1` per turn over-estimates at larger
-    /// quanta (it predicts 19 where the fourth row measures 16). ★ **The list of configurations
-    /// is a generator; count its axes.** Five rows and two distinct quanta is how this hid.
+    /// **6** against 4. It survived because **the five configurations that asserted it used only
+    /// `quantum ∈ {2, 5}`** — a vCPU placed at tick `t` has `elapsed == 0` and is not preemptible
+    /// until `t + 1`, so a turn can outlast `quantum`, and no row ever set `quantum` low enough
+    /// for that to show. ★ **The list of configurations is a generator; count its axes.** That is
+    /// the same defect ㉘ found one level below, where two tiers shared a four-operation alphabet
+    /// that never varied affinity. **The grid below is now 75 rows and varies all four axes** —
+    /// vCPU count, weight skew, pCPU count, and quantum *including the value that broke it*.
     ///
     /// ⚠ **The count-based intuition is WRONG, and that is the transferable part.** A bound of
     /// "(vcpus − pcpus) × quantum" predicts **4** for weights `[1,2,3]`; the measured answer is
@@ -2458,16 +2459,27 @@ mod tests {
     /// monitor's latency budget is a function of what else is configured to run, and adding a
     /// heavy neighbour lengthens the monitor's worst case without adding a vCPU.
     ///
-    /// ## Two kill probes, both run, both killed
+    /// ⚠ **The bound is sound on all 75 rows and attained on 29.** The looseness is not
+    /// mysterious — see the body and `policy`'s module doc for the measured law (`n − 2` on one
+    /// pCPU) and its cause (step 3 charges a min-to-max spread where the turn only closes
+    /// min-to-second-min). **Tightening it is open work; do not close it by fitting.**
     ///
-    /// 1. **Tightness** — dropping the `+ 1` makes the first configuration fail immediately
-    ///    (`worst wait 5 exceeds the bound 4`). The inequality has no slack in it, so a
-    ///    regression cannot hide inside a generous margin.
+    /// ## Two kill probes, both re-run against THIS bound, both killed
+    ///
+    /// ⚠ Both were re-run when the bound changed. **A probe inherited from a superseded formula is
+    /// evidence about nothing**, which is the whole reason this section is not simply carried over.
+    ///
+    /// 1. **The strictness term is load-bearing** — dropping the `+ 1` inside the `max` (so a turn
+    ///    is charged `⌊wⱼ·quantum / w_min⌋` rather than one tick more) fails on the very first row:
+    ///    `weights=[1, 1] pcpus=1 quantum=1: worst wait 2 exceeds the bound 1`.
     /// 2. **The harness, not the code** — disabling the `worst.max(*w)` update so nothing is ever
-    ///    recorded fires the non-vacuity assertion (`the harness has stopped measuring`) rather
-    ///    than passing with a comfortable zero. This is the probe worth having: ㉓ found two of
-    ///    its four defects in the *test* rather than the code, and a latency test that silently
-    ///    measures nothing looks exactly like a scheduler with no latency.
+    ///    recorded fails rather than passing with a comfortable zero. ★ Note *which* assertion
+    ///    catches it: the **exactness** pin fires first (`the derived bound is no longer attained
+    ///    on the family where it is known tight`), not the non-vacuity one, because a dead
+    ///    accumulator reads as a bound that stopped being attained. The non-vacuity assertion is
+    ///    kept anyway because it names the *cause*. ㉓ found two of its four defects in the *test*
+    ///    rather than the code, and a latency test that silently measures nothing looks exactly
+    ///    like a scheduler with no latency.
     #[test]
     fn policy_bounds_scheduling_latency() {
         // ⚠ THE GRID IS THE POINT. The previous version asserted five hand-picked rows in which
@@ -2516,10 +2528,29 @@ mod tests {
                     // that, `W_total − wᵢ` is not. Measurement agrees: [2,2] and [1,1] produce
                     // identical waits (2, 3, 4, 6, 9).
                     //
-                    // ⚠ Sound on every configuration below and ATTAINED on n=2 at any quantum and
-                    // on quantum=1 at any n; loose elsewhere. The slack is understood rather than
-                    // mysterious: step 3 charges every vCPU the worst-case spread, but the spread
-                    // cannot be extremal for all of them at once. Tightening that is open work.
+                    // ⚠ Sound on all 75 rows and ATTAINED on 29: n=2 at any quantum, plus quantum=1
+                    // with EQUAL weights. ⛔ Not "quantum=1 at any n" — [1,1,2] and [1,2,3] at
+                    // quantum=1 are both loose, which is why the exactness predicate below carries
+                    // `equal` and not just `quantum == 1`.
+                    //
+                    // The slack has a MEASURED LAW, not a hand-wave: on one pCPU the bound
+                    // over-predicts by EXACTLY n-2, for every weight vector and every quantum here,
+                    // with the single exception of quantum=1 with equal weights, where every turn is
+                    // strictness-limited rather than spread-limited and the bound is exact. More
+                    // than one pCPU adds ceiling-rounding on top and has no clean law.
+                    //
+                    // ★ THE CAUSE IS A MISMATCHED ORDER STATISTIC. Step 2 bounds the spread from the
+                    // MINIMUM share to the MAXIMUM; step 3 then charges that spread to every turn.
+                    // But the gap a turn actually closes is min-to-SECOND-min, and with n vCPUs
+                    // cycling the shares are staggered, so consecutive order statistics sit far
+                    // closer than the full spread — which is why the over-charge grows with n
+                    // exactly as measured. Tightening step 3 means bounding min-to-second-min.
+                    //
+                    // ⛔ The obvious repair is UNSOUND and was measured to be: moving the strictness
+                    // `+ 1` outside the sum (charging it once as a placement tick rather than once
+                    // per turn) predicts 3 for [1,1,1] at quantum=1 on one pCPU, where the real wait
+                    // is 4 — at quantum=1 strictness binds on EVERY turn. The `+ 1` is sometimes
+                    // per-turn and sometimes not; a tighter bound must say which, not drop it.
                     let lightest_count = weights
                         .iter()
                         .filter(|&&w| u64::from(w) == lightest)
@@ -2543,18 +2574,21 @@ mod tests {
                     // ⚠ EXACTNESS IS NO LONGER ASSERTED EVERYWHERE, AND THAT IS AN HONEST DOWNGRADE.
                     // The old test asserted `worst == bound` on all five of its rows, which read as a
                     // tight, well-understood result — and made a sample feel like a theorem. Across this
-                    // grid the bound is attained on roughly two thirds of the configurations and is loose
-                    // on the rest, most visibly with more than one pCPU. ⛔ That looseness is NOT
-                    // explained, and it is the open half of this work; see `policy`'s module doc. What is
-                    // kept is the anti-vacuity guarantee the equality was really providing: on the
-                    // single-pCPU rows the bound must be ATTAINED, so a scheduler that regressed into
-                    // waiting longer could not hide inside a generous margin.
-                    // Exactness is pinned to the family where the DERIVED bound was measured to
-                    // be attained: two vCPUs at any quantum, and quantum = 1 with equal weights.
-                    // 28 of the 30 candidate rows are tight; the two that are not are skewed
-                    // three-vCPU rows at quantum = 1, and they are excluded by name rather than
-                    // by loosening the predicate. ⚠ Everywhere else the bound is sound but loose
-                    // for the reason given above — the spread is charged to every vCPU at once.
+                    // grid the bound is attained on 29 of the 75 rows and is loose on the other 46, most
+                    // visibly with more than one pCPU. ⚠ "Roughly two thirds" stood here and was wrong:
+                    // it was measured against the SUPERSEDED bound and never re-counted when the derived
+                    // one replaced it. That looseness is explained above — it is the open half of
+                    // this work, not an unknown.
+                    //
+                    // What is kept is the anti-vacuity guarantee the equality was really providing:
+                    // on the family where the DERIVED bound is attained, it must STAY attained, so a
+                    // scheduler that regressed into waiting longer cannot hide inside a generous
+                    // margin. That family is two vCPUs at any quantum, plus quantum = 1 with equal
+                    // weights: 28 of the 30 single-pCPU candidate rows. The two that are not tight
+                    // are the skewed three-vCPU rows at quantum = 1, and they are excluded by
+                    // NARROWING THE FAMILY (the `equal` conjunct below) rather than by weakening
+                    // `assert_eq!` to an inequality — the distinction that keeps this a pin rather
+                    // than a formality.
                     let equal = weights.iter().all(|&w| u64::from(w) == lightest);
                     if pcpus == 1 && (weights.len() == 2 || (quantum == 1 && equal)) {
                         assert_eq!(

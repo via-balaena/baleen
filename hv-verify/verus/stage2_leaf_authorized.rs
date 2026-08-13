@@ -76,7 +76,7 @@
 //! `OutOfDomain` rather than a `Violation` can conceal nothing; the shipped `leaf_map_from_edges`'s
 //! fail-loud is proven **total** by Kani (`hv-verify/src/lib.rs::stage2_refinement`).
 //!
-//! ## Fidelity (a mirror, managed — the #21b discipline)
+//! ## Fidelity (a mirror, managed)
 //!
 //! `emitted` mirrors `leaf_map_from_edges`'s loop, including its **overwrite** semantics: a later
 //! selected edge into the same frame replaces an earlier one, so the map's value is the *last*

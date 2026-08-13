@@ -273,12 +273,32 @@ concrete quantum, and a single instant. That is ∀-values on the symbolic axes,
 reachable by any larger Kani harness**:
 
 - **Weighted-proportional fairness** is a statement about a *limit*.
-- **Starvation-freedom** — the bound `(W_total − wᵢ) × quantum / pcpus + 1` — is a statement about
-  *unbounded runs*. ⚠⚠ **And that formula is false at `quantum == 1`**, which was found while
-  scoping the proof and is stated here rather than quietly fixed: on one pCPU, `[1,1,1]` waits 4
-  against a predicted 3. The five configurations asserting it use only `quantum ∈ {2, 5}`. **A
-  configuration list is a generator too, and its axes need counting** — the same defect this whole
-  piece is about, one level further out. The correct general formula has not been derived.
+- **Starvation-freedom** — a bound on the worst wait — is a statement about *unbounded runs*.
+  ⚠⚠ **And the formula published here, `(W_total − wᵢ) × quantum / pcpus + 1`, was false at
+  `quantum == 1`.** That was found while scoping the proof, and stated rather than quietly fixed:
+  on one pCPU, `[1,1,1]` waits 4 against a predicted 3. It survived because the five configurations
+  asserting it used only `quantum ∈ {2, 5}`. **A configuration list is a generator too, and its
+  axes need counting** — the same defect this whole piece is about, one level further out.
+
+  ✅ **Since first publication that has been repaired, and how it was repaired is the more useful
+  half.** The grid went from 5 rows to 75, varying all four axes. The replacement bound is
+  *derived from the scheduler's own ranking function* rather than fitted to the measurements:
+
+  > `worst_wait ≤ ⌈ Σⱼ≠ᵢ max(quantum, ⌊wⱼ·quantum / w_min⌋ + 1) / pcpus ⌉`
+
+  A better-fitting formula was found and **rejected**: it matched 45 of the 75 rows exactly, against
+  the derived one's 29, but it was not scale-invariant — and since the policy ranks by
+  `service / weight`, multiplying every weight by a constant *cannot* change a decision, so no
+  correct bound can vary under that scaling. ★ **An invariance the code has and a formula lacks
+  retires that whole family of formulas at once** — a far stronger instrument than hunting
+  counterexamples, and available by reading the ranking function rather than running anything.
+  **A justified conservative bound beats a tighter unjustified one, especially for a latency
+  budget.**
+
+  ⚠ What remains open is the *tier*, not the formula: this is still simulation evidence, and the
+  bound is sound-but-loose on 46 of the 75 rows in a way that now has a measured law (on one pCPU
+  it over-predicts by exactly `n − 2`) and an identified cause (the derivation charges a
+  min-to-maximum spread where a turn only closes min-to-second-minimum).
 
 Neither is a bounded-depth property, so closing them needs a different technique, not a bigger
 harness.

@@ -259,9 +259,11 @@ td.c{text-align:center}
     </ul></div>
     <div class="col tech"><h3>Needs a different technique</h3><div class="cnt num">3</div><ul>
       <li><b>Scheduler latency bound.</b> A claim about unbounded runs, so no larger bounded harness
-      reaches it — and a safety monitor would budget against exactly this. <b>The published formula
-      is also false at quantum = 1</b>, found while scoping the proof; the five configurations
-      asserting it use only two distinct quanta. <b>Technique scoped, not unknown:</b> Verus has a
+      reaches it — and a safety monitor would budget against exactly this. The formula itself is no
+      longer the problem: an earlier one was found false at quantum = 1 and has been replaced by a
+      bound <b>derived from the scheduler's ranking function</b> and asserted across a 75-row grid.
+      What is still missing is the <b>tier</b> — that is simulation evidence, and the bound is
+      sound-but-loose on 46 of the 75 rows. <b>Technique scoped, not unknown:</b> Verus has a
       TLA embedding and Anvil used it to verify controller liveness, on the same Verus already
       gating this repo.</li>
       <li><b>Proportional fairness.</b> A statement about a limit, so not bounded-depth either.</li>
