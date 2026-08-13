@@ -89,7 +89,7 @@
 //! case, is itself enumerator-checked, not Verus-proven: the borrow moves the residual, it does not
 //! erase it.
 //!
-//! ## Fidelity (a mirror, managed — the #21b discipline)
+//! ## Fidelity (a mirror, managed)
 //!
 //! [`inv`] mirrors `first_cross_violation`'s page-table↔grant loop including the unowned-end skip;
 //! [`authorizes`] mirrors `grant::System::authorizes` (a scan of the grantor's live entries for a

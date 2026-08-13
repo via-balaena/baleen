@@ -66,7 +66,7 @@
 //! statement below quantifies over a `Seq` of arbitrary length. Neither subsumes the other, and the
 //! headline "∀-N" is exactly their conjunction plus the enumerator's real-code sweep.
 //!
-//! ## Fidelity (a mirror, managed — the #21b discipline)
+//! ## Fidelity (a mirror, managed)
 //!
 //! [`inv`] mirrors the device clause of `hypervisor.rs::is_unreferenced`, which
 //! `first_cross_violation` reports as `CrossViolation::DeadDomainReferenced`.

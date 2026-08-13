@@ -67,13 +67,13 @@
 //! * **Weighted-proportional-fair** — each vCPU carries a [`Weight`]; over time the
 //!   CPU splits between continuously-runnable vCPUs in proportion to their weights,
 //!   because the policy always runs the one with the least *service per weight*.
-//! * **Starvation-free, with a MEASURED BOUND rather than "eventually"** — a
+//! * **Starvation-free, with a DERIVED BOUND rather than "eventually"** — a
 //!   [`Scheduler::quantum`] time-slice forces a running vCPU to yield to a more-deserving
-//!   waiter. The worst observed wait for a continuously-runnable vCPU `i` is
-//!   `(W_total − wᵢ) × quantum / pcpus + 1`, matched exactly across five configurations by
+//!   waiter. The worst wait for a continuously-runnable vCPU `i` is bounded by
+//!   `⌈ Σⱼ≠ᵢ max(quantum, ⌊wⱼ·quantum / w_min⌋ + 1) / pcpus ⌉`, asserted across a 75-row grid by
 //!   `hv-sim`'s `policy_bounds_scheduling_latency`.
 //!   ⚠⚠ **THE ORIGINAL FORMULA WAS `(W_total − wᵢ) × quantum / pcpus + 1` AND IT WAS FALSE AT
-//!   `quantum == 1`** — `[1,1,1]` on one pCPU waits **4** against a predicted 3. The bound is now
+//!   `quantum == 1`** — `[1,1,1]` on one pCPU waits **4** against a predicted 3. The bound above is
 //!   **derived from the mechanism** instead, in three steps that each trace to this file:
 //!
 //!   1. **Turn length.** `more_deserving` is *strict*, so a runner whose share merely **ties** the
@@ -93,10 +93,24 @@
 //!   code has and a formula lacks retires the whole family of formulas in that quantity** — a far
 //!   stronger instrument than hunting counterexamples, and available by reading the ranking
 //!   function rather than running anything.
-//!   ⚠ **Sound on all 75 measured configurations; ATTAINED on two vCPUs at any quantum and on
-//!   `quantum = 1` with equal weights.** Loose elsewhere, and the slack is understood rather than
-//!   mysterious: step 3 charges *every* vCPU the worst-case spread, but the spread cannot be
-//!   extremal for all of them simultaneously. **Tightening that is the open work.**
+//!   ⚠ **Sound on all 75 measured configurations and ATTAINED on 29 of them** — two vCPUs at any
+//!   quantum, plus `quantum = 1` with equal weights. Loose on the other 46, and the slack now has a
+//!   **measured law rather than a hand-wave**: on one pCPU the bound over-predicts by **exactly
+//!   `n − 2`**, for every weight vector and every quantum in the grid, with one exception — at
+//!   `quantum = 1` with equal weights every turn is strictness-limited rather than spread-limited
+//!   and the bound is exact. More than one pCPU adds ceiling-rounding on top of that and has no
+//!   clean law.
+//!   ★ **The cause is a MISMATCHED ORDER STATISTIC, and naming it is the progress.** Step 2 bounds
+//!   the spread from the *minimum* share to the *maximum*; step 3 then charges that spread to every
+//!   turn. But the gap a turn actually closes is from the minimum to the **second** minimum. With
+//!   `n` vCPUs cycling, the shares are staggered, so consecutive order statistics sit far closer
+//!   than the full spread — and the over-charge therefore grows with `n`, exactly as measured.
+//!   **Tightening step 3 means bounding min-to-second-min instead. That is the open work.**
+//!   ⚠ The obvious repair — moving the strictness `+ 1` outside the sum, so it is charged once as a
+//!   placement tick rather than once per turn — **is UNSOUND and was measured to be**: it predicts
+//!   3 for `[1,1,1]` at `quantum = 1` on one pCPU, where the real wait is 4. At `quantum = 1` the
+//!   strictness genuinely binds on *every* turn. **The `+ 1` is sometimes per-turn and sometimes
+//!   not; a tighter bound has to say which, not drop it.**
 //!   ⛔ **Do not repair it by fitting.** A tighter expression exists —
 //!   `max((W_total − wᵢ)·quantum/pcpus + 1, 2(W_total − wᵢ)/pcpus)`, sound on all 75 and tight on
 //!   45 — and it is **not used**, because it has the wrong shape: it is not scale-invariant, so it
