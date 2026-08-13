@@ -72,22 +72,34 @@
 //!   waiter. The worst observed wait for a continuously-runnable vCPU `i` is
 //!   `(W_total − wᵢ) × quantum / pcpus + 1`, matched exactly across five configurations by
 //!   `hv-sim`'s `policy_bounds_scheduling_latency`.
-//!   ⚠⚠ **THAT FORMULA IS FALSE AT `quantum == 1`, AND ITS VALIDATED DOMAIN IS
-//!   `quantum ∈ {2, 5}` — the only values the five configurations use.** Measured
-//!   counterexamples, on one pCPU with equal weights: **`[1,1,1]` waits 4 against a predicted
-//!   3**, and **`[1,1,1,1]` waits 6 against a predicted 4**. The cause is visible in a trace
-//!   (`A B C C A B B A C C A B`): a vCPU placed at tick `t` has `elapsed == 0` and is therefore
-//!   **not preemptible until `t + 1`**, so a turn occupies more ticks than `quantum` and the
-//!   `× quantum` term under-counts. At `quantum ≥ 2` the discrepancy happens not to bite in the
-//!   shapes tested — which is not the same as it not existing.
-//!   ⛔ **The correct general formula has NOT been derived.** The obvious repair
-//!   (`quantum + 1` per turn) over-estimates at larger quanta — it predicts 19 where `[1,1,1,1]`
-//!   at `quantum = 5` measures 16 — so this needs a derivation, not a patch. **Until then, treat
-//!   the bound as validated only where it is tested, and do not quote it as a general result.**
-//!   ★ How it was missed is the reusable part: the test asserts five hand-picked configurations,
-//!   and `quantum` takes **two distinct values** across all of them. **A configuration list is a
-//!   generator, and its axes need counting exactly like a fuzzer's op alphabet** — the same
-//!   defect ㉘ found one level below this one.
+//!   ⚠⚠ **THE ORIGINAL FORMULA WAS `(W_total − wᵢ) × quantum / pcpus + 1` AND IT WAS FALSE AT
+//!   `quantum == 1`** — `[1,1,1]` on one pCPU waits **4** against a predicted 3, `[1,1,1,1]`
+//!   waits **6** against 4. The corrected form floors it with a second term:
+//!   `max((W_total − wᵢ)·quantum / pcpus + 1, 2(W_total − wᵢ) / pcpus)`, which is **sound on all
+//!   75 measured configurations** and attained on every all-weights-1 single-pCPU row.
+//!   ★ **The correction is derived from the mechanism, not fitted to the failures.**
+//!   `more_deserving` is **strict**, so a runner whose share merely *ties* the best waiter is
+//!   not preempted — it keeps the CPU one more tick. A turn therefore costs
+//!   `max(quantum, gap + 1)` ticks rather than `quantum`, and with the share spread bounded by
+//!   one unit that floor is **2**. The old formula assumed every turn cost exactly `quantum`,
+//!   which is precisely why it held at `quantum ≥ 2` and broke at 1.
+//!   ⛔⛔ **AND IT IS STILL NOT THE RIGHT ANSWER — the shape is wrong, provably.** The policy
+//!   ranks by `service / weight`, which is **scale-invariant**: multiplying every weight by a
+//!   constant cannot change any decision. Measurement agrees — `[2,2]` and `[1,1]` produce
+//!   *identical* waits (2, 3, 4, 6, 9 for quantum 1, 2, 3, 5, 8). But `W_total − wᵢ` is **not**
+//!   scale-invariant: it doubles. So any formula in that quantity is the wrong shape, and the
+//!   current one is merely a sound over-approximation — loose on 30 of the 75 rows, worst on
+//!   multiple pCPUs. **The scale-invariant quantity is the relative spread, and a correct bound
+//!   is expected to be a function of it; deriving one is open work.**
+//!   ⚠ **Do not "fix" this by fitting.** `quantum + 1` per turn repairs both counterexamples and
+//!   breaks rows that already worked (predicting 19 where `[1,1,1,1]`@`quantum=5` measures 16);
+//!   `Σⱼ max(quantum, wⱼ+1)` fits the `quantum = 1` rows and under-predicts at `quantum ≥ 2`,
+//!   which is *unsound*. A formula adjusted until the known failures pass is fitted, not derived.
+//!   ★ How the original was missed: `policy_bounds_scheduling_latency` asserted **five**
+//!   hand-picked configurations in which `quantum` took **two** distinct values. **A configuration
+//!   list is a generator, and its axes need counting exactly like a fuzzer's op alphabet** — the
+//!   same defect ㉘ found one level below. The grid now varies vCPU count, weight skew, pCPU count
+//!   and quantum, and is 75 rows.
 //!   ⚠ **Note what that bound is a function of: the WEIGHTS of the other vCPUs, not their
 //!   number.** The count-based intuition `(vcpus − pcpus) × quantum` predicts 4 for weights
 //!   `[1,2,3]` where the real answer is 11 — so adding a *heavy* neighbour lengthens a vCPU's
