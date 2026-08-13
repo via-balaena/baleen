@@ -274,10 +274,31 @@ reachable by any larger Kani harness**:
 
 - **Weighted-proportional fairness** is a statement about a *limit*.
 - **Starvation-freedom** — the bound `(W_total − wᵢ) × quantum / pcpus + 1` — is a statement about
-  *unbounded runs*.
+  *unbounded runs*. ⚠⚠ **And that formula is false at `quantum == 1`**, which was found while
+  scoping the proof and is stated here rather than quietly fixed: on one pCPU, `[1,1,1]` waits 4
+  against a predicted 3. The five configurations asserting it use only `quantum ∈ {2, 5}`. **A
+  configuration list is a generator too, and its axes need counting** — the same defect this whole
+  piece is about, one level further out. The correct general formula has not been derived.
 
 Neither is a bounded-depth property, so closing them needs a different technique, not a bigger
 harness.
+
+★ **And "a different technique" is no longer a hand-wave, which is a change worth recording.** The
+bound's shape — the sum of the *other* partitions' quanta, over the server count — is the classic
+**weighted round-robin / Deficit Round Robin** latency result, and this project's case is the
+tractable one: every vCPU continuously backlogged, fixed weights, no arrival process. The general
+DRR analysis needs network calculus; this does not. **And the tooling already exists in a form this
+project can reach**: [Verus has a TLA embedding](https://github.com/anvil-verifier/verus-tla) with
+`always` / `eventually` / `leads_to` / `weak_fairness`, and
+[Anvil](https://www.usenix.org/system/files/osdi24-sun-xudong.pdf) used it to verify **liveness** of
+Kubernetes controllers — the same Verus this repository already runs as a required gate.
+
+⚠ **What that does and does not mean.** It moves this from *"unknown technique"* to *"scoped and
+unstarted"*, which is a real difference. It does not make it small: Anvil is a multi-person research
+effort, and there is a genuine gap between **qualitative** liveness (*a runnable, affine vCPU
+eventually runs* — the `leads_to` shape) and the **quantitative** bound (*within B ticks*), which
+needs a counting argument layered on top. The qualitative half is the scarier one and the natural
+first rung.
 
 ⚠⚠ **And notice that both are liveness properties — the same class as the defect above, and the same
 class the mixed-criticality role depends on.** The starvation bound is precisely what a safety
