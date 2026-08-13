@@ -28,12 +28,21 @@ const DOMAINS: usize = 2;
 const VCPUS: usize = 3;
 const PCPUS: usize = 2;
 
-/// Whether a physical CPU is idle while a vCPU is runnable — a work-conservation
-/// breach.
+/// Whether a physical CPU is idle while a vCPU that **may use it** is runnable — a
+/// work-conservation breach.
+///
+/// ⚠ The affinity clause is required, not a softening: a vCPU whose mask excludes every free CPU
+/// is `Runnable` and legitimately unplaceable, so the free-CPU and the waiter must be paired
+/// rather than chosen independently. See the same predicate in `hv-sim`'s `scenario.rs`.
 fn idle_cpu_with_waiter(sys: &System) -> bool {
-    let idle = (0..sys.pcpu_count() as u32).any(|p| sys.occupant(p).is_none());
-    idle && (0..sys.domain_count() as u16).any(|d| {
-        (0..sys.vcpu_count(d) as u32).any(|v| sys.state_of(d, v) == Some(RunState::Runnable))
+    (0..sys.pcpu_count() as u32).any(|p| {
+        sys.occupant(p).is_none()
+            && (0..sys.domain_count() as u16).any(|d| {
+                (0..sys.vcpu_count(d) as u32).any(|v| {
+                    sys.state_of(d, v) == Some(RunState::Runnable)
+                        && sys.affinity_permits(d, v, p)
+                })
+            })
     })
 }
 
@@ -56,8 +65,13 @@ fuzz_target!(|data: &[u8]| {
         let vcpu = (u32::from(a >> 2)) % VCPUS as u32;
         now = now.wrapping_add(1 + u64::from(a & 0x7));
 
-        // Only availability changes here; placing vCPUs on CPUs is the policy's job.
-        match op % 4 {
+        // Only availability and affinity change here; placing vCPUs on CPUs is the policy's job.
+        //
+        // ⚠⚠ The `set_affinity` arm is ㉘'s. Without it this alphabet was identical to
+        // `hv-sim`'s `run_policy` churn, so the fuzzer and the seeded simulation were not two
+        // independent tiers over the same property — they were one blind spot with two names,
+        // and the work-conservation defect ㉘ fixed lived precisely on the axis neither moved.
+        match op % 5 {
             0 => {
                 let _ = sys.admit(dom, vcpu);
             }
@@ -66,6 +80,11 @@ fuzz_target!(|data: &[u8]| {
             }
             2 => {
                 let _ = sys.wake(dom, vcpu);
+            }
+            3 => {
+                // Includes the all-zero mask — a vCPU that may run nowhere is representable in
+                // production, so the generator must be able to produce one.
+                let _ = sys.set_affinity(dom, vcpu, u64::from(a) % (1u64 << PCPUS));
             }
             _ => {
                 let _ = sys.offline(dom, vcpu, now);

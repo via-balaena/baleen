@@ -52,9 +52,18 @@ default in the same machine, all under required CI gates.
   runnable pool (from `Blocked`, or freshly admitted) at the pool's floor, so a
   long-slept vCPU can't monopolise a CPU to "catch up" and starve the ones that stayed
   runnable — the scheduler's version of CFS's `place_entity`. Unlike a state machine
-  it has no safety invariant — a bad policy is unfair, not unsafe — so it is held to
-  *properties* instead: work-conservation, proportional fairness, starvation-freedom,
-  and sleeper fairness, all property-tested (`hv-sim`) and fuzzed (`hv-fuzz`).
+  it has no safety invariant, so it is held to *properties* instead: work-conservation,
+  proportional fairness, starvation-freedom, and sleeper fairness.
+  **㉘ machine-checked the first of the four** (`hv-verify`'s
+  `advance_leaves_no_legal_dispatch_unmade`, at a bounded shape); the other three remain
+  property-tested (`hv-sim`) and fuzzed (`hv-fuzz`), and two of them — a *limit* and a claim about
+  *unbounded runs* — are not bounded-depth properties, so no larger Kani harness reaches them.
+  ⚠ **"A bad policy is unfair, not unsafe" used to stand here unqualified, and ㉘ is the reason it
+  no longer does.** The work-conservation property was false: a vCPU pinned away from the lowest
+  idle CPU made the policy recommend a dispatch the mechanism refuses, which `advance` took as its
+  break — stalling the machine completely and permanently, every CPU idle with every vCPU
+  runnable. No invariant was ever violated. **Unfairness is not the worst a policy can do; it can
+  also simply stop.**
 - **Page-type accounting** *(landed)*: `hv-core::p2m` — a fourth whole-system state
   machine, Xen's third historical XSA factory after event channels and grant tables.
   Every machine frame carries an existence reference count and two typed counts

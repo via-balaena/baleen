@@ -448,15 +448,29 @@ pub struct PolicyOutcome {
     pub work_conserving: bool,
 }
 
-/// Whether any physical CPU is idle while some vCPU is runnable — the negation of
-/// work conservation, checked directly against the mechanism state.
+/// Whether any physical CPU is idle while some vCPU that **may use it** is runnable — the
+/// negation of work conservation, checked directly against the mechanism state.
+///
+/// ⚠⚠ **The affinity clause is not a weakening; without it this predicate is simply wrong**, and
+/// it is what ㉘ added. A vCPU whose hard-affinity mask excludes every free CPU is `Runnable` and
+/// legitimately unplaceable — `set_affinity(_, _, 0)` is accepted, so a permanently unplaceable
+/// vCPU is representable — and demanding it be scheduled would make the property unsatisfiable
+/// rather than strict. The pairing must therefore be per-CPU: *this* free CPU with a waiter
+/// affine to *it*, not "some free CPU" and "some waiter" chosen independently.
+///
+/// ★ The old form survived only because nothing ever set an affinity mask. `run_policy`'s churn
+/// and the `policy` fuzz target both drew from the same four-op alphabet
+/// (admit/block/wake/offline), so every mask stayed full for the whole of every run — and a
+/// predicate that is wrong on an axis nothing moves looks exactly like a predicate that is right.
 fn has_idle_cpu_with_waiter(sys: &sched::System) -> bool {
-    let idle = (0..sys.pcpu_count() as u32).any(|p| sys.occupant(p).is_none());
-    if !idle {
-        return false;
-    }
-    (0..sys.domain_count() as u16).any(|d| {
-        (0..sys.vcpu_count(d) as u32).any(|v| sys.state_of(d, v) == Some(sched::RunState::Runnable))
+    (0..sys.pcpu_count() as u32).any(|p| {
+        sys.occupant(p).is_none()
+            && (0..sys.domain_count() as u16).any(|d| {
+                (0..sys.vcpu_count(d) as u32).any(|v| {
+                    sys.state_of(d, v) == Some(sched::RunState::Runnable)
+                        && sys.affinity_permits(d, v, p)
+                })
+            })
     })
 }
 
@@ -492,8 +506,16 @@ pub fn run_policy(seed: u64, steps: u32) -> PolicyOutcome {
         let vcpu = rng.below(VCPUS);
 
         // Churn availability. `run`/`preempt` are the policy's job, so this stream only
-        // changes whether a vCPU *wants* a CPU, never places one directly.
-        match rng.below(4) {
+        // changes whether a vCPU *wants* a CPU — and, since ㉘, *which* CPUs it may have —
+        // never placing one directly.
+        //
+        // ⚠⚠ **The fifth arm is the whole point of ㉘.** For four arcs this match had four arms
+        // and never touched affinity, so every mask stayed full for every step of every seed.
+        // The `hv-fuzz` `policy` target drew from the identical alphabet, so the two tiers were
+        // not independent: they were one blind spot with two names, and the work-conservation
+        // defect ㉘ fixed lived exactly there. A generator that cannot reach an axis is not
+        // evidence about it.
+        match rng.below(5) {
             0 => {
                 if sys.admit(dom, vcpu).is_ok() {
                     admitted[dom as usize][vcpu as usize] = true;
@@ -504,6 +526,12 @@ pub fn run_policy(seed: u64, steps: u32) -> PolicyOutcome {
             }
             2 => {
                 let _ = sys.wake(dom, vcpu);
+            }
+            3 => {
+                // The full mask range for this machine, INCLUDING 0 (a vCPU that may run
+                // nowhere) — representable in production, so the generator must reach it.
+                let mask = u64::from(rng.below(1 << PCPUS));
+                let _ = sys.set_affinity(dom, vcpu, mask);
             }
             _ => {
                 let _ = sys.offline(dom, vcpu, now);
