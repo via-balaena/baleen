@@ -130,7 +130,7 @@ fuzz_target!(|data: &[u8]| {
         let slot = u32::from(a) % TABLE_SLOTS;
         now = now.wrapping_add(1 + u64::from(a));
 
-        let call = match op % 34 {
+        let call = match op % 35 {
             0 => HvCall::CreditGrant {
                 amount: u32::from(a),
             },
@@ -252,6 +252,12 @@ fuzz_target!(|data: &[u8]| {
             // outliving its holder into a reborn slot.
             31 => HvCall::DeviceAssign { dev, to: other },
             32 => HvCall::DeviceRelease { dev, from: other },
+            // ㉙ — appended rather than slotted beside the other `Evtchn*` arms, so the existing
+            // indices keep their meaning and the persisted corpus stays interpretable. It was
+            // missing entirely: 34 arms against 35 variants, with the module doc above naming
+            // `EvtchnUnmask` as one of the interesting seam cases while nothing ever built one.
+            // `cargo xtask hvcall-census` now fails if a variant goes unconstructed again.
+            33 => HvCall::EvtchnUnmask { port },
             _ => HvCall::SchedSetAffinity {
                 target: other,
                 vcpu,

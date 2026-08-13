@@ -128,6 +128,7 @@ fn main() {
         "doc-tasks" => doc_tasks(),
         "doc-modules" => doc_modules(),
         "seam-census" => seam_census(),
+        "hvcall-census" => hvcall_census(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -169,6 +170,11 @@ fn main() {
                 // placed above the seam, where no HvCall enumeration reaches it — arrives in
                 // ordinary feature work and is silent in every other gate.
                 && seam_census()
+                // ㉙: and the generator that claims the whole hypercall surface must name all of
+                // it. Same family as `seam-census` — both ask whether a coverage claim is gated or
+                // merely audited — but a different question, so a different task rather than a
+                // second obligation hidden under the first one's name.
+                && hvcall_census()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -197,6 +203,7 @@ fn main() {
                  doc-tasks    assert every `cargo xtask` command the docs name really exists\n  \
                  doc-modules  assert a README enumerating a directory enumerates ALL of it\n  \
                  seam-census  assert every hv-core transition is hypercall-reachable, or DECLARED above the seam\n  \
+                 hvcall-census  assert the fuzz target that drives HvCall constructs EVERY variant\n  \
                  verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  kani-harnesses  run the Kani corpus and assert it contains exactly the expected harnesses\n  \
                  sweeps assert the deep exhaustive-sweep corpus is exactly the expected one\n  \
@@ -2737,6 +2744,148 @@ fn seam_census() -> bool {
             found.len(),
             ABOVE_SEAM.len(),
             ABOVE_SEAM.join(", ")
+        );
+    }
+    ok
+}
+
+/// ★★ ㉙ — **the generator that claims the whole hypercall surface must actually name all of it.**
+///
+/// `hv-fuzz/fuzz_targets/hypervisor.rs` drives `dispatch` across `HvCall`, so it presents itself as
+/// covering the guest-visible surface entire. Its alphabet was a **hand-typed `op % 34`** against a
+/// `HVCALL_VARIANT_COUNT` of **35**, and the missing variant was `EvtchnUnmask` — unnamed, ungenerated,
+/// and invisible to every gate.
+///
+/// ⚠ **Severity is low and saying so is part of the finding:** the enumerator sweeps `EvtchnUnmask`
+/// exhaustively and `fuzz_targets/evtchn.rs` calls `unmask` directly, so nothing was actually
+/// uncovered. **The defect is the drift, not the gap** — a generator's alphabet diverged from the
+/// surface it advertises and only a hand diff found it, which is the same shape as the
+/// work-conservation defect of #198 one layer down.
+///
+/// ## The extraction is self-checking, which is what makes this non-vacuous
+///
+/// The variant list is parsed out of the `pub enum HvCall` block — and then **balanced against
+/// `HVCALL_VARIANT_COUNT`**, which the compiler itself checks against `core::mem::variant_count`.
+/// So a parser that silently under-collects does not quietly shrink the universe and pass; it
+/// disagrees with a compiler fact and fails loudly (#281, handled at the source rather than with a
+/// floor guess).
+///
+/// ⚠ The modulus is checked too, and it has to be: naming every variant is **not sufficient** if the
+/// `op % N` that selects them is smaller than the arm count, because the trailing arms are then
+/// unreachable and their variants are named but never generated. A future deliberate exclusion
+/// belongs in a declared constant here, the way the enumerator declares `NUM_EXCLUDED` — not in a
+/// smaller modulus.
+fn hvcall_census() -> bool {
+    eprintln!("$ xtask hvcall-census");
+
+    const SEAM: &str = "hv-core/src/hypervisor.rs";
+    const TARGET: &str = "hv-fuzz/fuzz_targets/hypervisor.rs";
+
+    let (Ok(seam), Ok(target)) = (
+        std::fs::read_to_string(SEAM),
+        std::fs::read_to_string(TARGET),
+    ) else {
+        eprintln!("hvcall-census: FAIL — cannot read {SEAM} or {TARGET}");
+        return false;
+    };
+
+    // The compiler-checked total, read from the source rather than retyped here.
+    let Some(declared) = seam
+        .split("pub const HVCALL_VARIANT_COUNT: usize = ")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    else {
+        eprintln!("hvcall-census: FAIL — cannot read HVCALL_VARIANT_COUNT from {SEAM}");
+        return false;
+    };
+
+    // The variants themselves.
+    let Some(body) = seam
+        .split("pub enum HvCall {")
+        .nth(1)
+        .and_then(|s| s.split("\n}").next())
+    else {
+        eprintln!("hvcall-census: FAIL — cannot find the `pub enum HvCall` block in {SEAM}");
+        return false;
+    };
+    let mut variants: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let t = line.trim_start();
+        // A variant opens at four-space indentation with an upper-case name; anything else in the
+        // block is a doc comment, an attribute, or a field of the variant above.
+        if line.starts_with("    ") && !line.starts_with("     ") {
+            let name: String = t
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.chars().next().is_some_and(|c| c.is_uppercase()) && !variants.contains(&name) {
+                variants.push(name);
+            }
+        }
+    }
+
+    let mut ok = true;
+
+    // (1) The extraction balances against the compiler fact, so it cannot be vacuous.
+    if variants.len() != declared {
+        eprintln!(
+            "hvcall-census: FAIL — parsed {} variants from the enum but HVCALL_VARIANT_COUNT is \
+             {declared}. The parser is wrong, not the code; fix it rather than the constant.",
+            variants.len()
+        );
+        return false;
+    }
+
+    // (2) Every variant must be named by the generator that claims the whole surface.
+    let mut missing: Vec<&str> = Vec::new();
+    for v in &variants {
+        if !target.contains(&format!("HvCall::{v}")) {
+            missing.push(v);
+        }
+    }
+    if !missing.is_empty() {
+        eprintln!(
+            "hvcall-census: FAIL — {TARGET} drives `dispatch` across HvCall but never constructs \
+             {} of {declared} variants: {}.\n\
+             \x20                   A generator that covers part of a surface reads as covering all \
+             of it.",
+            missing.len(),
+            missing.join(", ")
+        );
+        ok = false;
+    }
+
+    // (3) The selector must reach every arm. Naming a variant in an arm the modulus cannot select
+    // is the same defect wearing a disguise.
+    let modulus = target
+        .split("let call = match op % ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.trim_end_matches('{').trim().parse::<usize>().ok());
+    match modulus {
+        Some(n) if n == declared => {}
+        Some(n) => {
+            eprintln!(
+                "hvcall-census: FAIL — {TARGET} selects with `op % {n}` against {declared} \
+                 variants. Arms past the modulus are unreachable, so their variants are named but \
+                 never generated."
+            );
+            ok = false;
+        }
+        None => {
+            eprintln!(
+                "hvcall-census: FAIL — cannot read the `let call = match op % N` selector in \
+                 {TARGET}; the check above would be vacuous without it."
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        eprintln!(
+            "hvcall-census: OK — {TARGET} constructs all {declared} HvCall variants, and its \
+             selector reaches every one"
         );
     }
     ok
