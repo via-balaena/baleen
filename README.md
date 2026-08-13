@@ -25,9 +25,13 @@ test on a multi-year solo project.
 > `publish = false` and are not intended for crates.io.
 
 > **Where to go next.** This file is long, deliberately — it carries the claims *and* the honest
-> ledger of what is not proven. If you would rather be pointed somewhere:
-> **[`docs/README.md`](docs/README.md)** is a map of every design document, with three reading
-> orders, and every crate below links to its own front door.
+> ledger of what is not proven. Three shorter ways in, by what you actually want:
+>
+> | if you want | go to |
+> |---|---|
+> | the picture — what is proven, what is only witnessed, what is open | **[the assurance map](https://via-balaena.github.io/baleen/)**, whose every figure is generated from the gates |
+> | one defect, end to end, with no prior context | **[Three green test tiers, one false property](docs/CASE-STUDY-WORK-CONSERVATION.md)** — a scheduler property that a simulation, a fuzz target *and* an exhaustive enumerator all reported green while it was false |
+> | the design documents | **[`docs/README.md`](docs/README.md)** — a map of all of them, with three reading orders |
 
 ## What this is, honestly
 
@@ -86,6 +90,57 @@ The open question this is really poking at: **how much assurance can you get for
 fraction of a full-verification budget, and exactly which parts do you lose?** The honest ledger
 is what makes that answerable instead of rhetorical.
 
+## The architecture in one picture
+
+Everything above the fence is proof-reachable; everything below it is not. That single line
+explains most of the honest ledger.
+
+```
+  guest A — unmodified Linux            guest B — Linux, or a bare-metal payload
+             │                                        │
+             │        traps · hypercalls · MMIO       │
+  ═══════════╪════════════════════════════════════════╪═══════════════  EL2
+             ▼                                        ▼
+  ┌────────────────────────────────────────────────────────────────┐
+  │ hv-vdev   the devices a guest sees — GICv3, PL011, SGI decode  │
+  ├────────────────────────────────────────────────────────────────┤
+  │ hv-core   domains · grants · event channels · p2m · scheduler  │   every crate
+  │           · policy                              — the model    │   in this box
+  ├──────────────────────────────┬─────────────────────────────────┤   is #![forbid(
+  │ hv-part  partition arithmetic│ hv-s2  Stage-2 emitter, and the │   unsafe_code)]
+  │          windows, frame runs │        ∀-address refinement     │   and reachable
+  ├──────────────────────────────┴─────────────────────────────────┤   by Kani, Verus
+  │ hv-hal    the southbound fence — architecture-neutral traits   │   and the sweeps
+  └────────────────────────────────────────────────────────────────┘
+  ═══════════════════════  the proof fence  ══════════════════════════
+  ┌───────────────────────────┐        ┌───────────────────────────┐
+  │ hv-sim    host backend    │        │ hv-metal   AArch64 / EL2  │
+  │ fake memory, manual clock │        │ boot · MMU · Stage-2 ·    │
+  │ deterministic simulation  │        │ vGIC — the unsafe layer   │
+  └───────────────────────────┘        └───────────────────────────┘
+     runs on a laptop, cargo test          QEMU today; not yet silicon
+```
+
+**The southbound fence is the same line as the `unsafe` boundary, and the same line as the proof
+boundary.** Above it, seven crates are `#![forbid(unsafe_code)]` — enforced by the compiler, not by
+convention — and every verification tool in the project can reach them. Below it, `hv-metal` needs
+`unsafe` for MMIO and assembly, is excluded from the workspace, and is held to boot witnesses
+instead.
+
+⚠ **That is not a small remainder.** Shipped code splits almost exactly in half either side of the
+fence — the live figure is on the [assurance map](https://via-balaena.github.io/baleen/), which
+generates it rather than restating it. Anyone reading "machine-checked isolation core" should know
+what fraction that phrase covers.
+
+⚠ **The picture above replaced one that had gone stale**: it drew a Xen personality that was
+dropped, labelled boxes with milestone numbers that had moved on, and omitted `hv-part`, `hv-vdev`
+and `hv-s2` entirely — three of the five crates inside the fence. A diagram is prose with lines
+around it and rots exactly as fast.
+
+⚠ That sentence used to read *"~85% of bugs live in `hv-core`"*. **Nobody measured 85%.** It was a
+design intuition wearing a statistic's clothes, and this repo gates the numbers it states — so the
+number is deleted rather than sourced, per design-lesson #276.
+
 ## Workspace
 
 The comment ratio across this workspace is high on purpose: much of the project's argument
@@ -133,15 +188,17 @@ after that, which is the same finding one crate along. `board-probe` was therefo
 > undercounts its own subject makes the ones it omits invisible — and the omitted two are
 > precisely the crates whose exclusion cost had already bitten twice.
 
-**Direction (2026-08-07).** The long-run build target is unchanged: a greenfield **"slim
-Qubes"** — GPU-accelerated near-metal disposables, an offline vault, direct device attach and
-a trusted input/GUI domain, on the proven core, using **hardware-virt + virtio** so unmodified
-guests need no knowledge of Baleen. The once-planned Xen personality (`baleen-xenabi`) stays
-**dropped**: matching Xen's ABI would drag its unproven semantics onto a clean core and leave
-us chasing an external surface forever. See [**`docs/ROADMAP.md`**](docs/ROADMAP.md).
+## Direction
 
-What has changed since that was written is where the work actually is. The model is proven and the
-effort has moved to the **seam between the proof and the metal**. Two unmodified Alpine kernels run
+The long-run build target is a greenfield **"slim Qubes"** — GPU-accelerated near-metal
+disposables, an offline vault, direct device attach and a trusted input/GUI domain, on the proven
+core, using **hardware-virt + virtio** so unmodified guests need no knowledge of Baleen. The
+once-planned Xen personality (`baleen-xenabi`) stays **dropped**: matching Xen's ABI would drag its
+unproven semantics onto a clean core and leave us chasing an external surface forever. See
+[**`docs/ROADMAP.md`**](docs/ROADMAP.md).
+
+Where the work actually is has moved. The model is proven and the effort is now on the **seam
+between the proof and the metal**. Two unmodified Alpine kernels run
 isolated on hardware EL2, and the device path — a DMA-capable device under the same proven `p2m` the
 CPU uses — **is closed**: the SMMU rungs took it from a default-deny stream table to the metal
 deriving that table, and `docs/SMMU-DEVICE-PATH-COMPOSITION.md` states the whole path as one theorem.
@@ -153,21 +210,19 @@ milestone log moved out and why what remains here is written as *what is true*, 
 
 ### Identity vs. personality
 
-`hv-core` does not know what Xen is. Schedulers, event-channel state machines,
-memory accounting, and grant-style resource lifecycles are *generic* hypervisor
-logic. Guest-facing wire formats and boot protocols live in a **personality**
-northbound of the core, in the same architectural position `hv-hal` sits southbound —
-the core stays ABI-agnostic, and the personality is chosen per target.
+`hv-core` does not know what Xen is. Schedulers, event-channel state machines, memory accounting
+and grant-style resource lifecycles are *generic* hypervisor logic. Guest-facing wire formats and
+boot protocols live in a **personality** northbound of the core, in the same architectural
+position `hv-hal` sits southbound — the core stays ABI-agnostic, and the personality is chosen per
+target.
 
-The **greenfield "slim Qubes"** capstone (see [`docs/ROADMAP.md`](docs/ROADMAP.md)) fills
-that slot with a **native + virtio** personality: guests run under hardware virtualization
-and speak **virtio** (block, console, input, gpu), which unmodified Linux already supports —
-so no guest needs to know Baleen exists, and no Xen ABI is implemented. The once-planned Xen
-personality (`baleen-xenabi`) is **dropped**: reimplementing the Qubes *architecture* (isolated
-disposables, a vault, controlled inter-VM comms) fresh on the proven core keeps the proof's
-guarantees flowing all the way up, where emulating Xen's ABI would sever them at the boundary.
-The clean-room / ABI-as-spec discipline (see [`CLEANROOM.md`](CLEANROOM.md)) still governs any
-*standard* wire format we implement (virtio), just not a Xen-compatibility layer.
+The clean-room / ABI-as-spec discipline ([`CLEANROOM.md`](CLEANROOM.md)) governs any *standard*
+wire format implemented here (virtio) — it never governed a Xen-compatibility layer, because there
+is not going to be one.
+
+⚠ **This section used to restate the dropped-Xen decision and the slim-Qubes goal in full, one
+screen after the paragraph above had already made both points.** Two passages saying the same
+thing drift apart rather than reinforce; the duplicate is deleted, not reworded.
 
 ### ARM and x86 are co-equal targets
 
@@ -184,45 +239,6 @@ afterthought: it is a second implementation of the same `hv-hal` traits, and the
 brain above it does not change. This is a load-bearing design constraint — the fence's trait
 surface stays free of any architecture-specific concept, so each port is a new metal layer,
 never a rewrite.
-
-## The architecture in one picture
-
-The core is sandwiched between two thin translation layers. Both are *personalities*
-of a sort — one faces guests, one faces hardware — and neither leaks into the core.
-
-```
-   NORTHBOUND — guest ABI (personality, not identity)
-         ┌────────────────────────┐   ┌──────────────────┐
-         │ native + virtio        │   │ (Xen personality │
-         │ blk·net·console·input· │   │  dropped — see    │
-         │ gpu → ops  — M5+ —     │   │  ROADMAP.md)     │
-         └───────────┬────────────┘   └──────────────────┘
-                  │      neutral, ABI-agnostic ops
-          ┌───────▼────────────────────────▼─────────────┐
-          │  hv-core   (no_std, zero unsafe)              │
-          │  sched · evtchn · grant · page-type accounting│
-          │  dispatch · invariants — knows no personality │
-          └───────────────────┬──────────────────────────┘
-                              │  speaks ONLY through
-                     ┌────────┴────────┐  hv-hal traits
-                     │                 │
-         ┌───────────▼──────┐   ┌──────▼─────────────────┐
-         │ hv-sim (host)    │   │ hv-metal (bare metal)  │
-         │ Vec<u8> memory   │   │ real Stage-2 tables    │
-         │ manual clock     │   │ the thin unsafe core   │
-         │ deterministic    │   │  — M4 —                │
-         └──────────────────┘   └────────────────────────┘
-   SOUTHBOUND — hardware (the fence)
-```
-
-The southbound fence between core and hardware is the *same* fence as the `unsafe` boundary. **Most
-of the logic that can be wrong lives in `hv-core`, and is found on your laptop**; the two translation
-layers are each small enough to audit line by line (that is what the hardware — and, northbound,
-virtio conformance against real guest drivers — is for).
-
-⚠ That sentence used to read *"~85% of bugs live in `hv-core`"*. **Nobody measured 85%.** It was a
-design intuition wearing a statistic's clothes, and this repo gates the numbers it states — so the
-number is deleted rather than sourced, per design-lesson #276.
 
 ## Try it
 
@@ -258,12 +274,20 @@ cargo xtask hvcall-census    # the fuzz target driving HvCall constructs every v
 ```
 
 ⚠ **`seam-census` exists because the exhaustive sweep reaches `hv-core` through exactly one door.**
-`HVCALL_VARIANT_COUNT` is machine-checked against `core::mem::variant_count::<HvCall>()`, so anything
-a *hypercall* can reach is swept — **45 of the 48 mutating operations**. The other three are
-`policy::advance`, `policy::set_weight` and `policy::set_wake_boost`, which no hypercall reaches by
-design: the policy sits above the dispatch seam, driven by the hypervisor's own tick. They are
-covered by named generators instead, and the census fails if one loses its generator, if the
-classification goes stale, or if a new operation appears without being classified either way.
+`HVCALL_VARIANT_COUNT` is machine-checked against `core::mem::variant_count::<HvCall>()`, so
+anything a *hypercall* can reach is swept — and a handful of operations sit **above** that seam,
+driven by the hypervisor's own tick rather than by a guest, where no enumeration can ever reach
+them. Those are covered by named generators instead, and the census fails if one loses its
+generator, if the classification goes stale, or if a new operation appears unclassified.
+
+The live split, and which subsystems it leaves uncovered, is on the
+[assurance map](https://via-balaena.github.io/baleen/) — generated, so it stays true.
+
+And the map's own data:
+
+```sh
+cargo xtask site-data        # regenerate it from the gates; `ci` fails if it is stale
+```
 
 ★ **`cargo xtask ci` is the honest answer to "is any of this real?"** — it is the same entry point
 CI uses, and it fails on a stale number in this file as readily as on a broken test.
@@ -272,69 +296,100 @@ CI uses, and it fails on a stale number in this file as readily as on a broken t
 
 *What the commands above actually establish, and where each stops.*
 
-M1's headline test runs `hv-core` through 10,000 seeded interleavings of the toy
-credit-account state machine, checking its conservation invariant on every
-transition. Same seed → same run, exactly — so any future invariant break is a
-one-line regression test, not a Heisenbug.
+### Seeded simulation — cheap, deterministic, and the weakest tier
 
-Beyond sampling, `hv-sim::enumerate` does **bounded model checking**: for a tiny
-configuration it breadth-first visits *every* reachable state and checks the
-integrated invariant at each — a proof, not a sample, that no reachable state can
-break it. CI runs shallow per-seam sweeps in seconds; the **23** deep exhaustive sweeps
-(`cargo test --release -- --ignored`) have exhaustively cleared **millions** of
-distinct states (grant↔page-type + page-table↔grant to depth 7 ≈ 828k states —
-including cross-domain foreign *node* shares, not just leaves; the whole integrated
-core to depth 5 ≈ 415k; event↔scheduler to depth 7 ≈ 2.1M) with zero violations.
+M1's headline test runs `hv-core` through 10,000 seeded interleavings of the toy credit-account
+state machine, checking its conservation invariant on every transition. Same seed → same run,
+exactly — so any future invariant break is a one-line regression test, not a Heisenbug.
 
-**Bounded → unbounded (the true-diamond program, Tier B).** Those sweeps are bounded
-in two ways: hypercall *depth* and config *size*. The enumerator now distinguishes a
-run that merely exhausts its depth budget from one that **saturates** — whose BFS
-frontier goes *empty*, meaning the config's entire reachable set has been visited at
-**every** depth, an all-depths theorem. Most configs saturate (nothing in them grows
-a refcount without bound): the domain lifecycle (47k states), vCPU affinity (237k),
-the delegation forest (58k), event channels and the scheduler each on their own — all
-proven safe at *all* depths, not merely up to a bound. The lone exception is
-grant↔p2m *together*: a frame can be mapped an unbounded number of times, so that
-state space is genuinely infinite and finite only per depth — precisely the boundary
-where deductive proof (Tier C) becomes unavoidable, since one cannot enumerate an
-infinite space. A per-invariant **locality/cutoff** analysis (each of the 28
-invariants is violated by a bounded witness, so a size cutoff k0 = 4 domains / 3
-frames bounds the search — which Tier A's 3-domain grant/p2m and 4-domain delegation
-sweeps already cover as the base case) and a **data-independence/symmetry** argument
-(the core branches on no literal id except dom0-at-boot and vCPU-0-at-notify) complete
-the size axis. That symmetry argument is now also an **enumerator optimization**:
-canonicalizing each state to its orbit representative (over frame / port / grant
-id-permutations) before dedup collapses each symmetry orbit to one state — up to ≈20×
-fewer states for frame-heavy page-table configs — which turned the **full four-level
-page-table hierarchy** from argued-finite into a *measured* all-depths theorem
-(saturates at 1,030,856 orbit representatives). Its soundness is validated ruthlessly
-(the group is checked to be a genuine automorphism on saturated reachable sets, and the
-reduced run to hide no reachable orbit) since a wrong canonicalization would silently
-hide states. The full argument, its two honest residuals handed to Tier C, and the
-measured saturation table live in
+⚠ It is also the tier that has actually been wrong. See the
+[case study](docs/CASE-STUDY-WORK-CONSERVATION.md): a property this tier reported green for four
+development arcs was false the whole time.
+
+### Exhaustive enumeration — a proof, not a sample, at small size
+
+`hv-sim::enumerate` does **bounded model checking**: for a tiny configuration it breadth-first
+visits *every* reachable state and checks the integrated invariant at each. CI runs shallow
+per-seam sweeps in seconds; the **23** deep exhaustive sweeps (`cargo test --release -- --ignored`)
+have cleared **millions** of distinct states with zero violations:
+
+| sweep | depth | states |
+| --- | --- | --- |
+| grant↔page-type + page-table↔grant — including cross-domain foreign *node* shares, not just leaves | 7 | ≈ 828k |
+| the whole integrated core | 5 | ≈ 415k |
+| event↔scheduler | 7 | ≈ 2.1M |
+
+### Bounded → unbounded: how small sweeps say something about all sizes
+
+Those sweeps are bounded two ways — hypercall **depth** and config **size** — and each is closed
+by a separate argument.
+
+**Depth, by saturation.** The enumerator distinguishes a run that merely exhausts its budget from
+one that **saturates**: the BFS frontier goes *empty*, meaning the config's whole reachable set has
+been visited at **every** depth. That is an all-depths theorem, not a bound. Most configs saturate,
+because nothing in them grows a refcount without limit:
+
+| config | states at saturation |
+| --- | --- |
+| domain lifecycle | 47k |
+| vCPU affinity | 237k |
+| the delegation forest | 58k |
+| the full four-level page-table hierarchy | 1,030,856 orbit representatives |
+
+⚠ **One config genuinely does not saturate, and it is the interesting one.** Grant↔p2m *together*
+is infinite: a frame can be mapped an unbounded number of times, so the space is finite only per
+depth. **That is precisely where enumeration stops being able to help and deductive proof becomes
+unavoidable** — you cannot enumerate an infinite space — and it is why Tier C exists.
+
+**Size, by cutoff and symmetry.** A per-invariant **locality** analysis shows each of the 28
+invariants is violated by a bounded witness, so a size cutoff of 4 domains / 3 frames bounds the
+search — already covered as a base case by the 3-domain grant/p2m and 4-domain delegation sweeps. A
+**data-independence** argument completes it: the core branches on no literal id except dom0-at-boot
+and vCPU-0-at-notify.
+
+★ **That symmetry argument then paid for itself twice.** Canonicalizing each state to its orbit
+representative before dedup — over frame, port and grant id-permutations — collapses each orbit to
+one state, up to ≈20× fewer for frame-heavy configs. It is what turned the full page-table
+hierarchy from *argued* finite into a **measured** all-depths theorem. ⚠ Its soundness is checked
+ruthlessly, because a wrong canonicalization would silently hide states rather than fail: the group
+is verified to be a genuine automorphism on saturated reachable sets, and the reduced run verified
+to hide no reachable orbit.
+
+The full argument, its two residuals handed to Tier C, and the measured saturation table are in
 [`docs/TIER-B-CUTOFF.md`](docs/TIER-B-CUTOFF.md).
 
-**Deductive proof (Tier C) — the ∀-N jump, begun.** Bounded model checking, however
-exhaustive, enumerates small states; Tier C *proves every transition preserves every
-invariant for arbitrary size*, reasoning over all states at once. The tooling is a
-**bridge**: [Kani](https://github.com/model-checking/kani) symbolically executes the
-**real** hv-core code (a scalar made symbolic is checked over all 2³² values by its SMT
-backend, no bound), then **Verus** for the full arbitrary-size proofs. The first spike
-(`hv-verify`) discharges the cleanest Tier B residual — the grant refcount *infinity* — as a
-machine-checked theorem: `WritableExceedsMaps` (`writable_maps ≤ maps`) is preserved by the
-map and unmap count-transitions for **every** refcount magnitude, and the unchecked
-increment provably cannot overflow. The proofs call the *same* count arithmetic production
-does (one derivation, no drift). The spike already earned its keep by surfacing a precise
-finding: `WritableExceedsMaps` is **not** self-inductive under unmap — its preservation
-*borrows* from `RefcountMismatch`, so the "±1 lockstep" is a genuine coupling, and
-`RefcountMismatch`'s own (scalar-to-`Vec`) preservation is the next, Verus-shaped obligation.
-The decision, repo/CI shape, what is proven, and that finding live in
-[`docs/TIER-C-SPIKE.md`](docs/TIER-C-SPIKE.md). ⚠ **This paragraph used to end "the proofs run in the scheduled `Deep verification`
-workflow, not the per-PR gate". That is no longer true and has not been for some time.**
-`kani proofs (PR)` and `verus proofs (PR)` are **required checks on `main`**, run on any PR
-touching `hv-hal` / `hv-core` / `hv-part` / `hv-s2` / `hv-vdev` / `hv-verify`; a PR that touches none of
-them green-skips in seconds. `Deep verification` still exists for what does *not* belong in a
-PR gate — the ∀-size enumerator sweeps, fuzzing, and a weekly backstop re-run of the proofs.
+### Deductive proof — the ∀-size jump
+
+Bounded model checking, however exhaustive, enumerates *small* states. This tier proves every
+transition preserves every invariant at **arbitrary size**, reasoning over all states at once. The
+tooling is a bridge, and the two halves do different jobs:
+
+- **[Kani](https://github.com/model-checking/kani)** symbolically executes the **real** `hv-core`
+  code — a scalar made symbolic is checked across all 2³² values by its SMT backend, with no bound.
+  It runs on shipped code, which is what makes it evidence rather than modelling.
+- **Verus** carries the arbitrary-*size* proofs, over a mirror written in its dialect. That mirror
+  is the price of the ∀-size step, and the fidelity argument for it is stated rather than assumed.
+
+The first spike discharged the cleanest Tier B residual — the grant refcount infinity — as a
+machine-checked theorem: `WritableExceedsMaps` (`writable_maps ≤ maps`) is preserved by the map and
+unmap count-transitions for **every** refcount magnitude, and the unchecked increment provably
+cannot overflow. The proofs call the *same* count arithmetic production does, so there is one
+derivation and nothing to drift.
+
+★ **The spike earned its keep by refuting an assumption rather than confirming one.**
+`WritableExceedsMaps` is **not** self-inductive under unmap — its preservation *borrows* from
+`RefcountMismatch`, making the "±1 lockstep" a genuine coupling rather than a convenience. That
+finding is what set the next obligation's shape.
+
+⚠ **This section used to end "the proofs run in the scheduled `Deep verification` workflow, not the
+per-PR gate", and that had been false for some time.** `kani proofs (PR)` and `verus proofs (PR)`
+are **required checks on `main`**, run on any PR touching `hv-hal` / `hv-core` / `hv-part` /
+`hv-s2` / `hv-vdev` / `hv-verify`; a PR touching none of them green-skips in seconds. `Deep
+verification` remains for what does not belong in a PR gate — the ∀-size sweeps, fuzzing, and a
+weekly backstop re-run of the proofs.
+
+The decision, the repo and CI shape, and that finding are in
+[`docs/TIER-C-SPIKE.md`](docs/TIER-C-SPIKE.md).
 
 ## Milestones
 
