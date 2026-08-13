@@ -86,6 +86,35 @@ the entire time. It never ran either, because the abandoned fixpoint never got t
 And throughout, **no invariant was ever violated.** The mechanism's safety property — one vCPU per
 pCPU — held perfectly. It is trivially satisfied by a machine that runs nothing.
 
+### Why that matters more than "a scheduler bug"
+
+It would be fair to read this as a liveness fault in the least safety-critical layer, and shrug.
+Three facts make it sharper than that.
+
+**It crossed domains.** The old rule scanned *every* domain for the most-deserving runnable vCPU,
+and abandoned the pass when that one could not be placed. So the unplaceable vCPU did not merely
+starve itself — it stopped every other domain from being scheduled too. Memory isolation held
+throughout; **temporal isolation did not.** For a separation kernel that distinction is the whole
+product: partitions are supposed to be unable to affect each other, and one partition's
+configuration stopped the rest of the machine.
+
+**And a guest could set that configuration itself.** `SchedSetAffinity`'s guard is
+`caller != target && no control edge → Denied` — so `caller == target` passes, deliberately: a
+domain may affine its own vCPUs, since doing so only narrows what it already has. Under the old
+rule, narrowing your own mask was enough to stall everyone.
+
+⚠ **What keeps this honest: the shipped binary was never exposed.** `hv-metal` does not use
+`hv-core::policy` at all — it drives `sched` directly — so `advance` never executed on the metal,
+and no guest could reach the defect there. It was a live defect in the model and a latent one in the
+product. **Both halves of that sentence belong in it.**
+
+★ **The structural point is the one worth carrying away.** Every invariant this project proves is a
+*safety* property: one vCPU per pCPU, refcount coupling, no unauthorized leaf, non-interference. The
+guarantee a mixed-criticality system actually buys a separation kernel for — that a critical
+partition keeps getting CPU time no matter what an untrusted one does — is a **liveness** property.
+Those are different classes, and everything proven here is in one of them. A machine that runs
+nothing satisfies every theorem in this repository.
+
 ---
 
 ## 3. Why nothing saw it
@@ -242,8 +271,15 @@ reachable by any larger Kani harness**:
   *unbounded runs*.
 
 Neither is a bounded-depth property, so closing them needs a different technique, not a bigger
-harness. That matters here specifically: the starvation bound is what a safety monitor running as a
-partition would budget its latency against, and it is still the weakest tier in the project.
+harness.
+
+⚠⚠ **And notice that both are liveness properties — the same class as the defect above, and the same
+class the mixed-criticality role depends on.** The starvation bound is precisely what a safety
+monitor running as a partition would budget its latency against, and it remains at the weakest tier
+in the project. **So the honest summary of this case study is not "verification caught a bug."** It
+is: *the one property class this architecture most depends on is the class with the least evidence
+behind it, and that is exactly where the defect turned up.* Fixing work conservation closed one
+instance. It did not close the class.
 
 `advance`'s `break` is now unreachable — every refusal reason is excluded before it — but that is
 **by construction, not by proof**. Nothing yet asserts "`next` never proposes a decision the
