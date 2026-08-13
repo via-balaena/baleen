@@ -40,7 +40,7 @@ Then read the root [`README.md`](../README.md)'s *"What this is, honestly"* sect
 limits before the claims, and [`QEMU-AND-METAL.md`](QEMU-AND-METAL.md) — **what testing against QEMU
 does and does not mean**. Read that one before believing any sentence containing the word "metal".
 
-**"Show me the verification catching something."** — [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md): a real defect, why three
+**"Show me a defect that got past the tests."** — [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md): a real defect, why three
 green test tiers missed it, and what the harness did differently. **Start here if you have an hour
 and no context.**
 
@@ -87,7 +87,7 @@ did that they could not.*
 
 | document | what it establishes |
 |---|---|
-| [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md) | a scheduler property that a seeded simulation, a fuzz target **and** an exhaustive enumerator all reported green while it was false — one pinned vCPU stopped the machine permanently, with every safety invariant holding. The Kani harness that caught it uses the **mechanism as its own oracle**, which is the transferable technique; the lesson is *count the axes your generators move, not the tiers that assert* |
+| [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md) | a scheduler property that a seeded simulation, a fuzz target **and** an exhaustive enumerator all reported green while it was false — one pinned vCPU stopped the machine permanently, with every safety invariant holding. A plain unit test reproduced it first — the harness that *generalised* it uses the **mechanism as its own oracle**, which is the transferable technique; the lesson is *count the axes your generators move, not the tiers that assert* |
 
 ## The deductive program — the model, proven
 
