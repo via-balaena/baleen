@@ -73,33 +73,42 @@
 //!   `(W_total − wᵢ) × quantum / pcpus + 1`, matched exactly across five configurations by
 //!   `hv-sim`'s `policy_bounds_scheduling_latency`.
 //!   ⚠⚠ **THE ORIGINAL FORMULA WAS `(W_total − wᵢ) × quantum / pcpus + 1` AND IT WAS FALSE AT
-//!   `quantum == 1`** — `[1,1,1]` on one pCPU waits **4** against a predicted 3, `[1,1,1,1]`
-//!   waits **6** against 4. The corrected form floors it with a second term:
-//!   `max((W_total − wᵢ)·quantum / pcpus + 1, 2(W_total − wᵢ) / pcpus)`, which is **sound on all
-//!   75 measured configurations** and attained on every all-weights-1 single-pCPU row.
-//!   ★ **The correction is derived from the mechanism, not fitted to the failures.**
-//!   `more_deserving` is **strict**, so a runner whose share merely *ties* the best waiter is
-//!   not preempted — it keeps the CPU one more tick. A turn therefore costs
-//!   `max(quantum, gap + 1)` ticks rather than `quantum`, and with the share spread bounded by
-//!   one unit that floor is **2**. The old formula assumed every turn cost exactly `quantum`,
-//!   which is precisely why it held at `quantum ≥ 2` and broke at 1.
-//!   ⛔⛔ **AND IT IS STILL NOT THE RIGHT ANSWER — the shape is wrong, provably.** The policy
-//!   ranks by `service / weight`, which is **scale-invariant**: multiplying every weight by a
-//!   constant cannot change any decision. Measurement agrees — `[2,2]` and `[1,1]` produce
-//!   *identical* waits (2, 3, 4, 6, 9 for quantum 1, 2, 3, 5, 8). But `W_total − wᵢ` is **not**
-//!   scale-invariant: it doubles. So any formula in that quantity is the wrong shape, and the
-//!   current one is merely a sound over-approximation — loose on 30 of the 75 rows, worst on
-//!   multiple pCPUs. **The scale-invariant quantity is the relative spread, and a correct bound
-//!   is expected to be a function of it; deriving one is open work.**
-//!   ⚠ **Do not "fix" this by fitting.** `quantum + 1` per turn repairs both counterexamples and
-//!   breaks rows that already worked (predicting 19 where `[1,1,1,1]`@`quantum=5` measures 16);
-//!   `Σⱼ max(quantum, wⱼ+1)` fits the `quantum = 1` rows and under-predicts at `quantum ≥ 2`,
-//!   which is *unsound*. A formula adjusted until the known failures pass is fitted, not derived.
+//!   `quantum == 1`** — `[1,1,1]` on one pCPU waits **4** against a predicted 3. The bound is now
+//!   **derived from the mechanism** instead, in three steps that each trace to this file:
+//!
+//!   1. **Turn length.** `more_deserving` is *strict*, so a runner whose share merely **ties** the
+//!      best waiter is not preempted — the turn ends only at the first tick it *strictly* exceeds.
+//!      A turn costs `max(quantum, w·gap + 1)` ticks, never simply `quantum`. **That is exactly why
+//!      the original held at `quantum ≥ 2` and broke at 1.**
+//!   2. **Spread.** After a turn the runner exceeds the second-minimum by at most
+//!      `max(1, quantum)/w`, so the share spread `D` is bounded by `quantum / w_min`.
+//!   3. **Wait.** While one vCPU waits, each other takes at most one such turn, and `pcpus` servers
+//!      drain them in parallel:
+//!      `⌈ Σⱼ≠ᵢ max(quantum, ⌊wⱼ·quantum / w_min⌋ + 1) / pcpus ⌉`.
+//!
+//!   ★★ **It is SCALE-INVARIANT, which the original was not and could never be.** The policy ranks
+//!   by `service / weight`, so multiplying every weight by a constant cannot change a decision —
+//!   `wⱼ·quantum / w_min` is invariant under that; `W_total − wᵢ` **doubles**. Measurement agrees
+//!   exactly: `[2,2]` and `[1,1]` produce identical waits (2, 3, 4, 6, 9). ⚠ **An invariance the
+//!   code has and a formula lacks retires the whole family of formulas in that quantity** — a far
+//!   stronger instrument than hunting counterexamples, and available by reading the ranking
+//!   function rather than running anything.
+//!   ⚠ **Sound on all 75 measured configurations; ATTAINED on two vCPUs at any quantum and on
+//!   `quantum = 1` with equal weights.** Loose elsewhere, and the slack is understood rather than
+//!   mysterious: step 3 charges *every* vCPU the worst-case spread, but the spread cannot be
+//!   extremal for all of them simultaneously. **Tightening that is the open work.**
+//!   ⛔ **Do not repair it by fitting.** A tighter expression exists —
+//!   `max((W_total − wᵢ)·quantum/pcpus + 1, 2(W_total − wᵢ)/pcpus)`, sound on all 75 and tight on
+//!   45 — and it is **not used**, because it has the wrong shape: it is not scale-invariant, so it
+//!   cannot be the true bound however well it fits. **A justified conservative bound beats a
+//!   tighter unjustified one, especially for a latency budget.** Two further fits were tried and
+//!   rejected: `quantum + 1` per turn breaks rows that already worked, and
+//!   `Σⱼ max(quantum, wⱼ+1)` under-predicts at `quantum ≥ 2`, which is unsound.
 //!   ★ How the original was missed: `policy_bounds_scheduling_latency` asserted **five**
 //!   hand-picked configurations in which `quantum` took **two** distinct values. **A configuration
 //!   list is a generator, and its axes need counting exactly like a fuzzer's op alphabet** — the
-//!   same defect ㉘ found one level below. The grid now varies vCPU count, weight skew, pCPU count
-//!   and quantum, and is 75 rows.
+//!   same defect ㉘ found one level below. The grid is now 75 rows across vCPU count, weight skew,
+//!   pCPU count and quantum.
 //!   ⚠ **Note what that bound is a function of: the WEIGHTS of the other vCPUs, not their
 //!   number.** The count-based intuition `(vcpus − pcpus) × quantum` predicts 4 for weights
 //!   `[1,2,3]` where the real answer is 11 — so adding a *heavy* neighbour lengthens a vCPU's
