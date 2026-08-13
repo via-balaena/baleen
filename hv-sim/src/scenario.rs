@@ -2442,6 +2442,16 @@ mod tests {
     /// makes `≤` meaningful here — a bound nothing approaches is a bound that would pass however
     /// badly the scheduler regressed.
     ///
+    /// ⚠⚠ **AND THE FIVE ARE THE WHOLE DOMAIN: `quantum` takes only the values 2 and 5 across
+    /// them, and the formula is FALSE at `quantum == 1`.** On one pCPU with equal weights,
+    /// `[1,1,1]` measures a worst wait of **4** against a predicted 3, and `[1,1,1,1]` measures
+    /// **6** against 4. A vCPU placed at tick `t` has `elapsed == 0` and is not preemptible until
+    /// `t + 1`, so a turn occupies more ticks than `quantum`. ⛔ **Do not add `quantum = 1` here
+    /// expecting it to pass, and do not "fix" it by loosening the assertion** — the correct
+    /// general formula has not been derived, and `quantum + 1` per turn over-estimates at larger
+    /// quanta (it predicts 19 where the fourth row measures 16). ★ **The list of configurations
+    /// is a generator; count its axes.** Five rows and two distinct quanta is how this hid.
+    ///
     /// ⚠ **The count-based intuition is WRONG, and that is the transferable part.** A bound of
     /// "(vcpus − pcpus) × quantum" predicts **4** for weights `[1,2,3]`; the measured answer is
     /// **11**. Latency depends on the *weights* of the other vCPUs, not their number — so a

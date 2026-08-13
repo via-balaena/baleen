@@ -259,9 +259,11 @@ td.c{text-align:center}
     </ul></div>
     <div class="col tech"><h3>Needs a different technique</h3><div class="cnt num">3</div><ul>
       <li><b>Scheduler latency bound.</b> A claim about unbounded runs, so no larger bounded harness
-      reaches it — and a safety monitor would budget against exactly this. <b>Scoped, not
-      unknown:</b> Verus has a TLA embedding and Anvil used it to verify controller liveness, on the
-      same Verus already gating this repo.</li>
+      reaches it — and a safety monitor would budget against exactly this. <b>The published formula
+      is also false at quantum = 1</b>, found while scoping the proof; the five configurations
+      asserting it use only two distinct quanta. <b>Technique scoped, not unknown:</b> Verus has a
+      TLA embedding and Anvil used it to verify controller liveness, on the same Verus already
+      gating this repo.</li>
       <li><b>Proportional fairness.</b> A statement about a limit, so not bounded-depth either.</li>
       <li><b>The model-to-metal step</b> is a construction argument narrowed by compile-time
       assertions, because no prover links the metal.</li>

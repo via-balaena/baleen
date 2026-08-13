@@ -72,6 +72,22 @@
 //!   waiter. The worst observed wait for a continuously-runnable vCPU `i` is
 //!   `(W_total − wᵢ) × quantum / pcpus + 1`, matched exactly across five configurations by
 //!   `hv-sim`'s `policy_bounds_scheduling_latency`.
+//!   ⚠⚠ **THAT FORMULA IS FALSE AT `quantum == 1`, AND ITS VALIDATED DOMAIN IS
+//!   `quantum ∈ {2, 5}` — the only values the five configurations use.** Measured
+//!   counterexamples, on one pCPU with equal weights: **`[1,1,1]` waits 4 against a predicted
+//!   3**, and **`[1,1,1,1]` waits 6 against a predicted 4**. The cause is visible in a trace
+//!   (`A B C C A B B A C C A B`): a vCPU placed at tick `t` has `elapsed == 0` and is therefore
+//!   **not preemptible until `t + 1`**, so a turn occupies more ticks than `quantum` and the
+//!   `× quantum` term under-counts. At `quantum ≥ 2` the discrepancy happens not to bite in the
+//!   shapes tested — which is not the same as it not existing.
+//!   ⛔ **The correct general formula has NOT been derived.** The obvious repair
+//!   (`quantum + 1` per turn) over-estimates at larger quanta — it predicts 19 where `[1,1,1,1]`
+//!   at `quantum = 5` measures 16 — so this needs a derivation, not a patch. **Until then, treat
+//!   the bound as validated only where it is tested, and do not quote it as a general result.**
+//!   ★ How it was missed is the reusable part: the test asserts five hand-picked configurations,
+//!   and `quantum` takes **two distinct values** across all of them. **A configuration list is a
+//!   generator, and its axes need counting exactly like a fuzzer's op alphabet** — the same
+//!   defect ㉘ found one level below this one.
 //!   ⚠ **Note what that bound is a function of: the WEIGHTS of the other vCPUs, not their
 //!   number.** The count-based intuition `(vcpus − pcpus) × quantum` predicts 4 for weights
 //!   `[1,2,3]` where the real answer is 11 — so adding a *heavy* neighbour lengthens a vCPU's

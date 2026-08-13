@@ -274,7 +274,11 @@ reachable by any larger Kani harness**:
 
 - **Weighted-proportional fairness** is a statement about a *limit*.
 - **Starvation-freedom** — the bound `(W_total − wᵢ) × quantum / pcpus + 1` — is a statement about
-  *unbounded runs*.
+  *unbounded runs*. ⚠⚠ **And that formula is false at `quantum == 1`**, which was found while
+  scoping the proof and is stated here rather than quietly fixed: on one pCPU, `[1,1,1]` waits 4
+  against a predicted 3. The five configurations asserting it use only `quantum ∈ {2, 5}`. **A
+  configuration list is a generator too, and its axes need counting** — the same defect this whole
+  piece is about, one level further out. The correct general formula has not been derived.
 
 Neither is a bounded-depth property, so closing them needs a different technique, not a bigger
 harness.
