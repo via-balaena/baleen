@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 OR MIT -->
 <!-- Copyright (c) 2026 Via Balaena -->
 
-# Three green test tiers, one false property
+# Every tier was green. Only two were looking.
 
-*A scheduler property that a seeded simulation, a fuzz target and an exhaustive enumerator all
-reported clean — and that was false the whole time. How it hid, what actually found it, and what the
-proof added afterwards.*
+*A scheduler property that was false while the whole test suite passed. Two tiers asserted it and
+were blind to the same axis; the third could see that axis and could not reach the code. How it hid,
+what actually found it, and what the proof added afterwards.*
 
 ---
 
@@ -16,7 +16,7 @@ exhaustive enumerator sweeps every reachable state of small configurations. Two 
 Linux kernels boot on it and are refused by the hardware when they reach for each other's memory.
 
 This is a story about a module *inside* that verified crate which none of it touched, and about how
-the gap stayed invisible for four development arcs while three separate test tiers reported green.
+the gap stayed invisible for four development arcs while the suite stayed green.
 
 The bug is not exotic. That is the point.
 
@@ -34,15 +34,21 @@ four, and the first is **work conservation**:
 
 > it never leaves a physical CPU idle while a vCPU is runnable.
 
-Three artifacts asserted that property independently:
+**Two** artifacts asserted that property. A third looked like it did, and that turns out to be the
+more interesting one:
 
-| tier | artifact | what it did |
+| tier | artifact | what it *actually* did |
 |---|---|---|
-| seeded simulation | `hv-sim`'s `run_policy` | churned vCPU availability across 256 steps × many seeds, checked the property after every scheduling fixpoint |
-| fuzzing | `hv-fuzz/fuzz_targets/policy.rs` | the same property, driven by libFuzzer, in the weekly deep-verification job |
-| exhaustive enumeration | `hv-sim::enumerate` | swept every reachable state of small configurations — including **every affinity mask** |
+| seeded simulation | `hv-sim`'s `run_policy` | asserted the property after every scheduling fixpoint, across 256 steps × many seeds |
+| fuzzing | `hv-fuzz/fuzz_targets/policy.rs` | asserted the same property, driven by libFuzzer, in the weekly deep-verification job |
+| exhaustive enumeration | `hv-sim::enumerate` | **never ran on the policy at all.** It sweeps the *mechanism's* hypercall surface one layer below — exhaustively, and including every affinity mask |
 
-All three were green. The property was false.
+The suite was green. But the coverage was not three independent checks on one property: it was **two
+tiers that asserted it while blind to the same axis, and a third that could see that axis and could
+not reach the code.** The property was false throughout.
+
+★ That shape matters more than the count. Counting *tiers* said three. Counting *what each tier could
+actually observe* said zero.
 
 ---
 
@@ -85,6 +91,35 @@ the entire time. It never ran either, because the abandoned fixpoint never got t
 
 And throughout, **no invariant was ever violated.** The mechanism's safety property — one vCPU per
 pCPU — held perfectly. It is trivially satisfied by a machine that runs nothing.
+
+### Why that matters more than "a scheduler bug"
+
+It would be fair to read this as a liveness fault in the least safety-critical layer, and shrug.
+Three facts make it sharper than that.
+
+**It crossed domains.** The old rule scanned *every* domain for the most-deserving runnable vCPU,
+and abandoned the pass when that one could not be placed. So the unplaceable vCPU did not merely
+starve itself — it stopped every other domain from being scheduled too. Memory isolation held
+throughout; **temporal isolation did not.** For a separation kernel that distinction is the whole
+product: partitions are supposed to be unable to affect each other, and one partition's
+configuration stopped the rest of the machine.
+
+**And a guest could set that configuration itself.** `SchedSetAffinity`'s guard is
+`caller != target && no control edge → Denied` — so `caller == target` passes, deliberately: a
+domain may affine its own vCPUs, since doing so only narrows what it already has. Under the old
+rule, narrowing your own mask was enough to stall everyone.
+
+⚠ **What keeps this honest: the shipped binary was never exposed.** `hv-metal` does not use
+`hv-core::policy` at all — it drives `sched` directly — so `advance` never executed on the metal,
+and no guest could reach the defect there. It was a live defect in the model and a latent one in the
+product. **Both halves of that sentence belong in it.**
+
+★ **The structural point is the one worth carrying away.** Every invariant this project proves is a
+*safety* property: one vCPU per pCPU, refcount coupling, no unauthorized leaf, non-interference. The
+guarantee a mixed-criticality system actually buys a separation kernel for — that a critical
+partition keeps getting CPU time no matter what an untrusted one does — is a **liveness** property.
+Those are different classes, and everything proven here is in one of them. A machine that runs
+nothing satisfies every theorem in this repository.
 
 ---
 
@@ -242,8 +277,15 @@ reachable by any larger Kani harness**:
   *unbounded runs*.
 
 Neither is a bounded-depth property, so closing them needs a different technique, not a bigger
-harness. That matters here specifically: the starvation bound is what a safety monitor running as a
-partition would budget its latency against, and it is still the weakest tier in the project.
+harness.
+
+⚠⚠ **And notice that both are liveness properties — the same class as the defect above, and the same
+class the mixed-criticality role depends on.** The starvation bound is precisely what a safety
+monitor running as a partition would budget its latency against, and it remains at the weakest tier
+in the project. **So the honest summary of this case study is not "verification caught a bug."** It
+is: *the one property class this architecture most depends on is the class with the least evidence
+behind it, and that is exactly where the defect turned up.* Fixing work conservation closed one
+instance. It did not close the class.
 
 `advance`'s `break` is now unreachable — every refusal reason is excluded before it — but that is
 **by construction, not by proof**. Nothing yet asserts "`next` never proposes a decision the
