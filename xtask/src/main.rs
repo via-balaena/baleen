@@ -127,6 +127,8 @@ fn main() {
         "doc-index" => doc_index(),
         "doc-tasks" => doc_tasks(),
         "doc-modules" => doc_modules(),
+        "seam-census" => seam_census(),
+        "hvcall-census" => hvcall_census(),
         "verus-counts" => verus_counts(),
         "kani-harnesses" => kani_harnesses(),
         "sweeps" => deep_sweeps(),
@@ -163,6 +165,16 @@ fn main() {
                 && doc_tasks()
                 && doc_modules()
                 && help_covers_tasks()
+                // ㉙: the hypercall seam census. Cheap (six file reads) and it belongs on EVERY PR
+                // rather than only proof-path ones, because the thing it catches — a new operation
+                // placed above the seam, where no HvCall enumeration reaches it — arrives in
+                // ordinary feature work and is silent in every other gate.
+                && seam_census()
+                // ㉙: and the generator that claims the whole hypercall surface must name all of
+                // it. Same family as `seam-census` — both ask whether a coverage claim is gated or
+                // merely audited — but a different question, so a different task rather than a
+                // second obligation hidden under the first one's name.
+                && hvcall_census()
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
                 // a test that runs only when proof paths change cannot catch the defect where the
@@ -190,6 +202,8 @@ fn main() {
                  doc-index    assert docs/README.md classifies every document in docs/\n  \
                  doc-tasks    assert every `cargo xtask` command the docs name really exists\n  \
                  doc-modules  assert a README enumerating a directory enumerates ALL of it\n  \
+                 seam-census  assert every hv-core transition is hypercall-reachable, or DECLARED above the seam\n  \
+                 hvcall-census  assert the fuzz target that drives HvCall constructs EVERY variant\n  \
                  verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  kani-harnesses  run the Kani corpus and assert it contains exactly the expected harnesses\n  \
                  sweeps assert the deep exhaustive-sweep corpus is exactly the expected one\n  \
@@ -2576,6 +2590,410 @@ fn doc_modules() -> bool {
         }
     }
     ok
+}
+
+/// ★★★ ㉙ — **THE HYPERCALL-SEAM CENSUS: which operations the totality gate structurally cannot
+/// reach.**
+///
+/// `hv-core`'s exhaustive coverage argument runs through **one** surface. `HVCALL_VARIANT_COUNT` is
+/// machine-checked against `core::mem::variant_count::<HvCall>()`, and `hv-sim`'s enumerator asserts
+/// it emits exactly `HVCALL_VARIANT_COUNT - NUM_EXCLUDED` distinct guest variants — so any state
+/// machine driven *by a hypercall* is swept exhaustively, and adding a variant without wiring it in
+/// breaks that balance loudly. **That is a genuine gate and it covers 45 of the 48 mutating
+/// operations in `hv-core`.**
+///
+/// ⚠⚠ **The other three are not reachable from a hypercall at all, and no enumeration over `HvCall`
+/// can ever reach them.** `policy::` sits deliberately *above* the dispatch seam — a guest never
+/// asks to be scheduled; the hypervisor's own tick/idle path invokes the policy. So `advance`,
+/// `set_weight` and `set_wake_boost` are driven only by hand-written generators, and **that is
+/// exactly where ㉘'s defect lived for four arcs**: work conservation was flatly false while three
+/// tiers reported green, because the only two generators that could reach the policy drew from the
+/// same op alphabet and neither ever moved the affinity axis.
+///
+/// ★ **So this gate exists to make "above the seam" a fact the build states, not one somebody has to
+/// notice.** A new module or method placed above the seam inherits **no** enumerator coverage, and
+/// the failure is silent — the new code simply is not swept, and every existing gate stays green.
+///
+/// ## Why this is a BALANCE and not a search — the design decision worth not re-litigating
+///
+/// The obvious implementation is to grep `hypervisor.rs` for each operation's name and classify
+/// whatever is absent as above-seam. **That is unsound in the dangerous direction.** `p2m` exposes
+/// `get`, `put` and `free`; `hypervisor.rs` contains `.get(` and `.put(` on `Vec`/`Option` for
+/// entirely unrelated reasons. Those collisions make an above-seam operation look covered — the gate
+/// then *under-reports*, which is the failure mode it exists to prevent (design-lesson #281: an
+/// under-collecting extraction is a floor-proof failure, and here over-collection is the same defect
+/// mirrored).
+///
+/// So the classification is **declared** and the census **balances**: pin the total number of
+/// mutating operations, and pin the above-seam list. Adding a mutating method anywhere — above or
+/// below the seam — changes the total and fails this gate, forcing an explicit classification rather
+/// than allowing a silent inheritance of "covered". The name-search is kept only in its **safe**
+/// direction: a declared above-seam operation that *does* appear in `hypervisor.rs` is a
+/// contradiction, and a false positive there costs a spurious failure, never a missed one.
+///
+/// ⚠ **This is GATE-total, not COMPILER-total, and the difference is real.** `HvCall` is an enum, so
+/// its arity is a compiler fact; a set of methods is not, and there is no `variant_count` for `impl`
+/// blocks. Pinning counts is therefore the honest ceiling *here* — the compiler-total half belongs
+/// with the generators that drive the above-seam surface, not with this census.
+fn seam_census() -> bool {
+    eprintln!("$ xtask seam-census");
+
+    /// The state-bearing modules. `hypervisor` is the seam itself (classifying it against itself is
+    /// meaningless) and `prng` carries no state machine, so neither is a subject.
+    const MODULES: &[&str] = &["sched", "policy", "evtchn", "grant", "p2m", "device"];
+    /// Every `pub fn(&mut self)` across `MODULES`, measured 2026-08-13.
+    const TOTAL_MUTATING_OPS: usize = 48;
+    /// ⚠⚠ #275 — a parser that silently stops matching empties the universe and every check below
+    /// passes on nothing. Well under the real figure, so refactors do not trip it, but far enough
+    /// above zero that a broken extractor cannot read as success.
+    const FLOOR: usize = 40;
+    /// The operations no `HvCall` can reach. **Each one needs a named generator of its own**, because
+    /// the enumerator provably cannot drive it.
+    const ABOVE_SEAM: &[&str] = &[
+        "policy::advance",
+        "policy::set_wake_boost",
+        "policy::set_weight",
+    ];
+    const SEAM: &str = "hv-core/src/hypervisor.rs";
+    /// What drives the above-seam surface, since no `HvCall` enumeration can. `scenario.rs` holds
+    /// the seeded harnesses (`run_policy`, `run_policy_steady`, `run_policy_max_wait`,
+    /// `run_sleeper`); the fuzz target explores the same surface with an unseeded stream.
+    const ABOVE_SEAM_GENERATORS: &[&str] =
+        &["hv-sim/src/scenario.rs", "hv-fuzz/fuzz_targets/policy.rs"];
+
+    let mut found: Vec<String> = Vec::new();
+    for m in MODULES {
+        let path = format!("hv-core/src/{m}.rs");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("seam-census: FAIL — cannot read {path}");
+            return false;
+        };
+        // The production surface only: a `#[cfg(test)]` module's helpers are not transitions.
+        let prod = text
+            .split("\nmod tests {")
+            .next()
+            .unwrap_or(&text)
+            .to_string();
+        for name in mutating_ops(&prod) {
+            found.push(format!("{m}::{name}"));
+        }
+    }
+    found.sort();
+
+    if found.len() < FLOOR {
+        eprintln!(
+            "seam-census: FAIL — found only {} mutating operations across {} modules, expected at \
+             least {FLOOR}. The extractor has probably broken, which would make every check below \
+             vacuous.",
+            found.len(),
+            MODULES.len()
+        );
+        return false;
+    }
+
+    let mut ok = true;
+
+    // (1) THE BALANCE. Any added or removed mutating operation lands here first.
+    if found.len() != TOTAL_MUTATING_OPS {
+        eprintln!(
+            "seam-census: FAIL — {} mutating operations across hv-core, expected \
+             {TOTAL_MUTATING_OPS}.\n\
+             \x20                  A mutating operation was added or removed. Classify it: if a \
+             hypercall can reach it,\n\
+             \x20                  the enumerator sweeps it and you need only update \
+             TOTAL_MUTATING_OPS. If NOT, it is\n\
+             \x20                  ABOVE THE SEAM — nothing sweeps it, and it needs a named \
+             generator plus a line in\n\
+             \x20                  ABOVE_SEAM. Do not update the count without deciding which.",
+            found.len()
+        );
+        ok = false;
+    }
+
+    // (2) The declared above-seam operations must still EXIST. A rename would otherwise leave a
+    // dead entry here while the real operation quietly lost its declaration.
+    for want in ABOVE_SEAM {
+        if !found.iter().any(|f| f == want) {
+            eprintln!(
+                "seam-census: FAIL — ABOVE_SEAM names `{want}`, which no longer exists. It was \
+                 renamed or removed; update the list rather than deleting the obligation."
+            );
+            ok = false;
+        }
+    }
+
+    // (3) The safe direction of the name search: a declared above-seam operation must NOT appear at
+    // the seam. A false positive here costs a spurious failure; it can never hide a real one.
+    let Ok(seam_text) = std::fs::read_to_string(SEAM) else {
+        eprintln!("seam-census: FAIL — cannot read {SEAM}");
+        return false;
+    };
+    for want in ABOVE_SEAM {
+        let Some((_, name)) = want.split_once("::") else {
+            continue;
+        };
+        if seam_text.contains(&format!(".{name}(")) {
+            eprintln!(
+                "seam-census: FAIL — `{want}` is declared above the seam but `{SEAM}` appears to \
+                 call it. Either it became hypercall-reachable (drop it from ABOVE_SEAM — the \
+                 enumerator now sweeps it), or an unrelated method shares its name."
+            );
+            ok = false;
+        }
+    }
+
+    // (4) THE OBLIGATION THE OTHER THREE CHECKS ONLY DESCRIBE. Classifying an operation as
+    // above-seam says nothing drives it; it has to be *driven* by something, and the enumerator
+    // never will. So every declared above-seam operation must be named by at least one declared
+    // generator — the check that turns "it needs a named generator" from advice in a failure
+    // message into a thing the build enforces.
+    for want in ABOVE_SEAM {
+        let Some((_, name)) = want.split_once("::") else {
+            continue;
+        };
+        let driven: Vec<&str> = ABOVE_SEAM_GENERATORS
+            .iter()
+            .copied()
+            .filter(|g| std::fs::read_to_string(g).is_ok_and(|t| t.contains(&format!(".{name}("))))
+            .collect();
+        if driven.is_empty() {
+            eprintln!(
+                "seam-census: FAIL — `{want}` is above the seam and NO declared generator drives \
+                 it: {}.\n\
+                 \x20                  Nothing sweeps it and nothing exercises it, so it is \
+                 covered by unit tests at best.",
+                ABOVE_SEAM_GENERATORS.join(", ")
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        eprintln!(
+            "seam-census: OK — {} mutating operations; {} above the hypercall seam ({}), each \
+             outside every HvCall enumeration and each driven by a declared generator",
+            found.len(),
+            ABOVE_SEAM.len(),
+            ABOVE_SEAM.join(", ")
+        );
+    }
+    ok
+}
+
+/// ★★ ㉙ — **the generator that claims the whole hypercall surface must actually name all of it.**
+///
+/// `hv-fuzz/fuzz_targets/hypervisor.rs` drives `dispatch` across `HvCall`, so it presents itself as
+/// covering the guest-visible surface entire. Its alphabet was a **hand-typed `op % 34`** against a
+/// `HVCALL_VARIANT_COUNT` of **35**, and the missing variant was `EvtchnUnmask` — unnamed, ungenerated,
+/// and invisible to every gate.
+///
+/// ⚠ **Severity is low and saying so is part of the finding:** the enumerator sweeps `EvtchnUnmask`
+/// exhaustively and `fuzz_targets/evtchn.rs` calls `unmask` directly, so nothing was actually
+/// uncovered. **The defect is the drift, not the gap** — a generator's alphabet diverged from the
+/// surface it advertises and only a hand diff found it, which is the same shape as the
+/// work-conservation defect of #198 one layer down.
+///
+/// ## The extraction is self-checking, which is what makes this non-vacuous
+///
+/// The variant list is parsed out of the `pub enum HvCall` block — and then **balanced against
+/// `HVCALL_VARIANT_COUNT`**, which the compiler itself checks against `core::mem::variant_count`.
+/// So a parser that silently under-collects does not quietly shrink the universe and pass; it
+/// disagrees with a compiler fact and fails loudly (#281, handled at the source rather than with a
+/// floor guess).
+///
+/// ⚠ The modulus is checked too, and it has to be: naming every variant is **not sufficient** if the
+/// `op % N` that selects them is smaller than the arm count, because the trailing arms are then
+/// unreachable and their variants are named but never generated. A future deliberate exclusion
+/// belongs in a declared constant here, the way the enumerator declares `NUM_EXCLUDED` — not in a
+/// smaller modulus.
+fn hvcall_census() -> bool {
+    eprintln!("$ xtask hvcall-census");
+
+    const SEAM: &str = "hv-core/src/hypervisor.rs";
+    const TARGET: &str = "hv-fuzz/fuzz_targets/hypervisor.rs";
+
+    let (Ok(seam), Ok(target)) = (
+        std::fs::read_to_string(SEAM),
+        std::fs::read_to_string(TARGET),
+    ) else {
+        eprintln!("hvcall-census: FAIL — cannot read {SEAM} or {TARGET}");
+        return false;
+    };
+
+    // The compiler-checked total, read from the source rather than retyped here.
+    let Some(declared) = seam
+        .split("pub const HVCALL_VARIANT_COUNT: usize = ")
+        .nth(1)
+        .and_then(|s| s.split(';').next())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    else {
+        eprintln!("hvcall-census: FAIL — cannot read HVCALL_VARIANT_COUNT from {SEAM}");
+        return false;
+    };
+
+    // The variants themselves.
+    let Some(body) = seam
+        .split("pub enum HvCall {")
+        .nth(1)
+        .and_then(|s| s.split("\n}").next())
+    else {
+        eprintln!("hvcall-census: FAIL — cannot find the `pub enum HvCall` block in {SEAM}");
+        return false;
+    };
+    let mut variants: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let t = line.trim_start();
+        // A variant opens at four-space indentation with an upper-case name; anything else in the
+        // block is a doc comment, an attribute, or a field of the variant above.
+        if line.starts_with("    ") && !line.starts_with("     ") {
+            let name: String = t
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.chars().next().is_some_and(|c| c.is_uppercase()) && !variants.contains(&name) {
+                variants.push(name);
+            }
+        }
+    }
+
+    let mut ok = true;
+
+    // (1) The extraction balances against the compiler fact, so it cannot be vacuous.
+    if variants.len() != declared {
+        eprintln!(
+            "hvcall-census: FAIL — parsed {} variants from the enum but HVCALL_VARIANT_COUNT is \
+             {declared}. The parser is wrong, not the code; fix it rather than the constant.",
+            variants.len()
+        );
+        return false;
+    }
+
+    // (2) Every variant must be named by the generator that claims the whole surface.
+    let mut missing: Vec<&str> = Vec::new();
+    for v in &variants {
+        if !target.contains(&format!("HvCall::{v}")) {
+            missing.push(v);
+        }
+    }
+    if !missing.is_empty() {
+        eprintln!(
+            "hvcall-census: FAIL — {TARGET} drives `dispatch` across HvCall but never constructs \
+             {} of {declared} variants: {}.\n\
+             \x20                   A generator that covers part of a surface reads as covering all \
+             of it.",
+            missing.len(),
+            missing.join(", ")
+        );
+        ok = false;
+    }
+
+    // (3) The selector must reach every arm. Naming a variant in an arm the modulus cannot select
+    // is the same defect wearing a disguise.
+    let modulus = target
+        .split("let call = match op % ")
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.trim_end_matches('{').trim().parse::<usize>().ok());
+    match modulus {
+        Some(n) if n == declared => {}
+        Some(n) => {
+            eprintln!(
+                "hvcall-census: FAIL — {TARGET} selects with `op % {n}` against {declared} \
+                 variants. Arms past the modulus are unreachable, so their variants are named but \
+                 never generated."
+            );
+            ok = false;
+        }
+        None => {
+            eprintln!(
+                "hvcall-census: FAIL — cannot read the `let call = match op % N` selector in \
+                 {TARGET}; the check above would be vacuous without it."
+            );
+            ok = false;
+        }
+    }
+
+    if ok {
+        eprintln!(
+            "hvcall-census: OK — {TARGET} constructs all {declared} HvCall variants, and its \
+             selector reaches every one"
+        );
+    }
+    ok
+}
+
+/// Every `pub fn NAME(…)` in `text` whose argument list takes `&mut self`.
+///
+/// Deliberately a small hand parser: `xtask` has **no dependencies** and adding a regex crate to
+/// this workspace to read six files would be a poor trade. Generic parameters are skipped before the
+/// argument list is scanned, so `pub fn f<T: Fn(u8)>(&mut self)` is read correctly rather than having
+/// its bound mistaken for the arguments. A parse that silently stops matching is caught by the
+/// caller's `FLOOR`.
+fn mutating_ops(text: &str) -> Vec<String> {
+    const PAT: &str = "pub fn ";
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while let Some(rel) = text[at..].find(PAT) {
+        let name_start = at + rel + PAT.len();
+        let name_end = name_start
+            + text[name_start..]
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(0);
+        let name = &text[name_start..name_end];
+        at = name_end;
+        if name.is_empty() {
+            continue;
+        }
+
+        // Skip a generic parameter list, so its parentheses are not mistaken for the arguments.
+        let mut i = name_end;
+        if bytes.get(i) == Some(&b'<') {
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        if bytes.get(i) != Some(&b'(') {
+            continue;
+        }
+
+        // The argument list, paren-balanced so a nested `Fn(..)` type cannot end it early.
+        let args_start = i;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if i >= bytes.len() {
+            continue;
+        }
+        if text[args_start..i].contains("&mut self") {
+            out.push(name.to_string());
+        }
+        at = i;
+    }
+    out
 }
 
 /// ★ ⑳-l — **`cargo xtask` with no argument must name every task that exists.**

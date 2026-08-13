@@ -249,6 +249,22 @@ cargo xtask verus-counts     # the Verus obligations, by count
 cargo kani -p hv-verify --harness <name>      # run one (a full run takes minutes)
 ```
 
+And the two censuses that police the *coverage argument itself* — cheap enough to run on every PR,
+and both included in `cargo xtask ci`:
+
+```sh
+cargo xtask seam-census      # every hv-core transition is hypercall-reachable, or DECLARED above the seam
+cargo xtask hvcall-census    # the fuzz target driving HvCall constructs every variant
+```
+
+⚠ **`seam-census` exists because the exhaustive sweep reaches `hv-core` through exactly one door.**
+`HVCALL_VARIANT_COUNT` is machine-checked against `core::mem::variant_count::<HvCall>()`, so anything
+a *hypercall* can reach is swept — **45 of the 48 mutating operations**. The other three are
+`policy::advance`, `policy::set_weight` and `policy::set_wake_boost`, which no hypercall reaches by
+design: the policy sits above the dispatch seam, driven by the hypervisor's own tick. They are
+covered by named generators instead, and the census fails if one loses its generator, if the
+classification goes stale, or if a new operation appears without being classified either way.
+
 ★ **`cargo xtask ci` is the honest answer to "is any of this real?"** — it is the same entry point
 CI uses, and it fails on a stale number in this file as readily as on a broken test.
 

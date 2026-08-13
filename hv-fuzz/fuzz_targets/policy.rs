@@ -71,7 +71,7 @@ fuzz_target!(|data: &[u8]| {
         // `hv-sim`'s `run_policy` churn, so the fuzzer and the seeded simulation were not two
         // independent tiers over the same property — they were one blind spot with two names,
         // and the work-conservation defect ㉘ fixed lived precisely on the axis neither moved.
-        match op % 5 {
+        match op % 6 {
             0 => {
                 let _ = sys.admit(dom, vcpu);
             }
@@ -85,6 +85,12 @@ fuzz_target!(|data: &[u8]| {
                 // Includes the all-zero mask — a vCPU that may run nowhere is representable in
                 // production, so the generator must be able to produce one.
                 let _ = sys.set_affinity(dom, vcpu, u64::from(a) % (1u64 << PCPUS));
+            }
+            4 => {
+                // ㉙ — the weight axis, fixed at init by every generator until now. The mid-run
+                // change matters because wake-boost stores an offset derived from the weight, so
+                // changing the weight afterwards leaves that offset against a stale divisor.
+                pol.set_weight(dom, vcpu, 1 + u32::from(a) % 3);
             }
             _ => {
                 let _ = sys.offline(dom, vcpu, now);
