@@ -2655,6 +2655,11 @@ fn seam_census() -> bool {
         "policy::set_weight",
     ];
     const SEAM: &str = "hv-core/src/hypervisor.rs";
+    /// What drives the above-seam surface, since no `HvCall` enumeration can. `scenario.rs` holds
+    /// the seeded harnesses (`run_policy`, `run_policy_steady`, `run_policy_max_wait`,
+    /// `run_sleeper`); the fuzz target explores the same surface with an unseeded stream.
+    const ABOVE_SEAM_GENERATORS: &[&str] =
+        &["hv-sim/src/scenario.rs", "hv-fuzz/fuzz_targets/policy.rs"];
 
     let mut found: Vec<String> = Vec::new();
     for m in MODULES {
@@ -2737,10 +2742,36 @@ fn seam_census() -> bool {
         }
     }
 
+    // (4) THE OBLIGATION THE OTHER THREE CHECKS ONLY DESCRIBE. Classifying an operation as
+    // above-seam says nothing drives it; it has to be *driven* by something, and the enumerator
+    // never will. So every declared above-seam operation must be named by at least one declared
+    // generator — the check that turns "it needs a named generator" from advice in a failure
+    // message into a thing the build enforces.
+    for want in ABOVE_SEAM {
+        let Some((_, name)) = want.split_once("::") else {
+            continue;
+        };
+        let driven: Vec<&str> = ABOVE_SEAM_GENERATORS
+            .iter()
+            .copied()
+            .filter(|g| std::fs::read_to_string(g).is_ok_and(|t| t.contains(&format!(".{name}("))))
+            .collect();
+        if driven.is_empty() {
+            eprintln!(
+                "seam-census: FAIL — `{want}` is above the seam and NO declared generator drives \
+                 it: {}.\n\
+                 \x20                  Nothing sweeps it and nothing exercises it, so it is \
+                 covered by unit tests at best.",
+                ABOVE_SEAM_GENERATORS.join(", ")
+            );
+            ok = false;
+        }
+    }
+
     if ok {
         eprintln!(
             "seam-census: OK — {} mutating operations; {} above the hypercall seam ({}), each \
-             outside every HvCall enumeration and covered only by its own generators",
+             outside every HvCall enumeration and each driven by a declared generator",
             found.len(),
             ABOVE_SEAM.len(),
             ABOVE_SEAM.join(", ")

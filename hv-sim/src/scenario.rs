@@ -515,7 +515,7 @@ pub fn run_policy(seed: u64, steps: u32) -> PolicyOutcome {
         // not independent: they were one blind spot with two names, and the work-conservation
         // defect ㉘ fixed lived exactly there. A generator that cannot reach an axis is not
         // evidence about it.
-        match rng.below(5) {
+        match rng.below(6) {
             0 => {
                 if sys.admit(dom, vcpu).is_ok() {
                     admitted[dom as usize][vcpu as usize] = true;
@@ -532,6 +532,18 @@ pub fn run_policy(seed: u64, steps: u32) -> PolicyOutcome {
                 // nowhere) — representable in production, so the generator must reach it.
                 let mask = u64::from(rng.below(1 << PCPUS));
                 let _ = sys.set_affinity(dom, vcpu, mask);
+            }
+            4 => {
+                // ㉙ — the WEIGHT axis, which no generator moved until now: every harness here
+                // set weights once at init and left them fixed for the whole run, so weights
+                // varied *across* configurations and never *within* one.
+                //
+                // ★ The mid-run change is the interesting case rather than a completeness tick.
+                // Wake-boost's offset is computed FROM the weight — `target = floor.service *
+                // weight / floor.weight` — and then stored. Changing the weight afterwards
+                // leaves that offset standing against a divisor that no longer applies, so a
+                // vCPU's effective service-per-weight jumps. Nothing exercised that composition.
+                pol.set_weight(dom, vcpu, 1 + rng.below(3));
             }
             _ => {
                 let _ = sys.offline(dom, vcpu, now);
