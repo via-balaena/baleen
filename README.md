@@ -30,7 +30,7 @@ test on a multi-year solo project.
 > | if you want | go to |
 > |---|---|
 > | the picture — what is proven, what is only witnessed, what is open | **[the assurance map](https://via-balaena.github.io/baleen/)**, whose every figure is generated from the gates |
-> | one defect, end to end, with no prior context | **[Three green test tiers, one false property](docs/CASE-STUDY-WORK-CONSERVATION.md)** — a scheduler property that a simulation, a fuzz target *and* an exhaustive enumerator all reported green while it was false |
+> | one defect, end to end, with no prior context | **[Every tier was green. Only two were looking.](docs/CASE-STUDY-WORK-CONSERVATION.md)** — a scheduler property that was false while the whole suite passed, because the two tiers asserting it shared a blind spot and the third could not reach the code |
 > | the design documents | **[`docs/README.md`](docs/README.md)** — a map of all of them, with three reading orders |
 
 ## What this is, honestly

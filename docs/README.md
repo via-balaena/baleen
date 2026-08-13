@@ -87,7 +87,7 @@ did that they could not.*
 
 | document | what it establishes |
 |---|---|
-| [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md) | a scheduler property that a seeded simulation, a fuzz target **and** an exhaustive enumerator all reported green while it was false — one pinned vCPU stopped the machine permanently, with every safety invariant holding. A plain unit test reproduced it first — the harness that *generalised* it uses the **mechanism as its own oracle**, which is the transferable technique; the lesson is *count the axes your generators move, not the tiers that assert* |
+| [`CASE-STUDY-WORK-CONSERVATION.md`](CASE-STUDY-WORK-CONSERVATION.md) | a scheduler property that was false while the whole suite passed — two tiers asserted it and shared a blind spot, the third could not reach the code. One pinned vCPU stopped **every** domain permanently, with every safety invariant holding: memory isolation held, temporal isolation did not. A plain unit test reproduced it first — the harness that *generalised* it uses the **mechanism as its own oracle**, which is the transferable technique; the lesson is *count the axes your generators move, not the tiers that assert* |
 
 ## The deductive program — the model, proven
 

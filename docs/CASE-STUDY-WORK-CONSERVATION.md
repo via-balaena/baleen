@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: Apache-2.0 OR MIT -->
 <!-- Copyright (c) 2026 Via Balaena -->
 
-# Three green test tiers, one false property
+# Every tier was green. Only two were looking.
 
-*A scheduler property that a seeded simulation, a fuzz target and an exhaustive enumerator all
-reported clean — and that was false the whole time. How it hid, what actually found it, and what the
-proof added afterwards.*
+*A scheduler property that was false while the whole test suite passed. Two tiers asserted it and
+were blind to the same axis; the third could see that axis and could not reach the code. How it hid,
+what actually found it, and what the proof added afterwards.*
 
 ---
 
@@ -16,7 +16,7 @@ exhaustive enumerator sweeps every reachable state of small configurations. Two 
 Linux kernels boot on it and are refused by the hardware when they reach for each other's memory.
 
 This is a story about a module *inside* that verified crate which none of it touched, and about how
-the gap stayed invisible for four development arcs while three separate test tiers reported green.
+the gap stayed invisible for four development arcs while the suite stayed green.
 
 The bug is not exotic. That is the point.
 
@@ -34,15 +34,21 @@ four, and the first is **work conservation**:
 
 > it never leaves a physical CPU idle while a vCPU is runnable.
 
-Three artifacts asserted that property independently:
+**Two** artifacts asserted that property. A third looked like it did, and that turns out to be the
+more interesting one:
 
-| tier | artifact | what it did |
+| tier | artifact | what it *actually* did |
 |---|---|---|
-| seeded simulation | `hv-sim`'s `run_policy` | churned vCPU availability across 256 steps × many seeds, checked the property after every scheduling fixpoint |
-| fuzzing | `hv-fuzz/fuzz_targets/policy.rs` | the same property, driven by libFuzzer, in the weekly deep-verification job |
-| exhaustive enumeration | `hv-sim::enumerate` | swept every reachable state of small configurations — including **every affinity mask** |
+| seeded simulation | `hv-sim`'s `run_policy` | asserted the property after every scheduling fixpoint, across 256 steps × many seeds |
+| fuzzing | `hv-fuzz/fuzz_targets/policy.rs` | asserted the same property, driven by libFuzzer, in the weekly deep-verification job |
+| exhaustive enumeration | `hv-sim::enumerate` | **never ran on the policy at all.** It sweeps the *mechanism's* hypercall surface one layer below — exhaustively, and including every affinity mask |
 
-All three were green. The property was false.
+The suite was green. But the coverage was not three independent checks on one property: it was **two
+tiers that asserted it while blind to the same axis, and a third that could see that axis and could
+not reach the code.** The property was false throughout.
+
+★ That shape matters more than the count. Counting *tiers* said three. Counting *what each tier could
+actually observe* said zero.
 
 ---
 
