@@ -13,7 +13,7 @@ title: Documentation index
 
 # `docs/` — what is in here, and what to read first
 
-**36 documents.** (Plus this index, which `doc-index` exempts from classification because it is
+**37 documents.** (Plus this index, which `doc-index` exempts from classification because it is
 the thing doing the classifying, and the [site landing page](index.html), which the gate never
 sees at all — it collects `.md` only.)
 They are not a manual and they are not in order; each one was
@@ -56,6 +56,10 @@ makes "isolation" mean something.
 
 **"What is not proven?"** — the honest ledger lives in the root [`README.md`](../README.md), not
 here. Individual docs each end with their own residuals, which is where the ledger's items come from.
+
+**"I am building something like this — what should I not repeat?"** —
+[`CARRY-FORWARD.md`](CARRY-FORWARD.md), which is the residue rather than the results: the open items
+and the corrections, aimed at the next system rather than at this one.
 
 ---
 
@@ -168,6 +172,7 @@ first if you want the conclusion before the construction.*
 | [`ROADMAP.md`](ROADMAP.md) | from a proven model toward a "slim Qubes" — where this is going |
 | [`CONSUMER-CORTENFORGE.md`](CONSUMER-CORTENFORGE.md) | ⚠ **a requirements derivation, not a commitment** — what a named consumer would need, and the one place it **collides with the Tier-D precondition**. Read before reviving any rung parked "for want of a consumer" |
 | [`MILESTONES.md`](MILESTONES.md) | ⛔ **a LOG, not status** — the append-only record, 23 entries from M1's toy hypercall to two Alpine kernels on EL2. Moved out of the root README, where it was 561 of 850 lines |
+| [`CARRY-FORWARD.md`](CARRY-FORWARD.md) | ★ **the residue, not the results** — what did *not* close here, turned into advice for building the next mixed-criticality system on **seL4 + Microkit + libvmm**. Every item says whether choosing a verified kernel *removes* the problem or merely *relocates* it, and most relocate. **Read this one if you are picking up where this project stopped** |
 
 ---
 
