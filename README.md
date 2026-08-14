@@ -30,7 +30,7 @@ test on a multi-year solo project.
 > | if you want | go to |
 > |---|---|
 > | **what is already proved in this field, and by whom** | **[Proved Ground](https://via-balaena.github.io/baleen/)** — a dated, sourced map of who has closed which guarantee. Assembled by building one; the answer was that every axis was occupied |
-> | the picture of *this* artifact — what is proven, what is only witnessed, what is open | the same page, [§02 onward](https://via-balaena.github.io/baleen/#map), whose every figure is generated from the gates |
+> | the picture of *this* artifact — what is proven, what is only witnessed, what is open | the same page, [§02 onward](https://via-balaena.github.io/baleen/#instrument), whose every figure is generated from the gates |
 > | one defect, end to end, with no prior context | **[Every tier was green. Only two were looking.](docs/CASE-STUDY-WORK-CONSERVATION.md)** — a scheduler property that was false while the whole suite passed, because the two tiers asserting it shared a blind spot and the third could not reach the code |
 > | the design documents | **[`docs/README.md`](docs/README.md)** — a map of all of them, with three reading orders |
 
