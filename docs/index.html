@@ -285,7 +285,7 @@ td.c{text-align:center}
             <span class="when">repo pushed 2026-08-06 · <a class="src" href="https://sel4.systems">sel4.systems</a></span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">Abstract spec → executable spec → C, plus binary-level translation validation on Arm. <b>Deployed and flown</b> (DARPA HACMS). The deepest result in the field, and the artifact is maintained.</td>
+          <td class="lim">Abstract spec → executable spec → C. <b>Deployed and flown</b> (DARPA HACMS — the Red Team failed to compromise Boeing's Unmanned Little Bird in flight). The deepest result in the field, and the artifact is maintained.<br><br>⚠⚠ <b>BUT READ THE ARCHITECTURE ROW, NOT THE HEADLINE — AArch64 is seL4's LEAST-verified mainstream target.</b> Per seL4's own <a href="https://docs.sel4.systems/projects/sel4/verified-configurations.html">verified configurations</a>: <b>ARM 32-bit</b> has functional correctness, integrity, <b>confidentiality</b> and <b>binary correctness</b>. <b>RISC-V 64</b> has functional correctness (no fast path), integrity and confidentiality. <b>AArch64 has functional correctness and integrity — and NEITHER confidentiality NOR binary verification.</b> ★ This row previously read "binary-level translation validation on Arm", which is true of ARM32 and <b>false of AArch64</b>, the architecture this whole page is about.</td>
         </tr>
         <tr>
           <th>Mixed-criticality temporal isolation</th>
@@ -306,10 +306,10 @@ td.c{text-align:center}
         <tr>
           <th>Verified preemptive scheduler with temporal isolation</th>
           <td class="who">Virtual Timeline
-            <span class="when">PACMPL / POPL 2019 — Liu, Rieg, Shao &amp; Gu</span></td>
+            <span class="when">PACMPL 4(POPL), <b>POPL 2020</b> · <a class="src" href="https://dl.acm.org/doi/10.1145/3371088">10.1145/3371088</a></span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
           <td class="st"><span class="cell out"><span class="dot"></span>paper only</span></td>
-          <td class="lim">The formal abstraction for exactly this. <b>Occupies the problem we had identified as our sharpest open one</b>, seven years earlier and in a stronger form. ★ No artifact assessed — for the <em>novelty</em> question that does not matter, which is the point of separating the columns.</td>
+          <td class="lim">Liu, Rieg, Shao, Gu, Costanzo, Kim &amp; Yoon (the CertiKOS group). The formal abstraction for exactly this — <b>it occupies the problem we had identified as our sharpest open one</b>, six years earlier and in a stronger form. ★ No artifact assessed: for the <em>novelty</em> question that does not matter, which is the point of separating the columns. ⚠ This row said <b>POPL 2019</b> and named four of seven authors. It is <b>POPL 2020</b>.</td>
         </tr>
         <tr>
           <th>Linux guest beside a small analyzable partition</th>
@@ -347,7 +347,7 @@ td.c{text-align:center}
             <span class="when">repo pushed 2026-08-13 · <a class="src" href="https://arxiv.org/abs/2407.01688">arXiv 2407.01688</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>solved</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">An executable <b>Lean</b> model ~10× smaller than the production Rust, with <b>differential random testing as a release gate</b>: millions of inputs through both, outputs compared. 4 bugs from the proofs, 21 total. ★ A <b>template, not a research problem</b> — and it closes the gap we left open.</td>
+          <td class="lim">An executable <b>Lean</b> model (confirmed from the repo: 3.8 MB Lean to 1.2 MB Rust) roughly an order of magnitude smaller than the production Rust, with <b>differential random testing as a release gate</b>: millions of inputs through both, outputs compared. <b>4 bugs from the proofs and 21 more</b> from DRT and property-based testing — 25, not 21; this row previously said "21 total". ★ A <b>template, not a research problem</b> — and it closes the gap we left open.</td>
         </tr>
         <tr>
           <th>Verification affordable as a CI gate</th>
@@ -355,7 +355,7 @@ td.c{text-align:center}
             <span class="when">repo pushed 2026-08-14 · <a class="src" href="https://arxiv.org/abs/2607.01504">arXiv 2607.01504</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">27 harnesses across 3 suites, ~15 minutes, on Firecracker — the VMM behind Lambda and Fargate. Also s2n-quic, Hifitime, and the Rust standard library. <b>Existence proof that proving is a budget line, not a campaign.</b></td>
+          <td class="lim">Deployed in production CI on Firecracker — the VMM behind Lambda and Fargate — plus s2n-quic, Hifitime, and the Rust standard library. <b>Existence proof that proving is a budget line, not a campaign.</b> ⚠ A figure of <em>27 harnesses / 3 suites / ~15 min</em> stood here cited to the arXiv paper; it comes from the <b>Kani team's blog</b>, and we did not confirm it in the paper. Removed rather than re-sourced, because the claim does not need it.</td>
         </tr>
         <tr>
           <th>Whether diverse assurance arguments are independent</th>
@@ -408,7 +408,15 @@ td.c{text-align:center}
     2023. RayNu-V's came from a search snippet. ★★ <b>The distinction that fixes it: a row citing a
     PAPER is safe, because a paper's content never changes. A row about whether a PROJECT IS ALIVE is
     not — and its primary source is the repository, which is one API call.</b> Every project row here
-    now carries a repo-derived date. ⛔ Do not add a liveness row on the authority of a survey.</span>
+    now carries a repo-derived date. ⛔ Do not add a liveness row on the authority of a survey.
+    <br><br>⚠⚠ <b>A second audit then went after the CITATIONS, and found four more.</b> The seL4 row
+    claimed binary verification "on Arm" — true of ARM32, <b>false of AArch64</b>. Virtual Timeline
+    was dated <b>POPL 2019</b>; it is <b>2020</b>. Cedar's bug count read "21 total" when the paper
+    says 4 from proofs and <b>21 more</b>. A Kani deployment figure was cited to a paper that does
+    not contain it. ★★ <b>The cause is subtler than the liveness one, and worth more: every row said
+    "checked 2026-08-13", but for several of them the truth was "FOUND VIA SEARCH on 2026-08-13".
+    A date implies verification. Where there was none, the date was rigour-shaped decoration.</b>
+    ⛔ Do not date a row you have not opened the primary source for.</span>
   </div>
   <div class="keyrow">
     <span style="width:100%;color:var(--ink-3);font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase">Ground taken?</span>
@@ -498,8 +506,13 @@ td.c{text-align:center}
       <div class="v"><b>seL4, with Microkit and libvmm</b> — on a board seL4 supports.</div>
       <div class="why">A powered exoskeleton is a mixed-criticality system: a learned policy that
       cannot be trusted by construction, beside a safety monitor whose envelope must hold anyway.
-      For something worn by a person, a decade-old proved-and-flown kernel beats a months-old
-      single-core one that has never left QEMU. That we wrote the second is not an argument.</div>
+      For something worn by a person, a proved-and-flown kernel beats a four-week-old single-core one
+      that has never left QEMU. That we wrote the second is not an argument.
+      <br><br>⚠ <b>Go in knowing what AArch64 actually buys you.</b> It has seL4's functional
+      correctness and integrity proofs — <b>not</b> confidentiality, and <b>not</b> binary
+      verification; both exist on ARM 32-bit, and confidentiality also on RISC-V. It is still far
+      more than this project has, and it is <b>less than the headline "seL4 is verified" implies</b>
+      on the architecture you would ship.</div>
     </div>
     <div class="dec no">
       <div class="k">The datacentre</div>
@@ -539,7 +552,7 @@ td.c{text-align:center}
       reaches it. The formula itself is settled — an earlier one was false at quantum = 1 and has
       been replaced by a bound <b>derived from the scheduler's ranking function</b>, asserted across
       a 75-row grid. What is missing is the <b>tier</b>: that is simulation evidence, and the bound
-      is sound-but-loose on 46 of the 75 rows. ⚠ <b>Virtual Timeline (POPL '19) already owns this
+      is sound-but-loose on 46 of the 75 rows. ⚠ <b>Virtual Timeline (POPL 2020) already owns this
       problem</b> — see §01.</li>
       <li><b>Proportional fairness.</b> A statement about a limit, so not bounded-depth either.</li>
       <li><b>The model-to-metal step</b> is a construction argument narrowed by compile-time
