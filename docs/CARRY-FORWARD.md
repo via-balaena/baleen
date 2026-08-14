@@ -93,14 +93,15 @@ will be measurement rather than proof.
 ## 3. A latency bound must be derived, or declared unproven — never fitted
 
 **What happened here.** The scheduler's latency bound was **published false**, corrected, then
-derived, across four PRs. The instructive part is the middle step: the original bound **fitted 45 of
-75 measured rows** and was nonetheless *provably the wrong shape* — the policy ranks by
-`service/weight` and is therefore scale-invariant, while the fitted quantity doubled under that same
-scaling. **A formula that fits most of your data can still be structurally incapable of being the
-true bound.**
+derived, across four PRs. The instructive part is the middle step. The ad-hoc bound was **sound on
+all 75 measured rows and tight on 45 of them** — and was *still provably the wrong shape*, because
+the policy ranks by `service/weight` and is therefore scale-invariant, while the quantity the formula
+was built from doubles under that same scaling. **A formula that matches all of your data can be
+structurally incapable of being the true bound.**
 
-The derived replacement is sound on all 75 rows and **looser** than the ad-hoc one it replaced. That
-was the right trade and is recorded as such, so nobody "improves" it back.
+The derived replacement is sound on the same 75 rows and **tight on only 29** — strictly looser than
+the ad-hoc form it replaced. That was the right trade and is recorded as such, so nobody "improves"
+it back: an unproven formula of a provably impossible shape is worse than a proven loose one.
 
 ⛔ Also established: the remaining gap is **not reachable by a bigger harness**. A claim about
 unbounded runs is not bounded-depth, and a claim about a limit is not a finite check. Knowing which
