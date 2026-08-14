@@ -2,11 +2,20 @@
 <!-- SPDX-License-Identifier: Apache-2.0 OR MIT -->
 <!-- Copyright (c) 2026 Via Balaena -->
 <!--
-  ⚠ EVERY FIGURE ON THIS PAGE IS READ FROM `assurance-data.json`, WHICH IS GENERATED.
-  `cargo xtask site-data` derives that file from the same gates that police the rest of the
-  repository, and `cargo xtask ci` fails if the committed copy is stale. So this page cannot
-  drift away from the artifact it describes — which is the only reason it is allowed to state
-  numbers at all. Do not hand-write a figure into this file.
+  ⚠⚠ THIS PAGE CARRIES **TWO** KINDS OF FIGURE AND THEY HAVE DIFFERENT DISCIPLINES.
+  Confusing them is the one way this page can start lying, so the distinction is enforced in
+  the markup (`data-src="gen"` vs `data-src="field"`) and stated to the reader in §01 and the
+  footer. Do not add a figure without deciding which kind it is.
+
+  1. GENERATED (§02, §03) — read from `assurance-data.json`, which `cargo xtask site-data`
+     derives from the same gates that police the repository. `cargo xtask ci` fails if the
+     committed copy is stale, so these CANNOT drift. ⛔ Never hand-write one of these.
+
+  2. HAND-CHECKED (§01, §04) — the field map. These are facts about OTHER PEOPLE'S projects, so
+     no gate here can police them and none pretends to. Each row therefore carries a CHECKED-ON
+     date and a source link, and the page says plainly that they rot. ★ When a row changes —
+     seL4's Arm MCS proof landing is the obvious one — update the row AND its date in the same
+     edit. A stale date is worse than no date.
 
   Deliberately a plain .html page with no Jekyll front matter: Jekyll copies it through
   untouched, so the design here is not fighting a theme.
@@ -15,8 +24,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Baleen — the assurance map</title>
-<meta name="description" content="A separation kernel for AArch64/EL2, and an honest map of what is machine-checked, what is only witnessed, and what is not closed.">
+<title>Proved Ground</title>
+<meta name="description" content="What is already verified in separation kernels and hypervisors — who owns each guarantee, what state it is in, and what limitation still matters. Assembled by building one.">
 <style>
 :root{
   color-scheme: light;
@@ -88,6 +97,18 @@ h2{font-family:ui-monospace,Menlo,monospace;font-size:13px;letter-spacing:.16em;
 .card{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:26px;
   box-shadow:var(--shadow)}
 
+/* Provenance banner — which discipline a section's figures are held to. */
+.prov{display:flex;gap:10px;align-items:flex-start;font-size:13px;line-height:1.5;
+  border-radius:7px;padding:12px 15px;margin:0 0 26px;max-width:74ch}
+.prov .tag{font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:.12em;
+  text-transform:uppercase;font-weight:700;padding:2px 7px;border-radius:4px;flex:none;margin-top:2px}
+.prov.gen{background:color-mix(in srgb,var(--good) 8%,transparent);
+  border:1px solid color-mix(in srgb,var(--good) 28%,transparent)}
+.prov.gen .tag{background:var(--good);color:#fff}
+.prov.field{background:color-mix(in srgb,var(--warn) 10%,transparent);
+  border:1px solid color-mix(in srgb,var(--warn) 34%,transparent)}
+.prov.field .tag{background:var(--warn);color:#25200a}
+
 .fencebar{display:flex;height:60px;gap:2px;margin:8px 0 6px}
 .fencebar .seg{display:flex;align-items:center;justify-content:center;color:#fff;
   font-family:ui-monospace,Menlo,monospace;font-size:12px;font-weight:600;cursor:default;
@@ -113,16 +134,19 @@ th,td{padding:11px 13px;text-align:left;border-bottom:1px solid var(--rule);font
 thead th{font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.1em;
   text-transform:uppercase;color:var(--ink-3);font-weight:600;background:var(--surface-2);
   white-space:nowrap;vertical-align:bottom}
-tbody th{font-weight:600;white-space:nowrap}
+tbody th{font-weight:600}
 tbody tr:last-child th,tbody tr:last-child td{border-bottom:none}
 td.c{text-align:center}
 .cell{display:inline-flex;align-items:center;gap:6px;padding:3px 9px 3px 7px;border-radius:100px;
   font-family:ui-monospace,Menlo,monospace;font-size:11px;font-weight:600;border:1px solid transparent;
-  cursor:default}
+  cursor:default;white-space:nowrap}
 .dot{width:7px;height:7px;border-radius:50%;flex:none}
 .cell.full{background:color-mix(in srgb,var(--good) 13%,transparent);
   border-color:color-mix(in srgb,var(--good) 34%,transparent)}
 .cell.full .dot{background:var(--good)}
+.cell.ship{background:color-mix(in srgb,var(--s1) 13%,transparent);
+  border-color:color-mix(in srgb,var(--s1) 36%,transparent)}
+.cell.ship .dot{background:var(--s1)}
 .cell.part{background:color-mix(in srgb,var(--warn) 17%,transparent);
   border-color:color-mix(in srgb,var(--warn) 42%,transparent)}
 .cell.part .dot{background:var(--warn)}
@@ -133,6 +157,17 @@ td.c{text-align:center}
 .cell.out .dot{background:var(--none)}
 .keyrow{display:flex;gap:16px;flex-wrap:wrap;margin-top:16px;font-size:13px;color:var(--ink-2);
   align-items:center}
+
+/* Field-map table specifics */
+#fieldmap{min-width:880px}
+#fieldmap tbody th{width:23%;vertical-align:top;line-height:1.4;white-space:normal}
+#fieldmap td.who{width:19%;vertical-align:top;font-weight:600;line-height:1.4}
+#fieldmap td.st{width:13%;vertical-align:top;white-space:nowrap}
+#fieldmap td.lim{vertical-align:top;color:var(--ink-2);font-size:13.5px;line-height:1.5}
+#fieldmap td.lim b{color:var(--ink);font-weight:600}
+.when{display:block;font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:var(--ink-3);
+  margin-top:6px;letter-spacing:.03em}
+.src{font-weight:400;font-size:12.5px}
 
 .row{display:grid;grid-template-columns:190px 1fr 46px;gap:14px;align-items:center;padding:5px 0}
 .row .nm{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:var(--ink-2);text-align:right;
@@ -155,7 +190,21 @@ td.c{text-align:center}
 .col.tech h3{color:var(--warn)}.col.tech li::before{background:var(--warn)}
 .col.cons h3{color:var(--none)}.col.cons li::before{background:var(--none)}
 .col li b{color:var(--ink);font-weight:600}
+
+.settles{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+.dec{background:var(--surface);border:1px solid var(--rule);border-radius:8px;padding:20px 22px;
+  box-shadow:var(--shadow)}
+.dec .k{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-3);margin-bottom:9px;font-weight:600}
+.dec .v{font-size:15px;line-height:1.5}
+.dec .v b{font-weight:600}
+.dec .why{font-size:13px;color:var(--ink-2);margin-top:10px;line-height:1.5}
+.dec.yes{box-shadow:inset 3px 0 0 var(--good),var(--shadow)}
+.dec.no{box-shadow:inset 3px 0 0 var(--crit),var(--shadow)}
+.dec.open{box-shadow:inset 3px 0 0 var(--warn),var(--shadow)}
+
 .foot{padding:44px 0 72px;color:var(--ink-2);font-size:14px}
+.foot p{max-width:74ch}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 @media (max-width:640px){.row{grid-template-columns:132px 1fr 42px}}
 </style>
@@ -164,37 +213,201 @@ td.c{text-align:center}
 <div class="wrap">
 
 <header>
-  <p class="eyebrow">Separation kernel · AArch64 / EL2</p>
-  <h1>The assurance map</h1>
-  <p class="lede">Baleen keeps two guests apart, and is built so the claim can be <strong>checked
-  rather than believed</strong>. Two unmodified Linux kernels boot on it and are refused
-  <em>by the hardware</em> when they reach for each other's memory. This page is the honest
-  picture: what is machine-checked, what is only witnessed, and what is not closed at all.</p>
+  <p class="eyebrow">Reconnaissance · separation kernels &amp; hypervisors</p>
+  <h1>Proved Ground</h1>
+  <p class="lede">We built a separation kernel, then asked the field whether any of it was new.
+  The answer was <strong>no — on every axis we probed</strong>, and in several cases by work that
+  solves the same problem more deeply. This page is what that search returned: <strong>who has
+  already closed which guarantee</strong>, what state it is in, and the limitation that still
+  matters. The negative result is the deliverable, not the consolation.</p>
   <div class="cta">
-    <a class="btn primary" href="CASE-STUDY-WORK-CONSERVATION.html">Read the case study</a>
+    <a class="btn primary" href="#map">The map</a>
+    <a class="btn" href="CASE-STUDY-WORK-CONSERVATION.html">The case study</a>
     <a class="btn" href="https://github.com/via-balaena/baleen">Source</a>
     <a class="btn" href="README.html">Documentation</a>
   </div>
   <div class="tiers">
-    <div class="tier p"><div class="k">Proven</div><div class="v">The model's isolation invariants
-      and the emitter that refines them — symbolic inputs at bounded size, with the unbounded-size
-      half carried deductively.</div></div>
-    <div class="tier d"><div class="k">Demonstrated</div><div class="v">The metal — real kernels,
-      real hardware refusals, under required CI gates on every pull request.</div></div>
-    <div class="tier a"><div class="k">Argued</div><div class="v">The step from the generic
-      non-interference theorem to concrete Baleen. Prose over proved lemmas — declared, not
-      hidden.</div></div>
+    <div class="tier p"><div class="k">Why trust the map</div><div class="v">It was assembled by
+      someone who had to solve each problem first. Reading tells you what exists; building tells
+      you <em>what to ask</em>.</div></div>
+    <div class="tier d"><div class="k">The instrument</div><div class="v">Baleen — a static-partitioning
+      kernel for AArch64/EL2 in Rust, <span id="nharness" class="mono">…</span> machine-checked
+      harnesses carried as a required gate. §02 is its own honest picture.</div></div>
+    <div class="tier a"><div class="k">What it is not</div><div class="v">A product pitch. For a
+      device worn by a person, the answer below is seL4, and the fact that we wrote one of the
+      candidates is not an argument.</div></div>
   </div>
 </header>
 
-<section>
-  <h2>01 — The fence</h2>
+<section id="map">
+  <h2>01 — The map</h2>
+  <p class="claim">Every guarantee we needed was already closed by somebody.</p>
+  <p class="sub">Each row is a requirement a mixed-criticality system actually has, the project that
+  owns it today, and the caveat that decides whether you can rely on it. <strong>Read the last
+  column</strong> — "verified" is never a single fact, and the architecture, the artifact and the
+  proof's reach are usually where the answer lives.</p>
+
+  <div class="prov field" data-src="field">
+    <span class="tag">Hand-checked</span>
+    <span><b>These are facts about other people's projects, so no gate here can police them and
+    none pretends to.</b> Each row carries the date it was last verified and a link to the source.
+    <b>They rot</b> — seL4's Arm MCS proof landing would change a row below — so treat a stale date
+    as a warning, not a detail. This is the opposite discipline from §02 and §03, which are
+    generated and cannot drift.</span>
+  </div>
+
+  <div class="scroll">
+    <table id="fieldmap">
+      <thead><tr>
+        <th>Requirement</th><th>Who owns it</th><th>State</th><th>The limitation that matters</th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <th>Microkernel functional correctness</th>
+          <td class="who">seL4
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://sel4.systems">sel4.systems</a></span></td>
+          <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
+          <td class="lim">Abstract spec → executable spec → C, plus binary-level translation
+            validation on Arm. <b>Deployed and flown</b> (DARPA HACMS). This is the deepest result
+            in the field and the reference point for everything else here.</td>
+        </tr>
+        <tr>
+          <th>Mixed-criticality temporal isolation</th>
+          <td class="who">seL4 MCS
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://docs.sel4.systems/Tutorials/mcs.html">docs</a> · <a class="src" href="https://proofcraft.systems/news-2026/">Proofcraft</a></span></td>
+          <td class="st"><span class="cell part"><span class="dot"></span>partial</span></td>
+          <td class="lim">Scheduling contexts give capability-based access to CPU time with enforced
+            execution bounds. Functional correctness is <b>proved on RISC-V</b>; the Arm 64-bit port
+            is <b>in progress</b> under DARPA's PROVERS programme. ★ <b>This is the one row where
+            the answer today is "not yet on your architecture"</b> — and the only reason to know
+            that is to have asked the architecture question.</td>
+        </tr>
+        <tr>
+          <th>Verified hypervisor on multicore Arm</th>
+          <td class="who">SeKVM
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://dl.acm.org/doi/10.1145/3477132.3483560">SOSP '21</a></span></td>
+          <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
+          <td class="lim">Verified on <b>Arm relaxed memory hardware</b> — the multicore axis, with
+            the real memory model rather than a sequentially-consistent idealisation.</td>
+        </tr>
+        <tr>
+          <th>Verified preemptive scheduler with temporal isolation</th>
+          <td class="who">Virtual Timeline
+            <span class="when">checked 2026-08-13 · PACMPL / POPL 2019, Liu, Rieg, Shao &amp; Gu</span></td>
+          <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
+          <td class="lim">A formal abstraction for verifying preemptive schedulers with temporal
+            isolation. <b>This occupies the problem we had identified as our sharpest open one</b>,
+            and it was solved seven years earlier in a stronger form.</td>
+        </tr>
+        <tr>
+          <th>Linux guest beside a small analyzable partition</th>
+          <td class="who">libvmm / CAmkES VM
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://github.com/au-ts/libvmm">au-ts/libvmm</a></span></td>
+          <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
+          <td class="lim">A VMM for seL4 under Microkit, booting Linux guests on Arm. ⚠ <b>Confirm
+            GICv3 emulation for your specific board</b> — it has been a live discussion item rather
+            than a settled feature, and board support is per-platform.</td>
+        </tr>
+        <tr>
+          <th>Multi-tenant compute isolation</th>
+          <td class="who">Firecracker
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://firecracker-microvm.github.io/">firecracker-microvm</a></span></td>
+          <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
+          <td class="lim">Apache-2.0, Arm <b>and</b> x86, at AWS scale. Not formally verified as a
+            whole, but industrially proven — which for this requirement is the stronger claim.</td>
+        </tr>
+        <tr>
+          <th>Keeping a formal model honest against the implementation</th>
+          <td class="who">Cedar
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://arxiv.org/abs/2407.01688">arXiv 2407.01688</a></span></td>
+          <td class="st"><span class="cell ship"><span class="dot"></span>solved</span></td>
+          <td class="lim">An executable <b>Lean</b> model ~10× smaller than the production Rust, with
+            <b>differential random testing as a release gate</b>: millions of inputs through both,
+            outputs compared. 4 bugs from the proofs, 21 total. ★ This is a <b>template, not a
+            research problem</b> — and it closes the gap we left open.</td>
+        </tr>
+        <tr>
+          <th>Verification affordable as a CI gate</th>
+          <td class="who">Kani, in production
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://arxiv.org/abs/2607.01504">arXiv 2607.01504</a></span></td>
+          <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
+          <td class="lim">27 harnesses across 3 suites, ~15 minutes, on Firecracker — the VMM behind
+            Lambda and Fargate. Also s2n-quic, Hifitime, and the Rust standard library.
+            <b>Existence proof that proving is a budget line, not a campaign.</b></td>
+        </tr>
+        <tr>
+          <th>Whether diverse assurance arguments are independent</th>
+          <td class="who">Knight &amp; Leveson; Littlewood &amp; Wright; Rushby
+            <span class="when">checked 2026-08-13 · <a class="src" href="http://sunnyday.mit.edu/papers/nver-tse.pdf">Knight &amp; Leveson 1986</a></span></td>
+          <td class="st"><span class="cell full"><span class="dot"></span>settled</span></td>
+          <td class="lim"><b>They are not.</b> 27 independently written versions over 1M test cases
+            showed correlated failure far above chance; Littlewood &amp; Wright model dependence
+            between a <b>testing</b> leg and a <b>formal verification</b> leg specifically. Replicated
+            across NASA and nuclear-industry programmes. ⛔ Do not treat a verification portfolio as
+            a union of its tiers.</td>
+        </tr>
+        <tr>
+          <th>Static-partitioning hypervisors on Arm</th>
+          <td class="who">Bao, Jailhouse
+            <span class="when">checked 2026-08-13 · <a class="src" href="https://arxiv.org/pdf/2303.11186">survey, arXiv 2303.11186</a></span></td>
+          <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
+          <td class="lim">Real hardware, real deployments, mature. The architectural niche Baleen
+            occupies was already well populated before it started.</td>
+        </tr>
+        <tr>
+          <th>A verified hypervisor written in Rust</th>
+          <td class="who">RayNu-V, RVM <span class="src">(claimed)</span>
+            <span class="when">checked 2026-08-13 · provenance NOT established</span></td>
+          <td class="st"><span class="cell out"><span class="dot"></span>unverified</span></td>
+          <td class="lim">⚠ Two projects claim this ground with the same Verus-and-Kani pairing, one
+            asserting a machine-checked EPT isolation theorem. <b>We could not establish their
+            provenance</b>; both surface through channels associated with high-volume
+            machine-generated repositories. ★ Recorded as a finding in its own right:
+            <b>provenance checking is now part of a literature search</b>, and a plausible-looking
+            artifact is no longer evidence that ground is taken.</td>
+        </tr>
+        <tr>
+          <th>A verified hypervisor under compute-heavy simulation</th>
+          <td class="who">— nobody, and correctly so
+            <span class="when">checked 2026-08-13 · reasoning below</span></td>
+          <td class="st"><span class="cell gap"><span class="dot"></span>no case</span></td>
+          <td class="lim">A hypervisor does not make cores faster — it costs a few percent. Isolation
+            is not that workload's bottleneck, the binding constraint is <b>memory bandwidth</b>, and
+            Firecracker already owns multi-tenant isolation. ★ Kept as a row <b>because the idea is
+            attractive, recurs, and is wrong.</b></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="keyrow">
+    <span><span class="cell full"><span class="dot"></span>proved</span><span style="margin-left:6px">machine-checked</span></span>
+    <span><span class="cell ship"><span class="dot"></span>shipping</span><span style="margin-left:6px">industrially proven, not fully verified</span></span>
+    <span><span class="cell part"><span class="dot"></span>partial</span><span style="margin-left:6px">proved, but not on every architecture</span></span>
+    <span><span class="cell out"><span class="dot"></span>unverified</span><span style="margin-left:6px">claimed; provenance not established</span></span>
+    <span><span class="cell gap"><span class="dot"></span>no case</span><span style="margin-left:6px">deliberately unoccupied</span></span>
+    <span style="color:var(--ink-3)">— state is written in the chip, never carried by colour alone</span>
+  </div>
+</section>
+
+<section id="instrument">
+  <h2>02 — The instrument</h2>
   <p class="claim">Half the shipped code is machine-checked. The other half is a thin layer that
   cannot be.</p>
-  <p class="sub">Verification tools reach code inside the workspace.
-  <span class="mono">hv-metal</span> is deliberately excluded — it needs
-  <span class="mono">unsafe</span> for MMIO and assembly, so no prover links it and it is held to
-  boot witnesses instead. That one structural fact explains most of the open ledger below.</p>
+  <p class="sub">The map above is only worth what the person who assembled it knows, so here is that
+  person's own work, held to the same honesty. Verification tools reach code inside the workspace.
+  <span class="mono">hv-metal</span> is deliberately excluded — it needs <span class="mono">unsafe</span>
+  for MMIO and assembly, so no prover links it and it is held to boot witnesses instead.</p>
+
+  <div class="prov gen" data-src="gen">
+    <span class="tag">Generated</span>
+    <span><b>Every figure in this section and the next is read from
+    <span class="mono">assurance-data.json</span></b>, which <span class="mono">cargo xtask
+    site-data</span> derives from the same gates that police the repository — and
+    <span class="mono">cargo xtask ci</span> fails if the committed copy is stale. These
+    <b>cannot</b> drift from the artifact they describe, which is the only reason this page is
+    allowed to state them as numbers.</span>
+  </div>
+
   <div class="card">
     <div class="fencebar" id="fencebar"></div>
     <div class="axis"><span>0</span><span class="num" id="fencetotal"></span></div>
@@ -210,22 +423,16 @@ td.c{text-align:center}
     </div>
     <div class="readout" id="fencestats"></div>
   </div>
-</section>
 
-<section>
-  <h2>02 — Evidence by subsystem</h2>
-  <p class="claim">Five methods, ten subsystems, and the blanks are the point.</p>
-  <p class="sub">Each method answers a different question. The enumerator checks every reachable
-  state of a small configuration; Kani checks every <em>value</em> at bounded size on real code;
-  Verus carries the unbounded-size step; fuzzing explores wide interleavings; boot witnesses prove
-  the hardware agrees. Nothing is covered by all five, and nothing needs to be — but a
-  <em>gap</em> and a method that structurally <em>cannot reach</em> a subsystem are different
-  claims, so they are drawn differently.</p>
+  <div style="height:34px"></div>
+  <p class="claim" style="font-size:20px">Evidence by subsystem</p>
+  <p class="sub">Five methods with different reach. A row is only as strong as what the chips
+  actually say — and two of the columns share an input generator, which is how a real defect
+  survived four of them.</p>
   <div class="scroll">
     <table>
-      <thead><tr><th>Subsystem</th><th>Enumerator<br>∀ states, small</th>
-        <th>Kani<br>∀ values, real code</th><th>Verus<br>∀ size</th><th>Fuzz</th>
-        <th>Boot witness</th></tr></thead>
+      <thead><tr><th>Subsystem</th><th class="c">Enumerator</th><th class="c">Kani</th>
+        <th class="c">Verus</th><th class="c">Fuzz</th><th class="c">Boot</th></tr></thead>
       <tbody id="matrix"></tbody>
     </table>
   </div>
@@ -234,20 +441,51 @@ td.c{text-align:center}
 
 <section>
   <h2>03 — Where the proof effort actually went</h2>
-  <p class="claim">The corpus is weighted toward devices and partitioning, not the core state
-  machines.</p>
-  <p class="sub">The core — grants, page types, foreign links — carries few harnesses, because its
-  heavy lifting is done by the enumerator and by Verus. Worth knowing before reading a harness
-  count as uniform coverage.</p>
+  <p class="claim">Harnesses cluster where the isolation argument is load-bearing.</p>
+  <p class="sub">Kani harnesses by module. The shape is the honest one: the emitter and the model's
+  invariants carry the weight, because that is where a wrong answer becomes a cross-domain leak.</p>
   <div class="card" id="dist"></div>
 </section>
 
 <section>
-  <h2>04 — What is not closed</h2>
-  <p class="claim">Grouped by what would actually unblock it, not by severity.</p>
-  <p class="sub">Severity invites argument; "what would move this" invites a decision. Every item
-  is recorded in the repository's ledger with its reasoning — including the ones that were refuted
-  and kept in place so nobody re-pitches them.</p>
+  <h2>04 — What this settles</h2>
+  <p class="claim">A reconnaissance that ends without a decision has not finished.</p>
+  <p class="sub">The map is not neutral. It was assembled to answer specific questions for a
+  specific project — a differentiable simulation SDK whose capstone is a person-specific powered
+  exoskeleton — and these are the answers.</p>
+  <div class="settles">
+    <div class="dec yes">
+      <div class="k">The device</div>
+      <div class="v"><b>seL4, with Microkit and libvmm</b> — on a board seL4 supports.</div>
+      <div class="why">A powered exoskeleton is a mixed-criticality system: a learned policy that
+      cannot be trusted by construction, beside a safety monitor whose envelope must hold anyway.
+      For something worn by a person, a decade-old proved-and-flown kernel beats a months-old
+      single-core one that has never left QEMU. That we wrote the second is not an argument.</div>
+    </div>
+    <div class="dec no">
+      <div class="k">The datacentre</div>
+      <div class="v"><b>No verified hypervisor under simulation workloads.</b> Refuted, twice, and
+      recorded so it is not re-proposed.</div>
+      <div class="why">Isolation is not the bottleneck, memory bandwidth is; a hypervisor cannot
+      improve it and slightly worsens it. The single-tenant variant is <em>weaker</em> still —
+      there is nobody to isolate from.</div>
+    </div>
+    <div class="dec open">
+      <div class="k">The one thing still open</div>
+      <div class="v"><b>Proved temporal isolation on Arm.</b> seL4 MCS has it on RISC-V; the Arm
+      port is in progress.</div>
+      <div class="why">The only requirement on this page whose answer is "not yet, on your
+      architecture". Everything else is a matter of integration rather than research — which is the
+      most useful thing the search established.</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>05 — What is still open in the instrument</h2>
+  <p class="claim">Kept, because a map assembled by an artifact should show the artifact's edges.</p>
+  <p class="sub">These are Baleen's own gaps. They are no longer a roadmap — the decision above
+  routes around them — but they are what the honest picture in §02 does not cover.</p>
   <div class="board">
     <div class="col hw"><h3>Needs hardware</h3><div class="cnt num">4</div><ul>
       <li><b>No silicon.</b> Every metal result is QEMU. A board probe exists and has never run on
@@ -259,13 +497,11 @@ td.c{text-align:center}
     </ul></div>
     <div class="col tech"><h3>Needs a different technique</h3><div class="cnt num">3</div><ul>
       <li><b>Scheduler latency bound.</b> A claim about unbounded runs, so no larger bounded harness
-      reaches it — and a safety monitor would budget against exactly this. The formula itself is no
-      longer the problem: an earlier one was found false at quantum = 1 and has been replaced by a
-      bound <b>derived from the scheduler's ranking function</b> and asserted across a 75-row grid.
-      What is still missing is the <b>tier</b> — that is simulation evidence, and the bound is
-      sound-but-loose on 46 of the 75 rows. <b>Technique scoped, not unknown:</b> Verus has a
-      TLA embedding and Anvil used it to verify controller liveness, on the same Verus already
-      gating this repo.</li>
+      reaches it. The formula itself is settled — an earlier one was false at quantum = 1 and has
+      been replaced by a bound <b>derived from the scheduler's ranking function</b>, asserted across
+      a 75-row grid. What is missing is the <b>tier</b>: that is simulation evidence, and the bound
+      is sound-but-loose on 46 of the 75 rows. ⚠ <b>Virtual Timeline (POPL '19) already owns this
+      problem</b> — see §01.</li>
       <li><b>Proportional fairness.</b> A statement about a limit, so not bounded-depth either.</li>
       <li><b>The model-to-metal step</b> is a construction argument narrowed by compile-time
       assertions, because no prover links the metal.</li>
@@ -275,17 +511,21 @@ td.c{text-align:center}
       emitted descriptor — fine today, a surprise for anything expecting revocation to bite.</li>
       <li><b>Monitor freshness.</b> A starved observer cannot tell silence from health; the fix
       needs a telemetry format that may not be this project's to define.</li>
-      <li><b>Interrupt-id ceiling</b> — the hardware fence types an interrupt id as one byte, which
-      cannot express the full range. Deferred for want of anything that needs it.</li>
+      <li><b>Actuator and sensor I/O.</b> Groundwork only — no real device is driven, which is the
+      functional gap between a demonstration and a device.</li>
     </ul></div>
   </div>
 </section>
 
 <div class="foot">
-  <p>Every figure above is generated by <span class="mono">cargo xtask site-data</span> from the
-  same gates that police the repository, and <span class="mono">cargo xtask ci</span> fails if this
-  page's data is stale — so it cannot drift from the artifact it describes.
-  <a href="https://github.com/via-balaena/baleen">Source</a> · Apache-2.0 / MIT</p>
+  <p><b>Two disciplines, kept apart deliberately.</b> §02 and §03 are generated by
+  <span class="mono">cargo xtask site-data</span> from the gates that police the repository, and
+  <span class="mono">cargo xtask ci</span> fails if they are stale — so they cannot drift. §01 and
+  §04 are hand-checked facts about other people's work, dated per row, and they <b>will</b> rot.
+  Conflating the two is the one way this page starts lying, which is why it says so twice.</p>
+  <p style="margin-top:18px">Assembled from the development of <a href="https://github.com/via-balaena/baleen">Baleen</a>.
+  Apache-2.0 / MIT. Corrections are welcome and are the point —
+  <a href="https://github.com/via-balaena/baleen/issues">open an issue</a> if a row is out of date.</p>
 </div>
 </div>
 
@@ -295,14 +535,15 @@ const KEY=[["full","covered"],["part","covered, but explicitly bounded"],
            ["gap","reachable by this method, not covered"],
            ["out","structurally out of reach of this method"]];
 
-/* ⚠ Every visual on this page is rendered from the fetched data, so a single runtime error
-   would leave a front door of empty boxes that still looks deliberate. Both failure paths —
-   the fetch and the render — report instead of failing silently. */
+/* ⚠ The GENERATED visuals are rendered from fetched data, so a single runtime error would leave
+   empty boxes that still look deliberate. Both failure paths — the fetch and the render — report
+   instead of failing silently. The field map in §01 is static markup and is unaffected by this. */
 function fail(e){
   document.querySelectorAll("#fencebar,#matrix,#dist").forEach(n=>{
     n.innerHTML=`<p style="color:var(--crit);font-size:14px;margin:0">This view could not be
       rendered — ${String(e).replace(/</g,"&lt;")}. The figures live in
-      <span class="mono">assurance-data.json</span>; the repository is the authority either way.</p>`;
+      <span class="mono">assurance-data.json</span>; the repository is the authority either way.
+      The map in §01 above is static and is unaffected.</p>`;
   });
 }
 fetch("assurance-data.json").then(r=>{
@@ -311,7 +552,12 @@ fetch("assurance-data.json").then(r=>{
 }).then(d=>{ try{ render(d); }catch(e){ fail(e); } }).catch(fail);
 
 function render(d){
-  /* 01 — the fence */
+  /* header — the one figure above the fold, generated like every other. ⛔ Do not hard-code it:
+     a number in the hero is the one a reader quotes, so it is the one that must not rot. */
+  document.getElementById("nharness").textContent=
+    d.kani_by_module.reduce((a,m)=>a+m.harnesses,0);
+
+  /* 02 — the fence */
   const total=d.fence.reduce((a,b)=>a+b.lines,0);
   document.getElementById("fencebar").innerHTML=d.fence.map(c=>{
     const pct=c.lines/total*100;

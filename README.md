@@ -29,7 +29,8 @@ test on a multi-year solo project.
 >
 > | if you want | go to |
 > |---|---|
-> | the picture — what is proven, what is only witnessed, what is open | **[the assurance map](https://via-balaena.github.io/baleen/)**, whose every figure is generated from the gates |
+> | **what is already proved in this field, and by whom** | **[Proved Ground](https://via-balaena.github.io/baleen/)** — a dated, sourced map of who has closed which guarantee. Assembled by building one; the answer was that every axis was occupied |
+> | the picture of *this* artifact — what is proven, what is only witnessed, what is open | the same page, [§02 onward](https://via-balaena.github.io/baleen/#instrument), whose every figure is generated from the gates |
 > | one defect, end to end, with no prior context | **[Every tier was green. Only two were looking.](docs/CASE-STUDY-WORK-CONSERVATION.md)** — a scheduler property that was false while the whole suite passed, because the two tiers asserting it shared a blind spot and the third could not reach the code |
 > | the design documents | **[`docs/README.md`](docs/README.md)** — a map of all of them, with three reading orders |
 
@@ -128,7 +129,7 @@ convention — and every verification tool in the project can reach them. Below 
 instead.
 
 ⚠ **That is not a small remainder.** Shipped code splits almost exactly in half either side of the
-fence — the live figure is on the [assurance map](https://via-balaena.github.io/baleen/), which
+fence — the live figure is on [Proved Ground](https://via-balaena.github.io/baleen/), which
 generates it rather than restating it. Anyone reading "machine-checked isolation core" should know
 what fraction that phrase covers.
 
@@ -280,8 +281,8 @@ driven by the hypervisor's own tick rather than by a guest, where no enumeration
 them. Those are covered by named generators instead, and the census fails if one loses its
 generator, if the classification goes stale, or if a new operation appears unclassified.
 
-The live split, and which subsystems it leaves uncovered, is on the
-[assurance map](https://via-balaena.github.io/baleen/) — generated, so it stays true.
+The live split, and which subsystems it leaves uncovered, is on
+[Proved Ground](https://via-balaena.github.io/baleen/) — generated, so it stays true.
 
 And the map's own data:
 
