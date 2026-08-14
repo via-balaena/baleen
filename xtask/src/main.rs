@@ -176,7 +176,7 @@ fn main() {
                 // merely audited — but a different question, so a different task rather than a
                 // second obligation hidden under the first one's name.
                 && hvcall_census()
-                // ㉛: the published assurance map must still match the gates that produce its figures.
+                // ㉛: the published site's generated figures must still match the gates that produce them.
                 && site_data(false)
                 // ㉓: the gate that decides whether the PROOF gate runs. It lives here, in the
                 // REQUIRED `fmt · clippy · test` context, and deliberately not in `proofs.yml` —
@@ -207,7 +207,7 @@ fn main() {
                  doc-modules  assert a README enumerating a directory enumerates ALL of it\n  \
                  seam-census  assert every hv-core transition is hypercall-reachable, or DECLARED above the seam\n  \
                  hvcall-census  assert the fuzz target that drives HvCall constructs EVERY variant\n  \
-                 site-data    regenerate the published assurance map's data from the gates\n  \
+                 site-data    regenerate the published site's generated figures from the gates\n  \
                  verus-counts assert every Verus file discharges the obligations it is expected to\n  \
                  kani-harnesses  run the Kani corpus and assert it contains exactly the expected harnesses\n  \
                  sweeps assert the deep exhaustive-sweep corpus is exactly the expected one\n  \
@@ -4783,7 +4783,7 @@ fn crate_lines(krate: &str) -> usize {
     n
 }
 
-/// **Emit the published assurance map's data from the gates that own it (㉛).**
+/// **Emit the published site's generated figures from the gates that own them (㉛).**
 ///
 /// The site renders numbers; this produces them. `write == false` is the CI mode: recompute and
 /// compare against what is committed, failing if they differ — the same bargain `doc-counts`
@@ -4945,7 +4945,7 @@ fn site_data(write: bool) -> bool {
         true
     } else if current != j {
         eprintln!(
-            "site-data: FAIL — {OUT} is stale. The published assurance map would show figures \
+            "site-data: FAIL — {OUT} is stale. The published site would show figures \
              that no longer match the gates.\n\
              \x20                Run `cargo xtask site-data` and commit the result."
         );
