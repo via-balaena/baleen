@@ -1495,7 +1495,9 @@ const LINUX_MONITOR_FORBIDDEN: &[&str] = &["baleen: observe FAIL"];
 /// available for one command-line flag.
 ///
 /// MEASURED with `-global arm-smmuv3.stage=2`, on the runner: **all five markers below found**,
-/// `DEFAULT-DENY` included, in a 4-configuration `qemu-linux-test`.
+/// `DEFAULT-DENY` included, in what was then a 4-configuration `qemu-linux-test`.
+/// ⚠ **It is FIVE now** — `LinuxBoot::Monitor` was added in #196. The figure above is left as the
+/// measurement's own record rather than silently updated, but do not read it as the current gate.
 ///
 /// ★ **So the SMMU rungs (#91–#95) are CI-GATED FOR THE FIRST TIME** — hardware witness as well as
 /// proofs. Before this, `iommu=smmuv3` had never appeared in a CI run at all: `boot-test.sh`'s
