@@ -14,11 +14,18 @@
 > place where the consumer's requirements **collide with a property this project has
 > already proved** — because that is a design question, not a backlog item.
 >
-> ⚠ This sentence first read *"the **two** places"*, and there is **one**. The other ⚠
-> rows below are gaps — unanalyzed, or never attempted — which is a different and much
-> cheaper thing than a collision with a theorem. Corrected rather than quietly reworded,
-> because a count asserted in a header is exactly the kind this project keeps writing
-> wrong (#276, #281–#284).
+> ⚠ This sentence first read *"the **two** places"*, and there is **one**. The remaining
+> non-✅ rows below are gaps — unanalyzed, or needing hardware — which is a different and
+> much cheaper thing than a collision with a theorem. Corrected rather than quietly
+> reworded, because a count asserted in a header is exactly the kind this project keeps
+> writing wrong (#276, #281–#284).
+>
+> ⚠⚠ **And it went wrong AGAIN, in this very sentence, in the way it warns about.** It said
+> *"the other ⚠ **rows**"* — plural — and after the 2026-08-13 re-derivation there is exactly
+> **one** ⚠ row left. ★★ **So the fix is not a better count, it is to NAME the exceptions
+> instead of counting them:** what is still open below is **actuator/sensor I/O**, **real
+> silicon**, and **SMP** (deliberately). **A name rots visibly — the row it points at either
+> exists or does not. A count rots silently.**
 
 ## The consumer
 
@@ -154,7 +161,7 @@ answer was read.
 | **Bounded scheduling latency for the monitor** | ✅ **bounded** — first stated in #194, but that formula was **false at `quantum = 1`**; the bound in force is the *derived*, scale-invariant one from #208. ⚠ Still at the *simulation* tier only, and **budget against the weights you configure, not the vCPU count** | `hv-sim`'s `policy_bounds_scheduling_latency` |
 | **Actuator / sensor I/O reaching a guest** | ⚠ groundwork only; no real device is driven | `hv-metal/src/smmu.rs` |
 | A non-Linux (small) monitor partition, **alone** | ✅ done on every default boot | `hv-metal/src/guest.rs`'s `load_guest` |
-| **A non-Linux monitor partition running *beside* a Linux one** | ⚠ **never attempted — the two paths are mutually exclusive** | `hv-metal/src/main.rs` |
+| **A non-Linux monitor partition running *beside* a Linux one** | ✅ **BUILT (#196), observation channel added (#197), and CI-GATED** — `--features monitor` gives guest slot B a small bare-metal payload instead of a second Linux kernel, so an unmodified kernel and a tiny analyzable partition time-slice one pCPU, isolated. It is the **fifth configuration of `qemu-linux-test`**, inside the required `real-linux boot (QEMU)` check | `hv-metal/src/monitor.rs`, `hv-metal/Cargo.toml`'s `monitor` feature; run it alone with `cargo xtask qemu-linux-monitor` |
 | Real silicon | ⛔ never run outside QEMU | [`QEMU-AND-METAL.md`](QEMU-AND-METAL.md) |
 | SMP | ⛔ **not wanted** — see below | — |
 
@@ -174,13 +181,29 @@ changed.
   synthetic Arc 0–5 guests *are* bare-metal EL1 payloads. It runs on **every default boot**. The row
   was written from an assumption about what a "guest" meant here, not from the loader.
 * The real gap was one question further in, and only appeared once the first answer was checked:
-  the synthetic and `real-linux` paths are **mutually exclusive** (`main.rs`: *"the synthetic phases
-  are replaced by the real-Linux capstone"*), so a small bare-metal monitor has never run **beside**
+  the synthetic and `real-linux` paths were **mutually exclusive** (`main.rs`: *"the synthetic phases
+  are replaced by the real-Linux capstone"*), so a small bare-metal monitor had never run **beside**
   a Linux partition — which is the configuration the whole mixed-criticality role needs.
+  ✅ **THAT GAP IS CLOSED: #196 built it and #197 gave it the one-way observation channel.** The
+  `monitor` feature makes guest slot B a bare-metal payload, and the boot is the fifth configuration
+  of the required `qemu-linux-test`. **The row above was not updated for two PRs**, which is the
+  subject of the sweep note below.
 
 ★ **A requirements table is exactly as good as the reading behind each row**, and a row asserting
 that something was never attempted is the cheapest of all to get wrong: nothing contradicts it,
 because absence leaves no artifact to trip over.
+
+⚠⚠ **AND THAT SAME ROW THEN ROTTED A SECOND TIME, IN THE OPPOSITE DIRECTION — which is the finding
+worth keeping.** First it was *wrong on arrival* (asserting a gap that was not there). Then, once the
+real gap was identified and **closed by #196/#197**, the row still read *"never attempted"* for two
+further PRs. **Both failures have one cause: nothing points back at a negative claim.** Closing a gap
+produces an artifact — a feature flag, a boot configuration, a CI gate — and **none of them knows a
+sentence somewhere says the gap is still open.**
+
+★★ **So a "never attempted" row needs an owner and a re-check, exactly like an in-flight run id.**
+This sweep re-derived **every** row against the code rather than patching the one that was reported,
+and that is the only reason the `qemu-linux-test` configuration count in `xtask` was found stale in
+the same pass. ⛔ **Do not patch a single row of this table again — re-derive it.**
 
 ⚠ **The `no_std` question was checked and came back the other way.** A bare-metal
 partition running CortenForge code directly is not available: its layer-0 crates declare
