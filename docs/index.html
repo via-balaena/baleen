@@ -17,6 +17,14 @@
      seL4's Arm MCS proof landing is the obvious one — update the row AND its date in the same
      edit. A stale date is worse than no date.
 
+     ⚠⚠ AND WITHIN ONE DAY OF FIRST PUBLICATION, TWO ROWS WERE FOUND WRONG. Both from SECONDARY
+     sources: Jailhouse's "mature" came from a 2023 survey (its last commit was January 2023),
+     and RayNu-V's "machine-checked theorem" came from a search snippet describing that
+     document's ARC rather than its results. ★★ THE RULE THAT FALLS OUT: a row citing a PAPER is
+     safe — a paper's content never changes. A row about whether a PROJECT IS ALIVE is not, and
+     its primary source is the REPOSITORY, which is one `gh repo view` away. ⛔ Never take
+     liveness from a survey.
+
   Deliberately a plain .html page with no Jekyll front matter: Jekyll copies it through
   untouched, so the design here is not fighting a theme.
 -->
@@ -347,24 +355,42 @@ td.c{text-align:center}
             a union of its tiers.</td>
         </tr>
         <tr>
-          <th>Static-partitioning hypervisors on Arm</th>
-          <td class="who">Bao, Jailhouse
-            <span class="when">checked 2026-08-13 · <a class="src" href="https://arxiv.org/pdf/2303.11186">survey, arXiv 2303.11186</a></span></td>
+          <th>Static-partitioning hypervisor on Arm</th>
+          <td class="who">Bao
+            <span class="when">repo pushed 2026-08-10 · <a class="src" href="https://github.com/bao-project/bao-hypervisor">bao-project</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
-          <td class="lim">Real hardware, real deployments, mature. The architectural niche Baleen
-            occupies was already well populated before it started.</td>
+          <td class="lim">Real hardware, real deployments, <b>actively maintained</b> — pushed three
+            days before this row was written. The architectural niche Baleen occupies was already
+            well populated before it started, and still is.</td>
+        </tr>
+        <tr>
+          <th>Static-partitioning hypervisor, the older reference</th>
+          <td class="who">Jailhouse
+            <span class="when">last default-branch commit 2023-01-16 · last push 2024-05-18 · <a class="src" href="https://github.com/siemens/jailhouse">siemens/jailhouse</a></span></td>
+          <td class="st"><span class="cell part"><span class="dot"></span>dormant</span></td>
+          <td class="lim">⚠ <b>Not archived, 1,950 stars, and not moving.</b> Last commit on the
+            default branch was <b>January 2023</b>; the last push anywhere was <b>May 2024</b>. Still
+            a legitimate architectural reference — <b>not a live option to build on.</b>
+            ★ This row was originally merged with Bao's under "mature", <b>on the authority of a 2023
+            survey</b>. See the note below the table: that error has a cause worth more than the fix.</td>
         </tr>
         <tr>
           <th>A verified hypervisor written in Rust</th>
           <td class="who">RayNu-V, RVM <span class="src">(claimed)</span>
             <span class="when">checked 2026-08-13 · provenance NOT established</span></td>
           <td class="st"><span class="cell out"><span class="dot"></span>unverified</span></td>
-          <td class="lim">⚠ Two projects claim this ground with the same Verus-and-Kani pairing, one
-            asserting a machine-checked EPT isolation theorem. <b>We could not establish their
-            provenance</b>; both surface through channels associated with high-volume
-            machine-generated repositories. ★ Recorded as a finding in its own right:
-            <b>provenance checking is now part of a literature search</b>, and a plausible-looking
-            artifact is no longer evidence that ground is taken.</td>
+          <td class="lim">⚠⚠ <b>This row overstated their claim and has been corrected.</b> RayNu-V
+            pairs Verus and Kani on an x86/VMX/EPT hypervisor and states an EPT isolation theorem —
+            but its own page lists milestones <b>M0–M6 with none completed</b>. The theorem is
+            <b>the plan's endpoint, not a result</b>; a search snippet described the document's arc
+            and we quoted it as an achievement. ★ <b>A search snippet reports what a document says it
+            is ABOUT, not what it achieved.</b>
+            <br><br>★ The comparison is worth more than the claim: RayNu-V began <b>2026-07-18</b>,
+            three days after this project, and <b>explicitly rejects <span class="mono">forbid(unsafe_code)</span></b> —
+            the defining choice here. <b>Convergent, not derivative</b>: in 2026 Verus and Kani are
+            the only mature Rust options and page-table exclusive ownership is the obvious first
+            theorem, so the design space is narrow enough to produce shape-alikes independently.
+            ⛔ Which also makes <em>"first verified hypervisor in language X"</em> worthless as a claim.</td>
         </tr>
         <tr>
           <th>A verified hypervisor under compute-heavy simulation</th>
@@ -379,10 +405,21 @@ td.c{text-align:center}
       </tbody>
     </table>
   </div>
+  <div class="prov field" data-src="field" style="margin:26px 0 0">
+    <span class="tag">How this rots</span>
+    <span><b>Two rows above were found wrong within a day of first publication, and both had the same
+    cause: they were assembled from SECONDARY sources.</b> Jailhouse's status came from a 2023 survey
+    — accurate when written, and by then already describing a project whose last commit was January
+    2023. RayNu-V's came from a search snippet. ★★ <b>The distinction that fixes it: a row citing a
+    PAPER is safe, because a paper's content never changes. A row about whether a PROJECT IS ALIVE is
+    not — and its primary source is the repository, which is one API call.</b> Every project row here
+    now carries a repo-derived date. ⛔ Do not add a liveness row on the authority of a survey.</span>
+  </div>
   <div class="keyrow">
     <span><span class="cell full"><span class="dot"></span>proved</span><span style="margin-left:6px">machine-checked</span></span>
     <span><span class="cell ship"><span class="dot"></span>shipping</span><span style="margin-left:6px">industrially proven, not fully verified</span></span>
     <span><span class="cell part"><span class="dot"></span>partial</span><span style="margin-left:6px">proved, but not on every architecture</span></span>
+    <span><span class="cell part"><span class="dot"></span>dormant</span><span style="margin-left:6px">real, but not moving — check before building on it</span></span>
     <span><span class="cell out"><span class="dot"></span>unverified</span><span style="margin-left:6px">claimed; provenance not established</span></span>
     <span><span class="cell gap"><span class="dot"></span>no case</span><span style="margin-left:6px">deliberately unoccupied</span></span>
     <span style="color:var(--ink-3)">— state is written in the chip, never carried by colour alone</span>
