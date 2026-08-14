@@ -320,6 +320,20 @@ td.c{text-align:center}
           <td class="lim">A VMM for seL4 under Microkit, booting Linux guests on Arm. ⚠ <b>Confirm GICv3 emulation for your specific board</b> — a live discussion item rather than a settled feature, and board support is per-platform.</td>
         </tr>
         <tr>
+          <th>The framework you would actually build the system with</th>
+          <td class="who">seL4 Microkit
+            <span class="when">repo pushed 2026-08-14 · <a class="src" href="https://github.com/seL4/microkit">seL4/microkit</a></span></td>
+          <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
+          <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
+          <td class="lim">★★ <b>And it is written in Rust</b> — 465 KB Rust against 187 KB C by
+            language breakdown, pushed <b>today</b>, with recent commits that are Rust idiom cleanups
+            (<span class="mono">prefer &amp;str over &amp;String</span>). <b>The verified kernel is C;
+            the framework you compose a static system with is not.</b>
+            <a href="https://github.com/seL4/rust-sel4">rust-sel4</a> (userspace support) is live too.
+            ⚠ Worth stating plainly because it cuts against the obvious reading of the row above:
+            choosing seL4 over a Rust hypervisor <b>does not mean leaving Rust.</b></td>
+        </tr>
+        <tr>
           <th>Multi-tenant compute isolation</th>
           <td class="who">Firecracker
             <span class="when">repo pushed 2026-08-13 · <a class="src" href="https://github.com/firecracker-microvm/firecracker">firecracker-microvm</a></span></td>
