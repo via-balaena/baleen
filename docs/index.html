@@ -17,13 +17,12 @@
      seL4's Arm MCS proof landing is the obvious one — update the row AND its date in the same
      edit. A stale date is worse than no date.
 
-     ⚠⚠ AND WITHIN ONE DAY OF FIRST PUBLICATION, TWO ROWS WERE FOUND WRONG. Both from SECONDARY
-     sources: Jailhouse's "mature" came from a 2023 survey (its last commit was January 2023),
-     and RayNu-V's "machine-checked theorem" came from a search snippet describing that
-     document's ARC rather than its results. ★★ THE RULE THAT FALLS OUT: a row citing a PAPER is
-     safe — a paper's content never changes. A row about whether a PROJECT IS ALIVE is not, and
-     its primary source is the REPOSITORY, which is one `gh repo view` away. ⛔ Never take
-     liveness from a survey.
+     ⚠⚠ FROZEN 2026-08-13. The hand-checked rows are a dated snapshot and the page says so at the
+     top. Within a day of first publication this table had EIGHT defects, all from citing sources
+     nobody had opened. Two rules came out of it and both are stated on the page: a row citing a
+     PAPER is safe because a paper's content never changes, while a row about whether a PROJECT IS
+     ALIVE is not and its primary source is the repository; and a date implies verification, so
+     never date a row whose primary source you have not read.
 
   Deliberately a plain .html page with no Jekyll front matter: Jekyll copies it through
   untouched, so the design here is not fighting a theme.
@@ -116,6 +115,8 @@ h2{font-family:ui-monospace,Menlo,monospace;font-size:13px;letter-spacing:.16em;
 .prov.field{background:color-mix(in srgb,var(--warn) 10%,transparent);
   border:1px solid color-mix(in srgb,var(--warn) 34%,transparent)}
 .prov.field .tag{background:var(--warn);color:#25200a}
+.prov.frozen{background:var(--surface-2);border:1px solid var(--rule)}
+.prov.frozen .tag{background:var(--ink-3);color:var(--surface)}
 
 .fencebar{display:flex;height:60px;gap:2px;margin:8px 0 6px}
 .fencebar .seg{display:flex;align-items:center;justify-content:center;color:#fff;
@@ -240,12 +241,23 @@ td.c{text-align:center}
       you <em>what to ask</em>.</div></div>
     <div class="tier d"><div class="k">The instrument</div><div class="v">Baleen — a static-partitioning
       kernel for AArch64/EL2 in Rust, <span id="nharness" class="mono">…</span> machine-checked
-      harnesses carried as a required gate. §02 is its own honest picture.</div></div>
+      harnesses carried as a required gate. Four weeks old, and <strong>complete as research rather
+      than continuing as a project</strong>. §02 is its own honest picture.</div></div>
     <div class="tier a"><div class="k">What it is not</div><div class="v">A product pitch. For a
       device worn by a person, the answer below is seL4, and the fact that we wrote one of the
       candidates is not an argument.</div></div>
   </div>
 </header>
+
+<div class="prov frozen" data-src="field" style="margin:30px 0 0;max-width:none">
+  <span class="tag">Frozen</span>
+  <span><b>A snapshot as of 2026-08-13, and it is not maintained.</b> Every row was true on its date
+  and several will not be by the time you read this — seL4's AArch64 confidentiality proof and its
+  Arm MCS port are both in flight, and either landing changes a row below. ★ <b>Treat the dates as
+  the claim's expiry, not its authority</b>, and check the linked source before relying on any row.
+  The generated figures in §02 are a different matter: they are derived from this repository's own
+  gates and cannot drift.</span>
+</div>
 
 <section id="map">
   <h2>01 — The map</h2>
@@ -282,34 +294,34 @@ td.c{text-align:center}
         <tr>
           <th>Microkernel functional correctness</th>
           <td class="who">seL4
-            <span class="when">repo pushed 2026-08-06 · <a class="src" href="https://sel4.systems">sel4.systems</a></span></td>
+            <span class="when">seL4/seL4 · <a class="src" href="https://docs.sel4.systems/projects/sel4/verified-configurations.html">verified configurations</a></span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">Abstract spec → executable spec → C. <b>Deployed and flown</b> (DARPA HACMS — the Red Team failed to compromise Boeing's Unmanned Little Bird in flight). The deepest result in the field, and the artifact is maintained.<br><br>⚠⚠ <b>BUT READ THE ARCHITECTURE ROW, NOT THE HEADLINE — AArch64 is seL4's LEAST-verified mainstream target.</b> Per seL4's own <a href="https://docs.sel4.systems/projects/sel4/verified-configurations.html">verified configurations</a>: <b>ARM 32-bit</b> has functional correctness, integrity, <b>confidentiality</b> and <b>binary correctness</b>. <b>RISC-V 64</b> has functional correctness (no fast path), integrity and confidentiality. <b>AArch64 has functional correctness and integrity — and NEITHER confidentiality NOR binary verification.</b> ★ This row previously read "binary-level translation validation on Arm", which is true of ARM32 and <b>false of AArch64</b>, the architecture this whole page is about.</td>
+          <td class="lim">Abstract spec → executable spec → C. <b>Deployed and flown</b> — DARPA HACMS, where the Red Team failed to compromise Boeing's Unmanned Little Bird in flight.<br><br>⚠⚠ <b>Verification is not uniform across architectures, and AArch64 is the weakest mainstream target.</b> ARM 32-bit has functional correctness, integrity, <b>confidentiality</b> and <b>binary correctness</b>. RISC-V 64 has functional correctness (no fast path), integrity and confidentiality. <b>AArch64 has functional correctness and integrity — neither of the other two.</b> ★ It is the architecture most people ship on.</td>
         </tr>
         <tr>
           <th>Mixed-criticality temporal isolation</th>
           <td class="who">seL4 MCS
-            <span class="when">checked 2026-08-13 · <a class="src" href="https://docs.sel4.systems/Tutorials/mcs.html">docs</a> · <a class="src" href="https://proofcraft.systems/news-2026/">Proofcraft</a></span></td>
+            <span class="when"><a class="src" href="https://docs.sel4.systems/Tutorials/mcs.html">docs</a> · <a class="src" href="https://proofcraft.systems/news-2026/">Proofcraft</a></span></td>
           <td class="st"><span class="cell part"><span class="dot"></span>partial</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">Scheduling contexts: capability-based access to CPU time with enforced execution bounds. Functional correctness <b>proved on RISC-V</b>; the Arm 64-bit port is <b>in progress</b> under DARPA PROVERS. ★ <b>The one row whose answer today is "not yet on your architecture."</b></td>
+          <td class="lim">Scheduling contexts: capability-based access to CPU time with enforced execution bounds. Functional correctness <b>proved on RISC-V</b>; the Arm 64-bit port is <b>in progress</b> under DARPA PROVERS. ★ The one row whose answer today is <em>"not yet, on your architecture."</em></td>
         </tr>
         <tr>
           <th>Verified hypervisor on multicore Arm</th>
           <td class="who">SeKVM
-            <span class="when">paper SOSP 2021 · repo <code>VeriGu/SeKVM-4.18</code> last push <b>2021-09-18</b></span></td>
+            <span class="when">SOSP 2021 · repo <span class="mono">SeKVM-4.18</span>, last push 2021-09-18</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
           <td class="st"><span class="cell part"><span class="dot"></span>dormant</span></td>
-          <td class="lim">⚠⚠ <b>The clearest case of the split this table now makes.</b> The <a href="https://dl.acm.org/doi/10.1145/3477132.3483560">SOSP 2021 result</a> — verified on Arm <b>relaxed memory hardware</b>, the multicore axis — is <b>permanent</b>. The artifact is <b>not</b>: pinned to <b>Linux 4.18</b> (2018) and untouched since September 2021, with its companion QEMU frozen at 3.0. <b>The ground is taken; the code is a museum piece.</b></td>
+          <td class="lim">The <a href="https://dl.acm.org/doi/10.1145/3477132.3483560">SOSP 2021 result</a> — verified on Arm <b>relaxed memory hardware</b> — is permanent. The artifact is not: pinned to <b>Linux 4.18</b> and untouched since 2021, with its companion QEMU frozen at 3.0. ★ <b>The clearest case for two columns: the ground is taken, the code is a museum piece.</b></td>
         </tr>
         <tr>
           <th>Verified preemptive scheduler with temporal isolation</th>
           <td class="who">Virtual Timeline
-            <span class="when">PACMPL 4(POPL), <b>POPL 2020</b> · <a class="src" href="https://dl.acm.org/doi/10.1145/3371088">10.1145/3371088</a></span></td>
+            <span class="when">PACMPL 4(POPL), POPL 2020 · <a class="src" href="https://dl.acm.org/doi/10.1145/3371088">10.1145/3371088</a></span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>proved</span></td>
           <td class="st"><span class="cell out"><span class="dot"></span>paper only</span></td>
-          <td class="lim">Liu, Rieg, Shao, Gu, Costanzo, Kim &amp; Yoon (the CertiKOS group). The formal abstraction for exactly this — <b>it occupies the problem we had identified as our sharpest open one</b>, six years earlier and in a stronger form. ★ No artifact assessed: for the <em>novelty</em> question that does not matter, which is the point of separating the columns. ⚠ This row said <b>POPL 2019</b> and named four of seven authors. It is <b>POPL 2020</b>.</td>
+          <td class="lim">Liu, Rieg, Shao, Gu, Costanzo, Kim &amp; Yoon — the CertiKOS group. The formal abstraction for exactly this, and <b>it occupies the problem this project had identified as its sharpest open one</b>, six years earlier and in a stronger form.</td>
         </tr>
         <tr>
           <th>Linux guest beside a small analyzable partition</th>
@@ -317,21 +329,15 @@ td.c{text-align:center}
             <span class="when">repo pushed 2026-08-13 · <a class="src" href="https://github.com/au-ts/libvmm">au-ts/libvmm</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">A VMM for seL4 under Microkit, booting Linux guests on Arm. ⚠ <b>Confirm GICv3 emulation for your specific board</b> — a live discussion item rather than a settled feature, and board support is per-platform.</td>
+          <td class="lim">A VMM for seL4 under Microkit, booting Linux guests on Arm. ⚠ <b>Confirm GICv3 emulation for your board</b> — a live discussion item rather than a settled feature, and support is per-platform.</td>
         </tr>
         <tr>
-          <th>The framework you would actually build the system with</th>
+          <th>The framework you would build the system with</th>
           <td class="who">seL4 Microkit
             <span class="when">repo pushed 2026-08-14 · <a class="src" href="https://github.com/seL4/microkit">seL4/microkit</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">★★ <b>And it is written in Rust</b> — 465 KB Rust against 187 KB C by
-            language breakdown, pushed <b>today</b>, with recent commits that are Rust idiom cleanups
-            (<span class="mono">prefer &amp;str over &amp;String</span>). <b>The verified kernel is C;
-            the framework you compose a static system with is not.</b>
-            <a href="https://github.com/seL4/rust-sel4">rust-sel4</a> (userspace support) is live too.
-            ⚠ Worth stating plainly because it cuts against the obvious reading of the row above:
-            choosing seL4 over a Rust hypervisor <b>does not mean leaving Rust.</b></td>
+          <td class="lim">★★ <b>Written in Rust</b> — 465 KB Rust to 187 KB C, pushed the day this row was written, with recent commits that are Rust idiom cleanups. <a href="https://github.com/seL4/rust-sel4">rust-sel4</a> is live too. ★ <b>The verified kernel is C; the layer you compose a static system with is not.</b> Choosing seL4 does not mean leaving Rust.</td>
         </tr>
         <tr>
           <th>Multi-tenant compute isolation</th>
@@ -342,20 +348,20 @@ td.c{text-align:center}
           <td class="lim">Apache-2.0, Arm <b>and</b> x86, at AWS scale. Not formally verified as a whole, but industrially proven — which for this requirement is the stronger claim.</td>
         </tr>
         <tr>
-          <th>Keeping a formal model honest against the implementation</th>
+          <th>Keeping a formal model honest against the code</th>
           <td class="who">Cedar
             <span class="when">repo pushed 2026-08-13 · <a class="src" href="https://arxiv.org/abs/2407.01688">arXiv 2407.01688</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>solved</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">An executable <b>Lean</b> model (confirmed from the repo: 3.8 MB Lean to 1.2 MB Rust) roughly an order of magnitude smaller than the production Rust, with <b>differential random testing as a release gate</b>: millions of inputs through both, outputs compared. <b>4 bugs from the proofs and 21 more</b> from DRT and property-based testing — 25, not 21; this row previously said "21 total". ★ A <b>template, not a research problem</b> — and it closes the gap we left open.</td>
+          <td class="lim">An executable <b>Lean</b> model — 3.8 MB Lean to 1.2 MB Rust — with <b>differential random testing as a release gate</b>: millions of inputs through both, outputs compared. <b>4 bugs from the proofs, 21 more from DRT and property-based testing.</b> ★ A template, not a research problem.</td>
         </tr>
         <tr>
           <th>Verification affordable as a CI gate</th>
           <td class="who">Kani, in production
-            <span class="when">repo pushed 2026-08-14 · <a class="src" href="https://arxiv.org/abs/2607.01504">arXiv 2607.01504</a></span></td>
+            <span class="when"><a class="src" href="https://arxiv.org/abs/2607.01504">arXiv 2607.01504</a> · repo pushed 2026-08-14</span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">Deployed in production CI on Firecracker — the VMM behind Lambda and Fargate — plus s2n-quic, Hifitime, and the Rust standard library. <b>Existence proof that proving is a budget line, not a campaign.</b> ⚠ A figure of <em>27 harnesses / 3 suites / ~15 min</em> stood here cited to the arXiv paper; it comes from the <b>Kani team's blog</b>, and we did not confirm it in the paper. Removed rather than re-sourced, because the claim does not need it.</td>
+          <td class="lim">Running in production CI on Firecracker — the VMM behind Lambda and Fargate — plus s2n-quic, Hifitime, and the Rust standard library. ★ <b>Existence proof that proving is a budget line, not a campaign.</b></td>
         </tr>
         <tr>
           <th>Whether diverse assurance arguments are independent</th>
@@ -363,7 +369,7 @@ td.c{text-align:center}
             <span class="when"><a class="src" href="http://sunnyday.mit.edu/papers/nver-tse.pdf">Knight &amp; Leveson 1986</a></span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>settled</span></td>
           <td class="st"><span class="cell out"><span class="dot"></span>paper only</span></td>
-          <td class="lim"><b>They are not.</b> 27 independently written versions over 1M test cases showed correlated failure far above chance; Littlewood &amp; Wright model dependence between a <b>testing</b> leg and a <b>formal verification</b> leg specifically. Replicated across NASA and nuclear programmes. ⛔ Do not treat a verification portfolio as a union of its tiers.</td>
+          <td class="lim"><b>They are not.</b> 27 independently written versions over 1M test cases showed correlated failure far above chance; Littlewood &amp; Wright model dependence between a <b>testing</b> leg and a <b>formal verification</b> leg specifically. Replicated across NASA and nuclear programmes. ⛔ A verification portfolio is not the union of its tiers.</td>
         </tr>
         <tr>
           <th>Static-partitioning hypervisor on Arm</th>
@@ -371,7 +377,7 @@ td.c{text-align:center}
             <span class="when">repo pushed 2026-08-10 · <a class="src" href="https://github.com/bao-project/bao-hypervisor">bao-project</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
           <td class="st"><span class="cell full"><span class="dot"></span>live</span></td>
-          <td class="lim">Real hardware, real deployments, <b>actively maintained</b>. The architectural niche Baleen occupies was already well populated before it started, and still is.</td>
+          <td class="lim">Real hardware, real deployments, actively maintained. The architectural niche this project occupies was already well populated before it started, and still is.</td>
         </tr>
         <tr>
           <th>Static-partitioning hypervisor, the older reference</th>
@@ -379,7 +385,7 @@ td.c{text-align:center}
             <span class="when">last commit 2023-01-16 · last push 2024-05-18 · <a class="src" href="https://github.com/siemens/jailhouse">siemens/jailhouse</a></span></td>
           <td class="st"><span class="cell ship"><span class="dot"></span>shipping</span></td>
           <td class="st"><span class="cell part"><span class="dot"></span>dormant</span></td>
-          <td class="lim">⚠ <b>Not archived, 1,950 stars, and not moving.</b> Last default-branch commit <b>January 2023</b>; last push anywhere <b>May 2024</b>. A legitimate architectural reference — <b>not a live option to build on.</b></td>
+          <td class="lim">⚠ Not archived, 1,950 stars, and not moving. A legitimate architectural reference — <b>not a live option to build on.</b> ★ Note the direction: dormant, but it ran on real silicon in production. That still beats active-but-never-left-the-emulator.</td>
         </tr>
         <tr>
           <th>A verified hypervisor written in Rust</th>
@@ -387,7 +393,7 @@ td.c{text-align:center}
             <span class="when">RayNu-V page read 2026-08-13 (v0.1.1) · RVM not read</span></td>
           <td class="st"><span class="cell out"><span class="dot"></span>unverified</span></td>
           <td class="st"><span class="cell out"><span class="dot"></span>not assessed</span></td>
-          <td class="lim">⚠⚠ <b>This row previously overstated their claim.</b> RayNu-V pairs Verus and Kani on an x86/VMX/EPT hypervisor and states an EPT isolation theorem — but its page lists milestones <b>M0–M6 with none completed</b>. The theorem is <b>the plan's endpoint, not a result</b>; a search snippet described the document's arc and we quoted it as an achievement. ★ <b>A snippet reports what a document is ABOUT, not what it achieved.</b><br><br>★ It began <b>2026-07-18</b>, three days after this project, and <b>explicitly rejects <span class="mono">forbid(unsafe_code)</span></b> — the defining choice here, and the first thing a deriver would take. <b>Convergent, not derivative.</b> ⛔ Which also makes <em>"first verified hypervisor in language X"</em> worthless as a claim. ⚠ RVM is separate and <b>has not been read</b>; its verification is described as <em>planned</em>.</td>
+          <td class="lim">RayNu-V pairs Verus and Kani on an x86/VMX/EPT hypervisor and states an EPT isolation theorem — but its page lists milestones <b>M0–M6 with none completed</b>, so the theorem is the plan's endpoint. It began <b>2026-07-18</b>, three days after this project, and <b>explicitly rejects <span class="mono">forbid(unsafe_code)</span></b>. ★ <b>Convergent, not derivative</b> — and a reason <em>"first verified hypervisor in language X"</em> is worthless as a claim. ⚠ RVM has not been read; its verification is described as <em>planned</em>.</td>
         </tr>
         <tr>
           <th>A verified hypervisor under compute-heavy simulation</th>
@@ -395,28 +401,21 @@ td.c{text-align:center}
             <span class="when">reasoning, not a citation</span></td>
           <td class="st"><span class="cell gap"><span class="dot"></span>no case</span></td>
           <td class="st"><span class="cell out"><span class="dot"></span>—</span></td>
-          <td class="lim">A hypervisor does not make cores faster — it costs a few percent. Isolation is not that workload's bottleneck, the binding constraint is <b>memory bandwidth</b>, and Firecracker already owns multi-tenant isolation. ★ Kept as a row <b>because the idea is attractive, recurs, and is wrong.</b></td>
+          <td class="lim">A hypervisor does not make cores faster. Isolation is not that workload's bottleneck, the binding constraint is <b>memory bandwidth</b>, and Firecracker already owns multi-tenant isolation. ★ Kept as a row because the idea is attractive, recurs, and is wrong.</td>
         </tr>
       </tbody>
     </table>
   </div>
   <div class="prov field" data-src="field" style="margin:26px 0 0">
-    <span class="tag">How this rots</span>
-    <span><b>Two rows above were found wrong within a day of first publication, and both had the same
-    cause: they were assembled from SECONDARY sources.</b> Jailhouse's status came from a 2023 survey
-    — accurate when written, and by then already describing a project whose last commit was January
-    2023. RayNu-V's came from a search snippet. ★★ <b>The distinction that fixes it: a row citing a
-    PAPER is safe, because a paper's content never changes. A row about whether a PROJECT IS ALIVE is
-    not — and its primary source is the repository, which is one API call.</b> Every project row here
-    now carries a repo-derived date. ⛔ Do not add a liveness row on the authority of a survey.
-    <br><br>⚠⚠ <b>A second audit then went after the CITATIONS, and found four more.</b> The seL4 row
-    claimed binary verification "on Arm" — true of ARM32, <b>false of AArch64</b>. Virtual Timeline
-    was dated <b>POPL 2019</b>; it is <b>2020</b>. Cedar's bug count read "21 total" when the paper
-    says 4 from proofs and <b>21 more</b>. A Kani deployment figure was cited to a paper that does
-    not contain it. ★★ <b>The cause is subtler than the liveness one, and worth more: every row said
-    "checked 2026-08-13", but for several of them the truth was "FOUND VIA SEARCH on 2026-08-13".
-    A date implies verification. Where there was none, the date was rigour-shaped decoration.</b>
-    ⛔ Do not date a row you have not opened the primary source for.</span>
+    <span class="tag">How this went wrong</span>
+    <span><b>Within a day of first publication this table had eight defects, and every one came from
+    citing something nobody had opened.</b> Liveness taken from a 2023 survey (Jailhouse had been
+    still for a year by then). A machine-checked theorem taken from a search snippet that was
+    describing a document's <em>plan</em>. A binary-verification claim that held for ARM 32-bit and
+    not for AArch64. A paper dated to the wrong year. ★★ <b>Two rules came out of it. A row citing a
+    PAPER is safe, because a paper's content never changes; a row about whether a PROJECT IS ALIVE is
+    not, and its primary source is the repository. And a date implies verification — where there was
+    none, the date was rigour-shaped decoration.</b></span>
   </div>
   <div class="keyrow">
     <span style="width:100%;color:var(--ink-3);font-family:ui-monospace,Menlo,monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase">Ground taken?</span>
@@ -440,8 +439,8 @@ td.c{text-align:center}
   <h2>02 — The instrument</h2>
   <p class="claim">Half the shipped code is machine-checked. The other half is a thin layer that
   cannot be.</p>
-  <p class="sub">The map above is only worth what the person who assembled it knows, so here is that
-  person's own work, held to the same honesty. Verification tools reach code inside the workspace.
+  <p class="sub">A map is only worth what the person assembling it knows, so here is that person's
+  own work, held to the same standard. Verification tools reach code inside the workspace.
   <span class="mono">hv-metal</span> is deliberately excluded — it needs <span class="mono">unsafe</span>
   for MMIO and assembly, so no prover links it and it is held to boot witnesses instead.</p>
 
@@ -484,18 +483,18 @@ td.c{text-align:center}
     </table>
   </div>
   <div class="keyrow" id="key"></div>
-</section>
 
-<section>
-  <h2>03 — Where the proof effort actually went</h2>
-  <p class="claim">Harnesses cluster where the isolation argument is load-bearing.</p>
+  <div style="height:34px"></div>
+<p class="claim" style="font-size:20px">Harnesses cluster where the isolation argument is load-bearing.</p>
   <p class="sub">Kani harnesses by module. The shape is the honest one: the emitter and the model's
   invariants carry the weight, because that is where a wrong answer becomes a cross-domain leak.</p>
   <div class="card" id="dist"></div>
 </section>
 
+
+
 <section>
-  <h2>04 — What this settles</h2>
+  <h2>03 — What this settles</h2>
   <p class="claim">A reconnaissance that ends without a decision has not finished.</p>
   <p class="sub">The map is not neutral. It was assembled to answer specific questions for a
   specific project — a differentiable simulation SDK whose capstone is a person-specific powered
@@ -534,10 +533,11 @@ td.c{text-align:center}
 </section>
 
 <section>
-  <h2>05 — What is still open in the instrument</h2>
-  <p class="claim">Kept, because a map assembled by an artifact should show the artifact's edges.</p>
-  <p class="sub">These are Baleen's own gaps. They are no longer a roadmap — the decision above
-  routes around them — but they are what the honest picture in §02 does not cover.</p>
+  <h2>04 — Where this project stopped</h2>
+  <p class="claim">A map assembled by an artifact should show that artifact's edges.</p>
+  <p class="sub">Baleen is <strong>complete as research and paused as a project</strong>. These are
+  not a roadmap — the decision above routes around them. They are the honest statement of where it
+  stopped, and they are why it is not a thing to build on.</p>
   <div class="board">
     <div class="col hw"><h3>Needs hardware</h3><div class="cnt num">4</div><ul>
       <li><b>No silicon.</b> Every metal result is QEMU. A board probe exists and has never run on
