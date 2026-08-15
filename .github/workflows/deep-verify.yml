@@ -68,7 +68,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # ⑳-c: the inventory FIRST — `--list` enumerates without running (~2 s), so a deleted sweep
       # is named here rather than silently reducing the run below. `cargo xtask ci` checks the same
@@ -117,7 +117,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Kani is a cargo subcommand plus its own downloaded backend (CBMC). The version is
       # pinned so a Kani release cannot silently change proof semantics — raise it deliberately
@@ -220,11 +220,11 @@ jobs:
           toolchain: nightly
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        uses: taiki-e/install-action@b20dedce73af6905cdc30d6611090c9b67557c8d # v2.85.12
         with:
           tool: cargo-fuzz
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: hv-fuzz
 
