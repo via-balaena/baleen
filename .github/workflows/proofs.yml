@@ -76,7 +76,7 @@ jobs:
       run: ${{ steps.detect.outputs.run }}
     steps:
       - name: Harden the runner (audit egress)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -135,7 +135,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Harden the runner (audit egress)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
@@ -152,7 +152,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: needs.changes.outputs.run == 'true'
 
       # Kani is a cargo subcommand plus its downloaded CBMC backend. The version is pinned so a Kani
@@ -190,7 +190,7 @@ jobs:
       VERUS_ZIP: verus-0.2026.07.12.0b42f4c-x86-linux.zip
     steps:
       - name: Harden the runner (audit egress)
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
           egress-policy: audit
 
